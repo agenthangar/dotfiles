@@ -34,16 +34,29 @@ enable_sleep() {
         rm -f "$CAFFEINATE_PIDFILE"
     fi
 
-    # Restore pmset defaults (sensible values; user can tune later).
+    # Restore pmset defaults and clear the hard sleep lock.
     echo "Restoring pmset defaults (requires sudo)..."
-    sudo pmset -a sleep 10 displaysleep 10 disksleep 10
+    sudo pmset -a disablesleep 0 sleep 10 displaysleep 10 disksleep 10
     echo "Sleep re-enabled."
 }
 
 disable_sleep() {
-    # TODO: implement — see prompt below.
-    echo "disable_sleep not yet implemented" >&2
-    exit 1
+    # Belt and suspenders, matching the user's ~/.zshrc nosleep style:
+    #   1. pmset disablesleep 1 — the strongest macOS setting (survives logout)
+    #   2. caffeinate -dimsu     — process assertion as a second layer
+    # Unlike the interactive zshrc version, this runs caffeinate in the
+    # background and records its PID so `enable` can stop it later.
+    if [[ -f "$CAFFEINATE_PIDFILE" ]] && kill -0 "$(cat "$CAFFEINATE_PIDFILE")" 2>/dev/null; then
+        echo "Sleep is already disabled (caffeinate pid $(cat "$CAFFEINATE_PIDFILE"))."
+        exit 0
+    fi
+
+    echo "Disabling sleep (requires sudo)..."
+    sudo pmset -a disablesleep 1
+    nohup caffeinate -dimsu >/dev/null 2>&1 &
+    echo $! > "$CAFFEINATE_PIDFILE"
+    disown 2>/dev/null || true
+    echo "Sleep disabled. caffeinate pid: $(cat "$CAFFEINATE_PIDFILE")"
 }
 
 case "${1:-}" in

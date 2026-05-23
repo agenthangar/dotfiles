@@ -6,7 +6,7 @@ Personal shell config and utility scripts.
 
 - `.zshrc` — zsh shell config (aliases, functions, PATH)
 - `bin/` — utility scripts (added to PATH)
-  - `sleep-manager.sh` — manage macOS sleep behavior (`status`, `disable`, `enable`)
+  - `sleep-manager` — manage macOS sleep behavior (`status`, `disable`, `enable`)
 
 The files in this repo are the source of truth. `~/.zshrc` and `~/bin/<script>`
 are symlinks back into this repo, so editing either side edits both.

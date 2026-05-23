@@ -20,6 +20,6 @@ link() {
 }
 
 link "$DOTFILES_DIR/.zshrc"             "$HOME/.zshrc"
-link "$DOTFILES_DIR/bin/sleep-manager.sh" "$HOME/bin/sleep-manager.sh"
+link "$DOTFILES_DIR/bin/sleep-manager" "$HOME/bin/sleep-manager"
 
 echo "Done."

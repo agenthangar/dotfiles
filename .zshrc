@@ -1,4 +1,4 @@
-export PATH="$HOME/.local/bin:$PATH"
+export PATH="$HOME/bin:$HOME/.local/bin:$PATH"
 
 # OpenClaw Completion
 source "/Users/chrisobrien/.openclaw/completions/openclaw.zsh"

@@ -1,10 +1,54 @@
 #!/usr/bin/env bash
-# sleep-manager.sh — manage macOS sleep behavior
-# Usage: sleep-manager.sh {status|disable|enable}
+# sleep-manager — manage macOS sleep behavior
 
 set -euo pipefail
 
 CAFFEINATE_PIDFILE="/tmp/sleep-manager-caffeinate.pid"
+
+usage() {
+    cat <<'EOF'
+sleep-manager — manage macOS sleep behavior
+
+USAGE
+    sleep-manager <command>
+
+COMMANDS
+    status      Show current sleep settings and any active sleep blockers.
+                Prints the pmset timeouts (sleep, displaysleep, disksleep),
+                any system-wide assertions preventing sleep right now, and
+                whether this script has a caffeinate process running.
+                No sudo required.
+
+    disable     Prevent the Mac from sleeping. Applies two layers:
+                  1. sudo pmset -a disablesleep 1  (hard OS-level lock;
+                     survives logout and reboot)
+                  2. caffeinate -dimsu in the background, PID stored at
+                     /tmp/sleep-manager-caffeinate.pid
+                Idempotent: running it twice is a no-op the second time.
+                Requires sudo.
+
+    enable      Restore normal sleep behavior. Kills the backgrounded
+                caffeinate (if any) and runs:
+                  sudo pmset -a disablesleep 0 sleep 10 displaysleep 10 \
+                                disksleep 10
+                Requires sudo.
+
+    help, -h, --help    Show this message.
+
+TYPICAL FLOW
+    sleep-manager status      # check current state
+    sleep-manager disable     # before a long-running task
+    # ... do the work ...
+    sleep-manager enable      # back to normal
+
+NOTES
+    * `disable` does not survive a reboot of the caffeinate layer (the
+      process dies), but the pmset `disablesleep` flag DOES survive. Always
+      run `enable` to fully restore — don't rely on a reboot.
+    * `status` is the source of truth. If you're unsure whether sleep is
+      disabled, run it.
+EOF
+}
 
 status() {
     echo "=== Current Sleep Settings ==="
@@ -63,8 +107,15 @@ case "${1:-}" in
     status)  status ;;
     disable) disable_sleep ;;
     enable)  enable_sleep ;;
+    help|-h|--help) usage ;;
+    "")
+        usage >&2
+        exit 1
+        ;;
     *)
-        echo "Usage: $0 {status|disable|enable}" >&2
+        echo "sleep-manager: unknown command '$1'" >&2
+        echo >&2
+        usage >&2
         exit 1
         ;;
 esac

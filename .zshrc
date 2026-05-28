@@ -1,7 +1,12 @@
 export PATH="$HOME/bin:$HOME/.local/bin:$PATH"
 
+# Initialize the completion system before sourcing anything that calls `compdef`
+# (e.g. the example completion below). Without this, compdef is undefined and
+# sourcing the completion errors with "command not found: compdef".
+autoload -Uz compinit && compinit
+
 # OpenClaw Completion
-source "/Users/you/.example/completions/example.zsh"
+source "$HOME/.example/completions/example.zsh"
 
 # Quick PR status — usage: prview [pr-number]
 # (no arg → current branch's PR). Hides body/comments/diff; shows just

@@ -19,7 +19,8 @@ link() {
     echo "Linked $dst -> $src"
 }
 
-link "$DOTFILES_DIR/.zshrc"             "$HOME/.zshrc"
-link "$DOTFILES_DIR/bin/sleep-manager" "$HOME/bin/sleep-manager"
+link "$DOTFILES_DIR/.zshrc"               "$HOME/.zshrc"
+link "$DOTFILES_DIR/bin/sleep-manager"    "$HOME/bin/sleep-manager"
+link "$DOTFILES_DIR/claude/settings.json" "$HOME/.claude/settings.json"
 
 echo "Done."

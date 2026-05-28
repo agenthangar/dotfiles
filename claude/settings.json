@@ -1,0 +1,42 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(launchctl kickstart:*)",
+      "Bash(node -e:*)",
+      "Bash(grep:*)",
+      "Bash(rg:*)",
+      "Bash(python3:*)",
+      "Bash(lsof:*)",
+      "Bash(kill:*)"
+    ],
+    "defaultMode": "auto"
+  },
+  "enabledPlugins": {
+    "frontend-design@claude-plugins-official": true,
+    "github@claude-plugins-official": false,
+    "feature-dev@claude-plugins-official": true,
+    "code-simplifier@claude-plugins-official": true,
+    "commit-commands@claude-plugins-official": true,
+    "claude-md-management@claude-plugins-official": true,
+    "claude-code-setup@claude-plugins-official": true,
+    "skill-creator@claude-plugins-official": true,
+    "learning-output-style@claude-plugins-official": false,
+    "playground@claude-plugins-official": true,
+    "commit-commands@claude-code-plugins": true,
+    "feature-dev@claude-code-plugins": true,
+    "frontend-design@claude-code-plugins": true,
+    "superpowers@claude-plugins-official": false,
+    "learning-output-style@claude-code-plugins": true,
+    "typescript-lsp@claude-plugins-official": true,
+    "chrome-devtools-mcp@claude-plugins-official": false
+  },
+  "extraKnownMarketplaces": {
+    "claude-code-plugins": {
+      "source": {
+        "source": "github",
+        "repo": "anthropics/claude-code"
+      }
+    }
+  },
+  "skipAutoPermissionPrompt": true
+}

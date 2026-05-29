@@ -40,3 +40,54 @@ prview() {
 }
 
 nosleep() { trap 'sudo pmset -a disablesleep 0' EXIT INT; sudo pmset -a disablesleep 1 && caffeinate -dimsu; }
+
+# dev <repo> [slot] — open/reattach a Claude Code tmux session
+# repos: ff (financial-forecast), cfp (cashfwd-private), cf (cashfwd)
+# slot: optional 1-4, auto-picks next free slot if omitted
+dev() {
+  local repo="$1"
+  local slot="$2"
+
+  local -A repo_paths
+  repo_paths[ff]="$HOME/code/financial-forecast"
+  repo_paths[cfp]="$HOME/code/cashfwd-private"
+  repo_paths[cf]="$HOME/code/cashfwd"
+
+  if [[ -z "$repo" || -z "${repo_paths[$repo]}" ]]; then
+    echo "Usage: dev <ff|cfp|cf> [slot]"
+    echo "  ff  → financial-forecast"
+    echo "  cfp → cashfwd-private"
+    echo "  cf  → cashfwd"
+    return 1
+  fi
+
+  local dir="${repo_paths[$repo]}"
+
+  if [[ ! -d "$dir" ]]; then
+    echo "Repo dir not found: $dir"
+    return 1
+  fi
+
+  # auto-pick next free slot (1-4) if not specified
+  if [[ -z "$slot" ]]; then
+    for n in 1 2 3 4; do
+      local sname="dev-${repo}-${n}"
+      if ! tmux has-session -t "$sname" 2>/dev/null; then
+        slot=$n
+        break
+      fi
+    done
+    # if all slots exist, reattach slot 1
+    [[ -z "$slot" ]] && slot=1
+  fi
+
+  local session="dev-${repo}-${slot}"
+
+  if tmux has-session -t "$session" 2>/dev/null; then
+    echo "Reattaching $session"
+    tmux attach-session -t "$session"
+  else
+    echo "Starting $session in $dir"
+    tmux new-session -s "$session" -c "$dir" -x 220 -y 50 \; send-keys "claude" Enter
+  fi
+}

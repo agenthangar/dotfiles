@@ -22,5 +22,6 @@ link() {
 link "$DOTFILES_DIR/.zshrc"               "$HOME/.zshrc"
 link "$DOTFILES_DIR/bin/sleep-manager"    "$HOME/bin/sleep-manager"
 link "$DOTFILES_DIR/claude/settings.json" "$HOME/.claude/settings.json"
+link "$DOTFILES_DIR/ssh/config"           "$HOME/.ssh/config"
 
 echo "Done."

@@ -1,0 +1,6 @@
+Host *
+    # Load the key into the running ssh-agent on first use (one prompt per agent).
+    AddKeysToAgent yes
+    # Pull the key's passphrase from the macOS Keychain so it survives reboots.
+    UseKeychain yes
+    IdentityFile ~/.ssh/id_ed25519

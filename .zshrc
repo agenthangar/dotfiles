@@ -62,8 +62,8 @@ csync() {
 
   case "$direction" in
     push)
-      echo "↑ Pushing $local_dir → iCloud"
-      rsync -av --update --delete-after \
+      echo "↑ Pushing $local_dir → iCloud (merge, no delete)"
+      rsync -av --update \
         --exclude='.DS_Store' \
         "$local_dir/" "$icloud/"
       ;;

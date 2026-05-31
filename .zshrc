@@ -52,9 +52,6 @@ tpaste() {
   local slot="$2"
 
   local icloud="$HOME/Library/Mobile Documents/com~apple~CloudDocs"
-  local uploaddir="$HOME/.tmux-logs/uploads"
-  mkdir -p "$uploaddir"
-
   # find latest screenshot in iCloud Drive root (non-recursive, screenshots save here directly)
   local src
   src=$(find "$icloud" -maxdepth 1 -type f \( -iname 'Screenshot*.png' -o -iname 'Screenshot*.jpg' \) \
@@ -70,12 +67,7 @@ tpaste() {
     return 1
   fi
 
-  # copy to uploads dir with timestamp to avoid collisions
-  local ext="${src##*.}"
-  local dest="$uploaddir/$(date +%Y%m%d_%H%M%S).$ext"
-  cp "$src" "$dest"
-  echo "Using: $dest"
-  echo "  (source: $src)"
+  echo "Using: $src"
 
   # find session
   local -A repo_paths
@@ -109,7 +101,7 @@ tpaste() {
   fi
 
   # paste the path into the tmux pane (user still hits enter to send to Claude)
-  tmux send-keys -t "$session" "$dest"
+  tmux send-keys -t "$session" "$src"
   echo "Pasted path into $session — press Enter in that session to send to Claude."
 }
 

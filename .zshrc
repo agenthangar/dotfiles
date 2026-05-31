@@ -44,6 +44,42 @@ nosleep() { trap 'sudo pmset -a disablesleep 0' EXIT INT; sudo pmset -a disables
 # dots — pull latest dotfiles and reload zsh
 dots() { cd ~/code/dotfiles && git pull && source ~/.zshrc && cd - > /dev/null; }
 
+# csync [push|pull] — sync Claude Code session history to/from iCloud Drive
+# csync push  → upload ~/.claude/projects/ to iCloud (default if no arg)
+# csync pull  → download from iCloud to ~/.claude/projects/
+csync() {
+  local direction="${1:-push}"
+  local icloud="$HOME/Library/Mobile Documents/com~apple~CloudDocs/claude-sessions"
+  local local_dir="$HOME/.claude/projects"
+
+  if [[ ! -d "$HOME/Library/Mobile Documents/com~apple~CloudDocs" ]]; then
+    echo "iCloud Drive not found on this machine."
+    return 1
+  fi
+
+  mkdir -p "$icloud"
+  mkdir -p "$local_dir"
+
+  case "$direction" in
+    push)
+      echo "↑ Pushing $local_dir → iCloud"
+      rsync -av --update --delete-after \
+        --exclude='.DS_Store' \
+        "$local_dir/" "$icloud/"
+      ;;
+    pull)
+      echo "↓ Pulling iCloud → $local_dir"
+      rsync -av --update \
+        --exclude='.DS_Store' \
+        "$icloud/" "$local_dir/"
+      ;;
+    *)
+      echo "Usage: csync [push|pull]"
+      return 1
+      ;;
+  esac
+}
+
 # tpaste [repo] [slot] — paste latest iCloud Drive image path into a dev tmux session
 # tpaste ff     → paste into first ff session
 # tpaste ff 3   → paste into dev-ff-3

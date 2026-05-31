@@ -44,66 +44,52 @@ nosleep() { trap 'sudo pmset -a disablesleep 0' EXIT INT; sudo pmset -a disables
 # dots — pull latest dotfiles and reload zsh
 dots() { cd ~/code/dotfiles && git pull && source ~/.zshrc && cd - > /dev/null; }
 
-# tgo <repo> [slot] — attach to an existing dev tmux session
-# tgo ff      → attach to the first existing ff session
-# tgo ff 2    → attach to dev-ff-2 specifically
-# tgo         → interactive picker across all dev sessions
+# tgo [repo[slot]] — attach to an existing dev tmux session
+# tgo        → list all dev sessions
+# tgo ff     → attach to first ff session
+# tgo ff3    → attach to dev-ff-3
 tgo() {
-  local repo="$1"
-  local slot="$2"
+  local arg="$1"
 
-  local -A repo_paths
-  repo_paths[ff]="$HOME/code/financial-forecast"
-  repo_paths[cfp]="$HOME/code/cashfwd-private"
-  repo_paths[cf]="$HOME/code/cashfwd"
-
-  # no args — interactive picker
-  if [[ -z "$repo" ]]; then
-    local sessions
-    sessions=$(tmux list-sessions -F '#S' 2>/dev/null | grep '^dev-')
-    if [[ -z "$sessions" ]]; then
-      echo "No dev sessions running."
-      return 1
-    fi
-    echo "$sessions"
-    echo -n "Attach to: "
-    read chosen
-    [[ -n "$chosen" ]] && tmux attach-session -t "$chosen"
+  # no args — list sessions
+  if [[ -z "$arg" ]]; then
+    tmux list-sessions -F '#S' 2>/dev/null | grep '^dev-' || echo "No dev sessions running."
     return
   fi
 
-  if [[ -z "${repo_paths[$repo]}" ]]; then
-    echo "Unknown repo: $repo. Use ff, cfp, or cf."
+  # parse repo + optional slot: ff, ff1, ff2, cfp, cfp2, cf, cf1 ...
+  local repo slot
+  if [[ "$arg" =~ ^(cfp)([0-9]+)?$ ]]; then
+    repo="cfp"; slot="${match[2]}"
+  elif [[ "$arg" =~ ^(ff|cf)([0-9]+)?$ ]]; then
+    repo="${match[1]}"; slot="${match[2]}"
+  else
+    echo "Unknown repo: $arg. Use ff, ff2, cfp, cfp2, cf, cf2 ..."
     return 1
   fi
 
-  # specific slot
-  if [[ -n "$slot" ]]; then
-    local session="dev-${repo}-${slot}"
-    if tmux has-session -t "$session" 2>/dev/null; then
-      tmux attach-session -t "$session"
-    else
-      echo "No session: $session (use 'dev $repo $slot' to create it)"
+  # default slot: find first existing session for this repo
+  if [[ -z "$slot" ]]; then
+    local n=1
+    while (( n <= 20 )); do
+      if tmux has-session -t "dev-${repo}-${n}" 2>/dev/null; then
+        slot=$n; break
+      fi
+      (( n++ ))
+    done
+    if [[ -z "$slot" ]]; then
+      echo "No sessions for '$repo'. Use 'dev $repo' to start one."
       return 1
     fi
-    return
   fi
 
-  # no slot — find first existing session for this repo
-  local n=1
-  while true; do
-    local sname="dev-${repo}-${n}"
-    if tmux has-session -t "$sname" 2>/dev/null; then
-      echo "Attaching $sname"
-      tmux attach-session -t "$sname"
-      return
-    fi
-    (( n++ ))
-    if (( n > 20 )); then
-      echo "No sessions found for repo '$repo'. Use 'dev $repo' to start one."
-      return 1
-    fi
-  done
+  local session="dev-${repo}-${slot}"
+  if tmux has-session -t "$session" 2>/dev/null; then
+    tmux attach-session -t "$session"
+  else
+    echo "No session: $session (use 'dev $repo $slot' to create it)"
+    return 1
+  fi
 }
 
 # dev <repo> [slot] — open/reattach a Claude Code tmux session

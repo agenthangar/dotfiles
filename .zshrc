@@ -44,6 +44,71 @@ nosleep() { trap 'sudo pmset -a disablesleep 0' EXIT INT; sudo pmset -a disables
 # dots — pull latest dotfiles and reload zsh
 dots() { cd ~/code/dotfiles && git pull && source ~/.zshrc && cd - > /dev/null; }
 
+# tpaste [repo] [slot] — paste latest iCloud Drive image path into a dev tmux session
+# tpaste ff     → paste into first ff session
+# tpaste ff 3   → paste into dev-ff-3
+tpaste() {
+  local repo="${1:-ff}"
+  local slot="$2"
+
+  local icloud="$HOME/Library/Mobile Documents/com~apple~CloudDocs"
+  local uploaddir="$HOME/.tmux-logs/uploads"
+  mkdir -p "$uploaddir"
+
+  # find latest image in iCloud Drive (recursive, any depth)
+  local src
+  src=$(find "$icloud" -type f \( -iname '*.png' -o -iname '*.jpg' -o -iname '*.jpeg' -o -iname '*.heic' \) \
+    -not -path '*/.Trash/*' \
+    | xargs ls -t 2>/dev/null | head -1)
+
+  if [[ -z "$src" ]]; then
+    echo "No images found in iCloud Drive ($icloud)"
+    return 1
+  fi
+
+  # copy to uploads dir with timestamp to avoid collisions
+  local ext="${src##*.}"
+  local dest="$uploaddir/$(date +%Y%m%d_%H%M%S).$ext"
+  cp "$src" "$dest"
+  echo "Using: $dest"
+  echo "  (source: $src)"
+
+  # find session
+  local -A repo_paths
+  repo_paths[ff]="$HOME/code/financial-forecast"
+  repo_paths[cfp]="$HOME/code/cashfwd-private"
+  repo_paths[cf]="$HOME/code/cashfwd"
+
+  if [[ -z "${repo_paths[$repo]}" ]]; then
+    echo "Unknown repo: $repo. Use ff, cfp, or cf."
+    return 1
+  fi
+
+  if [[ -z "$slot" ]]; then
+    local n=1
+    while (( n <= 20 )); do
+      if tmux has-session -t "dev-${repo}-${n}" 2>/dev/null; then
+        slot=$n; break
+      fi
+      (( n++ ))
+    done
+    if [[ -z "$slot" ]]; then
+      echo "No sessions for '$repo'. Use 'dev $repo' to start one."
+      return 1
+    fi
+  fi
+
+  local session="dev-${repo}-${slot}"
+  if ! tmux has-session -t "$session" 2>/dev/null; then
+    echo "No session: $session"
+    return 1
+  fi
+
+  # paste the path into the tmux pane (user still hits enter to send to Claude)
+  tmux send-keys -t "$session" "$dest"
+  echo "Pasted path into $session — press Enter in that session to send to Claude."
+}
+
 # tgo [repo] [slot] — attach to an existing dev tmux session
 # tgo        → list all dev sessions
 # tgo ff     → attach to first ff session

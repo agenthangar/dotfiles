@@ -8,8 +8,8 @@ Personal shell config and utility scripts.
   `help` for a live, auto-generated list of every command defined here.
 - `bin/` — utility scripts (added to PATH)
   - `sleep-manager` — manage macOS sleep behavior (`status`, `disable`, `enable`)
-- `Brewfile` — third-party CLI tools the config depends on (`gh`, `jq`, `tmux`,
-  `gum`, `glow`); installed by `install.sh` via `brew bundle`
+- `Brewfile` — third-party CLI tools the config depends on (`gh`, `jq`, `tmux`);
+  installed by `install.sh` via `brew bundle`
 - `claude/` — Claude Code config
   - `settings.json` — symlinked to `~/.claude/settings.json`. Carries `enabledPlugins`,
     `extraKnownMarketplaces`, and `permissions`, so plugins reproduce on a new machine
@@ -20,19 +20,16 @@ The files in this repo are the source of truth. `~/.zshrc`, `~/bin/<script>`, an
 
 ## The `help` command
 
-`help` prints every custom command. The list is **generated at call time**, not
-stored: it reads the leading `# name <args> — description` comment above each
-`.zshrc` function and the header line of each `bin/` script. So a new command
-shows up automatically — just give it that one-line comment in the same format.
+`help` prints every custom command, grouped by purpose. Each command's name and
+description are **generated at call time**, not stored: they're read from the
+leading `# name <args> — description` comment above each `.zshrc` function and
+the header line of each `bin/` script. So a new command shows up automatically —
+just give it that one-line comment in the same format.
 
-`help` renders with the prettiest tool it finds, falling back so it never breaks:
-
-1. [`gum`](https://github.com/charmbracelet/gum) — nicest (rounded borders, color)
-2. [`glow`](https://github.com/charmbracelet/glow) — rendered Markdown table
-3. plain aligned columns — no dependency
-
-`gum` and `glow` are in the `Brewfile`, so `install.sh` installs them; with
-neither present you still get the plain list.
+Grouping lives in the `groups` list inside the `help` function — add a command's
+name to a group to file it; anything uncategorized appears under **Other**, so a
+new command is never hidden. Output is self-contained (plain ANSI, colored on a
+terminal); no external renderer required.
 
 ## Claude plugins & MCP
 

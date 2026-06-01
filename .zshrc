@@ -290,70 +290,79 @@ tread() {
   less -R +G "$logfile"
 }
 
-# help — show this command palette (auto-generated; renders via gum/glow/columns)
-# Each row's signature + description come from the leading `# name … — description`
-# comment above each ~/.zshrc function and the header line of each ~/bin script, so
-# the list stays current as you add commands. The renderer is the prettiest tool
-# found: gum → glow → plain columns, so it never hard-depends on either being
-# installed. (zsh's own help is `run-help` / ESC-h; this doesn't touch it.)
+# help — show this command list, grouped by purpose
+# Each command's name + description are parsed live from the leading
+# `# name … — description` comment above each ~/.zshrc function and the header
+# line of each ~/bin script, so descriptions stay current as you add commands.
+# Grouping is the `groups` list below; anything not placed there shows under
+# "Other" so it's never hidden.
+# (zsh's own help is `run-help` / ESC-h; this doesn't touch it.)
 help() {
   emulate -L zsh
 
-  # Collect "signature — description" lines. Functions whose name starts with `_`
-  # (completion helpers) are skipped; a function with no comment shows its name.
-  local -a fn_rows bin_rows
-  local line
-  fn_rows=( ${(f)"$(awk '
-    /^#/ { if (!c) { h=$0; sub(/^#[ ]?/, "", h); c=1 } next }
-    /^[A-Za-z_][A-Za-z0-9_-]*\(\)/ {
-      n=$0; sub(/\(\).*/, "", n)
-      if (n !~ /^_/) print (c ? h : n)
-      c=0; next
-    }
-    { c=0 }
-  ' ~/.zshrc)"} )
-  local f
+  # Build:  name -> "signature — description"  from functions and bin scripts.
+  # (Functions whose name starts with `_` — completion helpers — are skipped.)
+  typeset -A info
+  local line sig name f n g title
+  for line in ${(f)"$(awk '
+      /^#/ { if (!c) { h=$0; sub(/^#[ ]?/, "", h); c=1 } next }
+      /^[A-Za-z_][A-Za-z0-9_-]*\(\)/ {
+        n=$0; sub(/\(\).*/, "", n)
+        if (n !~ /^_/) print (c ? h : n)
+        c=0; next
+      }
+      { c=0 }
+    ' ~/.zshrc)"}; do
+    sig=${line%% — *}; name=${sig%% *}; info[$name]=$line
+  done
   for f in ~/bin/*(N); do
-    [[ -x $f ]] && bin_rows+="$(sed -n '2s/^# *//p' "$f")"
+    [[ -x $f ]] || continue
+    line="$(sed -n '2s/^# *//p' "$f")"
+    sig=${line%% — *}; name=${sig%% *}; info[$name]=$line
   done
 
-  # Split each row on " — " into signature | description, escaping `|` so it
-  # survives a Markdown table cell.
-  _help_md_rows() {
-    local row sig desc
-    for row in "$@"; do
-      sig=${row%% — *}; desc=${row#* — }
-      [[ $sig == $row ]] && desc=""        # no em-dash → description-less
-      print -r -- "| \`${sig//|/\\|}\` | ${desc//|/\\|} |"
+  # Grouping by purpose.  "Title:cmd cmd …" — drop a command's name into a group
+  # to file it; anything uncategorized falls through to "Other" at the end.
+  local -a groups=(
+    "Dotfiles & shell:dots help"
+    "Git & PRs:prview"
+    "Claude dev sessions (tmux):dev tgo tread tpaste"
+    "Claude session sync:csync"
+    "Keep the Mac awake:nosleep sleep-manager"
+  )
+
+  # Colour, suppressed when output isn't a terminal (so pipes stay clean).
+  local H C R
+  if [[ -t 1 ]]; then H=$'\e[1;38;5;212m'; C=$'\e[38;5;79m'; R=$'\e[0m'; fi
+
+  _help_group() {                       # $1 = title, $2… = command names
+    local title=$1; shift
+    local n w=0; local -a have
+    for n in "$@"; do
+      [[ -n ${info[$n]} ]] || continue
+      have+=$n; (( ${#${info[$n]%% — *}} > w )) && w=${#${info[$n]%% — *}}
     done
+    (( ${#have} )) || return
+    print -r -- "${H}${title}${R}"
+    for n in $have; do
+      printf '  %s%-*s%s  %s\n' "$C" $w "${info[$n]%% — *}" "$R" "${info[$n]#* — }"
+    done
+    print
   }
 
-  local -a md
-  md=(
-    "# Dotfiles commands"  ""
-    "## Shell — ~/.zshrc"  ""
-    "| Command | What it does |"  "|---|---|"
-    ${(f)"$(_help_md_rows $fn_rows)"}
-    ""
-    "## Scripts — ~/bin"  ""
-    "| Command | What it does |"  "|---|---|"
-    ${(f)"$(_help_md_rows $bin_rows)"}
-  )
-  unfunction _help_md_rows
+  print -r -- "${H}Dotfiles commands${R}"; print
+  typeset -A shown
+  local -a names
+  for g in $groups; do
+    title=${g%%:*}; names=(${(s: :)${g#*:}})
+    _help_group "$title" "${names[@]}"
+    for n in $names; do shown[$n]=1; done
+  done
+  local -a leftover
+  for name in ${(k)info}; do [[ -z ${shown[$name]} ]] && leftover+=$name; done
+  (( ${#leftover} )) && _help_group "Other" ${(o)leftover}
 
-  if (( $+commands[gum] )); then
-    printf '%s\n' $md | gum format
-  elif (( $+commands[glow] )); then
-    printf '%s\n' $md | glow -
-  else
-    # Plain fallback: strip Markdown, align on the pipe with `column`.
-    print -P "%B~/.zshrc commands%b"
-    _help_plain() { local r; for r in "$@"; do printf '%s\t%s\n' "${r% — *}" "${r#* — }"; done; }
-    _help_plain $fn_rows | column -t -s $'\t' | sed 's/^/  /'
-    print -P "\n%B~/bin scripts%b"
-    _help_plain $bin_rows | column -t -s $'\t' | sed 's/^/  /'
-    unfunction _help_plain
-  fi
+  unfunction _help_group
 }
 
 # --- tab completion for our commands -------------------------------------

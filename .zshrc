@@ -616,15 +616,20 @@ tpush() {
     echo "Resumed ${sid[1,8]}… in detached $session ($cwd)"
   fi
 
-  # Current-session mode with a listening claude() wrapper: arm the one-shot
-  # sentinel so leaving this Claude auto-attaches you into $session. Otherwise
-  # (picker mode, or an un-wrapped/older shell) fall back to the manual hint.
-  if [[ -n $CLAUDE_CODE_SESSION_ID && -n $CLAUDE_TPUSH_ATTACH ]]; then
+  # Land you in the session. Three cases:
+  if [[ -z $CLAUDE_CODE_SESSION_ID ]]; then
+    # Plain-shell picker mode: we own a real terminal, so attach straight in.
+    echo "$attach_hint"
+    tmux attach-session -t "$session"
+  elif [[ -n $CLAUDE_TPUSH_ATTACH ]]; then
+    # Inside Claude via the claude() wrapper: can't attach from this Bash
+    # subprocess, so arm the one-shot sentinel — leaving Claude attaches for us.
     print -r -- "$session" > "$CLAUDE_TPUSH_ATTACH"
     echo "→ Type /exit (or Ctrl-D) and you'll drop into $session automatically."
   else
+    # Inside Claude, but launched without the wrapper (older shell): manual.
     echo "$attach_hint"
-    [[ -n $CLAUDE_CODE_SESSION_ID ]] && echo "(Exit this foreground Claude — the tmux copy now owns the conversation.)"
+    echo "(Exit this foreground Claude — the tmux copy now owns the conversation.)"
   fi
 }
 

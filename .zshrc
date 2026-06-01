@@ -199,8 +199,41 @@ tpaste() {
   tmux attach-session -t "$session"
 }
 
+# _dev_list — print every dev-<repo>-<slot> tmux session on two axes:
+#   ● attached / ○ detached   (any client viewing it)
+#   ✓ active context          (pane foreground is node/claude = Claude alive
+#                              with its conversation loaded; blank once it exits
+#                              to a shell). These are independent: a detached
+#                              session can still hold a live Claude.
+# Shared by `dev list` and bare `tgo`. session_attached/session_path are
+# session-level formats; pane_current_command needs a per-session
+# display-message (not a session format), hence the loop.
+_dev_list() {
+  local names
+  names=$(tmux list-sessions -F '#{session_name}' 2>/dev/null | grep '^dev-' | sort)
+  if [[ -z "$names" ]]; then
+    echo "No dev sessions running."
+    return 0
+  fi
+  local g c r0=
+  if [[ -t 1 ]]; then g=$'\e[32m'; c=$'\e[36m'; r0=$'\e[0m'; fi
+  print -r -- "dev sessions  (● attached · ✓ Claude has active context)"
+  local s state cmd dir amark cmark
+  while IFS= read -r s; do
+    state=$(tmux display-message -p -t "$s" '#{?session_attached,attached,detached}' 2>/dev/null)
+    cmd=$(tmux display-message -p -t "$s" '#{pane_current_command}' 2>/dev/null)
+    dir=$(tmux display-message -p -t "$s" '#{session_path}' 2>/dev/null)
+    if [[ $state == attached ]]; then amark="${g}●${r0}"; else amark='○'; fi
+    case "$cmd" in
+      node|claude) cmark="${c}✓${r0}" ;;
+      *)           cmark=' ' ;;
+    esac
+    printf '  %s %s %-13s %-9s %s\n' "$amark" "$cmark" "$s" "$state" "${dir/#$HOME/~}"
+  done <<< "$names"
+}
+
 # tgo [repo] [slot] — attach to an existing dev tmux session
-# tgo        → list all dev sessions
+# tgo        → list all dev sessions (with attached state)
 # tgo ff     → attach to first ff session
 # tgo ff 3   → attach to dev-ff-3
 tgo() {
@@ -209,7 +242,7 @@ tgo() {
 
   # no args — list sessions
   if [[ -z "$repo" ]]; then
-    tmux list-sessions -F '#S' 2>/dev/null | grep '^dev-' || echo "No dev sessions running."
+    _dev_list
     return
   fi
 
@@ -258,6 +291,7 @@ _dev_new_session() {
 }
 
 # dev <repo> [slot] [--no-tmux] — open/reattach a Claude Code tmux session
+# dev list — show all dev sessions, marking attached + active Claude context
 # repos: ff (financial-forecast), cfp (cashfwd-private), cf (cashfwd)
 # slot: optional 1-4, auto-picks next free slot if omitted
 # --no-tmux: run the git setup + claude inline in this terminal, no tmux session
@@ -274,10 +308,17 @@ dev() {
   local repo="${pos[1]}"
   local slot="${pos[2]}"
 
+  # `dev list` (or `ls`) — show sessions + state, then stop.
+  if [[ "$repo" == list || "$repo" == ls ]]; then
+    _dev_list
+    return
+  fi
+
   # repo→path map: see the global DEV_REPOS (defined near the cd shortcuts)
 
   if [[ -z "$repo" || -z "${DEV_REPOS[$repo]}" ]]; then
     echo "Usage: dev <ff|cfp|cf> [slot] [--no-tmux]"
+    echo "       dev list | dev ls   → show all sessions (attached + active context)"
     echo "  ff  → financial-forecast"
     echo "  cfp → cashfwd-private"
     echo "  cf  → cashfwd"
@@ -436,7 +477,7 @@ _dev_resume_session() {
 #   • Match: exact ($cwd == path) only, or also accept worktrees/subdirs of a
 #     repo (cwd starts with "$path/")? Subdir matching is friendlier but can
 #     mis-bucket nested repos.
-#   • No match (cwd isn't a DEV_REPOS repo): give up (echo nothing → tresume
+#   • No match (cwd isn't a DEV_REPOS repo): give up (echo nothing → ttmux
 #     errors out), or fall back to a key derived from the dir's basename so any
 #     session is resumable? The latter means tgo/tread won't know that key.
 #   • Slot: reuse the "next free slot" loop from `dev`/`tpaste` (scan
@@ -455,7 +496,15 @@ _dev_slot_for_cwd() {
       (( ${#repodir} > best_len )) && { match="$key"; best_len=${#repodir}; }
     fi
   done
-  [[ -n "$match" ]] || return 1   # not a known dev repo → caller bails
+  # No DEV_REPOS match → derive a key from the dir's basename so ANY session is
+  # resumable (e.g. ~/code/dotfiles → "dotfiles"). Such a session still appears
+  # in `dev list`/`tgo`, but tgo/tread validate against DEV_REPOS and won't know
+  # the key — so ttmux prints a raw `tmux attach` hint for it instead.
+  if [[ -z "$match" ]]; then
+    match="${cwd:t}"                       # :t = basename
+    match="${match//[^A-Za-z0-9_-]/-}"     # sanitise for a tmux session name
+  fi
+  [[ -n "$match" ]] || return 1
 
   # Next free slot: first dev-<repo>-<n> with no running session (mirrors `dev`).
   local n=1
@@ -466,10 +515,10 @@ _dev_slot_for_cwd() {
   return 1
 }
 
-# tresume — fzf-pick a saved Claude session and resume it in a detached tmux
+# ttmux — fzf-pick a saved Claude session and resume it in a detached tmux
 # session (claude -r), named to fit the dev/tgo/tread family. Attach afterward
 # with the printed `tgo` command. No args: the picker drives everything.
-tresume() {
+ttmux() {
   local row sid cwd
   row=$(_claude_sessions_fzf) || return 1
   [[ -n $row ]] || return 1
@@ -483,14 +532,23 @@ tresume() {
   [[ -n $repo && -n $slot ]] || { echo "Couldn't map $cwd to a dev slot."; return 1; }
 
   local session="dev-${repo}-${slot}"
+
+  # tgo/tread only understand DEV_REPOS keys; for a derived key, point at raw tmux.
+  local attach_hint
+  if [[ -n "${DEV_REPOS[$repo]}" ]]; then
+    attach_hint="Attach: tgo $repo $slot    Read log: tread $repo $slot"
+  else
+    attach_hint="Attach: tmux attach -t $session"
+  fi
+
   if tmux has-session -t "$session" 2>/dev/null; then
-    echo "$session is already running — attach with: tgo $repo $slot"
+    echo "$session is already running — ${attach_hint#Attach: }"
     return 0
   fi
 
   _dev_resume_session "$session" "$cwd" "$sid"
   echo "Resumed ${sid[1,8]}… in detached $session ($cwd)"
-  echo "Attach: tgo $repo $slot    Read log: tread $repo $slot"
+  echo "$attach_hint"
 }
 
 # help — show this command list, grouped by purpose
@@ -524,12 +582,24 @@ help() {
     sig=${line%% — *}; name=${sig%% *}; info[$name]=$line
   done
 
+  # The bare `<repo>` shortcuts (ff, cfp, cf) are aliases generated from
+  # DEV_REPOS, so the function/script parser above never sees them — synthesise
+  # one entry per repo (:t = basename of the target dir) so they show in help.
+  local _r
+  for _r in ${(k)DEV_REPOS}; do
+    info[$_r]="$_r — cd straight to ${DEV_REPOS[$_r]:t}"
+  done
+
+  # `dev list` is a subcommand, not its own function, so the parser only captured
+  # `dev`'s first comment line — synthesise an entry so the subcommand is listed.
+  info[dev-list]="dev list — list dev sessions, marking attached + active Claude context"
+
   # Grouping by purpose.  "Title:cmd cmd …" — drop a command's name into a group
   # to file it; anything uncategorized falls through to "Other" at the end.
   local -a groups=(
     "Dotfiles & shell:dots help"
     "Git & PRs:prview"
-    "Claude dev sessions (tmux):dev tgo tread tpaste tresume"
+    "Claude dev sessions (tmux):dev dev-list tgo tread tpaste ttmux ${(kj: :)DEV_REPOS}"
     "Claude session sync:csync"
     "Keep the Mac awake:nosleep sleep-manager"
   )

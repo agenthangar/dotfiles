@@ -367,6 +367,132 @@ tread() {
   less -R +G "$logfile"
 }
 
+# _claude_sessions_fzf — fzf-pick a saved Claude transcript across all projects.
+# Echoes the chosen row as "<session-id>\t<cwd>\t<display>" (fzf only shows the
+# display column). Newest-first by transcript mtime; the JSONL is parsed once in
+# python for each file's real cwd (the `cwd` field, not the lossy folder name)
+# plus the first human message as a label. Returns nonzero on no pick / no fzf.
+_claude_sessions_fzf() {
+  # Diagnostics go to stderr: this function's stdout is captured by the caller's
+  # $(...), so a stdout error would be swallowed silently instead of shown.
+  command -v fzf     >/dev/null 2>&1 || { echo "fzf not installed (brew install fzf)" >&2; return 1; }
+  command -v python3 >/dev/null 2>&1 || { echo "python3 not found" >&2; return 1; }
+  local projects="$HOME/.claude/projects"
+  [[ -d $projects ]] || { echo "No Claude sessions at $projects" >&2; return 1; }
+
+  python3 - "$projects" <<'PY' | fzf --delimiter=$'\t' --with-nth=3 --no-hscroll \
+        --prompt='resume claude > ' --height=60% --reverse
+import json, os, sys, glob, datetime
+root = sys.argv[1]
+rows = []
+for f in glob.glob(os.path.join(root, '*', '*.jsonl')):
+    sid = os.path.basename(f)[:-6]
+    cwd = label = None
+    try:
+        for line in open(f, errors='ignore'):
+            try: d = json.loads(line)
+            except ValueError: continue
+            if cwd is None and d.get('cwd'): cwd = d['cwd']
+            if label is None and d.get('type') == 'user':
+                c = d.get('message', {}).get('content')
+                t = c if isinstance(c, str) else (
+                    ' '.join(x.get('text', '') for x in c if isinstance(x, dict))
+                    if isinstance(c, list) else '')
+                t = t.strip()
+                if t and not t.startswith('<'): label = t
+            if cwd and label: break
+    except OSError:
+        continue
+    mtime = os.path.getmtime(f)
+    short = os.path.basename(cwd) if cwd else '?'
+    label = ' '.join((label or '(no message)').split())[:70]
+    rows.append((mtime, sid, cwd or '?', short, label))
+rows.sort(reverse=True)
+for mtime, sid, cwd, short, label in rows:
+    when = datetime.datetime.fromtimestamp(mtime).strftime('%m-%d %H:%M')
+    print(f"{sid}\t{cwd}\t{when}  {short:<20}  {label}")
+PY
+}
+
+# _dev_resume_session <session> <dir> <session-id> — sibling of _dev_new_session:
+# create a detached, logged tmux session in <dir>, but RESUME an existing Claude
+# conversation (claude -r) rather than starting fresh on dev/claude-1. Same name
+# + log path convention so tgo/tread/tpaste/dev treat it like any dev session.
+_dev_resume_session() {
+  local session="$1" dir="$2" sid="$3"
+  local logfile="$HOME/.tmux-logs/${session}.log"
+  mkdir -p "$HOME/.tmux-logs"
+  tmux new-session -d -s "$session" -c "$dir" -x 220 -y 50
+  tmux pipe-pane -t "$session" -o "cat >> $logfile"
+  tmux send-keys -t "$session" "claude -r $sid" Enter
+}
+
+# _dev_slot_for_cwd <cwd> — map a transcript's working dir to a dev session slot.
+# Echo "<repo> <slot>" (space-separated) on success, or nothing on failure.
+# This is the glue that makes a resumed session "supported by dev": pick the
+# DEV_REPOS key whose path matches <cwd>, then choose a free slot for it.
+#
+# TODO(you): implement the mapping. Decisions worth making:
+#   • Match: exact ($cwd == path) only, or also accept worktrees/subdirs of a
+#     repo (cwd starts with "$path/")? Subdir matching is friendlier but can
+#     mis-bucket nested repos.
+#   • No match (cwd isn't a DEV_REPOS repo): give up (echo nothing → tresume
+#     errors out), or fall back to a key derived from the dir's basename so any
+#     session is resumable? The latter means tgo/tread won't know that key.
+#   • Slot: reuse the "next free slot" loop from `dev`/`tpaste` (scan
+#     dev-<repo>-<n> with `tmux has-session` until one is free).
+# DEV_REPOS (global, associative: key→path) and `tmux has-session -t NAME` are
+# your building blocks.
+_dev_slot_for_cwd() {
+  local cwd="$1" key match
+  # Find the DEV_REPOS key for this cwd. Prefer an exact path match; otherwise
+  # accept a subdir/worktree of a repo (cwd under "$path/"). Longest matching
+  # path wins so a nested repo beats its parent.
+  local best_len=0
+  for key in ${(k)DEV_REPOS}; do
+    local repodir="${DEV_REPOS[$key]}"
+    if [[ "$cwd" == "$repodir" || "$cwd" == "$repodir"/* ]]; then
+      (( ${#repodir} > best_len )) && { match="$key"; best_len=${#repodir}; }
+    fi
+  done
+  [[ -n "$match" ]] || return 1   # not a known dev repo → caller bails
+
+  # Next free slot: first dev-<repo>-<n> with no running session (mirrors `dev`).
+  local n=1
+  while (( n <= 20 )); do
+    tmux has-session -t "dev-${match}-${n}" 2>/dev/null || { print -r -- "$match $n"; return 0; }
+    (( n++ ))
+  done
+  return 1
+}
+
+# tresume — fzf-pick a saved Claude session and resume it in a detached tmux
+# session (claude -r), named to fit the dev/tgo/tread family. Attach afterward
+# with the printed `tgo` command. No args: the picker drives everything.
+tresume() {
+  local row sid cwd
+  row=$(_claude_sessions_fzf) || return 1
+  [[ -n $row ]] || return 1
+  sid=${row%%$'\t'*}
+  cwd=${${row#*$'\t'}%%$'\t'*}
+
+  [[ -d $cwd ]] || { echo "Session's directory no longer exists: $cwd"; return 1; }
+
+  local repo slot
+  read -r repo slot < <(_dev_slot_for_cwd "$cwd")
+  [[ -n $repo && -n $slot ]] || { echo "Couldn't map $cwd to a dev slot."; return 1; }
+
+  local session="dev-${repo}-${slot}"
+  if tmux has-session -t "$session" 2>/dev/null; then
+    echo "$session is already running — attach with: tgo $repo $slot"
+    return 0
+  fi
+
+  _dev_resume_session "$session" "$cwd" "$sid"
+  echo "Resumed ${sid[1,8]}… in detached $session ($cwd)"
+  echo "Attach: tgo $repo $slot    Read log: tread $repo $slot"
+}
+
 # help — show this command list, grouped by purpose
 # Each command's name + description are parsed live from the leading
 # `# name … — description` comment above each ~/.zshrc function and the header
@@ -403,7 +529,7 @@ help() {
   local -a groups=(
     "Dotfiles & shell:dots help"
     "Git & PRs:prview"
-    "Claude dev sessions (tmux):dev tgo tread tpaste"
+    "Claude dev sessions (tmux):dev tgo tread tpaste tresume"
     "Claude session sync:csync"
     "Keep the Mac awake:nosleep sleep-manager"
   )

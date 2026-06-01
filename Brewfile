@@ -10,3 +10,4 @@
 brew "gh"    # prview()                    — PR status via the GitHub CLI
 brew "jq"    # prview()                    — parse gh's JSON output
 brew "tmux"  # dev / tgo / tpaste / tread  — the Claude Code dev-session workflow
+brew "fzf"   # tresume                     — fuzzy-pick a Claude session to resume

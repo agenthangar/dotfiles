@@ -39,6 +39,7 @@ prview() {
   '
 }
 
+# nosleep — keep the Mac awake until Ctrl-C (interactive; sleep-manager for background)
 nosleep() { trap 'sudo pmset -a disablesleep 0' EXIT INT; sudo pmset -a disablesleep 1 && caffeinate -dimsu; }
 
 # dots — pull latest dotfiles and reload zsh
@@ -288,3 +289,37 @@ tread() {
   # open at bottom, follow live output, strip ANSI escape codes for readability
   less -R +G "$logfile"
 }
+
+# help — list the custom commands in this dotfiles setup. Descriptions are
+# pulled live from the leading `# …` comment above each ~/.zshrc function and
+# the header line of each ~/bin script, so this stays current automatically as
+# you add commands. (zsh's own help is `run-help` / ESC-h; this doesn't touch it.)
+help() {
+  print -P "%B~/.zshrc commands%b"
+  awk '
+    /^#/ { if (!c) { h=$0; sub(/^#[ ]?/, "", h); c=1 } next }
+    /^[A-Za-z_][A-Za-z0-9_-]*\(\)/ {
+      n=$0; sub(/\(\).*/, "", n)
+      if (n !~ /^_/) print "  " (c ? h : n)   # skip _internal completion helpers
+      c=0; next
+    }
+    { c=0 }
+  ' ~/.zshrc
+
+  print -P "\n%B~/bin scripts%b"
+  for f in ~/bin/*(N); do
+    [[ -x $f ]] || continue
+    printf "  %s\n" "$(sed -n '2s/^# *//p' "$f")"
+  done
+}
+
+# --- tab completion for our commands -------------------------------------
+# compinit already ran at the top of this file, so compdef is available here.
+# `dev <Tab>` → ff cfp cf, `csync <Tab>` → push pull, etc. These helper names
+# start with `_` so the `help` parser above skips them.
+_ff_repos()     { _arguments '1:repo:(ff cfp cf)' '2:slot:(1 2 3 4)' }
+_csync_dir()    { _arguments '1:direction:(push pull)' }
+_sleepmgr_cmd() { _arguments '1:command:(status disable enable help)' }
+compdef _ff_repos     dev tgo tpaste tread
+compdef _csync_dir    csync
+compdef _sleepmgr_cmd sleep-manager

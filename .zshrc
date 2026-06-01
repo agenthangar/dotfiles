@@ -60,9 +60,28 @@ done
 unset _repo
 
 # csync — two-way sync of Claude Code session history with iCloud Drive.
-# Lives in bin/csync now (so the launchd agent can run it without an interactive
-# shell); install.sh symlinks it onto PATH and sets up the 15-min timer. `help`
-# still lists it by scanning ~/bin. Just run `csync` on any machine to converge.
+# Lives in bin/csync (install.sh symlinks it onto PATH; `help` lists it by
+# scanning ~/bin). Run `csync` on any machine to converge.
+#
+# Periodic csync, the shell way. A launchd agent *can't* do this: iCloud Drive
+# is TCC-protected and background agents are denied — granting /bin/bash Full
+# Disk Access has no effect on recent macOS (the grant won't pin to a platform
+# interpreter running an arbitrary script). The shell, though, runs in the
+# Terminal's already-approved context, so we piggyback on the prompt: at most
+# once every 15 min, fire csync detached in the background. A stamp file gates
+# the interval (written *before* the run so overlapping shells don't double-fire).
+mkdir -p "$HOME/.cache" "$HOME/Library/Logs" 2>/dev/null
+zmodload zsh/datetime 2>/dev/null                     # $EPOCHSECONDS, no `date` fork
+autoload -Uz add-zsh-hook
+_csync_periodic() {
+  local interval=900 stamp="$HOME/.cache/csync-last-run" now=$EPOCHSECONDS last=0
+  [[ -d "$HOME/Library/Mobile Documents/com~apple~CloudDocs" ]] || return  # no iCloud here
+  [[ -r "$stamp" ]] && last=$(<"$stamp")
+  (( now - last >= interval )) || return
+  print -r -- "$now" >| "$stamp"
+  ( csync >>"$HOME/Library/Logs/csync.log" 2>&1 & )   # detached; never blocks the prompt
+}
+add-zsh-hook precmd _csync_periodic
 
 # _tpaste_claude_ready <session> — return 0 once Claude is accepting input in
 # the session's pane, else return 1. tpaste polls this after launching a fresh

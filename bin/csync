@@ -1,14 +1,14 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # csync — two-way sync of Claude Code session history with iCloud Drive.
 # One command, no direction: merges both ways (newest file wins, nothing
 # deleted) so every machine converges to the union of all sessions. Safe to
 # run anytime; --update never clobbers a newer copy and no --delete means it
-# never removes sessions. Run by hand, or every 15 min via the launchd agent
-# that install.sh sets up (logs to ~/Library/Logs/csync.log).
+# never removes sessions. Run by hand, or automatically every 15 min via the
+# precmd hook in .zshrc (which logs background runs to ~/Library/Logs/csync.log).
 #
-# NOTE: the launchd agent needs Full Disk Access granted to /bin/bash, else
-# macOS TCC blocks it from reading iCloud ("Operation not permitted"). Running
-# csync by hand from a terminal is unaffected — the terminal already has access.
+# Not run via launchd on purpose: iCloud Drive is TCC-protected and background
+# agents are denied (granting /bin/bash Full Disk Access has no effect on recent
+# macOS). The shell hook works because it runs in the Terminal's approved context.
 
 set -euo pipefail
 
@@ -28,8 +28,8 @@ mkdir -p "$icloud" "$local_dir"
 # evicted files local first: ask the daemon to fetch (brctl), then a plain
 # read() blocks until the bytes land.
 echo "⟳ Materialising cloud-only files in iCloud…"
-# Best-effort: under a launchd session brctl can't always reach the iCloud
-# daemon and exits non-zero — never let that abort the sync (set -e), so `|| true`.
+# Best-effort: brctl can exit non-zero (e.g. nothing to fetch) — never let that
+# abort the sync under set -e, so swallow its status with `|| true`.
 find "$icloud" -type f ! -name '.DS_Store' -exec brctl download {} + 2>/dev/null || true
 while IFS= read -r -d '' f; do
   # Dataless placeholder: 0 blocks allocated but a non-zero logical size.

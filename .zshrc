@@ -81,9 +81,26 @@ csync() {
   esac
 }
 
+# _tpaste_claude_ready <session> — return 0 once Claude is accepting input in
+# the session's pane, else return 1. tpaste polls this after launching a fresh
+# session so it knows when the path can be delivered. `tmux capture-pane -p`
+# dumps the pane's current visible text; decide which marker means "Claude has
+# finished booting (past the git checkout) and its input box is live."
+_tpaste_claude_ready() {
+  local session="$1"
+  local pane
+  pane=$(tmux capture-pane -p -t "$session" 2>/dev/null)
+  # TODO(you): return 0 when $pane shows Claude is ready for input, else 1.
+  #   Capture a freshly-started session with `tmux capture-pane -p -t dev-ff-1`
+  #   and pick a string that appears ONLY once the prompt is live — e.g. the
+  #   "? for shortcuts" footer or the input-box border — then match it here,
+  #   for example:  [[ $pane == *"? for shortcuts"* ]] && return 0
+  return 1
+}
+
 # tpaste [repo] [slot] — paste latest iCloud Drive image path into a dev tmux session
-# tpaste ff     → paste into first ff session
-# tpaste ff 3   → paste into dev-ff-3
+# tpaste ff     → start a new ff session and queue the path into it
+# tpaste ff 3   → paste into dev-ff-3 (creating it if it doesn't exist)
 tpaste() {
   local repo="${1:-ff}"
   local slot="$2"
@@ -127,29 +144,46 @@ tpaste() {
     return 1
   fi
 
+  # no slot → pick the next FREE slot, so the default is always a fresh session
   if [[ -z "$slot" ]]; then
     local n=1
     while (( n <= 20 )); do
-      if tmux has-session -t "dev-${repo}-${n}" 2>/dev/null; then
+      if ! tmux has-session -t "dev-${repo}-${n}" 2>/dev/null; then
         slot=$n; break
       fi
       (( n++ ))
     done
     if [[ -z "$slot" ]]; then
-      echo "No sessions for '$repo'. Use 'dev $repo' to start one."
+      echo "All 20 slots for '$repo' are in use."
       return 1
     fi
   fi
 
   local session="dev-${repo}-${slot}"
-  if ! tmux has-session -t "$session" 2>/dev/null; then
-    echo "No session: $session"
-    return 1
+
+  # existing session → Claude is already live, so paste straight in (no attach)
+  if tmux has-session -t "$session" 2>/dev/null; then
+    tmux send-keys -t "$session" "$src"
+    echo "Pasted path into $session — press Enter in that session to send to Claude."
+    return
   fi
 
-  # paste the path into the tmux pane (user still hits enter to send to Claude)
+  # new session → bootstrap Claude, wait for it to come up, queue the path, attach
+  echo "Starting $session for the screenshot…"
+  _dev_new_session "$session" "${repo_paths[$repo]}"
+
+  # wait (up to ~30s) for Claude to be ready before delivering the path; if the
+  # readiness check is left unimplemented this degrades to a plain 30s wait
+  local waited=0
+  while (( waited < 30 )); do
+    _tpaste_claude_ready "$session" && break
+    sleep 1
+    (( waited++ ))
+  done
+
   tmux send-keys -t "$session" "$src"
-  echo "Pasted path into $session — press Enter in that session to send to Claude."
+  echo "Queued path in $session — attaching; press Enter to send to Claude."
+  tmux attach-session -t "$session"
 }
 
 # tgo [repo] [slot] — attach to an existing dev tmux session
@@ -198,6 +232,19 @@ tgo() {
     echo "No session: $session (use 'dev $repo $slot' to create it)"
     return 1
   fi
+}
+
+# _dev_new_session <session> <dir> — create a detached tmux session in <dir>,
+# start logging, and launch Claude on the dev/claude-1 branch. Shared by `dev`
+# and `tpaste` so the bootstrap (branch dance, geometry, logging) lives in one
+# place; callers attach (or not) and deliver input themselves afterwards.
+_dev_new_session() {
+  local session="$1" dir="$2"
+  local logfile="$HOME/.tmux-logs/${session}.log"
+  mkdir -p "$HOME/.tmux-logs"
+  tmux new-session -d -s "$session" -c "$dir" -x 220 -y 50
+  tmux pipe-pane -t "$session" -o "cat >> $logfile"
+  tmux send-keys -t "$session" "git stash; git fetch origin; git checkout dev/claude-1 2>/dev/null || git checkout -b dev/claude-1; git pull origin dev/claude-1; claude" Enter
 }
 
 # dev <repo> [slot] [--no-tmux] — open/reattach a Claude Code tmux session
@@ -279,9 +326,7 @@ dev() {
     tmux attach-session -t "$session"
   else
     echo "Starting $session in $dir (logging to $logfile)"
-    tmux new-session -d -s "$session" -c "$dir" -x 220 -y 50
-    tmux pipe-pane -t "$session" -o "cat >> $logfile"
-    tmux send-keys -t "$session" "git stash; git fetch origin; git checkout dev/claude-1 2>/dev/null || git checkout -b dev/claude-1; git pull origin dev/claude-1; claude" Enter
+    _dev_new_session "$session" "$dir"
     tmux attach-session -t "$session"
   fi
 }
@@ -362,11 +407,12 @@ help() {
   # Palette — bold, UPPERCASE section headers (man-page / `gh` convention; bold is
   # the real separator, colour just a hint). Suppressed when stdout isn't a
   # terminal, so piped/grep'd output stays plain.
-  local H C D R
+  local H C M D R
   if [[ -t 1 ]]; then
-    H=$'\e[1;38;5;111m'   # bold periwinkle — section headers
-    C=$'\e[38;5;150m'     # soft green      — command names
-    D=$'\e[2m'            # dim             — intro line
+    H=$'\e[1;38;5;214m'   # bold amber  — section headers (the accent)
+    C=$'\e[38;5;180m'     # warm tan    — command names
+    M=$'\e[38;5;245m'     # muted grey  — descriptions
+    D=$'\e[2;38;5;245m'   # dim grey    — intro line
     R=$'\e[0m'
   fi
 
@@ -380,7 +426,7 @@ help() {
     (( ${#have} )) || return
     print -r -- "${H}${(U)title}${R}"             # UPPERCASE, bold header
     for n in $have; do
-      printf '  %s%-*s%s  %s\n' "$C" $w "${info[$n]%% — *}" "$R" "${info[$n]#* — }"
+      printf '  %s%-*s%s  %s%s%s\n' "$C" $w "${info[$n]%% — *}" "$R" "$M" "${info[$n]#* — }" "$R"
     done
     print
   }

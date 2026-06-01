@@ -83,6 +83,18 @@ csync() {
         "$local_dir/" "$icloud/"
       ;;
     pull)
+      # iCloud may keep file *contents* evicted (dataless placeholders) even
+      # though the names show up. rsync reads via mmap, which times out on those
+      # ("mmap: Operation timed out") instead of fetching them — and aborts the
+      # transfer. So force evicted files local first: ask the daemon to fetch
+      # (brctl), then a plain read() blocks until the bytes land.
+      echo "↓ Materialising cloud-only files in iCloud…"
+      find "$icloud" -type f ! -name '.DS_Store' -exec brctl download {} + 2>/dev/null
+      local f
+      find "$icloud" -type f ! -name '.DS_Store' -print0 2>/dev/null | while IFS= read -r -d '' f; do
+        [[ "$(stat -f '%b' "$f" 2>/dev/null)" -eq 0 && "$(stat -f '%z' "$f" 2>/dev/null)" -gt 0 ]] \
+          && cat "$f" >/dev/null 2>&1
+      done
       echo "↓ Pulling iCloud → $local_dir"
       rsync -av --update \
         --exclude='.DS_Store' \

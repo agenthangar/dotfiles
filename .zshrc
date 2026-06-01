@@ -22,7 +22,7 @@ if [ $? -eq 2 ]; then            # 2 = no agent reachable (1 = up but no keys)
   ssh-agent -a "$SSH_AUTH_SOCK" >/dev/null 2>&1
 fi
 
-# Quick PR status — usage: prview [pr-number]
+# prview [pr#] — quick PR status: mergeability, merge state, per-check verdicts
 # (no arg → current branch's PR). Hides body/comments/diff; shows just
 # mergeability, merge state, and per-check verdicts.
 prview() {
@@ -290,27 +290,70 @@ tread() {
   less -R +G "$logfile"
 }
 
-# help — list the custom commands in this dotfiles setup. Descriptions are
-# pulled live from the leading `# …` comment above each ~/.zshrc function and
-# the header line of each ~/bin script, so this stays current automatically as
-# you add commands. (zsh's own help is `run-help` / ESC-h; this doesn't touch it.)
+# help — show this command palette (auto-generated; renders via gum/glow/columns)
+# Each row's signature + description come from the leading `# name … — description`
+# comment above each ~/.zshrc function and the header line of each ~/bin script, so
+# the list stays current as you add commands. The renderer is the prettiest tool
+# found: gum → glow → plain columns, so it never hard-depends on either being
+# installed. (zsh's own help is `run-help` / ESC-h; this doesn't touch it.)
 help() {
-  print -P "%B~/.zshrc commands%b"
-  awk '
+  emulate -L zsh
+
+  # Collect "signature — description" lines. Functions whose name starts with `_`
+  # (completion helpers) are skipped; a function with no comment shows its name.
+  local -a fn_rows bin_rows
+  local line
+  fn_rows=( ${(f)"$(awk '
     /^#/ { if (!c) { h=$0; sub(/^#[ ]?/, "", h); c=1 } next }
     /^[A-Za-z_][A-Za-z0-9_-]*\(\)/ {
       n=$0; sub(/\(\).*/, "", n)
-      if (n !~ /^_/) print "  " (c ? h : n)   # skip _internal completion helpers
+      if (n !~ /^_/) print (c ? h : n)
       c=0; next
     }
     { c=0 }
-  ' ~/.zshrc
-
-  print -P "\n%B~/bin scripts%b"
+  ' ~/.zshrc)"} )
+  local f
   for f in ~/bin/*(N); do
-    [[ -x $f ]] || continue
-    printf "  %s\n" "$(sed -n '2s/^# *//p' "$f")"
+    [[ -x $f ]] && bin_rows+="$(sed -n '2s/^# *//p' "$f")"
   done
+
+  # Split each row on " — " into signature | description, escaping `|` so it
+  # survives a Markdown table cell.
+  _help_md_rows() {
+    local row sig desc
+    for row in "$@"; do
+      sig=${row%% — *}; desc=${row#* — }
+      [[ $sig == $row ]] && desc=""        # no em-dash → description-less
+      print -r -- "| \`${sig//|/\\|}\` | ${desc//|/\\|} |"
+    done
+  }
+
+  local -a md
+  md=(
+    "# Dotfiles commands"  ""
+    "## Shell — ~/.zshrc"  ""
+    "| Command | What it does |"  "|---|---|"
+    ${(f)"$(_help_md_rows $fn_rows)"}
+    ""
+    "## Scripts — ~/bin"  ""
+    "| Command | What it does |"  "|---|---|"
+    ${(f)"$(_help_md_rows $bin_rows)"}
+  )
+  unfunction _help_md_rows
+
+  if (( $+commands[gum] )); then
+    printf '%s\n' $md | gum format
+  elif (( $+commands[glow] )); then
+    printf '%s\n' $md | glow -
+  else
+    # Plain fallback: strip Markdown, align on the pipe with `column`.
+    print -P "%B~/.zshrc commands%b"
+    _help_plain() { local r; for r in "$@"; do printf '%s\t%s\n' "${r% — *}" "${r#* — }"; done; }
+    _help_plain $fn_rows | column -t -s $'\t' | sed 's/^/  /'
+    print -P "\n%B~/bin scripts%b"
+    _help_plain $bin_rows | column -t -s $'\t' | sed 's/^/  /'
+    unfunction _help_plain
+  fi
 }
 
 # --- tab completion for our commands -------------------------------------

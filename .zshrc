@@ -60,41 +60,9 @@ done
 unset _repo
 
 # csync — two-way sync of Claude Code session history with iCloud Drive.
-# One command, no direction: merges both ways (newest file wins, nothing
-# deleted) so every machine converges to the union of all sessions. Just run
-# `csync` on each machine. Safe to run anytime; --update means it never
-# clobbers a newer copy and --no-delete means it never removes sessions.
-csync() {
-  local icloud="$HOME/Library/Mobile Documents/com~apple~CloudDocs/claude-sessions"
-  local local_dir="$HOME/.claude/projects"
-
-  if [[ ! -d "$HOME/Library/Mobile Documents/com~apple~CloudDocs" ]]; then
-    echo "iCloud Drive not found on this machine."
-    return 1
-  fi
-
-  mkdir -p "$icloud" "$local_dir"
-
-  # iCloud may keep file *contents* evicted (dataless placeholders) even though
-  # the names show up. rsync reads via mmap, which times out on those ("mmap:
-  # Operation timed out") instead of fetching them — and aborts. So force
-  # evicted files local first: ask the daemon to fetch (brctl), then a plain
-  # read() blocks until the bytes land.
-  echo "⟳ Materialising cloud-only files in iCloud…"
-  find "$icloud" -type f ! -name '.DS_Store' -exec brctl download {} + 2>/dev/null
-  local f
-  find "$icloud" -type f ! -name '.DS_Store' -print0 2>/dev/null | while IFS= read -r -d '' f; do
-    [[ "$(stat -f '%b' "$f" 2>/dev/null)" -eq 0 && "$(stat -f '%z' "$f" 2>/dev/null)" -gt 0 ]] \
-      && cat "$f" >/dev/null 2>&1
-  done
-
-  # Merge both directions: iCloud → local, then local → iCloud. --update keeps
-  # the newer side on each file; no --delete, so sessions only ever accumulate.
-  echo "⟳ Syncing iCloud ↔ $local_dir"
-  rsync -a --update --exclude='.DS_Store' "$icloud/" "$local_dir/"
-  rsync -a --update --exclude='.DS_Store' "$local_dir/" "$icloud/"
-  echo "✓ csync complete"
-}
+# Lives in bin/csync now (so the launchd agent can run it without an interactive
+# shell); install.sh symlinks it onto PATH and sets up the 15-min timer. `help`
+# still lists it by scanning ~/bin. Just run `csync` on any machine to converge.
 
 # _tpaste_claude_ready <session> — return 0 once Claude is accepting input in
 # the session's pane, else return 1. tpaste polls this after launching a fresh

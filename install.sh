@@ -22,6 +22,8 @@ link() {
 link "$DOTFILES_DIR/.zshrc"               "$HOME/.zshrc"
 link "$DOTFILES_DIR/bin/sleep-manager"    "$HOME/bin/sleep-manager"
 link "$DOTFILES_DIR/claude/settings.json" "$HOME/.claude/settings.json"
+link "$DOTFILES_DIR/claude/commands/tpush.md" "$HOME/.claude/commands/tpush.md"
+link "$DOTFILES_DIR/claude/commands/tpop.md"  "$HOME/.claude/commands/tpop.md"
 link "$DOTFILES_DIR/ssh/config"           "$HOME/.ssh/config"
 
 # Install the Homebrew tools the shell config depends on (gum, glow, tmux, …).

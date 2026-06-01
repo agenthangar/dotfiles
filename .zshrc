@@ -476,6 +476,10 @@ _dev_resume_session() {
   mkdir -p "$HOME/.tmux-logs"
   tmux new-session -d -s "$session" -c "$dir" -x 220 -y 50
   tmux pipe-pane -t "$session" -o "cat >> $logfile"
+  # Record the resumed id on the session so `tpop` can pull the exact same
+  # conversation back to the foreground (it also falls back to the dir's newest
+  # transcript, but this is the precise signal when we know it).
+  tmux set-environment -t "$session" CLAUDE_RESUME_ID "$sid"
   tmux send-keys -t "$session" "claude -r $sid" Enter
 }
 
@@ -488,7 +492,7 @@ _dev_resume_session() {
 #   • Match: exact ($cwd == path) only, or also accept worktrees/subdirs of a
 #     repo (cwd starts with "$path/")? Subdir matching is friendlier but can
 #     mis-bucket nested repos.
-#   • No match (cwd isn't a DEV_REPOS repo): give up (echo nothing → ttmux
+#   • No match (cwd isn't a DEV_REPOS repo): give up (echo nothing → tpush
 #     errors out), or fall back to a key derived from the dir's basename so any
 #     session is resumable? The latter means tgo/tread won't know that key.
 #   • Slot: reuse the "next free slot" loop from `dev`/`tpaste` (scan
@@ -510,7 +514,7 @@ _dev_slot_for_cwd() {
   # No DEV_REPOS match → derive a key from the dir's basename so ANY session is
   # resumable (e.g. ~/code/dotfiles → "dotfiles"). Such a session still appears
   # in `dev list`/`tgo`, but tgo/tread validate against DEV_REPOS and won't know
-  # the key — so ttmux prints a raw `tmux attach` hint for it instead.
+  # the key — so tpush prints a raw `tmux attach` hint for it instead.
   if [[ -z "$match" ]]; then
     match="${cwd:t}"                       # :t = basename
     match="${match//[^A-Za-z0-9_-]/-}"     # sanitise for a tmux session name
@@ -526,15 +530,29 @@ _dev_slot_for_cwd() {
   return 1
 }
 
-# ttmux — fzf-pick a saved Claude session and resume it in a detached tmux
-# session (claude -r), named to fit the dev/tgo/tread family. Attach afterward
-# with the printed `tgo` command. No args: the picker drives everything.
-ttmux() {
-  local row sid cwd
-  row=$(_claude_sessions_fzf) || return 1
-  [[ -n $row ]] || return 1
-  sid=${row%%$'\t'*}
-  cwd=${${row#*$'\t'}%%$'\t'*}
+# tpush [-p] — push a Claude session into a detached background tmux session
+# Resumes via `claude -r`, named to fit the dev/tgo/tread family.
+#   • Run from INSIDE Claude (CLAUDE_CODE_SESSION_ID set): grabs THIS session +
+#     $PWD automatically — this is how `/tmux` backgrounds the current chat.
+#   • Run from a plain shell: fzf-pick any saved session.
+#   • -p / --pick: force the picker even when a current session is detectable.
+# Attach afterward with the printed command. Refusing to nest if already in tmux.
+tpush() {
+  if [[ -n $TMUX && "$1" != -p && "$1" != --pick ]]; then
+    echo "Already inside tmux ($(tmux display-message -p '#S')). Nothing to do." >&2
+    return 1
+  fi
+
+  local sid cwd
+  if [[ -n $CLAUDE_CODE_SESSION_ID && "$1" != -p && "$1" != --pick ]]; then
+    sid=$CLAUDE_CODE_SESSION_ID; cwd=$PWD          # current-session mode
+  else
+    local row
+    row=$(_claude_sessions_fzf) || return 1
+    [[ -n $row ]] || return 1
+    sid=${row%%$'\t'*}
+    cwd=${${row#*$'\t'}%%$'\t'*}
+  fi
 
   [[ -d $cwd ]] || { echo "Session's directory no longer exists: $cwd"; return 1; }
 
@@ -560,6 +578,58 @@ ttmux() {
   _dev_resume_session "$session" "$cwd" "$sid"
   echo "Resumed ${sid[1,8]}… in detached $session ($cwd)"
   echo "$attach_hint"
+  [[ -n $CLAUDE_CODE_SESSION_ID ]] && echo "(Exit this foreground Claude — the tmux copy now owns the conversation.)"
+}
+
+# tpop [repo|session] [slot] — migrate a tmux'd Claude session back to foreground
+# Kills the tmux session and resumes its conversation here with `claude -r` —
+# the inverse of tpush. Run from a plain shell, not inside the session you pop.
+#   tpop            → the dev session for the current dir
+#   tpop ff 3       → dev-ff-3
+#   tpop dev-cf-1   → that session by full name
+tpop() {
+  local session
+  if [[ "$1" == dev-* ]]; then
+    session="$1"
+  elif [[ -n "$1" ]]; then
+    local repo="$1" slot="$2"
+    if [[ -z "$slot" ]]; then                      # first existing slot for repo
+      local n=1
+      while (( n <= 20 )); do
+        tmux has-session -t "dev-${repo}-${n}" 2>/dev/null && { slot=$n; break; }
+        (( n++ ))
+      done
+    fi
+    session="dev-${repo}-${slot}"
+  else
+    # no args — find the dev session whose working dir is $PWD
+    local s
+    for s in ${(f)"$(tmux list-sessions -F '#{session_name}' 2>/dev/null | grep '^dev-')"}; do
+      [[ "$(tmux display-message -p -t "$s" '#{session_path}')" == "$PWD" ]] && { session="$s"; break; }
+    done
+    [[ -n $session ]] || { echo "No dev session for $PWD. Pass a repo/slot or session name."; return 1; }
+  fi
+
+  tmux has-session -t "$session" 2>/dev/null || { echo "No such session: $session"; return 1; }
+  if [[ -n $TMUX && "$(tmux display-message -p '#S')" == "$session" ]]; then
+    echo "You're inside $session right now — run tpop from a different terminal."; return 1
+  fi
+
+  # Resume id: the precise CLAUDE_RESUME_ID we stashed, else the dir's newest
+  # transcript (the live Claude in there keeps it freshest).
+  local dir sid
+  dir=$(tmux display-message -p -t "$session" '#{session_path}')
+  sid=$(tmux show-environment -t "$session" CLAUDE_RESUME_ID 2>/dev/null | cut -d= -f2)
+  if [[ -z $sid ]]; then
+    # newest transcript for the dir: (N)ullglob, (om) order by mtime, [1] = first
+    local -a tx=( "$HOME/.claude/projects/${dir//\//-}"/*.jsonl(Nom[1]) )
+    sid=${${tx[1]:t}%.jsonl}
+  fi
+  [[ -n $sid ]] || { echo "Couldn't find a session id for $session ($dir)."; return 1; }
+
+  echo "Popping $session → foreground (claude -r ${sid[1,8]}… in $dir)"
+  tmux kill-session -t "$session"
+  cd "$dir" && claude -r "$sid"
 }
 
 # help — show this command list, grouped by purpose
@@ -610,7 +680,7 @@ help() {
   local -a groups=(
     "Dotfiles & shell:dots help"
     "Git & PRs:prview"
-    "Claude dev sessions (tmux):dev dev-list tgo tread tpaste ttmux ${(kj: :)DEV_REPOS}"
+    "Claude dev sessions (tmux):dev dev-list tgo tread tpaste tpush tpop ${(kj: :)DEV_REPOS}"
     "Claude session sync:csync"
     "Keep the Mac awake:nosleep sleep-manager"
   )

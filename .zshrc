@@ -420,11 +420,14 @@ tread() {
   less -R +G "$logfile"
 }
 
-# _claude_sessions_fzf — fzf-pick a saved Claude transcript across all projects.
+# _claude_sessions_fzf [cwd] — fzf-pick a saved Claude transcript.
 # Echoes the chosen row as "<session-id>\t<cwd>\t<display>" (fzf only shows the
 # display column). Newest-first by transcript mtime; the JSONL is parsed once in
-# python for each file's real cwd (the `cwd` field, not the lossy folder name)
-# plus the first human message as a label. Returns nonzero on no pick / no fzf.
+# python for each file's real cwd (the `cwd` field, not the lossy folder name),
+# its title (the latest `aiTitle` — the session name Claude generates —
+# falling back to the first human message). With a <cwd> arg, only sessions
+# whose cwd is that dir or below are shown; omit it to list every project.
+# Returns nonzero on no pick / no fzf.
 _claude_sessions_fzf() {
   # Diagnostics go to stderr: this function's stdout is captured by the caller's
   # $(...), so a stdout error would be swallowed silently instead of shown.
@@ -432,38 +435,52 @@ _claude_sessions_fzf() {
   command -v python3 >/dev/null 2>&1 || { echo "python3 not found" >&2; return 1; }
   local projects="$HOME/.claude/projects"
   [[ -d $projects ]] || { echo "No Claude sessions at $projects" >&2; return 1; }
+  local filter="${1:-}"
+  local prompt='resume claude (all) > '
+  [[ -n $filter ]] && prompt="resume claude (${filter:t}) > "
 
-  python3 - "$projects" <<'PY' | fzf --delimiter=$'\t' --with-nth=3 --no-hscroll \
-        --prompt='resume claude > ' --height=60% --reverse
+  python3 - "$projects" "$filter" <<'PY' | fzf --delimiter=$'\t' --with-nth=3 --no-hscroll \
+        --prompt="$prompt" --height=60% --reverse
 import json, os, sys, glob, datetime
 root = sys.argv[1]
+filt = sys.argv[2] if len(sys.argv) > 2 else ''
+# Whole-file scan, but only JSON-parse the lines we need (cheap substring gate
+# first) so grabbing the *latest* aiTitle stays fast over hundreds of sessions.
 rows = []
 for f in glob.glob(os.path.join(root, '*', '*.jsonl')):
     sid = os.path.basename(f)[:-6]
-    cwd = label = None
+    cwd = msg = title = None
     try:
         for line in open(f, errors='ignore'):
-            try: d = json.loads(line)
-            except ValueError: continue
-            if cwd is None and d.get('cwd'): cwd = d['cwd']
-            if label is None and d.get('type') == 'user':
-                c = d.get('message', {}).get('content')
-                t = c if isinstance(c, str) else (
-                    ' '.join(x.get('text', '') for x in c if isinstance(x, dict))
-                    if isinstance(c, list) else '')
-                t = t.strip()
-                if t and not t.startswith('<'): label = t
-            if cwd and label: break
+            if cwd is None and '"cwd"' in line:
+                try: cwd = json.loads(line).get('cwd')
+                except ValueError: pass
+            if '"ai-title"' in line:
+                try:
+                    t = json.loads(line).get('aiTitle')
+                    if t: title = t                 # keep the most recent
+                except ValueError: pass
+            if msg is None and '"type":"user"' in line:
+                try:
+                    c = json.loads(line).get('message', {}).get('content')
+                    txt = c if isinstance(c, str) else (
+                        ' '.join(x.get('text', '') for x in c if isinstance(x, dict))
+                        if isinstance(c, list) else '')
+                    txt = txt.strip()
+                    if txt and not txt.startswith('<'): msg = txt
+                except ValueError: pass
     except OSError:
+        continue
+    if filt and not (cwd == filt or (cwd or '').startswith(filt + os.sep)):
         continue
     mtime = os.path.getmtime(f)
     short = os.path.basename(cwd) if cwd else '?'
-    label = ' '.join((label or '(no message)').split())[:70]
-    rows.append((mtime, sid, cwd or '?', short, label))
+    title = ' '.join((title or msg or '(no message)').split())[:80]
+    rows.append((mtime, sid, cwd or '?', short, title))
 rows.sort(reverse=True)
-for mtime, sid, cwd, short, label in rows:
+for mtime, sid, cwd, short, title in rows:
     when = datetime.datetime.fromtimestamp(mtime).strftime('%m-%d %H:%M')
-    print(f"{sid}\t{cwd}\t{when}  {short:<20}  {label}")
+    print(f"{sid}\t{cwd}\t{when}  {short:<18}  {title}")
 PY
 }
 
@@ -552,25 +569,35 @@ claude() {
   return $rc
 }
 
-# tpush [-p] — push a Claude session into a detached background tmux session
+# tpush [-p] [--all] — push a Claude session into a detached background tmux session
 # Resumes via `claude -r`, named to fit the dev/tgo/tread family.
 #   • Run from INSIDE Claude (CLAUDE_CODE_SESSION_ID set): grabs THIS session +
 #     $PWD automatically — this is how `/tmux` backgrounds the current chat.
-#   • Run from a plain shell: fzf-pick any saved session.
+#   • Run from a plain shell: fzf-pick a session. The picker is scoped to the
+#     current directory's sessions; pass --all to list every project.
 #   • -p / --pick: force the picker even when a current session is detectable.
 # Attach afterward with the printed command. Refusing to nest if already in tmux.
 tpush() {
-  if [[ -n $TMUX && "$1" != -p && "$1" != --pick ]]; then
+  local pick= all= a
+  for a in "$@"; do
+    case "$a" in
+      -p|--pick) pick=1 ;;
+      -a|--all)  pick=1; all=1 ;;   # --all implies the picker, unfiltered
+    esac
+  done
+
+  if [[ -n $TMUX && -z $pick ]]; then
     echo "Already inside tmux ($(tmux display-message -p '#S')). Nothing to do." >&2
     return 1
   fi
 
   local sid cwd
-  if [[ -n $CLAUDE_CODE_SESSION_ID && "$1" != -p && "$1" != --pick ]]; then
+  if [[ -n $CLAUDE_CODE_SESSION_ID && -z $pick ]]; then
     sid=$CLAUDE_CODE_SESSION_ID; cwd=$PWD          # current-session mode
   else
-    local row
-    row=$(_claude_sessions_fzf) || return 1
+    local row filter="$PWD"
+    [[ -n $all ]] && filter=""                     # --all: every project
+    row=$(_claude_sessions_fzf "$filter") || return 1
     [[ -n $row ]] || return 1
     sid=${row%%$'\t'*}
     cwd=${${row#*$'\t'}%%$'\t'*}

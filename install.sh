@@ -24,4 +24,15 @@ link "$DOTFILES_DIR/bin/sleep-manager"    "$HOME/bin/sleep-manager"
 link "$DOTFILES_DIR/claude/settings.json" "$HOME/.claude/settings.json"
 link "$DOTFILES_DIR/ssh/config"           "$HOME/.ssh/config"
 
+# Install the Homebrew tools the shell config depends on (gum, glow, tmux, …).
+# Idempotent — brew bundle skips anything already installed. Skipped entirely if
+# Homebrew is absent; the config degrades gracefully without these.
+if command -v brew >/dev/null 2>&1; then
+    echo "Installing Homebrew packages from Brewfile..."
+    brew bundle --file="$DOTFILES_DIR/Brewfile"
+else
+    echo "Homebrew not found — skipping Brewfile. Install it from https://brew.sh,"
+    echo "then re-run this script (or 'brew bundle') to get gum/glow/tmux/gh/jq."
+fi
+
 echo "Done."

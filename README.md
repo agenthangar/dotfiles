@@ -8,6 +8,8 @@ Personal shell config and utility scripts.
   `help` for a live, auto-generated list of every command defined here.
 - `bin/` — utility scripts (added to PATH)
   - `sleep-manager` — manage macOS sleep behavior (`status`, `disable`, `enable`)
+- `Brewfile` — third-party CLI tools the config depends on (`gh`, `jq`, `tmux`,
+  `gum`, `glow`); installed by `install.sh` via `brew bundle`
 - `claude/` — Claude Code config
   - `settings.json` — symlinked to `~/.claude/settings.json`. Carries `enabledPlugins`,
     `extraKnownMarketplaces`, and `permissions`, so plugins reproduce on a new machine
@@ -25,11 +27,12 @@ shows up automatically — just give it that one-line comment in the same format
 
 `help` renders with the prettiest tool it finds, falling back so it never breaks:
 
-1. [`gum`](https://github.com/charmbracelet/gum) — `brew install gum` (nicest)
-2. [`glow`](https://github.com/charmbracelet/glow) — `brew install glow`
+1. [`gum`](https://github.com/charmbracelet/gum) — nicest (rounded borders, color)
+2. [`glow`](https://github.com/charmbracelet/glow) — rendered Markdown table
 3. plain aligned columns — no dependency
 
-Both renderers are optional; with neither installed you still get a clean list.
+`gum` and `glow` are in the `Brewfile`, so `install.sh` installs them; with
+neither present you still get the plain list.
 
 ## Claude plugins & MCP
 
@@ -54,5 +57,7 @@ git clone git@github.com:chrisjob1021/dotfiles.git path/to/dotfiles
 path/to/dotfiles/install.sh
 ```
 
-It creates the symlinks (backing up anything in the way to `*.bak`). If you ever move
-the repo, just re-run `install.sh` from the new location to relink.
+It creates the symlinks (backing up anything in the way to `*.bak`), then runs
+`brew bundle` to install the `Brewfile` tools (skipped if Homebrew isn't present).
+Both steps are idempotent. If you ever move the repo, just re-run `install.sh`
+from the new location to relink.

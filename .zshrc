@@ -506,14 +506,42 @@ tplan() {
   fi
 }
 
-# _claude_sessions_fzf [cwd] — fzf-pick a saved Claude transcript.
+# tfind <query…> — find the Claude session that's working on something, by words.
+# Unlike the title-only picker the rest of the family uses, this searches each
+# session's title *and* every prompt you typed, ranks by relevance (then
+# recency), and fzf-pops the survivors. Pick one → it foreground-resumes there,
+# the same `cd <dir> && claude -r <sid>` landing as tpop.
+#   tfind portfolio redesign      → sessions about redesigning the portfolio tab
+#   tfind pine ema swing          → the EMA-on-pine-scripts session, etc.
+# Searches every project (use tgo/tpush/tpop when you already know the dir/slot).
+tfind() {
+  [[ -n "$1" ]] || { echo "Usage: tfind <words to search for>"; return 1; }
+  if [[ -n $TMUX && -n $CLAUDE_CODE_SESSION_ID ]]; then
+    echo "Run tfind from a plain shell — it resumes a session in the foreground." >&2
+    return 1
+  fi
+  local row
+  row=$(_claude_sessions_fzf "" "$*") || return 1   # all projects, scored by query
+  [[ -n $row ]] || return 1
+  local sid cwd
+  sid=${row%%$'\t'*}
+  cwd=${${row#*$'\t'}%%$'\t'*}
+  [[ -d $cwd ]] || { echo "Session's directory no longer exists: $cwd"; return 1; }
+  echo "Resuming claude -r ${sid[1,8]}… in $cwd"
+  cd "$cwd" && claude -r "$sid"
+}
+
+# _claude_sessions_fzf [cwd] [query] — fzf-pick a saved Claude transcript.
 # Echoes the chosen row as "<session-id>\t<cwd>\t<display>" (fzf only shows the
 # display column). Newest-first by transcript mtime; the JSONL is parsed once in
 # python for each file's real cwd (the `cwd` field, not the lossy folder name),
 # its title — preferring a /rename `customTitle`, then the generated `aiTitle`,
 # then the first human message. With a <cwd> arg, only sessions
 # whose cwd is that dir or below are shown; omit it to list every project.
-# Returns nonzero on no pick / no fzf.
+# With a <query> arg, every session is scored by how well the query terms match
+# its title + your prompts; non-matches are dropped and the list is ranked by
+# relevance, then recency (this is what `tfind` drives). Returns nonzero on no
+# pick / no fzf.
 _claude_sessions_fzf() {
   # Diagnostics go to stderr: this function's stdout is captured by the caller's
   # $(...), so a stdout error would be swallowed silently instead of shown.
@@ -521,21 +549,28 @@ _claude_sessions_fzf() {
   command -v python3 >/dev/null 2>&1 || { echo "python3 not found" >&2; return 1; }
   local projects="$HOME/.claude/projects"
   [[ -d $projects ]] || { echo "No Claude sessions at $projects" >&2; return 1; }
-  local filter="${1:-}"
+  local filter="${1:-}" query="${2:-}"
   local prompt='resume claude (all) > '
   [[ -n $filter ]] && prompt="resume claude (${filter:t}) > "
+  [[ -n $query  ]] && prompt="resume claude (search: $query) > "
 
-  python3 - "$projects" "$filter" <<'PY' | fzf --delimiter=$'\t' --with-nth=3 --no-hscroll \
+  python3 - "$projects" "$filter" "$query" <<'PY' | fzf --delimiter=$'\t' --with-nth=3 --no-hscroll \
         --prompt="$prompt" --height=60% --reverse
 import json, os, sys, glob, datetime
 root = sys.argv[1]
 filt = sys.argv[2] if len(sys.argv) > 2 else ''
+query = sys.argv[3] if len(sys.argv) > 3 else ''
+# Query terms, minus a few stopwords so "redesign of portfolio tab" matches on
+# the words that carry meaning, not "of". Short tokens like "ui"/"db" survive.
+STOP = {'of','the','a','an','to','on','in','for','and','is','it','with','at'}
+qterms = [t for t in query.lower().split() if t not in STOP]
 # Whole-file scan, but only JSON-parse the lines we need (cheap substring gate
 # first) so grabbing the *latest* aiTitle stays fast over hundreds of sessions.
 rows = []
 for f in glob.glob(os.path.join(root, '*', '*.jsonl')):
     sid = os.path.basename(f)[:-6]
     cwd = msg = title = ctitle = None
+    umsgs = []                                          # all your prompts (search mode)
     try:
         for line in open(f, errors='ignore'):
             if cwd is None and '"cwd"' in line:
@@ -551,25 +586,44 @@ for f in glob.glob(os.path.join(root, '*', '*.jsonl')):
                     t = json.loads(line).get('aiTitle')
                     if t: title = t                     # keep the most recent
                 except ValueError: pass
-            if msg is None and '"type":"user"' in line:
+            # First user message is enough for the display title; in search mode
+            # keep parsing to collect every prompt to match the query against.
+            if (msg is None or qterms) and '"type":"user"' in line:
                 try:
                     c = json.loads(line).get('message', {}).get('content')
                     txt = c if isinstance(c, str) else (
                         ' '.join(x.get('text', '') for x in c if isinstance(x, dict))
                         if isinstance(c, list) else '')
                     txt = txt.strip()
-                    if txt and not txt.startswith('<'): msg = txt
+                    if txt and not txt.startswith('<'):
+                        if msg is None: msg = txt
+                        if qterms: umsgs.append(txt.lower())
                 except ValueError: pass
     except OSError:
         continue
     if filt and not (cwd == filt or (cwd or '').startswith(filt + os.sep)):
         continue
+    # ── Relevance scoring (search mode) ──────────────────────────────────────
+    # The tunable heart of `tfind`: how much each match counts. A term in the
+    # session's headline (its title, or opening prompt if untitled) is weighted
+    # 4x a term buried mid-conversation — a session *about* X beats one that
+    # merely mentions X in passing. Drop sessions with no match at all.
+    score = 0
+    if qterms:
+        hay  = ' '.join(umsgs)
+        head = (ctitle or title or msg or '').lower()
+        score = sum(hay.count(t) + 4 * head.count(t) for t in qterms)
+        if score == 0:
+            continue
+    # ─────────────────────────────────────────────────────────────────────────
     mtime = os.path.getmtime(f)
     short = os.path.basename(cwd) if cwd else '?'
     title = ' '.join((ctitle or title or msg or '(no message)').split())[:80]
-    rows.append((mtime, sid, cwd or '?', short, title))
+    rows.append((score, mtime, sid, cwd or '?', short, title))
+# Primary key = relevance (0 for every row when not searching, so it collapses
+# to pure newest-first); tiebreak = recency.
 rows.sort(reverse=True)
-for mtime, sid, cwd, short, title in rows:
+for score, mtime, sid, cwd, short, title in rows:
     when = datetime.datetime.fromtimestamp(mtime).strftime('%m-%d %H:%M')
     print(f"{sid}\t{cwd}\t{when}  {short:<18}  {title}")
 PY
@@ -850,7 +904,7 @@ help() {
   local -a groups=(
     "Dotfiles & shell:dots help"
     "Git & PRs:prview"
-    "Claude dev sessions (tmux):dev dev-list tgo tread tpaste tpush tpop tplan ${(kj: :)DEV_REPOS}"
+    "Claude dev sessions (tmux):dev dev-list tgo tread tpaste tpush tpop tplan tfind ${(kj: :)DEV_REPOS}"
     "Claude session sync:csync"
     "Keep the Mac awake:nosleep sleep-manager"
   )

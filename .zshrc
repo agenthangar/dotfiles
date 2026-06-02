@@ -403,8 +403,13 @@ tread() {
     return 1
   fi
 
-  # open at bottom, follow live output, strip ANSI escape codes for readability
-  less -R +G "$logfile"
+  # Pre-process the log to strip control sequences that garble the output:
+  #   \r         — carriage returns overwrite lines in less, making text unreadable
+  #   \007 (^G)  — BEL character that appears as a literal glyph
+  #   CSI seqs   — cursor movement/erase sequences (\e[...A-N/S-Z/f/h/l/n)
+  # SGR sequences (\e[...m) are kept so less -R renders colors normally.
+  perl -pe 's/\r//g; s/\x07//g; s/\x1b\[[\d;]*[ABCDEFGHJKLMNSTXZfhln]//g; s/\x1b[()][012AB]//g' "$logfile" \
+    | less -R +G
 }
 
 # _claude_sessions_fzf [cwd] — fzf-pick a saved Claude transcript.

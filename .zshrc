@@ -412,25 +412,54 @@ tread() {
     | less -R +G
 }
 
-# tplan [--all] — render the plan a Claude session wrote, picked by session
-#   • Run from INSIDE Claude (CLAUDE_CODE_SESSION_ID set): renders THIS
-#     session's plan automatically.
-#   • Run from a plain shell: fzf-pick a session (scoped to $PWD's sessions;
-#     pass --all to list every project), then render its plan.
+# tplan [repo|session] [slot] | [--all] — render the plan a Claude session wrote
+# Resolves a session the same way the dev/tgo/tpop family does, then renders the
+# plan that session saved. glow word-wraps for narrow mobile terminals (Termius);
+# falls back to less.
+#   tplan            → inside Claude: THIS session; else fzf-pick scoped to $PWD
+#   tplan ff 1       → the session running in tmux dev-ff-1
+#   tplan dev-cf-2   → that tmux session by full name
+#   tplan --all      → fzf-pick across every project
 # Sessions name their plan by an absolute ~/.claude/plans/<slug>.md path in the
 # transcript; we grab the LAST one referenced (the plan as finally written).
-# glow renders + word-wraps for narrow mobile terminals; falls back to less.
 tplan() {
-  local all=
-  [[ "$1" == "--all" || "$1" == "-a" ]] && all=1
-
   local sid
-  if [[ -n $CLAUDE_CODE_SESSION_ID && -z $all ]]; then
-    sid=$CLAUDE_CODE_SESSION_ID                    # current-session mode
+  if [[ "$1" == "--all" || "$1" == "-a" ]]; then
+    local row
+    row=$(_claude_sessions_fzf "") || return 1     # every project
+    [[ -n $row ]] || return 1
+    sid=${row%%$'\t'*}
+  elif [[ -n "$1" ]]; then
+    # repo/slot or full session name → tmux session → stashed CLAUDE_RESUME_ID
+    # (set by _dev_resume_session), falling back to the dir's newest transcript.
+    # Mirrors tpop's resolution so `tplan ff 1` lines up with `tpop ff 1`.
+    local session
+    if [[ "$1" == dev-* ]]; then
+      session="$1"
+    else
+      local repo="$1" slot="$2"
+      if [[ -z "$slot" ]]; then                    # first existing slot for repo
+        local n=1
+        while (( n <= 20 )); do
+          tmux has-session -t "dev-${repo}-${n}" 2>/dev/null && { slot=$n; break; }
+          (( n++ ))
+        done
+      fi
+      session="dev-${repo}-${slot}"
+    fi
+    tmux has-session -t "$session" 2>/dev/null || { echo "No such session: $session" >&2; return 1; }
+    sid=$(tmux show-environment -t "$session" CLAUDE_RESUME_ID 2>/dev/null | cut -d= -f2)
+    if [[ -z $sid ]]; then
+      local dir; dir=$(tmux display-message -p -t "$session" '#{session_path}')
+      local -a tx=( "$HOME/.claude/projects/${dir//\//-}"/*.jsonl(Nom[1]) )
+      sid=${${tx[1]:t}%.jsonl}
+    fi
+    [[ -n $sid ]] || { echo "Couldn't find a session id for $session." >&2; return 1; }
+  elif [[ -n $CLAUDE_CODE_SESSION_ID ]]; then
+    sid=$CLAUDE_CODE_SESSION_ID                     # current-session mode
   else
-    local row filter="$PWD"
-    [[ -n $all ]] && filter=""                     # --all: every project
-    row=$(_claude_sessions_fzf "$filter") || return 1
+    local row
+    row=$(_claude_sessions_fzf "$PWD") || return 1  # scoped to this dir
     [[ -n $row ]] || return 1
     sid=${row%%$'\t'*}
   fi
@@ -849,5 +878,5 @@ _ff_repos()     { _arguments '1:repo:(ff cfp cf)' '2:slot:(1 2 3 4)' }
 _dev_repos()    { _arguments '1:repo:(ff cfp cf)' '2:slot:(1 2 3 4)' '*:flag:(--no-tmux)' }
 _sleepmgr_cmd() { _arguments '1:command:(status disable enable help)' }
 compdef _dev_repos    dev
-compdef _ff_repos     tgo tpaste tread
+compdef _ff_repos     tgo tpaste tread tplan tpop
 compdef _sleepmgr_cmd sleep-manager

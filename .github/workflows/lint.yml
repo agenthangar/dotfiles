@@ -1,0 +1,25 @@
+name: Lint
+
+# shellcheck for the Bash/sh scripts. .zshrc is intentionally excluded —
+# shellcheck has no zsh dialect and would false-error on zsh syntax.
+# shfmt is deliberately not run: it can't preserve the column-aligned `link`
+# calls in install.sh, so a format check would fight the intended style.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  shellcheck:
+    name: shellcheck
+    runs-on: ubuntu-latest   # shellcheck is preinstalled on ubuntu runners
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run shellcheck
+        run: shellcheck install.sh bin/* .githooks/*

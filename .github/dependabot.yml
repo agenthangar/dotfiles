@@ -1,0 +1,8 @@
+version: 2
+updates:
+  # Keep the pinned GitHub Action versions in .github/workflows/* patched.
+  # No language ecosystem here — this repo has no package manifests.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly

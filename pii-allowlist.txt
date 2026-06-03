@@ -20,7 +20,7 @@ chrisjob1021
 # Your public contact identity. Uncomment the ones you consider public:
 # chris@chrisobrien.ai
 # chrisobrien.ai
-# Chris O'Brien
+Chris O'Brien
 
 # Generic vendor/tech names the cashfwd denylist scrubs from the *financial*
 # repo but that are intrinsic to a Claude Code dotfiles repo. Not PII.

@@ -1,0 +1,17 @@
+# ~/.zshrc.local — per-machine config, sourced by ~/.zshrc if it exists.
+# NOT committed. install.sh copies this template to ~/.zshrc.local on a fresh
+# machine; edit that copy with your own values. DEV_REPOS is already declared
+# (typeset -gA) by the time this is sourced, so just add keys.
+
+# Repos you want `dev`, the bare `<key>` cd shortcuts, tread, tbeam, and tab
+# completion to know about. Key = short alias, value = absolute path.
+DEV_REPOS[api]="$HOME/code/my-api"
+DEV_REPOS[web]="$HOME/code/my-web"
+
+# Default host for `tbeam` (teleport a Claude session to another machine).
+# Omit this to require an explicit host argument every time.
+# export TBEAM_HOST=my-remote
+
+# Any machine-specific shell completions. compinit has already run in ~/.zshrc,
+# so compdef is available here. Guard with -f so a missing file is a no-op.
+# [[ -f "$HOME/.tool/completions/tool.zsh" ]] && source "$HOME/.tool/completions/tool.zsh"

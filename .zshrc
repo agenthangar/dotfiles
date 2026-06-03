@@ -1,12 +1,9 @@
 export PATH="$HOME/bin:$HOME/.local/bin:$PATH"
 
 # Initialize the completion system before sourcing anything that calls `compdef`
-# (e.g. the example completion below). Without this, compdef is undefined and
-# sourcing the completion errors with "command not found: compdef".
+# (e.g. a completion sourced from ~/.zshrc.local below). Without this, compdef is
+# undefined and sourcing such a completion errors with "command not found: compdef".
 autoload -Uz compinit && compinit
-
-# OpenClaw Completion
-source "$HOME/.example/completions/example.zsh"
 
 # --- ssh-agent: one persistent agent reachable from every shell ----------
 # macOS only hands its launchd ssh-agent to GUI apps, so inbound SSH sessions
@@ -47,13 +44,14 @@ dots() { cd ~/code/dotfiles && git pull && source ~/.zshrc && cd - > /dev/null; 
 
 # DEV_REPOS — single source of truth for the repos `dev` and the cd shortcuts
 # below both understand. Add a repo here and it gains a `dev <key>` session AND a
-# bare `<key>` cd shortcut, with no second list to keep in sync.
+# bare `<key>` cd shortcut, with no second list to keep in sync. The real entries
+# are machine-specific, so they live in ~/.zshrc.local (not committed); this file
+# just declares the array and sources that override. See .zshrc.local.example.
+#   DEV_REPOS[api]="$HOME/code/my-api"
 typeset -gA DEV_REPOS
-DEV_REPOS[ff]="$HOME/code/financial-forecast"
-DEV_REPOS[cfp]="$HOME/code/cashfwd-private"
-DEV_REPOS[cf]="$HOME/code/cashfwd"
+[[ -f "$HOME/.zshrc.local" ]] && source "$HOME/.zshrc.local"
 
-# Generate a cd shortcut per repo: `ff`, `cfp`, `cf` jump straight to the dir.
+# Generate a cd shortcut per repo: each key jumps straight to its dir.
 for _repo in ${(k)DEV_REPOS}; do
   alias "$_repo"="cd ${DEV_REPOS[$_repo]}"
 done
@@ -138,7 +136,7 @@ tpaste() {
   # repo→path map: see the global DEV_REPOS (defined near the cd shortcuts)
 
   if [[ -z "${DEV_REPOS[$repo]}" ]]; then
-    echo "Unknown repo: $repo. Use ff, cfp, or cf."
+    echo "Unknown repo: $repo. Use one of: ${(k)DEV_REPOS:-(none configured — see ~/.zshrc.local)}"
     return 1
   fi
 
@@ -275,7 +273,7 @@ tgo() {
   # repo→path map: see the global DEV_REPOS (defined near the cd shortcuts)
 
   if [[ -z "${DEV_REPOS[$repo]}" ]]; then
-    echo "Unknown repo: $repo. Use ff, cfp, or cf."
+    echo "Unknown repo: $repo. Use one of: ${(k)DEV_REPOS:-(none configured — see ~/.zshrc.local)}"
     return 1
   fi
 
@@ -318,7 +316,7 @@ _dev_new_session() {
 
 # dev <repo> [slot] [--no-tmux] — open/reattach a Claude Code tmux session
 # dev list | dev ls — show all dev sessions, marking attached + active context
-# repos: ff (financial-forecast), cfp (cashfwd-private), cf (cashfwd)
+# repos: the keys of DEV_REPOS (configured in ~/.zshrc.local)
 # slot: optional 1-4, auto-picks next free slot if omitted
 # --no-tmux: run the git setup + claude inline in this terminal, no tmux session
 dev() {
@@ -343,11 +341,14 @@ dev() {
   # repo→path map: see the global DEV_REPOS (defined near the cd shortcuts)
 
   if [[ -z "$repo" || -z "${DEV_REPOS[$repo]}" ]]; then
-    echo "Usage: dev <ff|cfp|cf> [slot] [--no-tmux]"
+    echo "Usage: dev <${(kj:|:)DEV_REPOS:-repo}> [slot] [--no-tmux]"
     echo "       dev list | dev ls   → show all sessions (attached + active context)"
-    echo "  ff  → financial-forecast"
-    echo "  cfp → cashfwd-private"
-    echo "  cf  → cashfwd"
+    if (( ${#DEV_REPOS} )); then
+      local _k
+      for _k in ${(ok)DEV_REPOS}; do echo "  $_k → ${DEV_REPOS[$_k]}"; done
+    else
+      echo "  (no repos configured — add them to ~/.zshrc.local; see .zshrc.local.example)"
+    fi
     echo "  --no-tmux → run git setup + claude inline (no tmux session)"
     return 1
   fi
@@ -415,7 +416,7 @@ tread() {
   # repo→path map: see the global DEV_REPOS (defined near the cd shortcuts)
 
   if [[ -z "$repo" || -z "${DEV_REPOS[$repo]}" ]]; then
-    echo "Usage: tread <ff|cfp|cf> [slot]"
+    echo "Usage: tread <${(kj:|:)DEV_REPOS:-repo}> [slot]"
     # list available logs
     echo "Available logs:"
     ls "$HOME/.tmux-logs/" 2>/dev/null || echo "  (none)"
@@ -1028,7 +1029,7 @@ _tbeam_land() {
 }
 
 # tbeam [-f|--fg] [-d|--detach] [-p|--pick] [-a|--all] [host] — teleport a Claude
-# session to another machine (default: the mac mini) and resume it there.
+# session to another machine (default: $TBEAM_HOST) and resume it there.
 # Like tpush, but the session lands on <host> instead of local tmux:
 #   • From INSIDE Claude: grabs THIS conversation + $PWD (always detaches — a
 #     Bash subprocess has no TTY to ssh -t into; you get an attach hint instead).
@@ -1053,7 +1054,11 @@ tbeam() {
       *)           host="$a" ;;
     esac
   done
-  host="${host:-mini}"
+  host="${host:-${TBEAM_HOST:-}}"
+  if [[ -z "$host" ]]; then
+    echo "tbeam: no host given and TBEAM_HOST is unset (set it in ~/.zshrc.local)" >&2
+    return 1
+  fi
   command -v rsync >/dev/null 2>&1 || { echo "tbeam: rsync not found" >&2; return 1; }
 
   # Resolve the session id + its working dir (mirrors tpush).
@@ -1138,8 +1143,8 @@ help() {
     sig=${line%% — *}; name=${sig%% *}; info[$name]=$line
   done
 
-  # The bare `<repo>` shortcuts (ff, cfp, cf) are aliases generated from
-  # DEV_REPOS, so the function/script parser above never sees them — synthesise
+  # The bare `<repo>` cd shortcuts are aliases generated from DEV_REPOS, so the
+  # function/script parser above never sees them — synthesise
   # one entry per repo (:t = basename of the target dir) so they show in help.
   local _r
   for _r in ${(k)DEV_REPOS}; do
@@ -1204,12 +1209,13 @@ help() {
 
 # --- tab completion for our commands -------------------------------------
 # compinit already ran at the top of this file, so compdef is available here.
-# `dev <Tab>` → ff cfp cf, etc. These helper names start with `_` so the `help`
-# parser above skips them. (csync takes no args, so it needs no completion.)
-_ff_repos()     { _arguments '1:repo:(ff cfp cf)' '2:slot:(1 2 3 4)' }
-_dev_repos()    { _arguments '1:repo:(ff cfp cf)' '2:slot:(1 2 3 4)' '*:flag:(--no-tmux)' }
+# `dev <Tab>` completes the DEV_REPOS keys (configured in ~/.zshrc.local). These
+# helper names start with `_` so the `help` parser above skips them. (csync takes
+# no args, so it needs no completion.)
+_ff_repos()     { _arguments "1:repo:(${(k)DEV_REPOS})" '2:slot:(1 2 3 4)' }
+_dev_repos()    { _arguments "1:repo:(${(k)DEV_REPOS})" '2:slot:(1 2 3 4)' '*:flag:(--no-tmux)' }
 _sleepmgr_cmd() { _arguments '1:command:(status disable enable help)' }
-_tbeam_args()   { _arguments '*:option:(-f --fg -d --detach -p --pick -a --all mini)' }
+_tbeam_args()   { _arguments '*:option:(-f --fg -d --detach -p --pick -a --all)' }
 compdef _dev_repos    dev
 compdef _ff_repos     tgo tpaste tread tplan tpop
 compdef _tbeam_args   tbeam

@@ -3,6 +3,10 @@
 .zsh_history
 .zcompdump*
 
+# Per-machine/private shell config (real repo paths, hosts) — never committed.
+# It lives in $HOME, not the repo, but ignore it as defense-in-depth.
+.zshrc.local
+
 # The PII denylist is private (real names/accounts/secrets) — never commit it
 # here. pii-scan reads it from ~/code/cashfwd-private/ locally and from the
 # PII_SCRUB_RULES secret in CI.

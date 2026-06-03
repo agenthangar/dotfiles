@@ -28,6 +28,15 @@ link "$DOTFILES_DIR/claude/commands/tpush.md" "$HOME/.claude/commands/tpush.md"
 link "$DOTFILES_DIR/claude/commands/tpop.md"  "$HOME/.claude/commands/tpop.md"
 link "$DOTFILES_DIR/ssh/config"           "$HOME/.ssh/config"
 
+# Per-machine config (real repo paths, default tbeam host, private completions)
+# lives in ~/.zshrc.local, which .zshrc sources if present. It's a real copy (not
+# a symlink) so it stays machine-specific and out of the repo. Seed it from the
+# template on first run; never clobber an existing one.
+if [[ ! -e "$HOME/.zshrc.local" ]]; then
+    cp "$DOTFILES_DIR/.zshrc.local.example" "$HOME/.zshrc.local"
+    echo "Created ~/.zshrc.local from template — edit it with your repos (DEV_REPOS) and TBEAM_HOST."
+fi
+
 # Point this repo's git at the tracked hooks so the PII pre-commit guard runs.
 # Repo-local config (not a $HOME symlink); safe to re-run. The hook fails open
 # when the cashfwd-private denylist is absent, so machines without it still commit.

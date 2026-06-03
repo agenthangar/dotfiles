@@ -19,6 +19,11 @@ Personal shell config and utility scripts.
 The files in this repo are the source of truth. `~/.zshrc`, `~/bin/<script>`, and
 `~/.claude/settings.json` are symlinks back into this repo, so editing either side edits both.
 
+Per-machine config — your real repo list (`DEV_REPOS`), the default `tbeam` host
+(`TBEAM_HOST`), and any private shell completions — lives in `~/.zshrc.local`, which
+`.zshrc` sources if present. It's a real copy (not a symlink) so it never lands in the
+repo; `install.sh` seeds it from `.zshrc.local.example` on first run. Edit that copy.
+
 ## The `help` command
 
 `help` prints every custom command, grouped by purpose. Each command's name and

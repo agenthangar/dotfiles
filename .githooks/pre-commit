@@ -1,0 +1,8 @@
+#!/bin/sh
+# Pre-commit: block staged PII before it enters history.
+# Enabled by install.sh via `git config core.hooksPath .githooks`.
+# Runs the literal cashfwd denylist scan over staged content only.
+# Missing denylist (no cashfwd-private on this machine) → warns and passes;
+# the GitHub Action is the backstop. Bypass once with: git commit --no-verify
+
+exec "$(git rev-parse --show-toplevel)/bin/pii-scan" --staged

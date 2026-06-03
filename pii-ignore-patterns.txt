@@ -1,0 +1,19 @@
+# pii-scan ignore patterns — Layer 2 of the cashfwd ruleset.
+#
+# One Python regex per line. Blank lines and '#' comments are ignored. For each
+# denylist hit, the matched value is tested against every regex here; if any
+# matches, the hit is suppressed. Keep this minimal — each entry should be a
+# documented false-positive *shape*, never a personal value. A real leak belongs
+# in the source tree fix or in pii-allowlist.txt, not here.
+
+# Upstream npm package author email baked into package-lock.json metadata
+# ("Isaac Z. Schlueter <i@izs.me>" via glob/npm ancestors). Not maintainer PII.
+^i@izs\.me$
+
+# RFC 2606 reserved-for-documentation domains. Test addresses like
+# demo@example.com are intrinsic fixture content, not real PII.
+^[A-Za-z0-9._%+-]+@example\.(com|org|net)$
+
+# Generic public-bound commit author email (noreply@cashfwd.dev). Intentionally
+# public per the cashfwd plan; carried into any seeded history.
+^noreply@cashfwd\.dev$

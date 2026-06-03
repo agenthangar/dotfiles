@@ -2,3 +2,8 @@
 *.swp
 .zsh_history
 .zcompdump*
+
+# The PII denylist is private (real names/accounts/secrets) — never commit it
+# here. pii-scan reads it from ~/code/cashfwd-private/ locally and from the
+# PII_SCRUB_RULES secret in CI.
+scrub-rules.json

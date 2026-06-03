@@ -22,10 +22,17 @@ link() {
 link "$DOTFILES_DIR/.zshrc"               "$HOME/.zshrc"
 link "$DOTFILES_DIR/bin/sleep-manager"    "$HOME/bin/sleep-manager"
 link "$DOTFILES_DIR/bin/csync"            "$HOME/bin/csync"
+link "$DOTFILES_DIR/bin/pii-scan"         "$HOME/bin/pii-scan"
 link "$DOTFILES_DIR/claude/settings.json" "$HOME/.claude/settings.json"
 link "$DOTFILES_DIR/claude/commands/tpush.md" "$HOME/.claude/commands/tpush.md"
 link "$DOTFILES_DIR/claude/commands/tpop.md"  "$HOME/.claude/commands/tpop.md"
 link "$DOTFILES_DIR/ssh/config"           "$HOME/.ssh/config"
+
+# Point this repo's git at the tracked hooks so the PII pre-commit guard runs.
+# Repo-local config (not a $HOME symlink); safe to re-run. The hook fails open
+# when the cashfwd-private denylist is absent, so machines without it still commit.
+git -C "$DOTFILES_DIR" config core.hooksPath .githooks
+echo "Set core.hooksPath -> .githooks (PII pre-commit guard)"
 
 # Periodic csync is handled by a precmd hook in .zshrc (linked above), not a
 # launchd agent: iCloud Drive is TCC-protected and background agents are denied,

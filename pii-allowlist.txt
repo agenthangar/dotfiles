@@ -1,0 +1,30 @@
+# pii-scan allowlist — Layer 3, dotfiles-specific.
+#
+# The cashfwd denylist treats your own name/email as PII because none of it
+# should appear in the *financial* repo. This is a *personal dotfiles* repo, so
+# some of your own identity is intentionally public. List those values here, one
+# per line (literal substrings). A denylist hit is cleared only when one of these
+# entries actually appears on the same line, so whitelisting an email also clears
+# its domain substring — but only on lines that contain the full email.
+#
+# Keep this tight: allow only what you *want* public. Everything else stays a
+# hard fail. Never add another person's name, an account number, or a secret.
+
+# TODO(chris): confirm or trim. These are the values that are already public in
+# this repo or that you'd be comfortable committing. Remove any you'd rather the
+# scanner flag, and add others as needed.
+
+# Your GitHub identity (already in README.md's clone URL).
+chrisjob1021
+
+# Your public contact identity. Uncomment the ones you consider public:
+# chris@chrisobrien.ai
+# chrisobrien.ai
+# Chris O'Brien
+
+# Generic vendor/tech names the cashfwd denylist scrubs from the *financial*
+# repo but that are intrinsic to a Claude Code dotfiles repo. Not PII.
+Anthropic
+OpenAI
+Claude subscriptions
+Claude API key

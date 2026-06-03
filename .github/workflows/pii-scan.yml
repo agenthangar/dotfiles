@@ -19,6 +19,15 @@ jobs:
   pii-scan:
     name: Scan tracked files for PII
     runs-on: ubuntu-latest
+    # The denylist comes from a secret, but GitHub withholds secrets from
+    # Dependabot and fork pull_request events — there the secret is empty and
+    # the fail-closed scan would error spuriously. Run on pushes and same-repo
+    # PRs (which can read the secret); skip Dependabot/fork PRs, which are
+    # covered by the push-to-main run after merge.
+    if: >-
+      github.actor != 'dependabot[bot]' &&
+      (github.event_name != 'pull_request' ||
+       github.event.pull_request.head.repo.full_name == github.repository)
     steps:
       - uses: actions/checkout@v4
         with:

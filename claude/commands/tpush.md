@@ -9,19 +9,21 @@ tooling. This is the CLI `tpush` command, run on your behalf.
 Do this:
 
 1. Run `tpush` in the Bash tool. It auto-detects the current session via
-   `$CLAUDE_CODE_SESSION_ID` and `$PWD`, picks a `dev-<repo>-<slot>` name, and
-   prints the attach command. **The detached `claude -r` is spawned when you
-   exit, not now** — resuming the session while this foreground copy is still
-   live would put two processes on one transcript (no lock → they diverge), so
-   the spawn is deferred to the moment this session releases the id.
-2. Report the exact attach command it printed back to the user (e.g.
-   `tgo ff 3` or `tmux attach -t dev-dotfiles-1`).
-3. Remind the user that **this foreground Claude must now be exited** (`/exit`
-   or Ctrl-D) — that's what actually launches the background copy and drops them
-   into it. Do not keep working in this one; the conversation continues there.
+   `$CLAUDE_CODE_SESSION_ID` and `$PWD`, picks a `dev-<repo>-<slot>` name, writes
+   the wrapper's resume sentinel, and then **signals this foreground `claude` to
+   exit automatically** — you do NOT need to tell the user to type `/exit`. On
+   that exit the `claude()` wrapper spawns the detached `claude -r` and drops the
+   user straight into the tmux pane. Killing happens *before* any spawn, so there
+   is never more than one live process on the transcript (no-divergence
+   invariant). Expect the Bash call to be cut off mid-run — that's this Claude
+   being terminated on purpose, not an error.
+2. Because this session is being killed, there's usually no chance to report
+   back. If `tpush` instead printed a fallback hint (it couldn't locate the
+   process, so it asked for a manual `/exit`), relay that and the attach command
+   it printed (e.g. `tgo ff 3` or `tmux attach -t dev-dotfiles-1`).
 
 Notes:
 - If `tpush` says "Already inside tmux", this session is already backgrounded —
-  just tell the user that and stop.
+  just tell the user that and stop (no auto-exit happens in that case).
 - To later pull it back to a normal terminal, that's `/tpop` (or the `tpop`
   shell command).

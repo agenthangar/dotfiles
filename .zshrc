@@ -951,6 +951,24 @@ claude() {
   return $rc
 }
 
+# _tpush_claude_pid — walk up from this shell to the controlling `claude` process
+# and echo its PID (empty on miss). tpush runs inside Claude's Bash-tool shell,
+# whose ancestry is …→ claude → login zsh → tmux; the nearest ancestor named
+# `claude` is the live foreground session. tpush signals it to exit so the user
+# doesn't have to type /exit — quitting hands control back to the claude() wrapper,
+# whose post-exit block resumes this session into tmux. Capped walk; stops at init.
+_tpush_claude_pid() {
+  local pid=$$ comm
+  while (( pid > 1 )); do
+    comm=$(ps -o comm= -p "$pid" 2>/dev/null) || return 1
+    [[ ${comm:t} == claude* ]] && { print -r -- "$pid"; return 0; }
+    pid=$(ps -o ppid= -p "$pid" 2>/dev/null) || return 1
+    pid=${pid//[[:space:]]/}
+    [[ -n $pid ]] || return 1
+  done
+  return 1
+}
+
 # tpush [-p] [--all] — push a Claude session into a detached background tmux session
 # Resumes via `claude -r`, named to fit the dev/tgo/tread family.
 #   • Run from INSIDE Claude (CLAUDE_CODE_SESSION_ID set): grabs THIS session +
@@ -1050,7 +1068,21 @@ tpush() {
     else
       print -r -- "SPAWN"$'\t'"$session"$'\t'"$cwd"$'\t'"$sid" > "$CLAUDE_TPUSH_ATTACH"
     fi
-    echo "→ Type /exit (or Ctrl-D) and you'll drop into $session automatically."
+    # Auto-exit: signal the controlling `claude` to quit so you don't have to type
+    # /exit. The sentinel above is already written and closed (the `>` redirection
+    # flushes on completion), so the wrapper's post-exit block will read it and
+    # resume this session into tmux. SIGTERM exits Claude cleanly (~2s, terminal
+    # restored on the wrapper's tmux attach); the transcript is appended live so
+    # only the in-flight tpush turn may be lost (cosmetic). Killing BEFORE any
+    # spawn preserves the one-live-owner invariant. If the process can't be found,
+    # fall back to the manual hint rather than leaving you stuck.
+    local cpid; cpid=$(_tpush_claude_pid)
+    if [[ -n $cpid ]]; then
+      echo "Backgrounding into $session… (exiting this foreground copy now)"
+      kill -TERM "$cpid"
+    else
+      echo "→ Type /exit (or Ctrl-D) and you'll drop into $session automatically."
+    fi
   else
     # Inside Claude without the wrapper (older shell): can't defer, so spawn now
     # and warn — exit immediately, two live copies of one session diverge.

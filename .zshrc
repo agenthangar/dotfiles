@@ -255,6 +255,20 @@ _dev_pid_tree_has_claude() {
   return 1
 }
 
+# _dev_session_at_welcome <session> — true if the session's Claude is parked on
+# its startup splash (launched but never given a prompt), i.e. a LIVE claude with
+# NO loaded conversation. _dev_session_has_claude can't tell these apart: a fresh
+# `claude` sitting at the welcome screen is just as live a process as one mid-
+# conversation. The "Welcome back" banner is only rendered before the first user
+# message and scrolls away after it, so its presence in the visible pane is the
+# reliable "nothing's actually happening here" signal. Used by _dev_list to
+# withhold the ✓ active-context mark from idle splash sessions (this was the
+# "dev ls says cfp-2 is active but it isn't" false positive — an old-style plain
+# `claude` with no transcript to map, so pane content is the only signal).
+_dev_session_at_welcome() {
+  tmux capture-pane -t "$1" -p 2>/dev/null | grep -q 'Welcome back'
+}
+
 # _dev_session_summary <session> <dir> — one-line "what it's working on" for a
 # dev session: the title of its Claude transcript — customTitle (set by /rename),
 # else the auto-generated aiTitle, else the first user prompt. Resolves the
@@ -344,6 +358,67 @@ _dev_list() {
   done <<< "$names"
 }
 
+# _dev_kill_one <session> <force> — kill a single dev tmux session. When it holds
+# a live Claude (active context) and <force> is empty, confirm first: killing only
+# SIGHUPs Claude and the transcript is appended live (so the conversation stays
+# resumable via tpop/dev), but we still guard against a typo dropping a live turn.
+_dev_kill_one() {
+  local session="$1" force="$2"
+  if [[ -z "$force" ]] && _dev_session_has_claude "$session"; then
+    read -q "REPLY?Kill $session? Claude is live there (context interrupted). [y/N] " \
+      || { print; echo "Skipped $session."; return 1; }
+    print
+  fi
+  tmux kill-session -t "$session" 2>/dev/null && echo "Killed $session"
+}
+
+# _dev_kill <repo> <slot|all> [force] — tear down dev-<repo>-<slot> sessions.
+# Keyed on session NAMES, not DEV_REPOS, so it also reaches orphaned sessions
+# whose repo alias is gone. A slot (or `all`) is REQUIRED — with no slot we list
+# the repo's sessions and bail rather than guess which to kill.
+_dev_kill() {
+  local repo="$1" slot="$2" force="$3"
+
+  if [[ -z "$repo" ]]; then
+    echo "Usage: dev kill <repo> <slot|all> [-f]"
+    return 1
+  fi
+
+  # collect this repo's live sessions by name (dev-<repo>-<N>), numerically sorted
+  local -a sessions
+  sessions=( ${(f)"$(tmux list-sessions -F '#{session_name}' 2>/dev/null \
+    | grep "^dev-${repo}-[0-9]\+\$" | sort -t- -k3 -n)"} )
+
+  if (( ! ${#sessions} )); then
+    echo "No sessions for '$repo'."
+    return 1
+  fi
+
+  # `all` — kill every slot for the repo (explicit opt-in to a mass kill).
+  if [[ "$slot" == all ]]; then
+    local s
+    for s in $sessions; do _dev_kill_one "$s" "$force"; done
+    return
+  fi
+
+  # no slot — refuse to guess; show what's there so the user can pick one.
+  if [[ -z "$slot" ]]; then
+    echo "Specify a slot to kill (or 'all'). Sessions for '$repo':"
+    local s
+    for s in $sessions; do
+      if _dev_session_has_claude "$s"; then echo "  $s  ✓ (Claude live)"; else echo "  $s"; fi
+    done
+    return 1
+  fi
+
+  local session="dev-${repo}-${slot}"
+  if ! tmux has-session -t "$session" 2>/dev/null; then
+    echo "No session: $session"
+    return 1
+  fi
+  _dev_kill_one "$session" "$force"
+}
+
 # tgo [repo] [slot] — attach to an existing dev tmux session
 # tgo        → list all dev sessions (with attached state)
 # tgo ff     → attach to first ff session
@@ -416,19 +491,23 @@ _dev_new_session() {
 
 # dev <repo> [slot|new] [--no-tmux] — open/reattach a Claude Code tmux session
 # dev list | dev ls — show all dev sessions, marking attached + active context
+# dev kill <repo> <slot|all> [-f] — tear down a session (or all of a repo's);
+#   confirms when Claude is live unless -f; matches session names, so it also
+#   reaches orphaned sessions whose repo alias is gone (dev kill dotfiles 1).
 # repos: the keys of DEV_REPOS (configured in ~/.zshrc.local)
 # slot: optional 1-4, auto-picks next free/unattached slot if omitted
 # new: force a brand-new slot (next never-used number) instead of reattaching
 # --no-tmux: run the git setup + claude inline in this terminal, no tmux session
 # The branch checked out is per-repo (DEV_BRANCHES[<repo>], else $DEV_BRANCH).
 dev() {
-  local no_tmux=
+  local no_tmux= force=
   local -a pos
   local arg
   for arg in "$@"; do
     case "$arg" in
-      --no-tmux) no_tmux=1 ;;
-      *)         pos+=("$arg") ;;
+      --no-tmux)  no_tmux=1 ;;
+      -f|--force) force=1 ;;
+      *)          pos+=("$arg") ;;
     esac
   done
   local repo="${pos[1]}"
@@ -440,11 +519,20 @@ dev() {
     return
   fi
 
+  # `dev kill <repo> <slot|all>` — tear down a session (or all of a repo's).
+  # Operates on session NAMES, not DEV_REPOS keys, so it can also clean up
+  # orphaned sessions whose repo alias no longer exists (e.g. dev-dotfiles-*).
+  if [[ "$repo" == kill ]]; then
+    _dev_kill "${pos[2]}" "${pos[3]}" "$force"
+    return
+  fi
+
   # repo→path map: see the global DEV_REPOS (defined near the cd shortcuts)
 
   if [[ -z "$repo" || -z "${DEV_REPOS[$repo]}" ]]; then
     echo "Usage: dev <${(kj:|:)DEV_REPOS:-repo}> [slot|new] [--no-tmux]"
-    echo "       dev list | dev ls   → show all sessions (attached + active context)"
+    echo "       dev list | dev ls         → show all sessions (attached + active context)"
+    echo "       dev kill <repo> <slot|all> [-f] → tear down a session (or all of a repo's)"
     if (( ${#DEV_REPOS} )); then
       local _k
       for _k in ${(ok)DEV_REPOS}; do echo "  $_k → ${DEV_REPOS[$_k]}"; done

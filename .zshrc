@@ -298,8 +298,9 @@ _dev_pid_tree_claude_pid() {
 # _dev_session_summary <session> <dir> — one-line "what it's working on" for a
 # dev session: the title of its Claude transcript — customTitle (set by /rename),
 # else the auto-generated aiTitle, else the first user prompt. Resolves the
-# transcript by the id stashed on the session (CLAUDE_RESUME_ID, set by both
-# _dev_new_session and _dev_resume_session). For OLD sessions with no stashed id
+# transcript by the id stashed on the session (CLAUDE_RESUME_ID, set by
+# _dev_new_session, _dev_resume_session, and the claude-stamp-tmux SessionStart
+# hook). For OLD (pre-hook) sessions with no stashed id
 # it matches the live claude's start time to a transcript's birthtime (see below)
 # rather than blindly taking the dir's newest — that newest-fallback gave sibling
 # slots in one repo identical summaries (the dev-dot-2/dot-3 duplicate bug).
@@ -728,7 +729,12 @@ tplan() {
     sid=${row%%$'\t'*}
   elif [[ -n "$1" ]]; then
     # repo/slot or full session name → tmux session → stashed CLAUDE_RESUME_ID
-    # (set by _dev_resume_session), falling back to the dir's newest transcript.
+    # (stamped by _dev_new_session/_dev_resume_session and, for every other launch
+    # path, by the claude-stamp-tmux SessionStart hook), falling back to the dir's
+    # newest transcript only for pre-hook sessions. That fallback is ambiguous when
+    # several slots share one repo dir (dev-ff-1..5 all root at financial-forecast,
+    # so one ~/.claude/projects/<enc>/) — it returns whichever sibling wrote last,
+    # not the slot you asked for. The hook is what makes this reliable now.
     # Mirrors tpop's resolution so `tplan ff 1` lines up with `tpop ff 1`.
     local session
     if [[ "$1" == dev-* ]]; then
@@ -1320,8 +1326,12 @@ tpop() {
     echo "You're inside $session right now — run tpop from a different terminal."; return 1
   fi
 
-  # Resume id: the precise CLAUDE_RESUME_ID we stashed, else the dir's newest
-  # transcript (the live Claude in there keeps it freshest).
+  # Resume id: the precise CLAUDE_RESUME_ID stamped on the session (by
+  # _dev_new_session/_dev_resume_session, or the claude-stamp-tmux SessionStart
+  # hook for any other launch path), else the dir's newest transcript. The
+  # newest-fallback is only for pre-hook sessions and is ambiguous when several
+  # slots share one repo dir (it returns whichever sibling wrote last); the hook
+  # is what makes targeting a specific slot reliable.
   local dir sid
   dir=$(tmux display-message -p -t "$session" '#{session_path}')
   sid=$(tmux show-environment -t "$session" CLAUDE_RESUME_ID 2>/dev/null | cut -d= -f2)

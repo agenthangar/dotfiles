@@ -1,0 +1,38 @@
+#!/usr/bin/env bash
+# claude-stamp-tmux — SessionStart hook: stamp this Claude session's id onto its
+# tmux session as CLAUDE_RESUME_ID, so tplan/tpop/dev can target the *exact*
+# session even when several slots share one project dir.
+#
+# The bug this fixes: tplan/tpop resolve a slot's session id from the tmux env
+# var CLAUDE_RESUME_ID, and when it's unset they fall back to "newest .jsonl by
+# mtime in the project dir." That fallback assumes one live Claude per project
+# dir — but e.g. dev-ff-1..5 all root at ~/code/financial-forecast and so share
+# one ~/.claude/projects/<enc>/ folder, so the fallback returns whichever
+# *sibling* slot wrote last, not the slot you asked for. _dev_new_session and
+# _dev_resume_session already stamp the id, but a session started any other way
+# (bare `claude`, `tmux new-session … send-keys claude`) never got stamped —
+# that's what made `tplan ff 2` render the wrong slot's (or no) plan.
+#
+# Running as a SessionStart hook closes the gap for *every* launch path: the
+# hook fires inside the already-running session (so it knows its own id) and in
+# the tmux pane's context (so `tmux set-environment` lands on the right session,
+# resolved from the inherited $TMUX_PANE). A no-op outside tmux. Always exits 0
+# so it can never block a session from starting.
+#
+# Wired via claude/settings.json -> hooks.SessionStart. The session_id arrives
+# in the hook's JSON payload on stdin; we fall back to $CLAUDE_CODE_SESSION_ID
+# if stdin can't be parsed (e.g. python3 absent).
+set -uo pipefail
+
+[[ -n ${TMUX:-} ]] || exit 0
+
+sid=$(python3 -c 'import sys, json
+try:
+    print(json.load(sys.stdin).get("session_id", ""))
+except Exception:
+    pass' 2>/dev/null) || sid=""
+[[ -n $sid ]] || sid=${CLAUDE_CODE_SESSION_ID:-}
+[[ -n $sid ]] || exit 0
+
+tmux set-environment CLAUDE_RESUME_ID "$sid" 2>/dev/null || true
+exit 0

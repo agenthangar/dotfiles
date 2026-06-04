@@ -237,9 +237,10 @@ _dev_pid_tree_has_claude() {
 # _dev_session_summary <session> <dir> — one-line "what it's working on" for a
 # dev session: the title of its Claude transcript — customTitle (set by /rename),
 # else the auto-generated aiTitle, else the first user prompt. Resolves the
-# transcript by the resumed id stashed on the session (CLAUDE_RESUME_ID, set by
-# _dev_resume_session), falling back to the dir's newest transcript — the same
-# resolution tplan/tpop use. Prints nothing if no transcript/title is found.
+# transcript by the id stashed on the session (CLAUDE_RESUME_ID, set by both
+# _dev_new_session and _dev_resume_session), falling back to the dir's newest
+# transcript for older sessions started before that — the same resolution
+# tplan/tpop use. Prints nothing if no transcript/title is found.
 _dev_session_summary() {
   # null_glob: an unmatched transcript glob expands to nothing instead of
   # erroring; bare_glob_qual: keep the (Nom[1]) qualifiers parsing even in a
@@ -372,13 +373,23 @@ tgo() {
 # dev/claude-1). Shared by `dev` and `tpaste` so the bootstrap (branch dance,
 # geometry, logging) lives in one place; callers attach (or not) and deliver
 # input themselves afterwards.
+#
+# We *pre-assign* Claude's session id (a lowercased uuidgen) and pass it as
+# `claude --session-id`, then stash it on the tmux session as CLAUDE_RESUME_ID —
+# the same precise signal _dev_resume_session records. Without it, every slot in
+# a repo shares one fallback (the dir's newest transcript), so `dev ls` showed
+# identical summaries for sibling slots and `tpop` couldn't target a specific
+# one. uuidgen is uppercase but Claude stores ids lowercase, so we lowercase to
+# keep the transcript filename glob (`<sid>.jsonl`) matching.
 _dev_new_session() {
   local session="$1" dir="$2"
   local logfile="$HOME/.tmux-logs/${session}.log"
+  local sid; sid="$(uuidgen | tr 'A-Z' 'a-z')"
   mkdir -p "$HOME/.tmux-logs"
   tmux new-session -d -s "$session" -c "$dir" -x 220 -y 50
   tmux pipe-pane -t "$session" -o "cat >> $logfile"
-  tmux send-keys -t "$session" "git stash; git fetch origin; git checkout $DEV_BRANCH 2>/dev/null || git checkout -b $DEV_BRANCH; git pull origin $DEV_BRANCH; claude" Enter
+  tmux set-environment -t "$session" CLAUDE_RESUME_ID "$sid"
+  tmux send-keys -t "$session" "git stash; git fetch origin; git checkout $DEV_BRANCH 2>/dev/null || git checkout -b $DEV_BRANCH; git pull origin $DEV_BRANCH; claude --session-id $sid" Enter
 }
 
 # dev <repo> [slot] [--no-tmux] — open/reattach a Claude Code tmux session

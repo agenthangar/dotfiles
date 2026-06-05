@@ -20,9 +20,13 @@ DEV_REPOS[web]="$HOME/code/my-web"
 # Omit this to require an explicit host argument every time.
 # export TBEAM_HOST=my-remote
 
-# Host for `mini` (run a command on the mini: `mini dev dot`). Falls back to
-# $TBEAM_HOST if unset, so set this only if the mini is a different box.
-# export MINI_HOST=my-mini
+# Remote machines `on` can reach (run a command there: `on mini dev dot`). Key =
+# short alias, value = ssh target. Each alias also gets its own shorthand function
+# (`mini dev dot` ≡ `on mini dev dot`) plus tab completion. REMOTE_HOSTS is already
+# declared, so just add keys. (An old MINI_HOST/TBEAM_HOST auto-seeds REMOTE_HOSTS
+# [mini], so `mini` keeps working even with no entry here.)
+# REMOTE_HOSTS[mini]=my-mini
+# REMOTE_HOSTS[studio]=studio.local
 
 # Any machine-specific shell completions. compinit has already run in ~/.zshrc,
 # so compdef is available here. Guard with -f so a missing file is a no-op.

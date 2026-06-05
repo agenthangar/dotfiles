@@ -135,7 +135,7 @@ dots() {
 # are machine-specific, so they live in ~/.zshrc.local (not committed); this file
 # just declares the array and sources that override. See .zshrc.local.example.
 #   DEV_REPOS[api]="$HOME/code/my-api"
-typeset -gA DEV_REPOS DEV_BRANCHES
+typeset -gA DEV_REPOS DEV_BRANCHES REMOTE_HOSTS
 [[ -f "$HOME/.zshrc.local" ]] && source "$HOME/.zshrc.local"
 
 # DEV_BRANCH — the global default branch `dev`/`_dev_new_session` check out (and
@@ -157,6 +157,22 @@ for _repo in ${(k)DEV_REPOS}; do
   alias "$_repo"="cd ${DEV_REPOS[$_repo]}"
 done
 unset _repo
+
+# REMOTE_HOSTS — single source of truth for machines `on` (and its generated
+# per-host shortcuts) can reach. Key = short alias, value = ssh target. Real
+# entries are machine-specific, so they live in ~/.zshrc.local (declared above so
+# the local file can just add keys). Back-compat: an old MINI_HOST/TBEAM_HOST
+# seeds a `mini` alias when the registry has none, so prior configs keep working.
+[[ -z ${REMOTE_HOSTS[mini]} && -n ${MINI_HOST:-${TBEAM_HOST:-}} ]] \
+  && REMOTE_HOSTS[mini]="${MINI_HOST:-$TBEAM_HOST}"
+
+# Generate a shorthand function per host: `mini …` ≡ `on mini …`. A function (not
+# an alias) so it forwards "$@" and also works bare (`mini` → a shell on it). `on`
+# is defined further down; function bodies bind late, so order doesn't matter.
+for _host in ${(k)REMOTE_HOSTS}; do
+  functions[$_host]="on ${(q)_host} \"\$@\""
+done
+unset _host
 
 # csync — two-way sync of Claude Code session history with iCloud Drive.
 # Lives in bin/csync (install.sh symlinks it onto PATH; `help` lists it by
@@ -1675,7 +1691,14 @@ _tbeam_land() {
 
 # tbeam — teleport a Claude session between machines (default: $TBEAM_HOST)
 #
-# Usage: tbeam [flags] [host]
+# Usage: tbeam [flags] [repo [slot]] [host]
+#
+# Arguments:
+#   repo        a DEV_REPOS key → beam that dev slot's session (like tpop/tplan);
+#               omit to beam THIS conversation (inside Claude) or fzf-pick
+#   slot        which dev-<repo>-<slot> (default: its first live slot)
+#   host        destination machine (default: $TBEAM_HOST). A bare positional is
+#               read as a host only when it isn't a DEV_REPOS key.
 #
 # Options:
 #   -f, --fg            resume in the foreground, no tmux slot (dies if the shell
@@ -1698,6 +1721,7 @@ tbeam() {
   # while/shift (not for-in) so -s/--session can consume the following token as
   # its value; the `=`-joined forms (-s=… / --session=…) work too.
   local fg= detach= pick= all= here= host= sid_arg=
+  local -a pos=()
   while (( $# )); do
     case "$1" in
       -h|--help)            _help_for tbeam; return 0 ;;
@@ -1709,10 +1733,29 @@ tbeam() {
       -s|--session|--id)    shift; sid_arg="$1" ;;
       -s=*|--session=*|--id=*) sid_arg="${1#*=}" ;;
       -*)                   echo "tbeam: unknown flag $1" >&2; return 1 ;;
-      *)                    host="$1" ;;
+      *)                    pos+=("$1") ;;
     esac
     shift
   done
+
+  # Positional grammar (push direction): [repo [slot]] [host], matching the
+  # dev/tplan/tpop/tgo family so `tbeam ff 1` lines up with `tpop ff 1`. The
+  # first positional is a <repo> only when it's a DEV_REPOS key — that's what
+  # disambiguates it from a bare host (`tbeam mini` still means host 'mini').
+  # An optional numeric slot follows, then an optional explicit host. --here
+  # SUMMONS a session that lives ON the host, so a LOCAL repo/slot is meaningless
+  # there — its positionals stay [host] (target a remote session with -s).
+  local repo_arg= slot_arg=
+  if [[ -z $here && -n ${pos[1]} && -n ${DEV_REPOS[${pos[1]}]} ]]; then
+    repo_arg=${pos[1]}
+    if [[ ${pos[2]} == <-> ]]; then    # numeric → slot, then optional host
+      slot_arg=${pos[2]}; host=${pos[3]}
+    else                               # no slot → second positional is the host
+      host=${pos[2]}
+    fi
+  else
+    host=${pos[1]}
+  fi
   host="${host:-${TBEAM_HOST:-}}"
   if [[ -z "$host" ]]; then
     echo "tbeam: no host given and TBEAM_HOST is unset (set it in ~/.zshrc.local)" >&2
@@ -1726,7 +1769,11 @@ tbeam() {
     return
   fi
 
-  # Resolve the session id + its working dir (mirrors tpush). Three ways:
+  # Resolve the session id + its working dir (mirrors tpush). Four ways:
+  #   • <repo> [slot] — a dev slot, resolved like tplan/tpop: tmux session →
+  #     its stamped CLAUDE_RESUME_ID (newest-transcript fallback for pre-hook
+  #     sessions). The origin is a local dev slot, so this is a MOVE that
+  #     kill-sessions it once landed (the self_move=… block below).
   #   • -s <id>  — an explicit id (full, or a unique prefix like the 8 chars the
   #     picker/tbeam show): resolve it locally to its transcript + recorded cwd,
   #     skipping both the picker and current-session mode. Lets you re-beam a
@@ -1737,7 +1784,26 @@ tbeam() {
   # move): only then do we SIGTERM ourselves to complete the move. For any other
   # origin (a dev slot) we kill-session it instead — see the two blocks below.
   local sid cwd self_move=
-  if [[ -n $sid_arg ]]; then
+  if [[ -n $repo_arg ]]; then
+    local slot=$slot_arg
+    if [[ -z $slot ]]; then                         # first existing slot for repo
+      local n=1
+      while (( n <= 20 )); do
+        tmux has-session -t "dev-${repo_arg}-${n}" 2>/dev/null && { slot=$n; break; }
+        (( n++ ))
+      done
+    fi
+    local session="dev-${repo_arg}-${slot}"
+    tmux has-session -t "$session" 2>/dev/null || { echo "tbeam: no such session: $session" >&2; return 1; }
+    sid=$(tmux show-environment -t "$session" CLAUDE_RESUME_ID 2>/dev/null | cut -d= -f2)
+    if [[ -z $sid ]]; then                          # pre-hook fallback: newest transcript in the dir
+      local dir; dir=$(tmux display-message -p -t "$session" '#{session_path}')
+      local -a tx=( "$HOME/.claude/projects/${dir//\//-}"/*.jsonl(Nom[1]) )
+      sid=${${tx[1]:t}%.jsonl}
+    fi
+    [[ -n $sid ]] || { echo "tbeam: couldn't find a session id for $session" >&2; return 1; }
+    cwd=${DEV_REPOS[$repo_arg]}
+  elif [[ -n $sid_arg ]]; then
     setopt local_options null_glob
     local -a tx=( "$HOME/.claude/projects"/*/"$sid_arg"*.jsonl )
     (( ${#tx} ))      || { echo "tbeam: no local session matching '$sid_arg'" >&2; return 1; }
@@ -1826,34 +1892,38 @@ tbeam() {
   fi
 }
 
-# mini — run a command on the mini (default: $MINI_HOST, else $TBEAM_HOST)
+# on — run a command on a remote host ($REMOTE_HOSTS alias, or any ssh target)
 #
-# Usage: mini [command...]
+# Usage: on <host> [command...]
 #
 # Arguments:
-#   command...   command to run on the mini; omit to open an interactive shell
+#   host         a $REMOTE_HOSTS alias (e.g. mini) or a literal ssh target
+#   command...   command to run there; omit to open an interactive shell
 #
-# Runs <command> on the mini over ssh in a login+interactive shell with a TTY, so
-# your dotfiles functions (dev, tgo, …), Homebrew PATH, and tmux all resolve there
-# — e.g. `mini dev dot` starts a dev session on the mini. With no command it just
-# drops you into a shell on it. Host comes from $MINI_HOST, falling back to
-# $TBEAM_HOST; set either in ~/.zshrc.local.
-mini() {
-  [[ "$1" == -h || "$1" == --help ]] && { _help_for mini; return 0; }
-  local host="${MINI_HOST:-${TBEAM_HOST:-}}"
-  if [[ -z "$host" ]]; then
-    echo "mini: no host — set MINI_HOST (or TBEAM_HOST) in ~/.zshrc.local" >&2
+# Runs <command> on <host> over ssh in a login+interactive shell with a TTY, so
+# your dotfiles functions (dev, tgo, …), Homebrew PATH, and tmux all resolve
+# remotely — e.g. `on mini dev dot` starts a dev session there. Each $REMOTE_HOSTS
+# alias also gets its own shorthand function (`mini dev dot` ≡ `on mini dev dot`).
+# Set aliases in ~/.zshrc.local (REMOTE_HOSTS[mini]=…); an unknown host is used
+# as a literal ssh target, so `on box.local uptime` works without registering it.
+on() {
+  [[ "$1" == -h || "$1" == --help ]] && { _help_for on; return 0; }
+  if (( ! $# )); then
+    local aliases="${(kj:, :)REMOTE_HOSTS}"
+    echo "on: usage: on <host> [command...]   (aliases: ${aliases:-none set})" >&2
     return 1
   fi
-  # No command: open an interactive login shell on the mini.
-  (( $# )) || { ssh -t "$host"; return; }
+  local host="$1"; shift
+  local target="${REMOTE_HOSTS[$host]:-$host}"   # registry alias, else a literal target
+  # No command: open an interactive login shell on the host.
+  (( $# )) || { ssh -t "$target"; return; }
   # Two quoting layers: (@q) quotes each arg so the remote zsh -c sees the original
   # words, then (q) wraps the joined string as ONE token for ssh's transport (ssh
   # otherwise re-splits its remote command on spaces). `zsh -lic` — login +
   # interactive — is what makes dev/tgo/Homebrew/tmux resolve remotely, the same
   # reason _tbeam_land runs under it.
   local cmd="${(j: :)${(@q)@}}"
-  ssh -t "$host" "zsh -lic ${(q)cmd}"
+  ssh -t "$target" "zsh -lic ${(q)cmd}"
 }
 
 # help — show this command list, grouped by purpose
@@ -1896,6 +1966,13 @@ help() {
     info[$_r]="$_r — cd straight to ${DEV_REPOS[$_r]:t}"
   done
 
+  # Same for the per-host `on` shortcuts generated from REMOTE_HOSTS — also not
+  # real text in this file, so synthesise an entry per alias.
+  local _hk
+  for _hk in ${(k)REMOTE_HOSTS}; do
+    info[$_hk]="$_hk — run a command on ${REMOTE_HOSTS[$_hk]} (≡ on $_hk)"
+  done
+
   # `dev list` is a subcommand, not its own function, so the parser only captured
   # `dev`'s first comment line — synthesise an entry so the subcommand is listed.
   info[dev-list]="dev list|ls — list dev sessions, marking attached + active Claude context"
@@ -1903,7 +1980,8 @@ help() {
   # Grouping by purpose.  "Title:cmd cmd …" — drop a command's name into a group
   # to file it; anything uncategorized falls through to "Other" at the end.
   local -a groups=(
-    "Dotfiles & shell:dots help mini"
+    "Dotfiles & shell:dots help"
+    "Remote machines:on ${(kj: :)REMOTE_HOSTS}"
     "Git & PRs:prview"
     "Claude dev sessions (tmux):dev dev-list tgo tread tpaste tpush tpop tbeam tplan tfind ${(kj: :)DEV_REPOS}"
     "Claude session sync:csync"
@@ -1961,7 +2039,9 @@ _ff_repos()     { _arguments "1:repo:(${(k)DEV_REPOS})" '2:slot:(1 2 3 4)' }
 _dev_repos()    { _arguments "1:repo:(${(k)DEV_REPOS})" '2:slot:(1 2 3 4 new)' '*:flag:(-f --fg --no-tmux -y --yes)' }
 _sleepmgr_cmd() { _arguments '1:command:(status disable enable help)' }
 _tbeam_args()   { _arguments '*:option:(-f --fg -d --detach -p --pick -a --all --here -s --session --id -h --help)' }
+_on_hosts()     { _arguments "1:host:(${(k)REMOTE_HOSTS})" '*::command: _normal' }
 compdef _dev_repos    dev
 compdef _ff_repos     tgo tpaste tread tplan tpop
 compdef _tbeam_args   tbeam
 compdef _sleepmgr_cmd sleep-manager
+compdef _on_hosts     on

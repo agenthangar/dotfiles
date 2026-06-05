@@ -12,6 +12,14 @@
 
 set -euo pipefail
 
+# -h/--help: print this script's leading doc comment (the block below the
+# shebang) and exit. csync otherwise takes no arguments.
+case "${1:-}" in
+  -h|--help) sed -n '2,11p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+  "") : ;;
+  *) echo "csync: unknown argument: $1 (csync takes no args; -h for help)" >&2; exit 2 ;;
+esac
+
 icloud="$HOME/Library/Mobile Documents/com~apple~CloudDocs/claude-sessions"
 local_dir="$HOME/.claude/projects"
 

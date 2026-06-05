@@ -5,6 +5,22 @@ export PATH="$HOME/bin:$HOME/.local/bin:$PATH"
 # undefined and sourcing such a completion errors with "command not found: compdef".
 autoload -Uz compinit && compinit
 
+# _help_for <name> — print the doc-comment block that sits directly above the
+# zsh function <name> in this file, with the leading "# " stripped. The comment
+# that already documents each command IS its help text, so there's a single
+# source of truth: every command's `-h`/`--help` flag just calls this. Captures
+# only the contiguous `#` lines immediately preceding `name() {` (a blank line or
+# the previous function's `}` resets the block), and exits nonzero if none found.
+_help_for() {
+  local name="${1:?_help_for: need a function name}"
+  awk -v fn="$name" '
+    /^#/                  { blk = blk $0 ORS; next }
+    $0 ~ "^" fn "\\(\\)"  { printf "%s", blk; found = 1; exit }
+                          { blk = "" }
+    END                   { exit !found }
+  ' ~/.zshrc | sed 's/^# \{0,1\}//'
+}
+
 # --- ssh-agent: one persistent agent reachable from every shell ----------
 # macOS only hands its launchd ssh-agent to GUI apps, so inbound SSH sessions
 # (and some terminals) start with SSH_AUTH_SOCK unset and `ssh-add` dies with
@@ -23,6 +39,7 @@ fi
 # (no arg → current branch's PR). Hides body/comments/diff; shows just
 # mergeability, merge state, and per-check verdicts.
 prview() {
+  [[ "$1" == -h || "$1" == --help ]] && { _help_for prview; return 0; }
   gh pr view "$@" --json mergeable,mergeStateStatus,statusCheckRollup | jq '
     {
       mergeable,
@@ -37,7 +54,7 @@ prview() {
 }
 
 # nosleep — keep the Mac awake until Ctrl-C (interactive; sleep-manager for background)
-nosleep() { trap 'sudo pmset -a disablesleep 0' EXIT INT; sudo pmset -a disablesleep 1 && caffeinate -dimsu; }
+nosleep() { [[ "$1" == -h || "$1" == --help ]] && { _help_for nosleep; return 0; }; trap 'sudo pmset -a disablesleep 0' EXIT INT; sudo pmset -a disablesleep 1 && caffeinate -dimsu; }
 
 # dots — fetch origin's main HEAD and reload zsh. Fast-forwards whatever branch
 # we're on to origin/main — true on main, and on a dev branch (dev/claude-1) that
@@ -45,6 +62,7 @@ nosleep() { trap 'sudo pmset -a disablesleep 0' EXIT INT; sudo pmset -a disables
 # makes this safe: if the branch has its own commits ahead, or local edits would
 # be overwritten, the merge aborts untouched and we just reload.
 dots() {
+  [[ "$1" == -h || "$1" == --help ]] && { _help_for dots; return 0; }
   cd ~/code/dotfiles || return
   git fetch origin main || { cd - > /dev/null; return 1; }
   local branch=$(git symbolic-ref --short -q HEAD)
@@ -127,6 +145,7 @@ _tpaste_claude_ready() {
 # tpaste ff     → start a new ff session and queue the path into it
 # tpaste ff 3   → paste into dev-ff-3 (creating it if it doesn't exist)
 tpaste() {
+  [[ "$1" == -h || "$1" == --help ]] && { _help_for tpaste; return 0; }
   local repo="${1:-ff}"
   local slot="$2"
 
@@ -487,6 +506,7 @@ _dev_kill() {
 # tgo ff     → attach to first ff session
 # tgo ff 3   → attach to dev-ff-3
 tgo() {
+  [[ "$1" == -h || "$1" == --help ]] && { _help_for tgo; return 0; }
   local repo="$1"
   local slot="$2"
 
@@ -575,6 +595,7 @@ dev() {
   local arg
   for arg in "$@"; do
     case "$arg" in
+      -h|--help)  _help_for dev; return 0 ;;
       --no-tmux)  no_tmux=1 ;;
       -f|--force) force=1 ;;
       *)          pos+=("$arg") ;;
@@ -680,6 +701,7 @@ dev() {
 # tread ff      → opens log for first ff session in less
 # tread ff 2    → opens log for dev-ff-2
 tread() {
+  [[ "$1" == -h || "$1" == --help ]] && { _help_for tread; return 0; }
   local repo="$1"
   local slot="${2:-1}"
 
@@ -721,6 +743,7 @@ tread() {
 # Sessions name their plan by an absolute ~/.claude/plans/<slug>.md path in the
 # transcript; we grab the LAST one referenced (the plan as finally written).
 tplan() {
+  [[ "$1" == -h || "$1" == --help ]] && { _help_for tplan; return 0; }
   local sid
   if [[ "$1" == "--all" || "$1" == "-a" ]]; then
     local row
@@ -795,6 +818,7 @@ tplan() {
 #   tfind -k pine ema swing              → skip Sonnet, fast offline keyword rank
 # Searches every project (use tgo/tpush/tpop when you already know the dir/slot).
 tfind() {
+  [[ "$1" == -h || "$1" == --help ]] && { _help_for tfind; return 0; }
   local keyword=
   [[ "$1" == "-k" || "$1" == "--keyword" ]] && { keyword=1; shift; }
   [[ -n "$1" ]] || { echo "Usage: tfind [-k] <words describing the session>"; return 1; }
@@ -1181,6 +1205,7 @@ tpush() {
   local pick= all= a
   for a in "$@"; do
     case "$a" in
+      -h|--help) _help_for tpush; return 0 ;;
       -p|--pick) pick=1 ;;
       -a|--all)  pick=1; all=1 ;;   # --all implies the picker, unfiltered
     esac
@@ -1299,6 +1324,7 @@ tpush() {
 #   tpop ff 3       → dev-ff-3
 #   tpop dev-cf-1   → that session by full name
 tpop() {
+  [[ "$1" == -h || "$1" == --help ]] && { _help_for tpop; return 0; }
   local session
   if [[ "$1" == dev-* ]]; then
     session="$1"
@@ -1402,7 +1428,7 @@ _tbeam_pull_transcript() {
 # effect. --all widens the picker past $PWD; -f resumes in this terminal instead
 # of a detached dev slot.
 _tbeam_pull() {
-  local host="$1" all="$2" fg="$3"
+  local host="$1" all="$2" fg="$3" notmux="$4"
   command -v fzf >/dev/null 2>&1 || { echo "tbeam: fzf not installed (brew install fzf)" >&2; return 1; }
 
   # Pull the HOST's session list (all projects), keep only real rows, then scope
@@ -1440,6 +1466,15 @@ _tbeam_pull() {
       existing="$s"; break
     fi
   done
+
+  # --no-tmux: the transcript is local now — don't make a dev slot or resume.
+  # Print the command to resume it by hand here (works from inside Claude too).
+  if [[ -n $notmux ]]; then
+    [[ -n $existing ]] && echo "tbeam: note — this conversation is already live locally in $existing."
+    echo "✓ Pulled ${sid[1,8]}… here (not resumed)."
+    echo "  Resume:  (cd ${(q)cwd} && claude -r $sid)"
+    return
+  fi
 
   # -f: resume straight in this terminal (subshell exec so the terminal returns to
   # your shell when Claude exits). If it's already live locally, attach instead.
@@ -1491,8 +1526,8 @@ _tbeam_land() {
   print -r -- "$session"                        # last line: caller reads it for the hint
 }
 
-# tbeam [-f|--fg] [-d|--detach] [-p|--pick] [-a|--all] [--here] [host] — teleport a
-# Claude session between this machine and another (default: $TBEAM_HOST).
+# tbeam [-f|--fg] [-d|--detach] [-p|--pick] [-a|--all] [--here] [--no-tmux] [host]
+# — teleport a Claude session between this machine and another (default: $TBEAM_HOST).
 # Like tpush, but across machines. Two directions:
 #   • PUSH (default): send a session FROM here TO <host>, land it there.
 #       – From INSIDE Claude: grabs THIS conversation + $PWD (always detaches — a
@@ -1509,17 +1544,22 @@ _tbeam_land() {
 #   -p/--pick    (push) force the picker even when a current session is detectable
 #   -a/--all     picker across every project (both directions)
 #   --here       PULL from <host> to this machine instead of pushing away
+#   --no-tmux    move the transcript only — don't create a tmux dev slot or resume;
+#                print the `claude -r` command to pick it up by hand. The one path
+#                that works from inside Claude (no TTY needed, unlike -f).
 # The session's repo must exist at the same path on both machines (yours all live
 # in ~/code everywhere); the transcript is rsync'd across before it resumes.
 tbeam() {
-  local fg= detach= pick= all= here= host= a
+  local fg= detach= pick= all= here= notmux= host= a
   for a in "$@"; do
     case "$a" in
+      -h|--help)   _help_for tbeam; return 0 ;;
       -f|--fg)     fg=1 ;;
       -d|--detach) detach=1 ;;
       -p|--pick)   pick=1 ;;
       -a|--all)    pick=1; all=1 ;;
       --here)      here=1 ;;
+      --no-tmux)   notmux=1 ;;
       -*)          echo "tbeam: unknown flag $a" >&2; return 1 ;;
       *)           host="$a" ;;
     esac
@@ -1533,7 +1573,7 @@ tbeam() {
 
   # --here flips the direction: pull a session off <host> onto this machine.
   if [[ -n $here ]]; then
-    _tbeam_pull "$host" "$all" "$fg"
+    _tbeam_pull "$host" "$all" "$fg" "$notmux"
     return
   fi
 
@@ -1560,6 +1600,17 @@ tbeam() {
 
   echo "⟳ Beaming ${sid[1,8]}… ($cwd) → $host"
   _tbeam_sync_transcript "$cwd" "$host" || return 1
+
+  # --no-tmux: just move the transcript across — don't make a dev-<repo>-<slot>
+  # session and don't resume anything. Print the command to pick it up by hand on
+  # the host. Unlike -f (which needs a TTY to ssh -t into), this works from inside
+  # Claude too, since it never tries to attach — it's the "move it, I'll resume it
+  # myself" path. Takes precedence over -f/-d if both are given.
+  if [[ -n $notmux ]]; then
+    echo "✓ Synced ${sid[1,8]}… to $host (not resumed)."
+    echo "  Resume there:  ssh $host -t \"zsh -lic 'cd ${(q)cwd} && claude -r $sid'\""
+    return
+  fi
 
   # Foreground mode: resume straight in the ssh session (needs a real terminal).
   if [[ -n $fg ]]; then
@@ -1597,6 +1648,7 @@ tbeam() {
 # (zsh's own help is `run-help` / ESC-h; this doesn't touch it.)
 help() {
   emulate -L zsh
+  [[ "$1" == -h || "$1" == --help ]] && { _help_for help; return 0; }
 
   # Build:  name -> "signature — description"  from functions and bin scripts.
   # (Functions whose name starts with `_` — completion helpers — are skipped.)
@@ -1691,7 +1743,7 @@ help() {
 _ff_repos()     { _arguments "1:repo:(${(k)DEV_REPOS})" '2:slot:(1 2 3 4)' }
 _dev_repos()    { _arguments "1:repo:(${(k)DEV_REPOS})" '2:slot:(1 2 3 4 new)' '*:flag:(--no-tmux)' }
 _sleepmgr_cmd() { _arguments '1:command:(status disable enable help)' }
-_tbeam_args()   { _arguments '*:option:(-f --fg -d --detach -p --pick -a --all --here)' }
+_tbeam_args()   { _arguments '*:option:(-f --fg -d --detach -p --pick -a --all --here --no-tmux -h --help)' }
 compdef _dev_repos    dev
 compdef _ff_repos     tgo tpaste tread tplan tpop
 compdef _tbeam_args   tbeam

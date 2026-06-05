@@ -525,7 +525,7 @@ _dev_kill() {
   local repo="$1" slot="$2" force="$3"
 
   if [[ -z "$repo" ]]; then
-    echo "Usage: dev kill <repo> <slot|all> [-f]"
+    echo "Usage: dev kill <repo> <slot|all> [-y]"
     return 1
   fi
 
@@ -648,15 +648,16 @@ _dev_new_session() {
 
 # dev — open/reattach a Claude Code tmux session
 #
-# Usage: dev <repo> [slot|new] [--no-tmux]
+# Usage: dev <repo> [slot|new] [-f]
 #
 # Commands:
 #   dev <repo> [slot|new]        open/reattach (slot 1-4, or 'new' to force fresh)
 #   dev list | ls                list all dev sessions (attached + active context)
-#   dev kill <repo> <slot|all>   tear down a session  [-f to skip the confirm]
+#   dev kill <repo> <slot|all>   tear down a session  [-y to skip the confirm]
 #
 # Options:
-#   --no-tmux   run git setup + claude inline, no tmux session
+#   -f, --fg    run git setup + claude inline, no tmux session (alias: --no-tmux)
+#   -y, --yes   dev kill: skip the "Claude is live" confirm (alias: --force)
 #
 # repo is a key of DEV_REPOS (configured in ~/.zshrc.local). The checked-out branch
 # is per-repo (DEV_BRANCHES[repo], else $DEV_BRANCH). dev kill matches session names,
@@ -665,12 +666,16 @@ dev() {
   local no_tmux= force=
   local -a pos
   local arg
+  # -f/--fg = foreground/no-tmux EVERYWHERE (matches tbeam -f). The kill-confirm
+  # skip moved off -f onto -y/--yes (--force kept as a long alias) so -f never
+  # means two things. `dev kill` returns before the no_tmux check below, so a
+  # stray -f on a kill is just an inert no-op rather than a silent force.
   for arg in "$@"; do
     case "$arg" in
-      -h|--help)  _help_for dev; return 0 ;;
-      --no-tmux)  no_tmux=1 ;;
-      -f|--force) force=1 ;;
-      *)          pos+=("$arg") ;;
+      -h|--help)         _help_for dev; return 0 ;;
+      -f|--fg|--no-tmux) no_tmux=1 ;;
+      -y|--yes|--force)  force=1 ;;
+      *)                 pos+=("$arg") ;;
     esac
   done
   local repo="${pos[1]}"
@@ -693,9 +698,9 @@ dev() {
   # repo→path map: see the global DEV_REPOS (defined near the cd shortcuts)
 
   if [[ -z "$repo" || -z "${DEV_REPOS[$repo]}" ]]; then
-    echo "Usage: dev <${(kj:|:)DEV_REPOS:-repo}> [slot|new] [--no-tmux]"
+    echo "Usage: dev <${(kj:|:)DEV_REPOS:-repo}> [slot|new] [-f]"
     echo "       dev list | dev ls         → show all sessions (attached + active context)"
-    echo "       dev kill <repo> <slot|all> [-f] → tear down a session (or all of a repo's)"
+    echo "       dev kill <repo> <slot|all> [-y] → tear down a session (or all of a repo's)"
     if (( ${#DEV_REPOS} )); then
       local _k
       for _k in ${(ok)DEV_REPOS}; do echo "  $_k → ${DEV_REPOS[$_k]}"; done
@@ -703,7 +708,7 @@ dev() {
       echo "  (no repos configured — add them to ~/.zshrc.local; see .zshrc.local.example)"
     fi
     echo "  new      → force a brand-new slot instead of reattaching"
-    echo "  --no-tmux → run git setup + claude inline (no tmux session)"
+    echo "  -f/--fg  → run git setup + claude inline (no tmux session)"
     return 1
   fi
 
@@ -715,8 +720,8 @@ dev() {
     return 1
   fi
 
-  # --no-tmux: cd into the repo, do the same branch setup, run claude inline.
-  # No session/slot/logging — slot is a tmux concept, so skip it entirely.
+  # -f/--fg (a.k.a. --no-tmux): cd into the repo, do the same branch setup, run
+  # claude inline. No session/slot/logging — slot is a tmux concept, so skip it.
   if [[ -n "$no_tmux" ]]; then
     echo "Starting claude in $dir (no tmux)"
     cd "$dir" || return 1
@@ -1913,7 +1918,7 @@ help() {
 # helper names start with `_` so the `help` parser above skips them. (csync takes
 # no args, so it needs no completion.)
 _ff_repos()     { _arguments "1:repo:(${(k)DEV_REPOS})" '2:slot:(1 2 3 4)' }
-_dev_repos()    { _arguments "1:repo:(${(k)DEV_REPOS})" '2:slot:(1 2 3 4 new)' '*:flag:(--no-tmux)' }
+_dev_repos()    { _arguments "1:repo:(${(k)DEV_REPOS})" '2:slot:(1 2 3 4 new)' '*:flag:(-f --fg --no-tmux -y --yes)' }
 _sleepmgr_cmd() { _arguments '1:command:(status disable enable help)' }
 _tbeam_args()   { _arguments '*:option:(-f --fg -d --detach -p --pick -a --all --here -s --session --id -h --help)' }
 compdef _dev_repos    dev

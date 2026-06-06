@@ -809,6 +809,11 @@ _dev_session_rows() {
 # warn accordingly. local-first; within a host, _dev_session_rows' own order holds.
 # Rows are prefixed verbatim (no re-splitting), so empty fields can't collapse.
 _dev_rows_all() {
+  # no_monitor/no_notify: this fans out with `&` + `wait`; under an interactive shell
+  # (the `zsh -lic` bin/t spawns, or a direct call) monitor mode would print job-control
+  # noise ("[2] 67794", "exit 1 …", "done") to the terminal. Background jobs and `wait`
+  # work fine without it. local_options restores the caller's settings on return.
+  setopt local_options no_monitor no_notify
   local tmpd; tmpd=$(mktemp -d) || return 1
   _dev_session_rows > "$tmpd/.local" 2>/dev/null &
   local h

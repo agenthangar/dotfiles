@@ -483,12 +483,39 @@ PY
 #                             (_dev_session_at_welcome — "idle, no conversation"),
 #                             and for a session that's exited to a shell ("no active
 #                             session"). Independent of attach state.
-# Shared by `dev list` and `dev ls`.
+# Shared by `dev list` and `dev ls`. With a <scope> dir arg, only sessions whose
+# working dir is that dir (or below) are listed — `dev ls` passes the current repo.
+#
+# _dev_cwd_repo_dir — print the DEV_REPOS directory that contains $PWD (exact match
+# or an ancestor; longest/most-specific wins), else nothing. The scope source for
+# `dev ls` — path-based, so it catches every slot in that repo regardless of which
+# alias keyed it (dot-* and dotfiles-* both root at ~/code/dotfiles).
+_dev_cwd_repo_dir() {
+  local k d best=
+  for k in ${(k)DEV_REPOS}; do
+    d=${DEV_REPOS[$k]}
+    [[ $PWD == $d || $PWD == $d/* ]] && (( ${#d} > ${#best} )) && best=$d
+  done
+  [[ -n $best ]] && print -r -- "$best"
+}
+
 _dev_list() {
+  local scope="$1"
   local names
   names=$(tmux list-sessions -F '#{session_name}' 2>/dev/null | grep '^dev-' | sort)
+  # Scope to the current repo dir (path-based) when asked: keep only sessions whose
+  # session_path is <scope> or below it.
+  if [[ -n $scope ]]; then
+    local kept=() _s _d
+    while IFS= read -r _s; do
+      [[ -n $_s ]] || continue
+      _d=$(tmux display-message -p -t "$_s" '#{session_path}' 2>/dev/null)
+      [[ $_d == $scope || $_d == $scope/* ]] && kept+=("$_s")
+    done <<< "$names"
+    names=${(F)kept}
+  fi
   if [[ -z "$names" ]]; then
-    echo "No dev sessions running."
+    echo "No dev sessions running${scope:+ in ${scope:t} (dev ls --all for every repo)}."
     return 0
   fi
   local g c y r0=
@@ -499,7 +526,7 @@ _dev_list() {
   # prefix before the summary = 2 (indent) + 8 (STATUS field) + name_w + 1 (gap)
   local avail=$(( ${COLUMNS:-80} - 11 - name_w ))
   (( avail < 12 )) && avail=$(( 80 - 11 - name_w ))
-  print -r -- "dev sessions   ${g}●${r0} attached · ${c}✓${r0} active context"
+  print -r -- "dev sessions   ${g}●${r0} attached · ${c}✓${r0} active context${scope:+   ${y}(${scope:t} — --all for all)${r0}}"
   print -r -- ""
   printf '  %s%-8s%-*s %s%s\n' "$y" 'STATUS' $name_w 'SESSION' 'WORKING ON' "$r0"
   local state dir amark cmark summary
@@ -609,9 +636,13 @@ _dev_rows_all() {
 # can survey what's live everywhere from one terminal. Read-only; to actually pull a
 # remote one down, `tbeam --here <host>` (its picker / -s <id>).
 _dev_list_remote() {
+  local scope="$1"
   local rows; rows=$(_dev_rows_all)
+  # Scope to the current repo dir (rows carry cwd in field 3; repos share the same
+  # ~/code path on every machine, so a local scope filters remote rows too).
+  [[ -n $scope ]] && rows=$(print -r -- "$rows" | awk -F'\t' -v d="$scope" '$3==d || index($3, d"/")==1')
   if [[ -z $rows ]]; then
-    echo "No dev sessions running on this machine or any reachable host."
+    echo "No dev sessions running${scope:+ in ${scope:t} (dev ls -r --all for every repo)}${scope:+,} on this machine or any reachable host."
     return 0
   fi
   local g c y r0=
@@ -626,7 +657,7 @@ _dev_list_remote() {
   # prefix before WORKING ON = 2 indent + 8 STATUS + host_w + 1 gap + name_w + 1 gap
   local avail=$(( ${COLUMNS:-80} - 12 - host_w - name_w ))
   (( avail < 12 )) && avail=$(( 80 - 12 - host_w - name_w ))
-  print -r -- "dev sessions   ${g}●${r0} attached · ${c}✓${r0} active context"
+  print -r -- "dev sessions   ${g}●${r0} attached · ${c}✓${r0} active context${scope:+   ${y}(${scope:t} — --all for all)${r0}}"
   print -r -- ""
   printf '  %s%-8s%-*s %-*s %s%s\n' "$y" 'STATUS' $host_w 'HOST' $name_w 'SESSION' 'WORKING ON' "$r0"
   local amark cmark
@@ -746,8 +777,9 @@ _dev_new_session() {
 #   dev <repo> [slot|new]        open/reattach (slot 1-4, or 'new' to force fresh)
 #   dev -r [repo [slot]]         attach a slot that's live on another $REMOTE_HOSTS
 #                                host (host auto-inferred; fzf-pick if several match)
-#   dev list | ls [-r]           list dev sessions (attached + active context); -r
-#                                spans every $REMOTE_HOSTS host (a cross-host view)
+#   dev list | ls [-r] [-a]      list dev sessions (attached + active context),
+#                                scoped to the repo you're in; -a/--all for every
+#                                repo; -r spans every $REMOTE_HOSTS host (cross-host)
 #   dev kill <repo> <slot|all>   tear down a session  [-y to skip the confirm]
 #   dev -r kill <repo> [slot]    tear down a slot on its $REMOTE_HOSTS host instead
 #
@@ -765,7 +797,7 @@ _dev_new_session() {
 # so it also reaches orphaned sessions whose repo alias is gone (dev kill dotfiles 1).
 # Surveying what's live everywhere is `dev ls -r`; sending a session away is `tbeam`.
 dev() {
-  local no_tmux= force= remote= here=
+  local no_tmux= force= remote= here= all=
   local -a pos
   local arg
   # -f/--fg = foreground/no-tmux EVERYWHERE (matches tbeam -f). The kill-confirm
@@ -779,6 +811,7 @@ dev() {
       -y|--yes|--force)  force=1 ;;
       -r|--remote)       remote=1 ;;
       --here)            here=1 ;;
+      -a|--all)          all=1 ;;
       *)                 pos+=("$arg") ;;
     esac
   done
@@ -786,9 +819,13 @@ dev() {
   local slot="${pos[2]}"
 
   # `dev list` (or `ls`) — show sessions + state, then stop. `-r` spans every
-  # $REMOTE_HOSTS host too (a cross-host view), else just this machine.
+  # $REMOTE_HOSTS host too (a cross-host view), else just this machine. By default
+  # it's SCOPED to the repo you're in (path-based, so dot-*/dotfiles-* both show in
+  # the dotfiles dir); `-a`/`--all` widens to every repo, as does standing outside
+  # any DEV_REPOS dir (nothing to scope to).
   if [[ "$repo" == list || "$repo" == ls ]]; then
-    if [[ -n $remote ]]; then _dev_list_remote; else _dev_list; fi
+    local scope=; [[ -z $all ]] && scope=$(_dev_cwd_repo_dir)
+    if [[ -n $remote ]]; then _dev_list_remote "$scope"; else _dev_list "$scope"; fi
     return
   fi
 
@@ -2195,7 +2232,7 @@ help() {
 # helper names start with `_` so the `help` parser above skips them. (csync takes
 # no args, so it needs no completion.)
 _ff_repos()     { _arguments "1:repo:(${(k)DEV_REPOS})" '2:slot:(1 2 3 4)' }
-_dev_repos()    { _arguments "1:repo:(${(k)DEV_REPOS} list ls kill)" '2:slot:(1 2 3 4 new)' '*:flag:(-f --fg --no-tmux -y --yes -r --remote --here)' }
+_dev_repos()    { _arguments "1:repo:(${(k)DEV_REPOS} list ls kill)" '2:slot:(1 2 3 4 new)' '*:flag:(-f --fg --no-tmux -y --yes -r --remote --here -a --all)' }
 _sleepmgr_cmd() { _arguments '1:command:(status disable enable help)' }
 _tbeam_args()   { _arguments '*:option:(-f --fg -d --detach -p --pick -a --all -s --session --id -h --help)' }
 _on_hosts()     { _arguments "1:host:(${(k)REMOTE_HOSTS})" '*::command: _normal' }

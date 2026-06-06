@@ -541,6 +541,11 @@ _dev_session_rows() {
     short="${s#dev-}"
     dir=$(tmux display-message -p -t "$s" '#{session_path}' 2>/dev/null)
     sid=$(tmux show-environment -t "$s" CLAUDE_RESUME_ID 2>/dev/null | cut -d= -f2)
+    # `-` sentinel for an unstamped slot (idle / no conversation): keeps every
+    # field non-empty so a tab is never a *leading/consecutive* IFS-whitespace
+    # delimiter that `read` would collapse, sliding the columns. Routing treats
+    # `-` as "no conversation to pull".
+    [[ -n $sid ]] || sid='-'
     state=$(tmux display-message -p -t "$s" '#{?session_attached,attached,detached}' 2>/dev/null)
     if ! _dev_session_has_claude "$s"; then
       summary='(no active session)'
@@ -1751,7 +1756,7 @@ _tbeam_include_remote() {
     return
   fi
 
-  [[ -n $sid ]] || { echo "tbeam: $host/$slot has no active conversation to pull" >&2; return 1; }
+  [[ -n $sid && $sid != - ]] || { echo "tbeam: $host/$slot has no active conversation to pull" >&2; return 1; }
   # _tbeam_pull ssh's to its <host> arg directly, so hand it the resolved ssh
   # target (REMOTE_HOSTS value), not the short key; -s <sid> skips its own picker.
   _tbeam_pull "${REMOTE_HOSTS[$host]:-$host}" "$all" "$fg" "$sid"

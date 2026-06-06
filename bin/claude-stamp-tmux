@@ -45,8 +45,10 @@ while [[ -n $pid && $pid != 1 && $n -lt 10 ]]; do
 done
 if [[ $comm == claude && -n $pid ]]; then
   reg="${XDG_CACHE_HOME:-$HOME/.cache}/claude-sessions"
+  # shellcheck disable=SC2015  # best-effort write; the `|| true` is the intended catch-all
   mkdir -p "$reg" 2>/dev/null && printf '%s\t%s\n' "$sid" "$cwd" > "$reg/$pid" 2>/dev/null || true
 fi
 
+# shellcheck disable=SC2015  # best-effort stamp; never fail the hook
 [[ -n ${TMUX:-} ]] && tmux set-environment CLAUDE_RESUME_ID "$sid" 2>/dev/null || true
 exit 0

@@ -20,7 +20,11 @@ permissions:
 
 jobs:
   # shellcheck for the Bash/sh scripts. .zshrc is intentionally excluded —
-  # shellcheck has no zsh dialect and would false-error on zsh syntax.
+  # shellcheck has no zsh dialect and would false-error on zsh syntax. bin/t is
+  # Python, not shell, so it must be excluded too (shellcheck SC1071 errors on a
+  # non-shell shebang). Rather than hardcode either skip, discover targets by
+  # shebang: only files whose first line names bash or sh are linted, so a new
+  # Python/zsh helper in bin/ is auto-excluded and a new shell script auto-covered.
   # shfmt is deliberately not run: it can't preserve the column-aligned `link`
   # calls in install.sh, so a format check would fight the intended style.
   shellcheck:
@@ -30,7 +34,13 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Run shellcheck
-        run: shellcheck install.sh bin/* .githooks/*
+        run: |
+          files=(install.sh)
+          for f in bin/* .githooks/*; do
+            head -1 "$f" | grep -qE '^#!.*\b(bash|sh)$' && files+=("$f")
+          done
+          printf 'linting: %s\n' "${files[*]}"
+          shellcheck "${files[@]}"
 
   # Detect committed credentials by *shape* (entropy/regex) across full history.
   # Complements pii-scan, which catches known personal values by literal denylist.

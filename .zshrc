@@ -751,7 +751,8 @@ _dev_new_session() {
 #   dev kill <repo> <slot|all>   tear down a session  [-y to skip the confirm]
 #
 # Options:
-#   -f, --fg     run git setup + claude inline, no tmux session (alias: --no-tmux)
+#   -f, --fg     no tmux: foreground-RESUME the named slot if it's live (≡ tpop),
+#                else git setup + a fresh claude inline (alias: --no-tmux)
 #   -y, --yes    dev kill: skip the "Claude is live" confirm (alias: --force)
 #   -r, --remote act on a slot that's live on another $REMOTE_HOSTS host, host
 #                inferred (attach in place); with `ls`, list every host (cross-host)
@@ -833,9 +834,17 @@ dev() {
     return 1
   fi
 
-  # -f/--fg (a.k.a. --no-tmux): cd into the repo, do the same branch setup, run
-  # claude inline. No session/slot/logging — slot is a tmux concept, so skip it.
+  # -f/--fg (a.k.a. --no-tmux): run claude inline, no tmux. If a SPECIFIC slot is
+  # named and it's live, foreground-RESUME that conversation (`claude -r`) — matching
+  # what -f means in tbeam / `dev -r`; that's exactly `tpop`, so delegate to it (it
+  # kills the slot first, honoring the one-live-owner invariant). Otherwise (no slot,
+  # `new`, or that slot doesn't exist yet) start a FRESH claude inline after the
+  # branch dance — slot is a tmux concept, so the fresh path has none.
   if [[ -n "$no_tmux" ]]; then
+    if [[ -n "$slot" && "$slot" != new ]] && tmux has-session -t "dev-${repo}-${slot}" 2>/dev/null; then
+      tpop "$repo" "$slot"
+      return
+    fi
     echo "Starting claude in $dir (no tmux)"
     cd "$dir" || return 1
     git stash; git fetch origin; git checkout $branch 2>/dev/null || git checkout -b $branch; git pull origin $branch

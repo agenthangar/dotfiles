@@ -10,8 +10,8 @@ distinctive part is the Claude Code session tooling, all defined in `.zshrc`:
 
 - **`tpush` / `tpop`** — move a Claude Code session between a foreground terminal
   and a detached background tmux session, with a one-live-owner guarantee.
-- **`tbeam`** — teleport a running Claude Code session to another machine (or
-  summon one back with `--here`) and resume it there.
+- **`tbeam`** — teleport a running Claude Code session to another machine and
+  resume it there; pull one back with `dev -r --here`.
 - **`tfind`** — semantic search across your saved Claude Code sessions ("which
   session was working on X?"), reranked by Claude.
 - **`csync`** — two-way sync of Claude Code session history across machines via
@@ -27,9 +27,12 @@ full, auto-generated command list.
   `help` for a live, auto-generated list of every command defined here.
 - `bin/` — utility scripts (added to PATH)
   - `sleep-manager` — manage macOS sleep behavior (`status`, `disable`, `enable`)
+  - `csync` — two-way sync of Claude Code session history across machines via iCloud Drive
+  - `claude-stamp-tmux` — Claude Code SessionStart hook; records each session's id
+    (tmux + a pid registry) so `dev`/`tpop`/`tplan` can target the exact session
   - `pii-scan` — fail if any PII appears in tracked/staged files (see **PII guard** below)
-- `Brewfile` — third-party CLI tools the config depends on (`gh`, `jq`, `tmux`);
-  installed by `install.sh` via `brew bundle`
+- `Brewfile` — third-party CLI tools the config depends on (`gh`, `jq`, `tmux`,
+  `fzf`, `glow`); installed by `install.sh` via `brew bundle`
 - `claude/` — Claude Code config
   - `settings.json` — symlinked to `~/.claude/settings.json`. Carries `enabledPlugins`,
     `extraKnownMarketplaces`, and `permissions`, so plugins reproduce on a new machine
@@ -71,8 +74,10 @@ MCP is two separate things:
 
 ## PII guard
 
-`pii-scan` keeps personal data out of this public repo. It reuses the cashfwd
-two-layer ruleset plus a dotfiles-specific allowlist:
+`pii-scan` keeps personal data out of this public repo. **This documents my own
+setup** — to reuse the pattern in your fork, point `$PII_RULES` at your own
+denylist JSON (mine happens to live in a private `cashfwd-private` repo). It
+reuses a two-layer ruleset plus a dotfiles-specific allowlist:
 
 1. **Denylist** — `scrub-rules.json`, the literal list of real personal
    identifiers (names, emails, phones, account numbers, private hosts). It is
@@ -105,6 +110,9 @@ Run it by hand anytime: `pii-scan` (all tracked files) or `pii-scan --staged`.
 
 ## Install on a new machine
 
+**Requirements:** macOS · zsh · [Claude Code](https://claude.com/claude-code) ·
+[Homebrew](https://brew.sh) (for the `Brewfile` tools).
+
 Clone the repo anywhere — `install.sh` is location-independent (it resolves its own
 path), so the symlink *targets* follow wherever you checked it out:
 
@@ -117,3 +125,9 @@ It creates the symlinks (backing up anything in the way to `*.bak`), then runs
 `brew bundle` to install the `Brewfile` tools (skipped if Homebrew isn't present).
 Both steps are idempotent. If you ever move the repo, just re-run `install.sh`
 from the new location to relink.
+
+## License & contributing
+
+MIT — see [LICENSE](LICENSE). This is a personal, opinionated setup published so
+others can borrow the patterns, not a general-purpose framework; see
+[CONTRIBUTING.md](CONTRIBUTING.md) for what that means for issues and PRs.

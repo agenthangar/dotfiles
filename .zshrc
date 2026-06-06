@@ -712,7 +712,7 @@ _dev_rows_all() {
 # of a direct tmux scan, and with a dedicated HOST column (STATUS/HOST/SESSION/
 # WORKING ON) — local rows read `local`, remote rows their $REMOTE_HOSTS key — so you
 # can survey what's live everywhere from one terminal. Read-only; to actually pull a
-# remote one down, `tbeam --here <host>` (its picker / -s <id>).
+# remote one down, `dev -r --here` (or `dev <host> <repo> <slot> --here`).
 _dev_list_remote() {
   local scope="$1"
   local rows; rows=$(_dev_rows_all)

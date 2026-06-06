@@ -1,0 +1,113 @@
+name: CI
+
+# Single CI workflow so branch protection needs only ONE required check: the
+# `CI` gate job at the bottom. It depends on every other job here and is the
+# only status check you require per repo — uniform name across all repos, so
+# there is nothing per-repo to remember. Add/remove jobs freely; just keep them
+# in the gate's `needs:` list and keep the gate named `CI`.
+#
+# (Scorecard stays in its own scorecard.yml: it has no pull_request trigger and
+# is public-gated, so it is never part of the gate.)
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  # shellcheck for the Bash/sh scripts. .zshrc is intentionally excluded —
+  # shellcheck has no zsh dialect and would false-error on zsh syntax.
+  # shfmt is deliberately not run: it can't preserve the column-aligned `link`
+  # calls in install.sh, so a format check would fight the intended style.
+  shellcheck:
+    name: shellcheck
+    runs-on: ubuntu-latest   # shellcheck is preinstalled on ubuntu runners
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run shellcheck
+        run: shellcheck install.sh bin/* .githooks/*
+
+  # Detect committed credentials by *shape* (entropy/regex) across full history.
+  # Complements pii-scan, which catches known personal values by literal denylist.
+  # Run as the gitleaks MIT CLI via its container so there's no GITLEAKS_LICENSE
+  # gate (that only applies to the gitleaks-action on GitHub Organizations).
+  gitleaks:
+    name: gitleaks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # full history so `detect` scans every commit
+
+      - name: Run gitleaks
+        run: |
+          docker run --rm -v "$PWD:/repo" ghcr.io/gitleaks/gitleaks:v8.21.2 \
+            detect --source=/repo --redact --verbose
+
+  # Backstop for the local pre-commit hook: runs the same literal cashfwd denylist
+  # scan in CI, where the private scrub-rules.json doesn't exist. The denylist is
+  # supplied as the PII_SCRUB_RULES repository secret (paste scrub-rules.json's
+  # contents). Without the secret the job fails closed (--require-rules), so a
+  # missing/dropped secret is loud, not silent.
+  pii-scan:
+    name: Scan tracked files for PII
+    runs-on: ubuntu-latest
+    # The denylist comes from a secret, but GitHub withholds secrets from
+    # Dependabot and fork pull_request events — there the secret is empty and
+    # the fail-closed scan would error spuriously. Run on pushes and same-repo
+    # PRs (which can read the secret); skip Dependabot/fork PRs, which are
+    # covered by the push-to-main run after merge. The CI gate treats this
+    # skip as a pass.
+    if: >-
+      github.actor != 'dependabot[bot]' &&
+      (github.event_name != 'pull_request' ||
+       github.event.pull_request.head.repo.full_name == github.repository)
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Materialize denylist from secret
+        env:
+          PII_SCRUB_RULES: ${{ secrets.PII_SCRUB_RULES }}
+        run: |
+          set -euo pipefail
+          if [ -z "${PII_SCRUB_RULES:-}" ]; then
+            echo "::error::PII_SCRUB_RULES secret is not set — add it (contents of scrub-rules.json)."
+            exit 1
+          fi
+          printf '%s' "$PII_SCRUB_RULES" > "$RUNNER_TEMP/scrub-rules.json"
+
+      - name: Run pii-scan
+        env:
+          PII_RULES: ${{ runner.temp }}/scrub-rules.json
+        run: |
+          set -euo pipefail
+          ./bin/pii-scan --require-rules
+
+      - name: Cleanup
+        if: always()
+        run: rm -f "$RUNNER_TEMP/scrub-rules.json"
+
+  # The single required status check. Turns green only when every job above
+  # succeeds (or is legitimately skipped, e.g. pii-scan on fork/Dependabot PRs).
+  # `if: always()` is load-bearing: without it the gate is itself skipped when a
+  # dependency fails, so the required check would never report failure and the PR
+  # would merge anyway. We inspect needs.*.result explicitly instead.
+  ci:
+    name: CI
+    if: always()
+    needs: [shellcheck, gitleaks, pii-scan]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Verify all required jobs passed
+        run: |
+          for r in ${{ join(needs.*.result, ' ') }}; do
+            [ "$r" = success ] || [ "$r" = skipped ] || { echo "gate failed: job result was '$r'"; exit 1; }
+          done
+          echo "All required jobs passed."

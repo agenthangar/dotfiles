@@ -393,53 +393,12 @@ _dev_pid_tree_claude_pid() {
   return 1
 }
 
-# _dev_session_summary <session> <dir> — one-line "what it's working on" for a
-# dev session: the title of its Claude transcript — customTitle (set by /rename),
-# else the auto-generated aiTitle, else the first user prompt. Resolves the
-# transcript by the id stashed on the session (CLAUDE_RESUME_ID, set by
-# _dev_new_session, _dev_resume_session, and the claude-stamp-tmux SessionStart
-# hook). For OLD (pre-hook) sessions with no stashed id
-# it matches the live claude's start time to a transcript's birthtime (see below)
-# rather than blindly taking the dir's newest — that newest-fallback gave sibling
-# slots in one repo identical summaries (the dev-dot-2/dot-3 duplicate bug).
-# Prints nothing if no transcript/title is found.
-_dev_session_summary() {
-  # null_glob: an unmatched transcript glob expands to nothing instead of
-  # erroring; bare_glob_qual: keep the (Nom[1]) qualifiers parsing even in a
-  # shell that disabled them. local_options scopes both to this function.
-  setopt local_options null_glob bare_glob_qual
-  local session="$1" dir="$2" sid
-  sid=$(tmux show-environment -t "$session" CLAUDE_RESUME_ID 2>/dev/null | cut -d= -f2)
-  local -a tx
-  if [[ -n $sid ]]; then
-    tx=( "$HOME/.claude/projects"/*/"$sid".jsonl(N) )
-  else
-    # No recorded sid: the dir's newest transcript is WRONG when two live claudes
-    # share a repo — both resolve to it and show identical summaries. Each `claude`
-    # creates its transcript within seconds of launching, so disambiguate by the
-    # live claude's start time: pick the dir transcript whose birthtime is closest
-    # to (and at/after) that start. Falls back to newest-by-mtime if the pid or
-    # birthtimes can't be read.
-    local proj="$HOME/.claude/projects/${dir//\//-}" cpid start
-    cpid=$(_dev_session_claude_pid "$session")
-    if [[ -n $cpid ]]; then
-      start=$(ps -o lstart= -p "$cpid" 2>/dev/null)
-      start=$(date -j -f '%a %b %d %T %Y' "${start## #}" +%s 2>/dev/null)
-    fi
-    if [[ -n $start ]]; then
-      local f b best bestdiff diff
-      for f in "$proj"/*.jsonl(N); do
-        b=$(stat -f %B "$f" 2>/dev/null) || continue
-        (( b < start - 2 )) && continue              # born before this claude → not ours
-        diff=$(( b - start ))
-        if [[ -z $bestdiff ]] || (( diff < bestdiff )); then bestdiff=$diff; best=$f; fi
-      done
-      [[ -n $best ]] && tx=( "$best" )
-    fi
-    [[ -n ${tx[1]} ]] || tx=( "$proj"/*.jsonl(Nom[1]) )   # fallback: newest by mtime
-  fi
-  [[ -n ${tx[1]} ]] || return 0
-  python3 - "${tx[1]}" <<'PY'
+# _transcript_title <transcript.jsonl> — print the one-line title of a Claude
+# transcript: customTitle (set by /rename) wins, else the generated aiTitle, else the
+# first real user prompt; trimmed to 50 chars. Factored out so dev-slot summaries and
+# foreground-session summaries share one parser.
+_transcript_title() {
+  python3 - "$1" <<'PY'
 import json, sys
 title = ctitle = msg = None
 try:
@@ -467,6 +426,109 @@ except OSError:
     pass
 print(' '.join((ctitle or title or msg or '').split())[:50])
 PY
+}
+
+# _dev_summary_for_pid <dir> <claude-pid> — title of the transcript a LIVE claude
+# (in <dir>, pid <claude-pid>) is driving, when there's no recorded session id. The
+# dir's newest transcript is WRONG when two live claudes share a repo (both resolve
+# to it, identical summaries); each `claude` creates its transcript within seconds of
+# launch, so disambiguate by birthtime closest to (and at/after) the process start.
+# Falls back to newest-by-mtime if the pid/birthtimes can't be read. Shared by
+# unstamped dev slots and foreground sessions (neither has a CLAUDE_RESUME_ID).
+_dev_summary_for_pid() {
+  setopt local_options null_glob bare_glob_qual
+  local dir="$1" cpid="$2"
+  local proj="$HOME/.claude/projects/${dir//\//-}" start
+  local -a tx
+  if [[ -n $cpid ]]; then
+    start=$(ps -o lstart= -p "$cpid" 2>/dev/null)
+    start=$(date -j -f '%a %b %d %T %Y' "${start## #}" +%s 2>/dev/null)
+  fi
+  if [[ -n $start ]]; then
+    local f b best bestdiff diff
+    for f in "$proj"/*.jsonl(N); do
+      b=$(stat -f %B "$f" 2>/dev/null) || continue
+      (( b < start - 2 )) && continue                  # born before this claude → not ours
+      diff=$(( b - start ))
+      if [[ -z $bestdiff ]] || (( diff < bestdiff )); then bestdiff=$diff; best=$f; fi
+    done
+    [[ -n $best ]] && tx=( "$best" )
+  fi
+  [[ -n ${tx[1]} ]] || tx=( "$proj"/*.jsonl(Nom[1]) )  # fallback: newest by mtime
+  [[ -n ${tx[1]} ]] || return 0
+  _transcript_title "${tx[1]}"
+}
+
+# _dev_session_summary <session> <dir> — one-line "what it's working on" for a dev
+# session: the title of its Claude transcript, resolved by the id stashed on the
+# session (CLAUDE_RESUME_ID, set by _dev_new_session / _dev_resume_session / the
+# claude-stamp-tmux SessionStart hook). For OLD (pre-hook) sessions with no stashed
+# id it defers to _dev_summary_for_pid (birthtime match). Prints nothing if none.
+_dev_session_summary() {
+  setopt local_options null_glob bare_glob_qual
+  local session="$1" dir="$2" sid
+  sid=$(tmux show-environment -t "$session" CLAUDE_RESUME_ID 2>/dev/null | cut -d= -f2)
+  if [[ -n $sid ]]; then
+    local -a tx=( "$HOME/.claude/projects"/*/"$sid".jsonl(N) )
+    [[ -n ${tx[1]} ]] || return 0
+    _transcript_title "${tx[1]}"
+  else
+    _dev_summary_for_pid "$dir" "$(_dev_session_claude_pid "$session")"
+  fi
+}
+
+# _dev_fg_rows — emit FOREGROUND claude sessions (ones you ran directly in a terminal,
+# NOT inside a dev-<repo>-<slot> tmux pane) in the same tab format as
+# _dev_session_rows: "<sid>\t<cwd>\t<slot>\t<state>\t<context>\t<summary>". A
+# foreground claude is a live process with comm `claude` that isn't the claude of any
+# dev-* tmux pane. The session id + cwd come from the registry the claude-stamp-tmux
+# SessionStart hook writes per live claude pid (~/.cache/claude-sessions/<pid>) — the
+# reliable pid→id link, since macOS hides another process's env and csync scrambles
+# transcript birthtimes; with the id we read the exact transcript title. A session
+# started BEFORE the hook recorded it has no entry → cwd via `lsof`, summary
+# "(foreground claude)". The slot label is "<repo>:fg" (repo from cwd, else basename).
+# The claude THIS shell runs under is skipped so a session doesn't list itself; dead-pid
+# registry entries are pruned here. Appended to _dev_session_rows (so `dev ls -r` shows
+# them per host) and rendered by _dev_list.
+_dev_fg_rows() {
+  setopt local_options null_glob
+  local reg="${XDG_CACHE_HOME:-$HOME/.cache}/claude-sessions"
+  # claude pids already owned by a dev-* tmux slot — exclude (listed as slots already).
+  local -A inslot; local s p
+  for s in ${(f)"$(tmux list-sessions -F '#{session_name}' 2>/dev/null | grep '^dev-')"}; do
+    p=$(_dev_session_claude_pid "$s") && [[ -n $p ]] && inslot[$p]=1
+  done
+  # the claude THIS shell is running under (walk up $$), so we don't list ourselves.
+  local me up=$$
+  while [[ -n $up && $up != 1 ]]; do
+    [[ "$(ps -o comm= -p $up 2>/dev/null)" == claude ]] && { me=$up; break; }
+    up=$(ps -o ppid= -p $up 2>/dev/null | tr -d ' ')
+  done
+  local -A live
+  local pid cwd repo k label sid title summary context
+  for pid in ${(f)"$(ps -Axo pid,comm 2>/dev/null | awk '{n=$2; sub(/.*\//,"",n)} n=="claude"{print $1}')"}; do
+    live[$pid]=1
+    [[ -n ${inslot[$pid]} || $pid == $me ]] && continue
+    sid= cwd=
+    [[ -r $reg/$pid ]] && IFS=$'\t' read -r sid cwd < "$reg/$pid"
+    [[ -n $cwd ]] || cwd=$(lsof -a -p "$pid" -d cwd -Fn 2>/dev/null | sed -n 's/^n//p' | head -1)
+    [[ -n $cwd ]] || continue
+    repo=${cwd:t}
+    for k in ${(k)DEV_REPOS}; do [[ ${DEV_REPOS[$k]} == $cwd ]] && { repo=$k; break; }; done
+    label="${repo}:fg"
+    if [[ -n $sid ]]; then
+      local -a tx=( "$HOME/.claude/projects"/*/"$sid".jsonl(N) )
+      title=$([[ -n ${tx[1]} ]] && _transcript_title "${tx[1]}")
+      if [[ -n $title ]]; then context=active; summary=$title
+      else context=idle; summary='(idle — no conversation)'; fi
+    else
+      sid='-'; context=unknown; summary='(foreground claude)'
+    fi
+    printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$sid" "$cwd" "$label" attached "$context" "$summary"
+  done
+  # prune registry entries whose pid is no longer a live claude (sessions that ended)
+  local f bpid
+  for f in "$reg"/*(N.); do bpid=${f:t}; [[ -z ${live[$bpid]} ]] && rm -f "$f"; done
 }
 
 # _dev_list — print every dev-<repo>-<slot> tmux session, compact enough to read
@@ -514,15 +576,20 @@ _dev_list() {
     done <<< "$names"
     names=${(F)kept}
   fi
-  if [[ -z "$names" ]]; then
+  # Foreground (non-tmux) claudes, same scope (rows carry cwd in field 2).
+  local fgrows; fgrows=$(_dev_fg_rows 2>/dev/null)
+  [[ -n $scope && -n $fgrows ]] && fgrows=$(print -r -- "$fgrows" | awk -F'\t' -v d="$scope" '$2==d || index($2, d"/")==1')
+  if [[ -z "$names" && -z "$fgrows" ]]; then
     echo "No dev sessions running${scope:+ in ${scope:t} (dev ls --all for every repo)}."
     return 0
   fi
   local g c y r0=
   if [[ -t 1 ]]; then g=$'\e[32m'; c=$'\e[36m'; y=$'\e[2m'; r0=$'\e[0m'; fi
-  # widest short name (sans dev-) so the WORKING ON column lines up
+  # widest name (dev slot sans dev-, plus foreground "<repo>:fg" labels) so WORKING ON lines up
   local s short name_w=7
-  while IFS= read -r s; do short="${s#dev-}"; (( ${#short} > name_w )) && name_w=${#short}; done <<< "$names"
+  while IFS= read -r s; do [[ -n $s ]] || continue; short="${s#dev-}"; (( ${#short} > name_w )) && name_w=${#short}; done <<< "$names"
+  local _fsid _fcwd _fslot _frest
+  while IFS=$'\t' read -r _fsid _fcwd _fslot _frest; do [[ -n $_fslot ]] || continue; (( ${#_fslot} > name_w )) && name_w=${#_fslot}; done <<< "$fgrows"
   # prefix before the summary = 2 (indent) + 8 (STATUS field) + name_w + 1 (gap)
   local avail=$(( ${COLUMNS:-80} - 11 - name_w ))
   (( avail < 12 )) && avail=$(( 80 - 11 - name_w ))
@@ -531,6 +598,7 @@ _dev_list() {
   printf '  %s%-8s%-*s %s%s\n' "$y" 'STATUS' $name_w 'SESSION' 'WORKING ON' "$r0"
   local state dir amark cmark summary
   while IFS= read -r s; do
+    [[ -n $s ]] || continue
     short="${s#dev-}"
     state=$(tmux display-message -p -t "$s" '#{?session_attached,attached,detached}' 2>/dev/null)
     dir=$(tmux display-message -p -t "$s" '#{session_path}' 2>/dev/null)
@@ -548,6 +616,14 @@ _dev_list() {
     # STATUS field (8 cols): "<amark> <cmark>" = 3 visible glyph cols + 5 pad
     printf '  %s %s     %-*s %s%s%s\n' "$amark" "$cmark" $name_w "$short" "$y" "$summary" "$r0"
   done <<< "$names"
+  # foreground rows: always ● (you're in the terminal); ✓ when context is active
+  local fstate fcontext fsummary
+  while IFS=$'\t' read -r _fsid _fcwd _fslot fstate fcontext fsummary; do
+    [[ -n $_fslot ]] || continue
+    [[ $fcontext == active ]] && cmark="${c}✓${r0}" || cmark=' '
+    (( ${#fsummary} > avail )) && fsummary="${fsummary[1,avail-1]}…"
+    printf '  %s %s     %-*s %s%s%s\n' "${g}●${r0}" "$cmark" $name_w "$_fslot" "$y" "$fsummary" "$r0"
+  done <<< "$fgrows"
 }
 
 # _dev_session_rows — machine-readable sibling of _dev_list: one tab-separated
@@ -562,9 +638,9 @@ _dev_list() {
 _dev_session_rows() {
   local names
   names=$(tmux list-sessions -F '#{session_name}' 2>/dev/null | grep '^dev-' | sort)
-  [[ -n $names ]] || return 0
   local s short sid dir state context summary
   while IFS= read -r s; do
+    [[ -n $s ]] || continue
     short="${s#dev-}"
     dir=$(tmux display-message -p -t "$s" '#{session_path}' 2>/dev/null)
     sid=$(tmux show-environment -t "$s" CLAUDE_RESUME_ID 2>/dev/null | cut -d= -f2)
@@ -582,6 +658,8 @@ _dev_session_rows() {
     fi
     printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$sid" "$dir" "$short" "$state" "$context" "$summary"
   done <<< "$names"
+  # plus any FOREGROUND (non-tmux) claudes on this machine, same row format.
+  _dev_fg_rows
 }
 
 # _dev_rows_all — fan _dev_session_rows out over THIS machine + every $REMOTE_HOSTS

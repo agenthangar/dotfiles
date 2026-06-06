@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Workflow
 
-After every change you make in this repo, commit and push it (directly to `main` — this is a personal single-author repo). No need to ask first.
+`main` is protected — it takes changes through PRs, not direct pushes. Do work on the `dev/claude-1` branch (the repo's standing dev branch; `t open dotfiles` checks it out by default now that the `DEV_BRANCHES[dotfiles]=main` override is gone). Commit and push to that branch as you go — no need to ask first — and open a PR to `main` when a change is ready. The symlink model still means edits take effect immediately on disk; the PR is just how they land on `main`.
 
 ## What this is
 

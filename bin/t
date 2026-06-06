@@ -36,6 +36,18 @@ CONFIG = os.path.join(os.environ.get("XDG_CONFIG_HOME", os.path.join(HOME, ".con
 # by subprocess + execvp); does not affect the user's own shell.
 os.environ["SHELL_SESSIONS_DISABLE"] = "1"
 
+# Job-control noise prelude, prepended to every zsh snippet we spawn. The fan-out
+# helpers run `&` + `wait` (e.g. _dev_rows_all behind `t ls -r`). When the spawned
+# `zsh -lic` inherits a controlling tty (it does from a real terminal), -i turns on
+# MONITOR (job control), so it prints job notices during the run and, crucially,
+# "warning: N jobs SIGHUPed" at *exit*. _dev_rows_all's own `setopt local_options
+# no_monitor` cannot fix the exit warning: local_options restores MONITOR=on when the
+# function returns, before the shell exits. Setting it here keeps MONITOR off for the
+# whole spawned-shell lifetime — quiet during the run AND at exit — and only touches
+# our throwaway capture shells, never the user's interactive shell (or the `$(…)`
+# subshell callers of _dev_rows_all, which already run with job control off).
+ZSH_PRELUDE = "setopt no_monitor no_notify 2>/dev/null; "
+
 # ─── config ──────────────────────────────────────────────────────────────────
 
 _CFG_LINE = re.compile(r"^(DEV_REPOS|DEV_BRANCHES|REMOTE_HOSTS)\[([^\]]+)\]=(.*)$|^(DEV_BRANCH)=(.*)$")
@@ -97,7 +109,7 @@ def zsh_capture(snippet):
     are only on the login/interactive PATH, and the _dev_* helpers are defined there.
     """
     try:
-        r = subprocess.run(["zsh", "-lic", snippet], stdout=subprocess.PIPE, text=True)
+        r = subprocess.run(["zsh", "-lic", ZSH_PRELUDE + snippet], stdout=subprocess.PIPE, text=True)
         return r.stdout
     except FileNotFoundError:
         return ""
@@ -291,7 +303,7 @@ def _delegate(snippet):
     verbs whose battle-tested logic stays in zsh during the hybrid migration; these
     end in a pager / tmux send-keys / tmux kill, all child-safe. (At hard cutover the
     target functions are renamed to internal _t_* helpers and these snippets follow.)"""
-    os.execvp("zsh", ["zsh", "-lic", snippet])
+    os.execvp("zsh", ["zsh", "-lic", ZSH_PRELUDE + snippet])
 
 
 def cmd_plan(cfg, args):

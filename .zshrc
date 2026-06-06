@@ -172,7 +172,7 @@ typeset -gA DEV_REPOS DEV_BRANCHES REMOTE_HOSTS
 
 # DEV_BRANCHES — per-repo branch overrides, keyed by the same alias as DEV_REPOS.
 # A repo with no entry falls back to $DEV_BRANCH; e.g. a repo whose workflow
-# commits straight to main wants DEV_BRANCHES[dotfiles]=main. Set in
+# commits straight to main wants DEV_BRANCHES[myrepo]=main. Set in
 # ~/.zshrc.local (declared above so the local file can just add keys).
 # _dev_branch_for <repo> — branch `dev` uses for <repo>: its DEV_BRANCHES
 # override if set, else the global $DEV_BRANCH.
@@ -809,10 +809,14 @@ _dev_session_rows() {
 # warn accordingly. local-first; within a host, _dev_session_rows' own order holds.
 # Rows are prefixed verbatim (no re-splitting), so empty fields can't collapse.
 _dev_rows_all() {
-  # no_monitor/no_notify: this fans out with `&` + `wait`; under an interactive shell
-  # (the `zsh -lic` bin/t spawns, or a direct call) monitor mode would print job-control
-  # noise ("[2] 67794", "exit 1 …", "done") to the terminal. Background jobs and `wait`
-  # work fine without it. local_options restores the caller's settings on return.
+  # no_monitor/no_notify: this fans out with `&` + `wait`; in a monitor-mode shell that
+  # would print in-run job-control notices ("[2] 67794", "exit 1 …", "done"). Silences
+  # them for a *direct* interactive call. local_options restores the caller's settings
+  # on return — which is why it canNOT silence the "N jobs SIGHUPed" warning printed at
+  # SHELL EXIT (monitor is back on by then): the `t ls -r` path spawns `zsh -lic
+  # _dev_rows_all` as the top-level command, and that exit warning is killed by bin/t's
+  # ZSH_PRELUDE (top-level `setopt no_monitor`, which persists to exit). The `$(…)`
+  # subshell callers below already run job-control-off, so they never warn either.
   setopt local_options no_monitor no_notify
   local tmpd; tmpd=$(mktemp -d) || return 1
   _dev_session_rows > "$tmpd/.local" 2>/dev/null &

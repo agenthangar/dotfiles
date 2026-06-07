@@ -134,8 +134,11 @@ echo "Set core.hooksPath -> .githooks (PII pre-commit guard)"
 
 # Install the Homebrew tools the shell config depends on (gh, jq, tmux, fzf, glow).
 # Idempotent — brew bundle skips anything already installed. Skipped entirely if
-# Homebrew is absent; the config degrades gracefully without these.
-if command -v brew >/dev/null 2>&1; then
+# Homebrew is absent; the config degrades gracefully without these. Set
+# DOTFILES_NO_BREW=1 to skip it too (used by `dots --dev` for a fast relink).
+if [[ -n "${DOTFILES_NO_BREW:-}" ]]; then
+    echo "DOTFILES_NO_BREW set — skipping Brewfile."
+elif command -v brew >/dev/null 2>&1; then
     echo "Installing Homebrew packages from Brewfile..."
     brew bundle --file="$DOTFILES_DIR/Brewfile"
 else

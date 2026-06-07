@@ -374,7 +374,21 @@ def cmd_pending(cfg, args):
 
 def build_parser():
     p = argparse.ArgumentParser(
-        prog="t", description="Claude session manager (open/list/move tmux'd Claude sessions).")
+        prog="t", description="Claude session manager (open/list/move tmux'd Claude sessions).",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""\
+examples:
+  t open api              open/reattach the next free api slot
+  t open api 3 --new      force a fresh session in api slot 3
+  t ls                    list this repo's live sessions
+  t ls -r                 list live sessions across every machine
+  t push                  send the current session to a background tmux slot
+  t pop api 3             pull dev-api-3 back to this terminal
+  t beam api --host mini  send a session to 'mini' and resume it there
+  t find "auth refactor"  search saved sessions, then resume the pick
+  t on mini ls            run a command on a remote host
+
+Run `t <verb> -h` for a verb's own flags.""")
     sub = p.add_subparsers(dest="verb", metavar="<verb>")
 
     sp = sub.add_parser("open", help="open or reattach a session in a per-repo tmux slot")

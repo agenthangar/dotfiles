@@ -32,8 +32,10 @@ link "$DOTFILES_DIR/claude/commands/tpop.md"  "$HOME/.claude/commands/tpop.md"
 # SSH config via Include, NOT a wholesale symlink. Symlinking ~/.ssh/config would
 # replace any existing host entries (backed up to .bak, but still a surprise). So
 # link our snippet to ~/.ssh/dotfiles.conf and make ~/.ssh/config pull it in with
-# an `Include` at the very top (Include must precede Host blocks for its settings
-# to apply as defaults). Non-destructive and idempotent.
+# an `Include` at the very bottom. OpenSSH uses "first value wins" semantics, and
+# our snippet's `Host *` defaults must lose to any per-host settings already in
+# the user's config — so the include goes after them, not before. Non-destructive
+# and idempotent.
 mkdir -p "$HOME/.ssh"
 chmod 700 "$HOME/.ssh"
 link "$DOTFILES_DIR/ssh/config" "$HOME/.ssh/dotfiles.conf"
@@ -47,10 +49,10 @@ if [[ ! -e "$ssh_main" ]]; then
     chmod 600 "$ssh_main"
     echo "Created $ssh_main with '$include_line'"
 elif ! grep -qE '^[[:space:]]*Include[[:space:]]+dotfiles\.conf[[:space:]]*$' "$ssh_main"; then
-    printf '%s\n\n%s\n' "$include_line" "$(cat "$ssh_main")" > "$ssh_main.tmp"
+    printf '%s\n\n%s\n' "$(cat "$ssh_main")" "$include_line" > "$ssh_main.tmp"
     mv "$ssh_main.tmp" "$ssh_main"
     chmod 600 "$ssh_main"
-    echo "Added '$include_line' to the top of $ssh_main"
+    echo "Added '$include_line' to the bottom of $ssh_main"
 else
     echo "$ssh_main already includes dotfiles.conf"
 fi

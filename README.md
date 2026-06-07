@@ -142,8 +142,10 @@ from the new location to relink.
 SSH config is the one exception to the symlink model: rather than replacing
 `~/.ssh/config` (which would shadow any host entries you already have),
 `install.sh` links the snippet to `~/.ssh/dotfiles.conf` and adds an
-`Include dotfiles.conf` line to the top of `~/.ssh/config`, creating that file if
-it doesn't exist. Your existing config is left intact.
+`Include dotfiles.conf` line to the bottom of `~/.ssh/config`, creating that file
+if it doesn't exist. The include goes last so the snippet's `Host *` defaults
+don't override any per-host settings already in your config (OpenSSH uses
+"first value wins" semantics). Your existing config is left intact.
 
 ## License & contributing
 

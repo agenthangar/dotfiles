@@ -409,7 +409,7 @@ def build_parser():
     sp = sub.add_parser("beam", help="send a session to another machine and resume it there")
     sp.add_argument("repo", nargs="?")
     sp.add_argument("slot", nargs="?")
-    sp.add_argument("--host", help="destination machine (default: $REMOTE_HOSTS[mini])")
+    sp.add_argument("--host", help="destination machine (default: $TBEAM_HOST)")
     sp.add_argument("--fg", action="store_true", help="resume in the foreground, no tmux slot")
     sp.add_argument("-d", "--detach", action="store_true", help="leave it running there; print attach hint")
     sp.add_argument("-p", "--pick", action="store_true", help="force the picker")

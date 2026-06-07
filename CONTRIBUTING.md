@@ -14,8 +14,8 @@ a framework and isn't trying to be portable, configurable, or general-purpose.
   welcome. Larger changes, new features, or "you should do it this way" reworks
   will usually be declined, not because they're wrong but because this repo tracks
   one person's preferences. Open an issue first if you're unsure.
-- This is a single-author repo that ships straight to `main`; expect force-pushes
-  and history that prioritizes my workflow over a stable public API.
+- This is a single-author repo; the history prioritizes my workflow over a stable
+  public API. `main` is branch-protected — changes land via PRs from `dev/claude-1`.
 
 ## Before you open a PR
 

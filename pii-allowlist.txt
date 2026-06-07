@@ -12,7 +12,7 @@
 # hard fail. Never add another person's name, an account number, or a secret.
 
 # Your GitHub identity (already in README.md's clone URL).
-chrisjob1021
+chrisobrien-ai
 
 # Your public contact identity. Uncomment the ones you consider public:
 # chris@chrisobrien.ai

@@ -5,6 +5,6 @@
     "dockerfile": "Dockerfile",
     "context": ".."
   },
-  "install": "./install.sh",
+  "install": "./install.sh && ./scripts/cloud-docker-ready.sh",
   "start": "./scripts/cloud-docker-ready.sh"
 }

@@ -138,16 +138,20 @@ nosleep() { [[ "$1" == -h || "$1" == --help ]] && { _help_for nosleep; return 0;
 
 # dots — sync your dotfiles to origin/main HEAD and reload zsh
 #
-# Usage: dots
+# Usage: dots [--dev]
 #
-# Fetches origin/main, switches to the main branch, fast-forwards it to
+# Default: fetches origin/main, switches to the main branch, fast-forwards it to
 # origin/main HEAD, and re-sources ~/.zshrc — so your live dotfiles become exactly
 # what is published on main, with nothing done locally (no merge, no commit). main
 # is protected (you never commit to it directly), so the fast-forward always
-# applies. Develop on the dev branch via `t open dotfiles`; dots is the "just give
-# me the latest" command and leaves you on main. Safe: if the working tree has
-# uncommitted edits it stops and only reloads, never discarding work — commit or
-# stash first.
+# applies. Leaves you on main; develop on the dev branch via `t open dotfiles`.
+# Safe: stops and only reloads if the working tree has uncommitted edits, so it
+# never discards work — commit or stash first.
+#
+# --dev (-d): install from whatever branch is checked out NOW instead — re-runs
+# install.sh (relinks any new/renamed files) and reloads, without fetching or
+# switching branches. Use it to apply in-progress dev work (e.g. a new bin script
+# that needs a fresh symlink) before it lands on main. Skips brew bundle.
 dots() {
   [[ "$1" == -h || "$1" == --help ]] && { _help_for dots; return 0; }
   # Resolve the repo from the ~/.zshrc symlink (:A follows it to the real path,
@@ -155,10 +159,45 @@ dots() {
   # location-independent, so don't hardcode ~/code/dotfiles.
   local dotdir="${${:-$HOME/.zshrc}:A:h}"
   cd "$dotdir" || return
-  git fetch origin main || { cd - > /dev/null; return 1; }
-  local branch=$(git symbolic-ref --short -q HEAD)
-  git merge --ff-only origin/main 2>/dev/null \
-    || print -u2 "dots: couldn't fast-forward '$branch' to origin/main (ahead/diverged or local edits) — reloaded only"
+
+  local g c y r0=
+  if [[ -t 1 ]]; then g=$'\e[32m'; c=$'\e[36m'; y=$'\e[2m'; r0=$'\e[0m'; fi
+
+  if [[ "$1" == --dev || "$1" == -d ]]; then
+    # Install from the current branch: relink (catches new files), no git, no brew.
+    local branch=$(git symbolic-ref --short -q HEAD)
+    local out
+    if out=$(DOTFILES_NO_BREW=1 ./install.sh 2>&1); then
+      print -r -- "${g}✓${r0} ${y}installed from ${c}${branch}${r0} ${y}(current branch) — reloaded${r0}"
+    else
+      print -r -- "${y}dots --dev — install.sh failed on ${c}${branch}${r0}${y}:${r0}"
+      print -r -- "$out"
+    fi
+    source ~/.zshrc
+    cd - > /dev/null
+    return
+  fi
+
+  if ! git fetch -q origin main 2>/dev/null; then
+    print -r -- "${y}dots — fetch failed (offline?), reloaded only${r0}"
+  elif ! git diff --quiet HEAD 2>/dev/null; then
+    print -r -- "${y}dots — uncommitted edits on ${c}$(git symbolic-ref --short -q HEAD)${r0}${y}; commit or stash first, reloaded only${r0}"
+  elif ! git checkout -q main 2>/dev/null; then
+    print -r -- "${y}dots — could not switch to main, reloaded only${r0}"
+  else
+    local before=$(git rev-parse --short main)
+    if git merge --ff-only origin/main >/dev/null 2>&1; then
+      local after=$(git rev-parse --short main)
+      if [[ $before == $after ]]; then
+        print -r -- "${g}✓${r0} ${y}on ${c}main${r0} ${y}at ${after} — already latest, reloaded${r0}"
+      else
+        print -r -- "${g}✓${r0} ${y}updated ${c}main${r0} ${y}${before} → ${after}, reloaded${r0}"
+      fi
+    else
+      print -r -- "${y}dots — main diverged from origin/main, can't fast-forward; reloaded only${r0}"
+    fi
+  fi
+
   source ~/.zshrc
   cd - > /dev/null
 }

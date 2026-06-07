@@ -114,7 +114,9 @@ It runs two ways, both wired up by `install.sh`:
   with `git commit --no-verify`.
 - **GitHub Action** (the `Scan tracked files for PII` job in
   `.github/workflows/ci.yml`) — runs on push/PR to `main` and **fails closed**,
-  so a missing secret is loud. Set the secret once:
+  so a missing secret is loud. Fork and Dependabot PRs can't read repository
+  secrets, so that one job skips there; the push-to-`main` run remains the
+  backstop. Set the secret once:
 
   ```sh
   gh secret set PII_SCRUB_RULES < ~/.config/pii-scan/scrub-rules.json

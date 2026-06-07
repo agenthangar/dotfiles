@@ -43,6 +43,12 @@ full verb list and `help` for the auto-generated command list.
   - `settings.json` — symlinked to `~/.claude/settings.json`. Carries `enabledPlugins`,
     `extraKnownMarketplaces`, and `permissions`, so plugins reproduce on a new machine
     (Claude re-clones the marketplaces and reinstalls whatever's enabled on first run).
+    > **Heads-up before you symlink this:** it is tuned for *my* low-friction,
+    > mostly-unattended workflow — `"defaultMode": "auto"`, `skipAutoPermissionPrompt`,
+    > and a Bash allowlist (`kill`, `python3`, `node -e`, `grep`, `rg`, `lsof`). That
+    > lets Claude run those without prompting. If you reuse this file, review those
+    > keys and dial them back (drop `auto`/`skipAutoPermissionPrompt`, trim the
+    > allowlist) unless you actively want that posture.
 
 The files in this repo are the source of truth. `~/.zshrc`, `~/bin/<script>`, and
 `~/.claude/settings.json` are symlinks back into this repo, so editing either side edits both.
@@ -82,13 +88,13 @@ MCP is two separate things:
 
 `pii-scan` keeps personal data out of this public repo. **This documents my own
 setup** — to reuse the pattern in your fork, point `$PII_RULES` at your own
-denylist JSON (mine happens to live in a private `cashfwd-private` repo). It
-reuses a two-layer ruleset plus a dotfiles-specific allowlist:
+denylist JSON (mine lives in a private repo). It uses a two-layer ruleset plus a
+dotfiles-specific allowlist:
 
 1. **Denylist** — `scrub-rules.json`, the literal list of real personal
    identifiers (names, emails, phones, account numbers, private hosts). It is
    **private and never committed here** (gitignored). Locally it's read from
-   `~/code/cashfwd-private/scrub-rules.json` (override with `$PII_RULES`); in CI
+   `~/.config/pii-scan/scrub-rules.json` (override with `$PII_RULES`); in CI
    it comes from the `PII_SCRUB_RULES` secret.
 2. **Ignore patterns** — `pii-ignore-patterns.txt`, regexes for known
    false-positive *shapes* (no PII; tracked).
@@ -103,13 +109,14 @@ It runs two ways, both wired up by `install.sh`:
 - **Pre-commit hook** (`.githooks/pre-commit`) — scans staged content before
   every commit. Enabled via `git config core.hooksPath .githooks` (repo-local,
   set by `install.sh`). It **fails open** when the denylist is absent — a machine
-  without `cashfwd-private` can still commit; CI is the backstop. Bypass once
+  without the denylist can still commit; CI is the backstop. Bypass once
   with `git commit --no-verify`.
-- **GitHub Action** (`.github/workflows/pii-scan.yml`) — runs on push/PR to
-  `main` and **fails closed**, so a missing secret is loud. Set the secret once:
+- **GitHub Action** (the `Scan tracked files for PII` job in
+  `.github/workflows/ci.yml`) — runs on push/PR to `main` and **fails closed**,
+  so a missing secret is loud. Set the secret once:
 
   ```sh
-  gh secret set PII_SCRUB_RULES < ~/code/cashfwd-private/scrub-rules.json
+  gh secret set PII_SCRUB_RULES < ~/.config/pii-scan/scrub-rules.json
   ```
 
 Run it by hand anytime: `pii-scan` (all tracked files) or `pii-scan --staged`.
@@ -131,6 +138,12 @@ It creates the symlinks (backing up anything in the way to `*.bak`), then runs
 `brew bundle` to install the `Brewfile` tools (skipped if Homebrew isn't present).
 Both steps are idempotent. If you ever move the repo, just re-run `install.sh`
 from the new location to relink.
+
+SSH config is the one exception to the symlink model: rather than replacing
+`~/.ssh/config` (which would shadow any host entries you already have),
+`install.sh` links the snippet to `~/.ssh/dotfiles.conf` and adds an
+`Include dotfiles.conf` line to the top of `~/.ssh/config`, creating that file if
+it doesn't exist. Your existing config is left intact.
 
 ## License & contributing
 

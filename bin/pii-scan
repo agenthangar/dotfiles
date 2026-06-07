@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# pii-scan — fail if any cashfwd PII denylist value appears in this repo.
+# pii-scan — fail if any PII denylist value appears in this repo.
 #
-# Reuses the cashfwd two-layer ruleset:
+# Two-layer ruleset:
 #   1. DENYLIST  (scrub-rules.json)        — literal, case-sensitive personal
 #      identifiers (real names, emails, phones, account numbers, private hosts).
-#      PRIVATE — never committed here. Local: ~/code/cashfwd-private/. CI: the
-#      PII_SCRUB_RULES secret, written to a temp file by the workflow.
+#      PRIVATE — never committed here. Local: ~/.config/pii-scan/ (override with
+#      $PII_RULES). CI: the PII_SCRUB_RULES secret, written to a temp file.
 #   2. IGNORE    (pii-ignore-patterns.txt) — regexes for documented false-positive
 #      *shapes* (npm author emails, example.com, long numeric demos). No PII; tracked.
 # Plus a dotfiles-specific third layer:
@@ -31,7 +31,7 @@ if [[ -z "$REPO_ROOT" ]]; then
   exit 2
 fi
 
-RULES="${PII_RULES:-$HOME/code/cashfwd-private/scrub-rules.json}"
+RULES="${PII_RULES:-$HOME/.config/pii-scan/scrub-rules.json}"
 IGNORE="${PII_IGNORE:-$REPO_ROOT/pii-ignore-patterns.txt}"
 ALLOW="${PII_ALLOW:-$REPO_ROOT/pii-allowlist.txt}"
 
@@ -52,7 +52,7 @@ if [[ ! -f "$RULES" ]]; then
     exit 2
   fi
   echo "pii-scan: denylist not found at $RULES — skipping literal scan." >&2
-  echo "          (install cashfwd-private or set PII_RULES; CI still scans via the secret.)" >&2
+  echo "          (point PII_RULES at your scrub-rules.json; CI still scans via the secret.)" >&2
   exit 0
 fi
 

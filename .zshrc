@@ -146,7 +146,11 @@ nosleep() { [[ "$1" == -h || "$1" == --help ]] && { _help_for nosleep; return 0;
 # Works from main or any dev branch that sits at/behind main (the dev-workflow norm).
 dots() {
   [[ "$1" == -h || "$1" == --help ]] && { _help_for dots; return 0; }
-  cd ~/code/dotfiles || return
+  # Resolve the repo from the ~/.zshrc symlink (:A follows it to the real path,
+  # :h takes its dir) so this works wherever the repo was cloned — install.sh is
+  # location-independent, so don't hardcode ~/code/dotfiles.
+  local dotdir="${${:-$HOME/.zshrc}:A:h}"
+  cd "$dotdir" || return
   git fetch origin main || { cd - > /dev/null; return 1; }
   local branch=$(git symbolic-ref --short -q HEAD)
   git merge --ff-only origin/main 2>/dev/null \
@@ -270,14 +274,18 @@ _tpaste_claude_ready() {
 # Usage: tpaste <repo> [slot]
 #
 # Commands:
-#   tpaste ff       start a new ff session and queue the path into it
-#   tpaste ff 3     paste into dev-ff-3 (creating it if it doesn't exist)
+#   tpaste api      start a new api session and queue the path into it
+#   tpaste api 3    paste into dev-api-3 (creating it if it doesn't exist)
 #
 # Grabs the newest image in iCloud Drive; press Enter in the session to send it.
 _t_paste() {
   [[ "$1" == -h || "$1" == --help ]] && { _help_for tpaste; return 0; }
-  local repo="${1:-ff}"
+  local repo="$1"
   local slot="$2"
+  if [[ -z "$repo" ]]; then
+    echo "Usage: tpaste <repo> [slot]   (repo: one of ${(k)DEV_REPOS:-(none configured — see ~/.zshrc.local)})"
+    return 1
+  fi
 
   local icloud="$HOME/Library/Mobile Documents/com~apple~CloudDocs"
   # verify iCloud Drive is accessible
@@ -1379,8 +1387,8 @@ _dev_pull() {
 #
 # Commands:
 #   tplan            inside Claude: THIS session; else fzf-pick scoped to $PWD
-#   tplan ff 1       the session running in tmux dev-ff-1
-#   tplan dev-cf-2   that tmux session by full name
+#   tplan api 1      the session running in tmux dev-api-1
+#   tplan dev-web-2  that tmux session by full name
 #   tplan --all      fzf-pick across every project
 #
 # Resolves a session like the dev/tpop family, then renders the last plan it
@@ -1399,10 +1407,10 @@ _t_plan() {
     # (stamped by _dev_new_session/_dev_resume_session and, for every other launch
     # path, by the claude-stamp-tmux SessionStart hook), falling back to the dir's
     # newest transcript only for pre-hook sessions. That fallback is ambiguous when
-    # several slots share one repo dir (dev-ff-1..5 all root at financial-forecast,
+    # several slots share one repo dir (dev-api-1..5 all root at the same project,
     # so one ~/.claude/projects/<enc>/) — it returns whichever sibling wrote last,
     # not the slot you asked for. The hook is what makes this reliable now.
-    # Mirrors tpop's resolution so `tplan ff 1` lines up with `tpop ff 1`.
+    # Mirrors tpop's resolution so `tplan api 1` lines up with `tpop api 1`.
     local session
     if [[ "$1" == dev-* ]]; then
       session="$1"
@@ -1971,8 +1979,8 @@ _t_push() {
 #
 # Commands:
 #   tpop            the dev session for the current dir
-#   tpop ff 3       dev-ff-3
-#   tpop dev-cf-1   that session by full name
+#   tpop api 3      dev-api-3
+#   tpop dev-web-1  that session by full name
 #
 # Kills the tmux session and resumes its conversation here with `claude -r` (the
 # inverse of tpush). Run from a plain shell, not inside the session you're popping.
@@ -2181,7 +2189,7 @@ _t_beam() {
   done
 
   # Positional grammar: [repo [slot]] [host], matching the dev/tplan/tpop family so
-  # `tbeam ff 1` lines up with `tpop ff 1`. The first positional is a <repo> only
+  # `tbeam api 1` lines up with `tpop api 1`. The first positional is a <repo> only
   # when it's a DEV_REPOS key — that's what disambiguates it from a bare host
   # (`tbeam mini` still means host 'mini'). An optional numeric slot follows, then
   # an optional explicit host. (To go the OTHER way — pull a session FROM a host

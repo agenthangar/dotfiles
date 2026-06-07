@@ -28,7 +28,32 @@ link "$DOTFILES_DIR/bin/t"                "$HOME/bin/t"
 link "$DOTFILES_DIR/claude/settings.json" "$HOME/.claude/settings.json"
 link "$DOTFILES_DIR/claude/commands/tpush.md" "$HOME/.claude/commands/tpush.md"
 link "$DOTFILES_DIR/claude/commands/tpop.md"  "$HOME/.claude/commands/tpop.md"
-link "$DOTFILES_DIR/ssh/config"           "$HOME/.ssh/config"
+
+# SSH config via Include, NOT a wholesale symlink. Symlinking ~/.ssh/config would
+# replace any existing host entries (backed up to .bak, but still a surprise). So
+# link our snippet to ~/.ssh/dotfiles.conf and make ~/.ssh/config pull it in with
+# an `Include` at the very top (Include must precede Host blocks for its settings
+# to apply as defaults). Non-destructive and idempotent.
+mkdir -p "$HOME/.ssh"
+chmod 700 "$HOME/.ssh"
+link "$DOTFILES_DIR/ssh/config" "$HOME/.ssh/dotfiles.conf"
+ssh_main="$HOME/.ssh/config"
+include_line="Include dotfiles.conf"
+# An older install symlinked ~/.ssh/config straight at the repo; drop that link so
+# we manage a real file (writing through the symlink would edit the repo copy).
+[[ -L "$ssh_main" ]] && rm "$ssh_main"
+if [[ ! -e "$ssh_main" ]]; then
+    printf '%s\n' "$include_line" > "$ssh_main"
+    chmod 600 "$ssh_main"
+    echo "Created $ssh_main with '$include_line'"
+elif ! grep -qE '^[[:space:]]*Include[[:space:]]+dotfiles\.conf[[:space:]]*$' "$ssh_main"; then
+    printf '%s\n\n%s\n' "$include_line" "$(cat "$ssh_main")" > "$ssh_main.tmp"
+    mv "$ssh_main.tmp" "$ssh_main"
+    chmod 600 "$ssh_main"
+    echo "Added '$include_line' to the top of $ssh_main"
+else
+    echo "$ssh_main already includes dotfiles.conf"
+fi
 
 # Per-machine config (real repo paths, default tbeam host, private completions)
 # lives in ~/.zshrc.local, which .zshrc sources if present. It's a real copy (not
@@ -41,7 +66,7 @@ fi
 
 # Point this repo's git at the tracked hooks so the PII pre-commit guard runs.
 # Repo-local config (not a $HOME symlink); safe to re-run. The hook fails open
-# when the cashfwd-private denylist is absent, so machines without it still commit.
+# when the private denylist is absent, so machines without it still commit.
 git -C "$DOTFILES_DIR" config core.hooksPath .githooks
 echo "Set core.hooksPath -> .githooks (PII pre-commit guard)"
 
@@ -50,7 +75,7 @@ echo "Set core.hooksPath -> .githooks (PII pre-commit guard)"
 # whereas the shell runs in the Terminal's already-approved context. Nothing to
 # set up here — the hook fires csync at most every 15 min from your prompt.
 
-# Install the Homebrew tools the shell config depends on (gum, glow, tmux, …).
+# Install the Homebrew tools the shell config depends on (gh, jq, tmux, fzf, glow).
 # Idempotent — brew bundle skips anything already installed. Skipped entirely if
 # Homebrew is absent; the config degrades gracefully without these.
 if command -v brew >/dev/null 2>&1; then
@@ -58,7 +83,7 @@ if command -v brew >/dev/null 2>&1; then
     brew bundle --file="$DOTFILES_DIR/Brewfile"
 else
     echo "Homebrew not found — skipping Brewfile. Install it from https://brew.sh,"
-    echo "then re-run this script (or 'brew bundle') to get gum/glow/tmux/gh/jq."
+    echo "then re-run this script (or 'brew bundle') to get gh/jq/tmux/fzf/glow."
 fi
 
 echo "Done."

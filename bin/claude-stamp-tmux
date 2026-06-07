@@ -11,7 +11,7 @@
 #
 # The tmux stamp fixes: tplan/tpop resolve a slot's session id from CLAUDE_RESUME_ID,
 # and when it's unset they fall back to "newest .jsonl by mtime in the project dir" —
-# wrong when e.g. dev-ff-1..5 share one ~/.claude/projects/<enc>/ folder (it returns
+# wrong when e.g. dev-api-1..5 share one ~/.claude/projects/<enc>/ folder (it returns
 # whichever *sibling* slot wrote last). _dev_new_session/_dev_resume_session already
 # stamp the id, but a session started any other way (bare `claude`) never got stamped.
 #

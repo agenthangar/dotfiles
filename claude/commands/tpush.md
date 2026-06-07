@@ -20,7 +20,7 @@ Do this:
 2. Because this session is being killed, there's usually no chance to report
    back. If `t push` instead printed a fallback hint (it couldn't locate the
    process, so it asked for a manual `/exit`), relay that and the attach command
-   it printed (e.g. `t open ff 3` or `tmux attach -t dev-dotfiles-1`).
+   it printed (e.g. `t open api 3` or `tmux attach -t dev-dotfiles-1`).
 
 Notes:
 - If `t push` says "Already inside tmux", this session is already backgrounded —

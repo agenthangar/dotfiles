@@ -40,18 +40,17 @@ full verb list and `help` for the auto-generated command list.
 - `Brewfile` — third-party CLI tools the config depends on (`gh`, `jq`, `tmux`,
   `fzf`, `glow`); installed by `install.sh` via `brew bundle`
 - `claude/` — Claude Code config
-  - `settings.json` — symlinked to `~/.claude/settings.json`. Carries `enabledPlugins`,
-    `extraKnownMarketplaces`, and `permissions`, so plugins reproduce on a new machine
-    (Claude re-clones the marketplaces and reinstalls whatever's enabled on first run).
-    > **Heads-up before you symlink this:** it is tuned for *my* low-friction,
-    > mostly-unattended workflow — `"defaultMode": "auto"`, `skipAutoPermissionPrompt`,
-    > and a Bash allowlist (`kill`, `python3`, `node -e`, `grep`, `rg`, `lsof`). That
-    > lets Claude run those without prompting. If you reuse this file, review those
-    > keys and dial them back (drop `auto`/`skipAutoPermissionPrompt`, trim the
-    > allowlist) unless you actively want that posture.
+  - `settings.json.example` — conservative defaults seeded to `~/.claude/settings.json`
+    on install (only the session-stamping hook; you approve Bash yourself). This is the
+    default; `install.sh` prompts before applying anything else.
+  - `settings.json` — the author's tuned config: `enabledPlugins`, `extraKnownMarketplaces`,
+    `"defaultMode": "auto"`, `skipAutoPermissionPrompt`, and a Bash allowlist. Opt in
+    at install time (choice 2) or later with `CLAUDE_SETTINGS=author ./install.sh` on a
+    machine that does not yet have `~/.claude/settings.json`. Symlinking this reproduces
+    plugins on a new machine (Claude re-clones marketplaces on first run).
 
-The files in this repo are the source of truth. `~/.zshrc`, `~/bin/<script>`, and
-`~/.claude/settings.json` are symlinks back into this repo, so editing either side edits both.
+The files in this repo are the source of truth. `~/.zshrc` and `~/bin/<script>` are
+symlinks back into this repo, so editing either side edits both.
 
 Per-machine config — your real repo list (`DEV_REPOS`), remote hosts
 (`REMOTE_HOSTS`), and any private shell completions — lives in `~/.zshrc.local`, which
@@ -73,7 +72,9 @@ terminal); no external renderer required.
 
 ## Claude plugins & MCP
 
-Plugins sync via `claude/settings.json` above — no extra step.
+Plugins sync via `claude/settings.json` when you opt into the author's settings at
+install time (or symlink it yourself). The default `settings.json.example` carries
+only the session-stamping hook — no plugin bundle.
 
 MCP is two separate things:
 
@@ -134,7 +135,9 @@ git clone git@github.com:chrisjob1021/dotfiles.git path/to/dotfiles
 path/to/dotfiles/install.sh
 ```
 
-It creates the symlinks (backing up anything in the way to `*.bak`), then runs
+It creates the symlinks (backing up anything in the way to `*.bak`), seeds
+`~/.zshrc.local` and `~/.claude/settings.json` from their templates when absent (with
+an interactive prompt for Claude settings — example by default), then runs
 `brew bundle` to install the `Brewfile` tools (skipped if Homebrew isn't present).
 Both steps are idempotent. If you ever move the repo, just re-run `install.sh`
 from the new location to relink.

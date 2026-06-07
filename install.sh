@@ -25,7 +25,6 @@ link "$DOTFILES_DIR/bin/csync"            "$HOME/bin/csync"
 link "$DOTFILES_DIR/bin/pii-scan"         "$HOME/bin/pii-scan"
 link "$DOTFILES_DIR/bin/claude-stamp-tmux" "$HOME/bin/claude-stamp-tmux"
 link "$DOTFILES_DIR/bin/t"                "$HOME/bin/t"
-link "$DOTFILES_DIR/claude/settings.json" "$HOME/.claude/settings.json"
 link "$DOTFILES_DIR/claude/commands/tpush.md" "$HOME/.claude/commands/tpush.md"
 link "$DOTFILES_DIR/claude/commands/tpop.md"  "$HOME/.claude/commands/tpop.md"
 
@@ -65,6 +64,62 @@ if [[ ! -e "$HOME/.zshrc.local" ]]; then
     cp "$DOTFILES_DIR/.zshrc.local.example" "$HOME/.zshrc.local"
     echo "Created ~/.zshrc.local from template — edit it with your repos (DEV_REPOS) and TBEAM_HOST."
 fi
+
+# Claude Code settings — prompt before applying the author's tuned config. The repo
+# copy (claude/settings.json) sets auto-approve Bash, skipAutoPermissionPrompt, and
+# a plugin bundle; settings.json.example is a conservative real file with only the
+# session-stamping hook the tmux tooling needs. Like ~/.zshrc.local, the default is
+# a copy (not a symlink) so adopters aren't surprised. Symlink the repo copy only
+# when explicitly chosen. Never clobber an existing ~/.claude/settings.json.
+# Non-interactive / no TTY: copy the example. Override with CLAUDE_SETTINGS=author
+# or CLAUDE_SETTINGS=example.
+install_claude_settings() {
+    local dst="$HOME/.claude/settings.json"
+    local example="$DOTFILES_DIR/claude/settings.json.example"
+    local author="$DOTFILES_DIR/claude/settings.json"
+    local choice="${CLAUDE_SETTINGS:-}"
+
+    mkdir -p "$HOME/.claude"
+
+    if [[ -e "$dst" || -L "$dst" ]]; then
+        echo "Keeping existing $dst"
+        return
+    fi
+
+    if [[ -z "$choice" && -t 0 ]]; then
+        echo ""
+        echo "Claude Code settings (~/.claude/settings.json):"
+        echo "  1) Example — session-stamping hook only; you approve Bash yourself (recommended)"
+        echo "  2) Author's settings — auto-approve Bash, skip permission prompts, plugin bundle"
+        read -r -p "Choice [1]: " choice
+        choice="${choice:-1}"
+        case "$choice" in
+            1|example) choice=example ;;
+            2|author)  choice=author ;;
+            *)
+                echo "Unknown choice '$choice' — using example." >&2
+                choice=example
+                ;;
+        esac
+    elif [[ -z "$choice" ]]; then
+        choice=example
+    fi
+
+    case "$choice" in
+        author)
+            link "$author" "$dst"
+            ;;
+        example)
+            cp "$example" "$dst"
+            echo "Created $dst from settings.json.example"
+            ;;
+        *)
+            echo "install.sh: unknown CLAUDE_SETTINGS='$choice' (use author or example)" >&2
+            exit 1
+            ;;
+    esac
+}
+install_claude_settings
 
 # Point this repo's git at the tracked hooks so the PII pre-commit guard runs.
 # Repo-local config (not a $HOME symlink); safe to re-run. The hook fails open

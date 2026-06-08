@@ -1240,8 +1240,15 @@ _t_dev() {
       if [[ -n $free ]]; then
         slot=$free                                                 # nothing to reattach → first free gap
       else
-        while tmux has-session -t "dev-${repo}-${n}" 2>/dev/null; do (( n++ )); done
-        slot=$n                                                    # all 1..20 live → next never-used slot (unbounded)
+        # all 1..20 live → keep scanning unbounded, still preferring an
+        # existing-but-unattached session above 20 over a fresh slot.
+        while tmux has-session -t "dev-${repo}-${n}" 2>/dev/null; do
+          if ! tmux list-clients -t "dev-${repo}-${n}" 2>/dev/null | grep -q .; then
+            slot=$n; break
+          fi
+          (( n++ ))
+        done
+        [[ -z $slot ]] && slot=$n                                  # nothing to reattach → next never-used slot
       fi
     fi
   fi

@@ -178,6 +178,7 @@ dots() {
     return
   fi
 
+  local prev_branch=$(git symbolic-ref --short -q HEAD)
   if ! git fetch -q origin main 2>/dev/null; then
     print -r -- "${y}dots — fetch failed (offline?), reloaded only${r0}"
   elif ! git diff --quiet HEAD 2>/dev/null; then
@@ -194,6 +195,11 @@ dots() {
         print -r -- "${g}✓${r0} ${y}updated ${c}main${r0} ${y}${before} → ${after}, reloaded${r0}"
       fi
     else
+      # Fast-forward failed: don't strand the user on a stale main — return to
+      # the branch they were on before the checkout above.
+      if [[ -n $prev_branch && $prev_branch != main ]]; then
+        git checkout -q "$prev_branch" 2>/dev/null
+      fi
       print -r -- "${y}dots — main diverged from origin/main, can't fast-forward; reloaded only${r0}"
     fi
   fi

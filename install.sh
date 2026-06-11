@@ -99,6 +99,21 @@ install_claude_settings() {
 }
 install_claude_settings
 
+# Global git default — a pull reconciliation strategy so `git pull` never emits
+# the "divergent branches" hint and never silently merges or rebases. ff-only: a
+# pull that cannot fast-forward aborts and tells you to choose (git rebase / git
+# merge) explicitly. This writes ~/.gitconfig, a REAL per-machine file (git also
+# stores user.name/email and other runtime state there) — NOT a symlink, same
+# reasoning as ~/.claude/settings.json. Only set it when neither pull.ff nor
+# pull.rebase is already configured, so a deliberate per-machine choice is kept.
+if [[ -z "$(git config --global --get pull.ff || true)" \
+   && -z "$(git config --global --get pull.rebase || true)" ]]; then
+    git config --global pull.ff only
+    echo "Set global pull.ff -> only (git pull fast-forwards or aborts; no divergent-branch hint)"
+else
+    echo "Global pull strategy already set — leaving ~/.gitconfig as-is"
+fi
+
 # Point this repo's git at the tracked hooks so the PII pre-commit guard runs.
 # Repo-local config (not a $HOME symlink); safe to re-run. The hook fails open
 # when the private denylist is absent, so machines without it still commit.

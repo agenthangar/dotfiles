@@ -1070,7 +1070,11 @@ _dev_new_session() {
   tmux set-option -t "$session" window-size latest 2>/dev/null
   tmux pipe-pane -t "$session" -o "cat >> $logfile"
   tmux set-environment -t "$session" CLAUDE_RESUME_ID "$sid"
-  tmux send-keys -t "$session" "git stash; git fetch origin; git checkout $branch 2>/dev/null || git checkout -b $branch; git pull origin $branch; claude --session-id $sid" Enter
+  # `; exit` so quitting Claude closes the pane's shell and tears down the
+  # (single-window) tmux session instead of leaving an idle prompt behind. Fires
+  # on any exit (clean or crash); crash output survives in the pipe-pane logfile
+  # (`t read`). `t pop` kill-sessions the slot itself, so the exit is moot there.
+  tmux send-keys -t "$session" "git stash; git fetch origin; git checkout $branch 2>/dev/null || git checkout -b $branch; git pull origin $branch; claude --session-id $sid; exit" Enter
 }
 
 # dev — open/reattach a Claude Code tmux session (local or on another host)
@@ -1812,7 +1816,9 @@ _dev_resume_session() {
   # conversation back to the foreground (it also falls back to the dir's newest
   # transcript, but this is the precise signal when we know it).
   tmux set-environment -t "$session" CLAUDE_RESUME_ID "$sid"
-  tmux send-keys -t "$session" "claude -r $sid" Enter
+  # `; exit` so quitting Claude tears the session down rather than leaving an idle
+  # shell (see _dev_new_session for the full rationale).
+  tmux send-keys -t "$session" "claude -r $sid; exit" Enter
 }
 
 # _dev_slot_for_cwd <cwd> — map a transcript's working dir to a dev session slot.

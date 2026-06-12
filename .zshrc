@@ -367,6 +367,9 @@ _t_paste() {
   # (N) is the nullglob qualifier: unmatched globs expand to nothing instead of
   # raising zsh's "no matches found" error. Collect into an array first so an
   # empty result never makes `ls` fall back to listing the current directory.
+  # extended_glob is needed for the parenthesized alternation in the filename
+  # pattern; local_options restores the caller's setopts on return.
+  setopt local_options extended_glob
   local src
   local -a files
   files=("$icloud"/*.(png|jpg|jpeg|heic|pdf|txt|md|csv|docx)(N))

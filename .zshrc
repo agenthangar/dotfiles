@@ -318,21 +318,39 @@ _tpaste_claude_ready() {
   return 1
 }
 
-# tpaste — paste the latest iCloud Drive screenshot path into a dev tmux session
+# tpaste — paste the latest iCloud Drive screenshot/doc path into a dev tmux session
 #
-# Usage: tpaste <repo> [slot]
+# Usage: tpaste [-p] [repo] [slot]
 #
 # Commands:
+#   tpaste          new session for the repo you're standing in, path queued
+#   tpaste 3        paste into this repo's slot 3 (repo inferred from $PWD)
 #   tpaste api      start a new api session and queue the path into it
 #   tpaste api 3    paste into dev-api-3 (creating it if it doesn't exist)
 #
-# Grabs the newest image in iCloud Drive; press Enter in the session to send it.
+# Options:
+#   -p, --pick   fzf-pick the file (newest first) instead of taking the newest
+#
+# Covers images (png/jpg/jpeg/heic) and docs (pdf/txt/md/csv/docx) in the iCloud
+# Drive root; newest by mtime wins. Press Enter in the session to send it.
 _t_paste() {
-  [[ "$1" == -h || "$1" == --help ]] && { _help_for tpaste; return 0; }
-  local repo="$1"
-  local slot="$2"
+  [[ "$1" == -h || "$1" == --help ]] && { _help_for _t_paste; return 0; }
+  local pick=0 arg
+  local -a _pos
+  for arg in "$@"; do
+    case "$arg" in
+      -p|--pick) pick=1 ;;
+      *)         _pos+=("$arg") ;;
+    esac
+  done
+  local repo="${_pos[1]}"
+  local slot="${_pos[2]}"
+  # Repo-aware: `t paste 4` ≡ `t paste <cwd-repo> 4`; bare `t paste` targets the
+  # $PWD repo's next free slot (see _t_infer_repo).
+  if [[ "$repo" == <-> && -z "$slot" ]]; then slot=$repo; repo=$(_t_infer_repo "$slot"); fi
+  [[ -z "$repo" ]] && repo=$(_t_infer_repo)
   if [[ -z "$repo" ]]; then
-    echo "Usage: tpaste <repo> [slot]   (repo: one of ${(k)DEV_REPOS:-(none configured — see ~/.zshrc.local)})"
+    echo "Usage: tpaste [-p] [repo] [slot]   (no repo: the one \$PWD is in; repo: one of ${(k)DEV_REPOS:-(none configured — see ~/.zshrc.local)})"
     return 1
   fi
 
@@ -342,25 +360,34 @@ _t_paste() {
     echo "iCloud Drive not found at: $icloud"
     return 1
   fi
-  # find latest screenshot in iCloud Drive root.
+  # collect pasteable files in the iCloud Drive root: images + docs, one flat
+  # set, newest-by-mtime wins. (Screenshots used to be a priority tier, but that
+  # made a just-exported PDF unreachable whenever any screenshot existed — the
+  # newest file IS the one you just saved, so the tiering bought nothing.)
   # (N) is the nullglob qualifier: unmatched globs expand to nothing instead of
   # raising zsh's "no matches found" error. Collect into an array first so an
   # empty result never makes `ls` fall back to listing the current directory.
   local src
-  local -a imgs
-  imgs=("$icloud"/Screenshot*.png(N) "$icloud"/Screenshot*.jpg(N))
-  # fall back to any image in root
-  if (( ${#imgs} == 0 )); then
-    imgs=("$icloud"/*.png(N) "$icloud"/*.jpg(N) "$icloud"/*.jpeg(N) "$icloud"/*.heic(N))
-  fi
+  local -a files
+  files=("$icloud"/*.(png|jpg|jpeg|heic|pdf|txt|md|csv|docx)(N))
 
-  if (( ${#imgs} == 0 )); then
-    echo "No images found in iCloud Drive ($icloud)"
+  if (( ${#files} == 0 )); then
+    echo "No images or docs found in iCloud Drive ($icloud)"
     return 1
   fi
 
+  if (( pick )); then
+    if [[ -t 0 && -t 1 ]] && command -v fzf >/dev/null 2>&1; then
+      # ls -t sorts newest-first; show just the basename but return the full path
+      src=$(ls -t "${files[@]}" | fzf --prompt='tpaste> ' --height=40% --reverse \
+            --delimiter=/ --with-nth=-1) || { echo "Cancelled."; return 1; }
+    else
+      echo "tpaste -p needs a TTY and fzf — falling back to the newest file." >&2
+      pick=0
+    fi
+  fi
   # newest by mtime
-  src=$(ls -t "${imgs[@]}" | head -1)
+  (( pick )) || src=$(ls -t "${files[@]}" | head -1)
 
   echo "Using: $src"
 
@@ -397,7 +424,7 @@ _t_paste() {
   fi
 
   # new session → bootstrap Claude, wait for it to come up, queue the path, attach
-  echo "Starting $session for the screenshot…"
+  echo "Starting $session for the file…"
   _dev_new_session "$session" "${DEV_REPOS[$repo]}" "$(_dev_branch_for "$repo")"
 
   # wait (up to ~30s) for Claude's process to take over the pane; if the
@@ -692,6 +719,14 @@ _dev_adopt_fg() {
     fi
     [[ -n $sel ]] || { echo "t fg: no foreground session matching '$arg' (see \`t ls\`)." >&2; return 1; }
     resumable=$sel
+  else
+    # Repo-aware: bare `t fg` prefers this repo's foreground claudes (row cwd in
+    # field 2, under the $PWD repo dir); outside a repo — or no match — all of them.
+    local scope; scope=$(_dev_cwd_repo_dir)
+    if [[ -n $scope ]]; then
+      local insc; insc=$(print -r -- "$resumable" | awk -F'\t' -v d="$scope" '$2==d || index($2, d"/")==1')
+      [[ -n $insc ]] && resumable=$insc
+    fi
   fi
   local sid cwd
   local -a lines=( ${(f)resumable} )
@@ -749,6 +784,38 @@ _dev_cwd_repo_dir() {
     [[ $PWD == $d || $PWD == $d/* ]] && (( ${#d} > ${#best} )) && best=$d
   done
   [[ -n $best ]] && print -r -- "$best"
+}
+
+# _t_infer_repo [slot] — the repo ALIAS implied by $PWD, for the repo-aware verb
+# defaults (`t paste 4` in ~/code/financial-forecast → that repo's slot 4; bare
+# `t open` → the repo you're standing in). _dev_cwd_repo_dir gives the DIR, but
+# slot verbs target session NAMES (dev-<alias>-<slot>) and several aliases can key
+# one dir (dot-* and dotfiles-* both root at ~/code/dotfiles) — so with a <slot>,
+# a LIVE dev-*-<slot> session rooted in this repo dir wins and the alias is read
+# off the actual session name (matches however the slot was created). Otherwise
+# fall back to the DEV_REPOS key for the dir: the key matching its basename, else
+# the shortest (the customary shorthand). Prints nothing / rc 1 outside any
+# DEV_REPOS dir, so callers can drop to their usage text.
+_t_infer_repo() {
+  local slot="$1" dir; dir=$(_dev_cwd_repo_dir)
+  [[ -n $dir ]] || return 1
+  if [[ $slot == <-> ]]; then
+    local s p
+    for s in ${(f)"$(tmux list-sessions -F '#{session_name}' 2>/dev/null | grep -- "^dev-.*-${slot}\$")"}; do
+      p=$(tmux display-message -p -t "$s" '#{session_path}' 2>/dev/null)
+      if [[ $p == $dir || $p == $dir/* ]]; then
+        s=${s#dev-}; print -r -- "${s%-*}"; return 0   # last dash splits off the slot
+      fi
+    done
+  fi
+  local k best=
+  for k in ${(k)DEV_REPOS}; do
+    [[ ${DEV_REPOS[$k]} == $dir ]] || continue
+    [[ $k == ${dir:t} ]] && { print -r -- "$k"; return 0 }
+    if [[ -z $best ]] || (( ${#k} < ${#best} )); then best=$k; fi
+  done
+  [[ -n $best ]] || return 1
+  print -r -- "$best"
 }
 
 _dev_list() {
@@ -998,11 +1065,20 @@ _dev_kill_one() {
 _dev_kill() {
   local repo="$1" slot="$2" force="$3"
 
+  # Repo-aware: `t kill 4` / `t kill all` mean the repo $PWD is in (live-session
+  # name wins — see _t_infer_repo); bare `t kill` infers the repo and then lists
+  # its slots below (a slot is still required — no guessing on a kill).
+  if [[ -z ${DEV_REPOS[$repo]:-} && -z $slot && ( $repo == <-> || $repo == all ) ]]; then
+    slot=$repo; repo=$(_t_infer_repo "$slot")
+  elif [[ -z $repo ]]; then
+    repo=$(_t_infer_repo)
+  fi
+
   if [[ -z "$repo" ]]; then
     {
       print -r -- "t kill — tear down a dev session (or all of a repo's)"
       print -r -- ""
-      print -r -- "Usage: t kill <repo> <slot|all> [-y]   (--remote to kill it on its host)"
+      print -r -- "Usage: t kill [repo] <slot|all> [-y]   (no repo: the one \$PWD is in; --remote kills on its host)"
     } | _help_style
     return 1
   fi
@@ -1116,7 +1192,7 @@ _t_dev() {
   # stray -f on a kill is just an inert no-op rather than a silent force.
   for arg in "$@"; do
     case "$arg" in
-      -h|--help)         _help_for dev; return 0 ;;
+      -h|--help)         _help_for _t_dev; return 0 ;;
       -f|--fg|--no-tmux) no_tmux=1 ;;
       -y|--yes|--force)  force=1 ;;
       -r|--remote)       remote=1 ;;
@@ -1165,6 +1241,17 @@ _t_dev() {
     _dev_remote "$repo" "$slot" "$no_tmux"     # explicit -r: force attach in place on its host
     return
   fi
+
+  # Repo-aware defaults: bare `t open` targets the repo $PWD is in, and a lone
+  # numeric/slot-keyword first arg is a SLOT of it (`t open 4` ≡ `t open <cwd-repo> 4`,
+  # `t open --new` → a fresh slot here) — see _t_infer_repo. Deliberately AFTER the
+  # -r branch above so the documented bare `t open -r` every-slot picker survives.
+  # Outside every DEV_REPOS dir this leaves repo empty and the usage below explains.
+  if [[ -z ${DEV_REPOS[$repo]:-} && -z $slot && ( $repo == <-> || $repo == new || $repo == fg ) ]]; then
+    slot=$repo; repo=
+  fi
+  [[ -z $repo ]] && repo=$(_t_infer_repo "$slot")
+
   if (( ${#REMOTE_HOSTS} )) && [[ -z $no_tmux && -n $repo && -n ${DEV_REPOS[$repo]} \
         && $slot != new && $slot != fg ]] && ! _dev_local_slot_live "$repo" "$slot"; then
     local res; res=$(_dev_remote_resolve "$repo" "$slot" 2>/dev/null)   # quiet probe
@@ -1184,9 +1271,10 @@ _t_dev() {
     {
       print -r -- "t open — open or reattach a Claude session in a per-repo tmux slot"
       print -r -- ""
-      print -r -- "Usage: t open <${(kj:|:)DEV_REPOS:-repo}> [slot] [--new] [--fg]"
+      print -r -- "Usage: t open [${(kj:|:)DEV_REPOS:-repo}] [slot] [--new] [--fg]"
       print -r -- ""
       print -r -- "Commands:"
+      print -r -- "  t open                      no repo: the one \$PWD is in (t open 4 = its slot 4)"
       print -r -- "  t open <repo> [slot]        open/reattach (slot 1-4, --new to force fresh)"
       print -r -- "  t open <repo> [slot] --fg   no tmux: foreground-resume / run inline"
       print -r -- "  t open <repo> [slot]        auto-attaches on another host if the slot is live there"
@@ -1505,7 +1593,7 @@ _dev_pull() {
 # saved (an absolute ~/.claude/plans/<slug>.md path in the transcript). glow
 # word-wraps for narrow mobile terminals (Termius), falling back to less.
 _t_plan() {
-  [[ "$1" == -h || "$1" == --help ]] && { _help_for tplan; return 0; }
+  [[ "$1" == -h || "$1" == --help ]] && { _help_for _t_plan; return 0; }
   local sid
   if [[ "$1" == "--all" || "$1" == "-a" ]]; then
     local row
@@ -1526,6 +1614,12 @@ _t_plan() {
       session="$1"
     else
       local repo="$1" slot="$2"
+      # Repo-aware: a lone numeric arg is a SLOT of the repo $PWD is in
+      # (`t plan 4` ≡ `t plan <cwd-repo> 4` — see _t_infer_repo).
+      if [[ "$repo" == <-> && -z "$slot" ]]; then
+        slot=$repo
+        repo=$(_t_infer_repo "$slot") || { echo "Not inside a DEV_REPOS dir — name the repo (t plan <repo> $slot)." >&2; return 1; }
+      fi
       if [[ -z "$slot" ]]; then                    # first existing slot for repo
         local n=1
         while (( n <= 20 )); do
@@ -1580,7 +1674,7 @@ _t_plan() {
 # (the same landing as tpop). Falls back to keyword order if the claude CLI is
 # unreachable. Searches every project — use dev/tpush/tpop when you know the slot.
 _t_find() {
-  [[ "$1" == -h || "$1" == --help ]] && { _help_for tfind; return 0; }
+  [[ "$1" == -h || "$1" == --help ]] && { _help_for _t_find; return 0; }
   local keyword=
   [[ "$1" == "-k" || "$1" == "--keyword" ]] && { keyword=1; shift; }
   [[ -n "$1" ]] || { echo "Usage: tfind [-k] <words describing the session>"; return 1; }
@@ -1971,7 +2065,7 @@ _t_push() {
   local pick= all= a
   for a in "$@"; do
     case "$a" in
-      -h|--help) _help_for tpush; return 0 ;;
+      -h|--help) _help_for _t_push; return 0 ;;
       -p|--pick) pick=1 ;;
       -a|--all)  pick=1; all=1 ;;   # --all implies the picker, unfiltered
     esac
@@ -2095,12 +2189,18 @@ _t_push() {
 # Kills the tmux session and resumes its conversation here with `claude -r` (the
 # inverse of tpush). Run from a plain shell, not inside the session you're popping.
 _t_pop() {
-  [[ "$1" == -h || "$1" == --help ]] && { _help_for tpop; return 0; }
+  [[ "$1" == -h || "$1" == --help ]] && { _help_for _t_pop; return 0; }
   local session
   if [[ "$1" == dev-* ]]; then
     session="$1"
   elif [[ -n "$1" ]]; then
     local repo="$1" slot="$2"
+    # Repo-aware: a lone numeric arg is a SLOT of the repo $PWD is in
+    # (`t pop 4` ≡ `t pop <cwd-repo> 4` — see _t_infer_repo).
+    if [[ "$repo" == <-> && -z "$slot" ]]; then
+      slot=$repo
+      repo=$(_t_infer_repo "$slot") || { echo "Not inside a DEV_REPOS dir — name the repo (t pop <repo> $slot)."; return 1; }
+    fi
     if [[ -z "$slot" ]]; then                      # first existing slot for repo
       local n=1
       while (( n <= 20 )); do
@@ -2110,12 +2210,14 @@ _t_pop() {
     fi
     session="dev-${repo}-${slot}"
   else
-    # no args — find the dev session whose working dir is $PWD
-    local s
+    # no args — find the dev session rooted in this repo (its dir or below; the
+    # repo dir from _dev_cwd_repo_dir so a subdir works too, else $PWD itself)
+    local s d scope; scope=$(_dev_cwd_repo_dir); scope=${scope:-$PWD}
     for s in ${(f)"$(tmux list-sessions -F '#{session_name}' 2>/dev/null | grep '^dev-')"}; do
-      [[ "$(tmux display-message -p -t "$s" '#{session_path}')" == "$PWD" ]] && { session="$s"; break; }
+      d=$(tmux display-message -p -t "$s" '#{session_path}')
+      [[ $d == $scope || $d == $scope/* ]] && { session="$s"; break; }
     done
-    [[ -n $session ]] || { echo "No dev session for $PWD. Pass a repo/slot or session name."; return 1; }
+    [[ -n $session ]] || { echo "No dev session for $scope. Pass a repo/slot or session name."; return 1; }
   fi
 
   tmux has-session -t "$session" 2>/dev/null || { echo "No such session: $session"; return 1; }
@@ -2289,7 +2391,7 @@ _t_beam() {
   local -a pos=()
   while (( $# )); do
     case "$1" in
-      -h|--help)            _help_for tbeam; return 0 ;;
+      -h|--help)            _help_for _t_beam; return 0 ;;
       -f|--fg)              fg=1 ;;
       -d|--detach)          detach=1 ;;
       -p|--pick)            pick=1 ;;
@@ -2314,6 +2416,12 @@ _t_beam() {
     command -v rsync >/dev/null 2>&1 || { echo "tbeam: rsync not found" >&2; return 1; }
     local repo_arg=${pos[1]} slot_arg=
     [[ ${pos[2]} == <-> ]] && slot_arg=${pos[2]}
+    # Repo-aware: bare/numeric positionals mean the repo $PWD is in (`t beam 4
+    # --from mini` pulls ITS slot 4 here). Alias-only inference (no slot passed to
+    # _t_infer_repo): the slot lives on the REMOTE host, so a same-numbered local
+    # session's name would be a coincidence, not evidence.
+    if [[ $repo_arg == <-> && -z $slot_arg ]]; then slot_arg=$repo_arg; repo_arg=$(_t_infer_repo); fi
+    [[ -z $repo_arg ]] && repo_arg=$(_t_infer_repo)
     [[ -n $repo_arg ]] || { echo "tbeam: --from needs a <repo> to pull (e.g. t beam dot 1 --from $from_host)" >&2; return 1; }
     [[ -n $CLAUDE_CODE_SESSION_ID ]] && fg=
     local target="${REMOTE_HOSTS[$from_host]:-$from_host}"
@@ -2335,6 +2443,12 @@ _t_beam() {
     else                               # no slot → second positional is the host
       host=${pos[2]}
     fi
+  elif [[ ${pos[1]} == <-> ]]; then
+    # Repo-aware: a lone numeric first positional is a SLOT of the repo $PWD is in
+    # (`t beam 4` ≡ `t beam <cwd-repo> 4`, optional host after — see _t_infer_repo).
+    slot_arg=${pos[1]}
+    repo_arg=$(_t_infer_repo "$slot_arg") || { echo "tbeam: not inside a DEV_REPOS dir — name the repo (t beam <repo> ${pos[1]})" >&2; return 1; }
+    host=${pos[2]}
   else
     host=${pos[1]}
   fi

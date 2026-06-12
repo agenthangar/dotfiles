@@ -389,6 +389,9 @@ _t_paste() {
   # (N) is the nullglob qualifier: unmatched globs expand to nothing instead of
   # raising zsh's "no matches found" error. Collect into an array first so an
   # empty result never makes `ls` fall back to listing the current directory.
+  # extended_glob is needed for the parenthesized alternation in the filename
+  # pattern; local_options restores the caller's setopts on return.
+  setopt local_options extended_glob
   local src
   local -a files
   files=("$icloud"/*.(png|jpg|jpeg|heic|pdf|txt|md|csv|docx)(N))
@@ -1301,7 +1304,10 @@ _t_dev() {
   # the remote auto-probe runs further down, once <repo> is resolved, so even a
   # bare `t open` can find a slot that is live only on another host. Outside every
   # DEV_REPOS dir this leaves repo empty and the usage below explains.
-  if [[ -z ${DEV_REPOS[$repo]:-} && -z $slot && ( $repo == <-> || $repo == new || $repo == fg ) ]]; then
+  # `t open 4 --new` lands here as `repo=4 slot=new` (--new became a positional in
+  # _t_open) — the explicit numeric slot still wins, the redundant keyword drops.
+  if [[ -z ${DEV_REPOS[$repo]:-} && ( $repo == <-> || $repo == new || $repo == fg ) \
+        && ( -z $slot || $slot == new || $slot == fg ) ]]; then
     slot=$repo; repo=
   fi
   [[ -z $repo ]] && repo=$(_t_infer_repo "$slot")
@@ -1562,6 +1568,14 @@ _dev_remote_attach() {
 # prompt — unless <force>/-y — works through the TTY). The mirror of a local dev kill.
 _dev_remote_kill() {
   local repo="$1" slot="$2" force="$3"
+  # Repo-aware: `t kill -r 4` / `t kill -r all` mean the repo $PWD is in, mirroring
+  # the local `t kill` slot-only forms (see _dev_kill / _t_infer_repo). Without this
+  # the raw `4`/`all` would be resolved as a remote repo alias.
+  if [[ -z ${DEV_REPOS[$repo]:-} && -z $slot && ( $repo == <-> || $repo == all ) ]]; then
+    slot=$repo; repo=$(_t_infer_repo "$slot")
+  elif [[ -z $repo ]]; then
+    repo=$(_t_infer_repo)
+  fi
   local res; res=$(_dev_remote_resolve "$repo" "$slot") || return 1
   local host=${res%%$'\t'*} prepo=${${res#*$'\t'}%%$'\t'*} pslot=${res##*$'\t'}
   local target="${REMOTE_HOSTS[$host]:-$host}"

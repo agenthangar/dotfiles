@@ -81,11 +81,14 @@ install_claude_settings() {
     mkdir -p "$HOME/.claude"
 
     if [[ -L "$dst" ]]; then
-        if cp "$dst" "$dst.tmp" 2>/dev/null; then   # cp follows the link
-            rm "$dst" && mv "$dst.tmp" "$dst"
+        if [[ -e "$dst" ]]; then
+            # Live symlink — copy through it, then atomically replace the link.
+            # mv -f does the rename in one step so a failure can't leave $dst gone.
+            cp "$dst" "$dst.tmp"
+            mv -f "$dst.tmp" "$dst"
             echo "Materialized $dst as a real copy (settings are per-machine now)"
         else
-            rm "$dst"   # dangling link (repo file gone) — reseed from the example
+            rm "$dst"   # dangling link (target gone) — reseed from the example
         fi
     fi
 

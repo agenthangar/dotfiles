@@ -19,6 +19,7 @@
 # for the data and renders in Python. Reimplementing ps-tree walking buys nothing.
 
 import argparse
+import glob
 import os
 import re
 import shlex
@@ -284,11 +285,56 @@ def cmd_on(cfg, args):
 _PERL_STRIP = r"s/\r//g; s/\x07//g; s/\x1b\[[\d;]*[ABCDEFGHJKLMNSTXZfhln]//g; s/\x1b[()][012AB]//g"
 
 
+def _infer_repo(cfg, slot=None):
+    """Repo alias implied by cwd — the bin-side twin of zsh's _t_infer_repo (t read
+    is bin-native so it can't call the zsh helper). Evidence is the log files
+    (t read targets logs, which outlive sessions): an existing dev-<alias>-<slot>.log
+    wins, then any dev-<alias>-*.log — newest mtime first either way, so when several
+    aliases key one dir (dot-* and dotfiles-* both at ~/code/dotfiles) the alias
+    actually in use beats a stale one. No logs → the DEV_REPOS key for the dir
+    (basename match preferred, then shortest)."""
+    d = cfg.repo_dir_for_cwd(os.getcwd())
+    if not d:
+        return None
+    aliases = [k for k, v in cfg.repos.items() if v == d]
+    if not aliases:
+        return None
+    logdir = os.path.join(HOME, ".tmux-logs")
+
+    def newest(patterns):
+        cands = []
+        for k in aliases:
+            for pat in patterns(k):
+                if os.path.isfile(pat):
+                    cands.append((os.path.getmtime(pat), k))
+        return max(cands)[1] if cands else None
+
+    if slot:
+        hit = newest(lambda k: [os.path.join(logdir, f"dev-{k}-{slot}.log")])
+        if hit:
+            return hit
+    hit = newest(lambda k: glob.glob(os.path.join(logdir, f"dev-{k}-[0-9]*.log")))
+    if hit:
+        return hit
+    base = os.path.basename(d)
+    if base in aliases:
+        return base
+    return min(aliases, key=len)
+
+
 def cmd_read(cfg, args):
-    if not args.repo or args.repo not in cfg.repos:
+    repo, slot = args.repo, args.slot
+    # Repo-aware: `t read 4` ≡ slot 4 of the repo cwd is in; bare `t read` is its
+    # first slot's log.
+    if repo is not None and repo.isdigit() and not slot:
+        repo, slot = None, repo
+    if not repo:
+        repo = _infer_repo(cfg, slot or "1")
+    if not repo or repo not in cfg.repos:
         _read_usage(cfg)
         return 1
-    slot = args.slot or "1"
+    args.repo = repo
+    slot = slot or "1"
     logfile = os.path.join(HOME, ".tmux-logs", f"dev-{args.repo}-{slot}.log")
     if not os.path.isfile(logfile):
         print(f"No log found: {logfile}")
@@ -322,6 +368,8 @@ def cmd_plan(cfg, args):
 
 def cmd_paste(cfg, args):
     parts = ["_t_paste"]
+    if args.pick:
+        parts.append("--pick")
     if args.repo:
         parts.append(shlex.quote(args.repo))
     if args.slot:
@@ -344,7 +392,7 @@ def cmd_kill(cfg, args):
 def _read_usage(cfg):
     repos = "|".join(cfg.repos) or "repo"
     print(f"t read — open a dev slot's tmux log in less\n")
-    print(f"Usage: t read <{repos}> [slot]\n")
+    print(f"Usage: t read [{repos}] [slot]   (no repo: the one cwd is in)\n")
     print("Logs:")
     logdir = os.path.join(HOME, ".tmux-logs")
     logs = sorted(f for f in os.listdir(logdir)) if os.path.isdir(logdir) else []
@@ -383,6 +431,8 @@ def build_parser():
 examples:
   t open api              open/reattach the next free api slot
   t open api 3 --new      force a fresh session in api slot 3
+  t open                  open/reattach in the repo cwd is in
+  t paste 4               slot-only args mean the cwd repo (all verbs)
   t open a4aa5f6a         adopt a foreground (:fg) session here (id from t ls)
   t ls                    list this repo's live sessions
   t ls -r                 list live sessions across every machine
@@ -440,9 +490,10 @@ Run `t <verb> -h` for a verb's own flags.""")
     sp.add_argument("slot", nargs="?")
     sp.add_argument("-a", "--all", action="store_true", help="fzf-pick across every project")
 
-    sp = sub.add_parser("paste", help="paste the latest screenshot path into a session")
+    sp = sub.add_parser("paste", help="paste the latest iCloud screenshot/doc path into a session")
     sp.add_argument("repo", nargs="?")
     sp.add_argument("slot", nargs="?")
+    sp.add_argument("-p", "--pick", action="store_true", help="fzf-pick the file instead of taking the newest")
 
     sp = sub.add_parser("find", help="semantic search across saved sessions, then resume")
     sp.add_argument("-k", "--keyword", action="store_true", help="offline keyword ranking (no Sonnet)")

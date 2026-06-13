@@ -271,14 +271,26 @@ def cmd_kill_owner(cfg, args):
 
 # ─── subprocess-safe verbs ─────────────────────────────────────────────────────
 
+def _set_term_title(text):
+    """Set the terminal/tab title via OSC, mirroring .zshrc's _term_title. No-op when
+    stdout is not a tty. Used before an execvp into ssh so the title reads `host: cmd`
+    instead of the leaked ssh argv. We cannot clear it afterward (execvp replaces this
+    process), but the shell's precmd refreshes the title on return."""
+    if sys.stdout.isatty():
+        sys.stdout.write(f"\033]0;{text}\007")
+        sys.stdout.flush()
+
+
 def cmd_on(cfg, args):
     if not args.rest:
         # interactive login shell on the host
         target = cfg.hosts.get(args.host, args.host)
+        _set_term_title(args.host)
         os.execvp("ssh", ["ssh", "-t", target])
     host = args.host
     target = cfg.hosts.get(host, host)
     inner = " ".join(shlex.quote(a) for a in args.rest)
+    _set_term_title(f"{host}: {' '.join(args.rest)}")
     os.execvp("ssh", ["ssh", "-t", target, f"zsh -lic {shlex.quote(inner)}"])
 
 

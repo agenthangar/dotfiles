@@ -1523,11 +1523,16 @@ _dev_remote_resolve() {
   printf '%s\t%s\t%s\n' "$host" "${hostslot%-*}" "${hostslot##*-}"
 }
 
-# _term_title <text> — set the terminal/tab title via an OSC escape. Terminal.app
-# honors it and STOPS auto-titling from the foreground process's argv — which is why
+# _term_title <text> — set the terminal/tab title via an OSC escape. When Terminal.app
+# honors it, it STOPS auto-titling from the foreground process's argv — which is why
 # a remote attach otherwise reads as the raw `ssh -t mini zsh -lic dev\ dotfiles\ 2`
 # (nothing set a title, so Terminal fell back to the ssh command line). Empty <text>
 # clears it so process tracking resumes. No-op when stdout is not a tty (cmd | cat).
+# CAVEAT: a Terminal profile (or recent macOS) that composes the title from "active
+# process name AND arguments" appends the ssh argv REGARDLESS of this OSC. The robust
+# defense is therefore the ssh-call quoting itself: every remote `ssh -t … zsh -lic
+# ${(qq)rcmd}` uses (qq) (single-quote), NOT (q) (backslash) — so even when the argv
+# leaks into the title it reads `zsh -lic 't open ff 1'`, not the ugly `t\ open\ ff\ 1`.
 _term_title() { [[ -t 1 ]] && printf '\e]0;%s\a' "$1" }
 
 # _dev_local_slot_live <repo> <slot> — true if a dev-<repo>-<slot> tmux session is
@@ -1600,7 +1605,7 @@ _dev_remote_attach() {
   local rcmd="t open ${(q)prepo} ${(q)pslot}"
   [[ -n $fg ]] && rcmd+=" --fg"
   _term_title "$host: $prepo $pslot"
-  ssh -t "$target" "zsh -lic ${(q)rcmd}"
+  ssh -t "$target" "zsh -lic ${(qq)rcmd}"
   _term_title ""
 }
 
@@ -1622,7 +1627,7 @@ _dev_remote_open() {
   for a in "$@"; do rcmd+=" ${(q)a}"; done
   echo "→ $host: $rcmd (stays on $host; Ctrl-b d to detach)"
   _term_title "$host: open ${(j: :)@}"
-  ssh -t "$target" "zsh -lic ${(q)rcmd}"
+  ssh -t "$target" "zsh -lic ${(qq)rcmd}"
   _term_title ""
 }
 
@@ -1661,7 +1666,7 @@ _dev_remote_delegate() {
   # Once the slot has resolved on a remote host, treat the delegation as handled
   # regardless of ssh's exit — ssh/the remote verb prints its own errors, and we
   # must not let the caller fall back to a misleading "No such session" message.
-  ssh -t "$target" "zsh -lic ${(q)rcmd}"
+  ssh -t "$target" "zsh -lic ${(qq)rcmd}"
   _term_title ""
   return 0
 }
@@ -1708,7 +1713,7 @@ _dev_remote_kill() {
       rtarget="${REMOTE_HOSTS[$h]:-$h}"
       echo "→ Killing all dev-${repo}-* on $h"
       _term_title "$h: kill $repo all"
-      ssh -t "$rtarget" "zsh -lic ${(q)rcmd}" || rc=$?
+      ssh -t "$rtarget" "zsh -lic ${(qq)rcmd}" || rc=$?
     done
     _term_title ""
     return $rc
@@ -1720,7 +1725,7 @@ _dev_remote_kill() {
   local rcmd="t kill ${(q)prepo} ${(q)pslot}"
   [[ -n $force ]] && rcmd+=" -y"
   _term_title "$host: kill $prepo $pslot"
-  ssh -t "$target" "zsh -lic ${(q)rcmd}"
+  ssh -t "$target" "zsh -lic ${(qq)rcmd}"
   _term_title ""
 }
 

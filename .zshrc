@@ -2614,8 +2614,10 @@ _t_beam() {
     local repo_arg=${pos[1]} slot_arg=
     [[ ${pos[2]} == <-> ]] && slot_arg=${pos[2]}
     # Repo-aware (mirrors --from): a lone numeric positional is a SLOT of the cwd repo.
+    # Bare `--here` (no positionals) stays empty so _dev_remote_resolve probes ALL remotes —
+    # do NOT infer from $PWD here, or standing in any DEV_REPOS dir would silently narrow
+    # the picker to that repo and hide every other remote session.
     if [[ $repo_arg == <-> && -z $slot_arg ]]; then slot_arg=$repo_arg; repo_arg=$(_t_infer_repo); fi
-    [[ -z $repo_arg ]] && repo_arg=$(_t_infer_repo)   # empty is fine → probe ALL remotes
     # _dev_remote_resolve returns "<host>\t<repo>\t<slot>" (fzf-picks if several live).
     local res; res=$(_dev_remote_resolve "$repo_arg" "$slot_arg") || return 1
     from_host=${res%%$'\t'*}

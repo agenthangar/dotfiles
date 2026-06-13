@@ -348,6 +348,8 @@ def cmd_read(cfg, args):
         return 1
     args.repo = repo
     slot = slot or "1"
+    # --tail implies --dump (a tailed pager makes no sense on mobile).
+    dump = args.dump or args.tail is not None
     logfile = os.path.join(HOME, ".tmux-logs", f"dev-{args.repo}-{slot}.log")
     if not os.path.isfile(logfile):
         # No log here — the slot may live on a remote host (the tmux log is host-local;
@@ -357,12 +359,33 @@ def cmd_read(cfg, args):
         # repo's remote slots (empty slot → _dev_remote_resolve picks / fzf-picks) so a
         # remote slot other than 1 is still found. With a repo or slot explicitly named,
         # pass the resolved slot so remote mirrors the local default of slot 1.
+        # --dump/--tail forward so the mobile-friendly stdout dump renders on the host.
         # rc 0 = handled (or a no-TTY hint printed); rc 1 = live nowhere → local error.
-        if _try_remote_delegate(args.repo, "" if bare else slot, "read") == 0:
+        extra = []
+        if args.tail is not None:
+            extra += ["--tail", str(args.tail)]
+        elif dump:
+            extra.append("--dump")
+        if _try_remote_delegate(args.repo, "" if bare else slot, "read", extra) == 0:
             return 0
         print(f"No log found: {logfile}")
         print(f"(start a session with 't open {args.repo} {slot}' first)")
         return 1
+    if dump:
+        # Print straight to stdout (no pager) so a mobile terminal's native touch-scroll
+        # can scroll it — `less` repaints one viewport and needs arrow/PageUp keys that
+        # are unusable on a phone. A tmux capture of a TUI separates screen REPAINTS with
+        # bare \r (overwrite column 0), emitting a real \n only rarely, so we must NOT
+        # strip \r here (as _PERL_STRIP does for less): split on BOTH \r and \n so each
+        # repaint row is one display line, then --tail N keeps the last N of them (bare
+        # --dump prints all). Cursor-move/charset escapes go; SGR colour stays.
+        raw = open(logfile, "rb").read().decode("utf-8", "replace")
+        cleaned = re.sub(r"\x07|\x1b\[[\d;]*[ABCDEFGHJKLMNSTXZfhln]|\x1b[()][012AB]", "", raw)
+        lines = re.split(r"[\r\n]+", cleaned)
+        if args.tail is not None:
+            lines = lines[-args.tail:]
+        sys.stdout.write("\n".join(lines) + "\n")
+        return 0
     perl = subprocess.Popen(["perl", "-pe", _PERL_STRIP, logfile], stdout=subprocess.PIPE)
     less = subprocess.Popen(["less", "-R", "+G"], stdin=perl.stdout)
     perl.stdout.close()
@@ -378,15 +401,17 @@ def _delegate(snippet):
     os.execvp("zsh", ["zsh", "-lic", ZSH_PRELUDE + snippet])
 
 
-def _try_remote_delegate(repo, slot, verb):
-    """Run zsh `_dev_remote_delegate <repo> <slot> <verb>` (login+interactive) so a slot
-    that is live on a $REMOTE_HOSTS host is handled THERE over ssh -t — the same shared
-    helper `t plan`/`t pop` use. Unlike _delegate() this does NOT exec: it runs as a
-    child (inheriting the TTY so the remote pager/attach works) and RETURNS the rc, so
-    a bin-native verb can fall back to its local path. rc 0 = handled (or a no-TTY hint
-    was printed); rc 1 = no remote slot. Returns 1 if zsh is unavailable."""
-    snippet = "_dev_remote_delegate %s %s %s" % (
-        shlex.quote(repo), shlex.quote(slot), shlex.quote(verb))
+def _try_remote_delegate(repo, slot, verb, extra=None):
+    """Run zsh `_dev_remote_delegate <repo> <slot> <verb> [extra…]` (login+interactive)
+    so a slot that is live on a $REMOTE_HOSTS host is handled THERE over ssh -t — the
+    same shared helper `t plan`/`t pop` use. Unlike _delegate() this does NOT exec: it
+    runs as a child (inheriting the TTY so the remote pager/attach works) and RETURNS the
+    rc, so a bin-native verb can fall back to its local path. `extra` forwards verb flags
+    (e.g. read's --dump/--tail) to the far-side `t <verb>`. rc 0 = handled (or a no-TTY
+    hint was printed); rc 1 = no remote slot. Returns 1 if zsh is unavailable."""
+    toks = ["_dev_remote_delegate", shlex.quote(repo), shlex.quote(slot), shlex.quote(verb)]
+    toks += [shlex.quote(a) for a in (extra or [])]
+    snippet = " ".join(toks)
     try:
         return subprocess.run(["zsh", "-lic", ZSH_PRELUDE + snippet]).returncode
     except OSError:
@@ -432,7 +457,8 @@ def cmd_kill(cfg, args):
 def _read_usage(cfg):
     repos = "|".join(cfg.repos) or "repo"
     print(f"t read — open a dev slot's tmux log in less\n")
-    print(f"Usage: t read [{repos}] [slot]   (no repo: the one cwd is in)\n")
+    print(f"Usage: t read [{repos}] [slot] [-d|-n N]   (no repo: the one cwd is in)")
+    print(f"       -d/--dump prints to stdout for mobile touch-scroll; -n N tails N lines\n")
     print("Logs:")
     logdir = os.path.join(HOME, ".tmux-logs")
     logs = sorted(f for f in os.listdir(logdir)) if os.path.isdir(logdir) else []
@@ -527,6 +553,10 @@ Run `t <verb> -h` for a verb's own flags.""")
     sp = sub.add_parser("read", help="read a dev slot's scrollable tmux log")
     sp.add_argument("repo", nargs="?")
     sp.add_argument("slot", nargs="?")
+    sp.add_argument("-d", "--dump", action="store_true",
+                    help="print to stdout (no less) so a mobile terminal can touch-scroll it")
+    sp.add_argument("-n", "--tail", nargs="?", const=200, type=int, metavar="N",
+                    help="dump only the last N lines to stdout (default 200; implies --dump)")
 
     sp = sub.add_parser("plan", help="render the plan a session wrote")
     sp.add_argument("repo", nargs="?")

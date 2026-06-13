@@ -1772,8 +1772,21 @@ _dev_remote_kill() {
   # delegate `t kill <repo> all` to each — the remote _dev_kill iterates its own.
   if [[ $slot == all ]]; then
     [[ -n $repo ]] || { echo "dev: kill --remote all needs a repo (none inferred from \$PWD)." >&2; return 1; }
-    local hosts; hosts=$(_dev_rows_all 2>/dev/null \
-      | awk -F'\t' -v w="${repo}-" '$1 != "local" && index($4,w)==1 {print $1}' | sort -u)
+    # Discover hosts by repo DIRECTORY (field 3), not the alias-derived slot label
+    # (field 4) — same reason _dev_remote_resolve does: a slot is `dev-dot-2` on
+    # mini but `dev-dotfiles-2` here, both keying ~/code/dotfiles, so an alias
+    # compare silently misses cross-host slots. Exclude foreground rows (`:` in
+    # field 4). Fall back to the alias-string match when the local alias has no
+    # DEV_REPOS dir.
+    local dir="${DEV_REPOS[$repo]:-}"
+    local hosts
+    if [[ -n $dir ]]; then
+      hosts=$(_dev_rows_all 2>/dev/null \
+        | awk -F'\t' -v d="$dir" '$1 != "local" && $3==d && $4 !~ /:/ {print $1}' | sort -u)
+    else
+      hosts=$(_dev_rows_all 2>/dev/null \
+        | awk -F'\t' -v w="${repo}-" '$1 != "local" && index($4,w)==1 {print $1}' | sort -u)
+    fi
     [[ -n $hosts ]] || { echo "dev: no live '$repo' sessions on any remote host (\`dev ls -r\`)." >&2; return 1; }
     local h rtarget rcmd="t kill ${(q)repo} all" rc=0
     [[ -n $force ]] && rcmd+=" -y"

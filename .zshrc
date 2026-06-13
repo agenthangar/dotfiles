@@ -263,8 +263,12 @@ unset _repo
 # per-host shortcuts) can reach. Key = short alias, value = ssh target. Real
 # entries are machine-specific, so they live in ~/.zshrc.local (declared above so
 # the local file can just add keys). Back-compat: an old MINI_HOST/TBEAM_HOST
-# seeds a `mini` alias when the registry has none, so prior configs keep working.
-[[ -z ${REMOTE_HOSTS[mini]} && -n ${MINI_HOST:-${TBEAM_HOST:-}} ]] \
+# seeds a `mini` alias ONLY when the whole registry is empty (a pre-REMOTE_HOSTS
+# config), so those configs keep working — but a machine that already populates
+# REMOTE_HOSTS and sets TBEAM_HOST purely as a `t beam` send default never gets a
+# phantom `mini` pointing at the beam target. (Gating on REMOTE_HOSTS[mini] alone
+# seeded `mini` even on a configured host the moment TBEAM_HOST was set.)
+(( ${#REMOTE_HOSTS} == 0 )) && [[ -n ${MINI_HOST:-${TBEAM_HOST:-}} ]] \
   && REMOTE_HOSTS[mini]="${MINI_HOST:-$TBEAM_HOST}"
 
 # _t_sync_config — derive ~/.config/t/config.sh from the live DEV_* / REMOTE_HOSTS
@@ -323,6 +327,26 @@ _csync_periodic() {
   ( csync >>"$HOME/Library/Logs/csync.log" 2>&1 & )   # detached; never blocks the prompt
 }
 add-zsh-hook precmd _csync_periodic
+
+# openclaw-workspace auto-pull — keep this machine's clone of the agent workspace
+# (DEV_REPOS[cw]) tracking the shared GitHub remote. The openclaw gateway auto-commits
+# + pushes the live workspace to that remote; every clone (laptop, mini) just rides
+# along by fast-forwarding. Same prompt-piggyback trick as csync: at most once per
+# interval, IF the repo exists AND its tracked tree is clean, `git pull --ff-only` in a
+# detached background job. Pull-only + clean-only + ff-only is the safety: a local edit
+# is never clobbered or merge-committed (a dirty/ahead clone simply skips — commit and
+# push it yourself, or let the gateway reconcile). Never blocks the prompt. See the
+# [[openclaw-workspace-sync]] memory.
+_clawsync_periodic() {
+  local dir=${DEV_REPOS[cw]:-} interval=600 stamp="$HOME/.cache/clawsync-last-run" now=$EPOCHSECONDS last=0
+  [[ -n $dir && -d $dir/.git ]] || return                     # no clone here → no-op
+  [[ -r "$stamp" ]] && last=$(<"$stamp")
+  (( now - last >= interval )) || return
+  print -r -- "$now" >| "$stamp"                              # stamp BEFORE the run (overlap guard)
+  ( git -C "$dir" diff --quiet && git -C "$dir" diff --cached --quiet \
+      && git -C "$dir" pull --ff-only --quiet ) >>"$HOME/Library/Logs/clawsync.log" 2>&1 &
+}
+add-zsh-hook precmd _clawsync_periodic
 
 # _tpaste_claude_ready <session> — return 0 once Claude is accepting input in
 # the session's pane, else return 1. tpaste polls this after launching a fresh
@@ -1689,6 +1713,58 @@ _dev_session_remote_fallback() {
   _dev_remote_delegate "$repo" "$slot" "$verb" "$@"
 }
 
+# _dev_remote_open <host> [open-args…] — start/attach a session on a SPECIFIC host
+# (the `t open --host <h>` path). Unlike the `-r`/auto-detect attach — which only
+# reaches an ALREADY-LIVE remote slot (host inferred via _dev_remote_resolve) — this
+# forces <host>, so it can start a FRESH session there: `t open ff --host mini` opens a
+# new mini session, `t open ff 3 --host mini` its slot 3. ssh -t + remote `t open`
+# (zsh -lic for the Homebrew-tmux / interactive-claude PATH split); the session stays
+# on <host> (Ctrl-b d to detach). The repo must exist at the same ~/code path there.
+_dev_remote_open() {
+  local host="$1"; shift
+  local target="${REMOTE_HOSTS[$host]:-$host}"
+  if [[ ! -t 1 ]]; then
+    echo "t open --host: starting a session on $host needs a terminal." >&2
+    return 1
+  fi
+  local rcmd="t open"; local a
+  for a in "$@"; do rcmd+=" ${(q)a}"; done
+  echo "→ $host: $rcmd (stays on $host; Ctrl-b d to detach)"
+  _term_title "$host: open ${(j: :)@}"
+  ssh -t "$target" "zsh -lic ${(q)rcmd}"
+  _term_title ""
+}
+
+# _dev_remote_delegate <repo> <slot> <verb> [extra…] — remote-aware shim for the
+# per-slot read verbs (plan/read/…). If dev-<repo>-<slot> is NOT live locally but IS
+# live on a $REMOTE_HOSTS host, run `t <verb> <repo> <slot> [extra]` there over ssh -t
+# and return 0 (handled); else return 1 so the caller falls back to its local path.
+# Needed because a beamed/remote slot's artifacts are host-local — the plan .md lives
+# in ~/.claude/plans and the tmux log in ~/.tmux-logs on the slot's host, neither of
+# which csync syncs — so the verb must run THERE. Host auto-inferred (_dev_remote_
+# resolve); no TTY → print a hint and still return 0 (do not fall through to a local
+# "No such session"). Mirrors _t_dev's auto-detect attach, but for non-attach verbs.
+_dev_remote_delegate() {
+  local repo="$1" slot="$2" verb="$3"; shift 3
+  (( ${#REMOTE_HOSTS} )) || return 1
+  [[ -n $repo ]] || return 1
+  _dev_local_slot_live "$repo" "$slot" && return 1
+  local res; res=$(_dev_remote_resolve "$repo" "$slot" 2>/dev/null) || return 1
+  [[ -n $res ]] || return 1
+  local host=${res%%$'\t'*} prepo=${${res#*$'\t'}%%$'\t'*} pslot=${res##*$'\t'}
+  local target="${REMOTE_HOSTS[$host]:-$host}"
+  if [[ ! -t 1 ]]; then
+    echo "t $verb: dev-${prepo}-${pslot} is live on $host — run it from a terminal (or \`t beam $prepo $pslot --from $host\` to pull it here)." >&2
+    return 0
+  fi
+  local rcmd="t $verb ${(q)prepo} ${(q)pslot}"; local a
+  for a in "$@"; do rcmd+=" ${(q)a}"; done
+  echo "→ $host:dev-${prepo}-${pslot}" >&2
+  _term_title "$host: $verb $prepo $pslot"
+  ssh -t "$target" "zsh -lic ${(q)rcmd}"
+  _term_title ""
+}
+
 # _dev_remote_kill <repo> <slot> <force> — `dev -r kill <repo> [slot]`: resolve a live
 # REMOTE slot (host auto-inferred / fzf-picked, _dev_remote_resolve) and tear it down
 # ON that host by running `dev kill <repo> <slot>` there over ssh -t (so its confirm
@@ -2609,6 +2685,7 @@ _tbeam_land() {
 #
 # Usage: tbeam [flags] [repo [slot]] [host]
 #        tbeam <repo> [slot] --from <host>        (pull a session HERE)
+#        tbeam [repo [slot]] --here               (pull HERE, auto-find the host)
 #
 # Arguments:
 #   repo        a DEV_REPOS key → beam that dev slot's session (like tpop/tplan);
@@ -2620,6 +2697,8 @@ _tbeam_land() {
 # Options:
 #   --from <host>       RECEIVE: pull <repo> [slot] from <host> onto THIS machine
 #                       (the mirror of the default send; repo required)
+#   --here              RECEIVE, auto-host: pull it back here without naming the host
+#                       (auto-detects where the slot is live; bare → pick any remote)
 #   -f, --fg            resume in the foreground, no tmux slot (dies if the shell
 #                       drops; needs a terminal, so not usable from inside Claude)
 #   -d, --detach        leave it running on <host>, just print how to attach
@@ -2638,7 +2717,7 @@ _tbeam_land() {
 _t_beam() {
   # while/shift (not for-in) so -s/--session can consume the following token as
   # its value; the `=`-joined forms (-s=… / --session=…) work too.
-  local fg= detach= pick= all= host= sid_arg= from_host=
+  local fg= detach= pick= all= host= sid_arg= from_host= here=
   local -a pos=()
   while (( $# )); do
     case "$1" in
@@ -2651,11 +2730,40 @@ _t_beam() {
       -s=*|--session=*|--id=*) sid_arg="${1#*=}" ;;
       --from)               shift; from_host="$1" ;;
       --from=*)             from_host="${1#*=}" ;;
+      --here)               here=1 ;;
       -*)                   echo "tbeam: unknown flag $1" >&2; return 1 ;;
       *)                    pos+=("$1") ;;
     esac
     shift
   done
+
+  # RECEIVE (auto-host): --here is "bring it back" without naming the host — it
+  # auto-detects which $REMOTE_HOSTS box the slot is live on (the same probe `t open`
+  # uses for remote attach, _dev_remote_resolve) and then runs the --from pull. The
+  # inverse of a send when you do not want to remember where it went. Repo/slot are
+  # optional and just SCOPE the probe: bare `t beam --here` fzf-picks among EVERY live
+  # remote session; `t beam <repo> [slot]` (or a lone slot in a repo dir) narrows it;
+  # one match → no prompt. Resolves to a concrete host+repo+slot, then shares the
+  # --from machinery below by setting from_host (so the MOVE + one-live-owner hold).
+  if [[ -n $here && -z $from_host ]]; then
+    command -v rsync >/dev/null 2>&1 || { echo "tbeam: rsync not found" >&2; return 1; }
+    local repo_arg=${pos[1]} slot_arg=
+    [[ ${pos[2]} == <-> ]] && slot_arg=${pos[2]}
+    # Repo-aware (mirrors --from): a lone numeric positional is a SLOT of the cwd repo.
+    # Bare `--here` (no positionals) stays empty so _dev_remote_resolve probes ALL remotes —
+    # do NOT infer from $PWD here, or standing in any DEV_REPOS dir would silently narrow
+    # the picker to that repo and hide every other remote session.
+    if [[ $repo_arg == <-> && -z $slot_arg ]]; then slot_arg=$repo_arg; repo_arg=$(_t_infer_repo); fi
+    # _dev_remote_resolve returns "<host>\t<repo>\t<slot>" (fzf-picks if several live).
+    local res; res=$(_dev_remote_resolve "$repo_arg" "$slot_arg") || return 1
+    from_host=${res%%$'\t'*}
+    repo_arg=${${res#*$'\t'}%%$'\t'*}
+    slot_arg=${res##*$'\t'}
+    [[ -n $CLAUDE_CODE_SESSION_ID ]] && fg=
+    local target="${REMOTE_HOSTS[$from_host]:-$from_host}"
+    _dev_pull "$from_host" "$target" "$repo_arg" "$slot_arg" "$fg"
+    return
+  fi
 
   # RECEIVE: --from <host> pulls a session FROM that host onto THIS machine — the exact
   # mirror of the default send, and a MOVE for the same one-live-owner reason (_dev_pull

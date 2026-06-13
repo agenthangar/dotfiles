@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# csync — two-way sync of Claude Code session history with iCloud Drive.
+# csync — two-way sync of Claude Code session history + saved plans with iCloud.
 # One command, no direction: merges both ways (newest file wins, nothing
-# deleted) so every machine converges to the union of all sessions. Safe to
-# run anytime; --update never clobbers a newer copy and no --delete means it
-# never removes sessions. Run by hand, or automatically every 15 min via the
+# deleted) so every machine converges to the union of all sessions and plans.
+# Safe to run anytime; --update never clobbers a newer copy and no --delete means
+# it never removes anything. Run by hand, or automatically every 15 min via the
 # precmd hook in .zshrc (which logs background runs to ~/Library/Logs/csync.log).
 #
 # Not run via launchd on purpose: iCloud Drive is TCC-protected and background
@@ -20,35 +20,47 @@ case "${1:-}" in
   *) echo "csync: unknown argument: $1 (csync takes no args; -h for help)" >&2; exit 2 ;;
 esac
 
-icloud="$HOME/Library/Mobile Documents/com~apple~CloudDocs/claude-sessions"
-local_dir="$HOME/.claude/projects"
+icloud_base="$HOME/Library/Mobile Documents/com~apple~CloudDocs"
 
-if [[ ! -d "$HOME/Library/Mobile Documents/com~apple~CloudDocs" ]]; then
+if [[ ! -d "$icloud_base" ]]; then
   echo "iCloud Drive not found on this machine."
   exit 1
 fi
 
-mkdir -p "$icloud" "$local_dir"
+# sync_pair <local_dir> <icloud_dir> <label> — converge one ~/.claude subtree with
+# its iCloud mirror, both directions, union-merge (newest wins, nothing deleted).
+sync_pair() {
+  local local_dir="$1" icloud="$2" label="$3"
+  mkdir -p "$icloud" "$local_dir"
 
-# iCloud may keep file *contents* evicted (dataless placeholders) even though
-# the names show up. rsync reads via mmap, which times out on those ("mmap:
-# Operation timed out") instead of fetching them — and aborts. So force
-# evicted files local first: ask the daemon to fetch (brctl), then a plain
-# read() blocks until the bytes land.
-echo "⟳ Materialising cloud-only files in iCloud…"
-# Best-effort: brctl can exit non-zero (e.g. nothing to fetch) — never let that
-# abort the sync under set -e, so swallow its status with `|| true`.
-find "$icloud" -type f ! -name '.DS_Store' -exec brctl download {} + 2>/dev/null || true
-while IFS= read -r -d '' f; do
-  # Dataless placeholder: 0 blocks allocated but a non-zero logical size.
-  if [[ "$(stat -f '%b' "$f" 2>/dev/null)" -eq 0 && "$(stat -f '%z' "$f" 2>/dev/null)" -gt 0 ]]; then
-    cat "$f" >/dev/null 2>&1 || true
-  fi
-done < <(find "$icloud" -type f ! -name '.DS_Store' -print0 2>/dev/null)
+  # iCloud may keep file *contents* evicted (dataless placeholders) even though
+  # the names show up. rsync reads via mmap, which times out on those ("mmap:
+  # Operation timed out") instead of fetching them — and aborts. So force
+  # evicted files local first: ask the daemon to fetch (brctl), then a plain
+  # read() blocks until the bytes land.
+  echo "⟳ Materialising cloud-only files in $label…"
+  # Best-effort: brctl can exit non-zero (e.g. nothing to fetch) — never let that
+  # abort the sync under set -e, so swallow its status with `|| true`.
+  find "$icloud" -type f ! -name '.DS_Store' -exec brctl download {} + 2>/dev/null || true
+  while IFS= read -r -d '' f; do
+    # Dataless placeholder: 0 blocks allocated but a non-zero logical size.
+    if [[ "$(stat -f '%b' "$f" 2>/dev/null)" -eq 0 && "$(stat -f '%z' "$f" 2>/dev/null)" -gt 0 ]]; then
+      cat "$f" >/dev/null 2>&1 || true
+    fi
+  done < <(find "$icloud" -type f ! -name '.DS_Store' -print0 2>/dev/null)
 
-# Merge both directions: iCloud → local, then local → iCloud. --update keeps
-# the newer side on each file; no --delete, so sessions only ever accumulate.
-echo "⟳ Syncing iCloud ↔ $local_dir"
-rsync -a --update --exclude='.DS_Store' "$icloud/" "$local_dir/"
-rsync -a --update --exclude='.DS_Store' "$local_dir/" "$icloud/"
+  # Merge both directions. --update keeps the newer side on each file; no
+  # --delete, so files only ever accumulate.
+  echo "⟳ Syncing $label  iCloud ↔ $local_dir"
+  rsync -a --update --exclude='.DS_Store' "$icloud/" "$local_dir/"
+  rsync -a --update --exclude='.DS_Store' "$local_dir/" "$icloud/"
+}
+
+# Transcripts and saved plans both live under ~/.claude but in separate trees.
+# Plans were previously NOT synced (only the host that authored a plan had its
+# .md), so `t plan` reported "no saved plan" for a session beamed to another
+# machine — the transcript moved but the plan file did not. Syncing the plans
+# tree closes that gap; csync converges plans the same union way as transcripts.
+sync_pair "$HOME/.claude/projects" "$icloud_base/claude-sessions" "sessions"
+sync_pair "$HOME/.claude/plans"    "$icloud_base/claude-plans"    "plans"
 echo "✓ csync complete"

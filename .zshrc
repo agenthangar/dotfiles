@@ -1578,6 +1578,25 @@ _dev_remote_kill() {
   elif [[ -z $repo ]]; then
     repo=$(_t_infer_repo)
   fi
+  # `all` can't be resolved as a single row (slot names are `<repo>-<N>`, never
+  # `<repo>-all`); enumerate the remote hosts with any live dev-<repo>-* slot and
+  # delegate `t kill <repo> all` to each — the remote _dev_kill iterates its own.
+  if [[ $slot == all ]]; then
+    [[ -n $repo ]] || { echo "dev: kill --remote all needs a repo (none inferred from \$PWD)." >&2; return 1; }
+    local hosts; hosts=$(_dev_rows_all 2>/dev/null \
+      | awk -F'\t' -v w="${repo}-" '$1 != "local" && index($4,w)==1 {print $1}' | sort -u)
+    [[ -n $hosts ]] || { echo "dev: no live '$repo' sessions on any remote host (\`dev ls -r\`)." >&2; return 1; }
+    local h rtarget rcmd="t kill ${(q)repo} all"
+    [[ -n $force ]] && rcmd+=" -y"
+    for h in ${(f)hosts}; do
+      rtarget="${REMOTE_HOSTS[$h]:-$h}"
+      echo "→ Killing all dev-${repo}-* on $h"
+      _term_title "$h: kill $repo all"
+      ssh -t "$rtarget" "zsh -lic ${(q)rcmd}"
+    done
+    _term_title ""
+    return
+  fi
   local res; res=$(_dev_remote_resolve "$repo" "$slot") || return 1
   local host=${res%%$'\t'*} prepo=${${res#*$'\t'}%%$'\t'*} pslot=${res##*$'\t'}
   local target="${REMOTE_HOSTS[$host]:-$host}"

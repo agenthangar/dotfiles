@@ -1713,58 +1713,6 @@ _dev_session_remote_fallback() {
   _dev_remote_delegate "$repo" "$slot" "$verb" "$@"
 }
 
-# _dev_remote_open <host> [open-args…] — start/attach a session on a SPECIFIC host
-# (the `t open --host <h>` path). Unlike the `-r`/auto-detect attach — which only
-# reaches an ALREADY-LIVE remote slot (host inferred via _dev_remote_resolve) — this
-# forces <host>, so it can start a FRESH session there: `t open ff --host mini` opens a
-# new mini session, `t open ff 3 --host mini` its slot 3. ssh -t + remote `t open`
-# (zsh -lic for the Homebrew-tmux / interactive-claude PATH split); the session stays
-# on <host> (Ctrl-b d to detach). The repo must exist at the same ~/code path there.
-_dev_remote_open() {
-  local host="$1"; shift
-  local target="${REMOTE_HOSTS[$host]:-$host}"
-  if [[ ! -t 1 ]]; then
-    echo "t open --host: starting a session on $host needs a terminal." >&2
-    return 1
-  fi
-  local rcmd="t open"; local a
-  for a in "$@"; do rcmd+=" ${(q)a}"; done
-  echo "→ $host: $rcmd (stays on $host; Ctrl-b d to detach)"
-  _term_title "$host: open ${(j: :)@}"
-  ssh -t "$target" "zsh -lic ${(q)rcmd}"
-  _term_title ""
-}
-
-# _dev_remote_delegate <repo> <slot> <verb> [extra…] — remote-aware shim for the
-# per-slot read verbs (plan/read/…). If dev-<repo>-<slot> is NOT live locally but IS
-# live on a $REMOTE_HOSTS host, run `t <verb> <repo> <slot> [extra]` there over ssh -t
-# and return 0 (handled); else return 1 so the caller falls back to its local path.
-# Needed because a beamed/remote slot's artifacts are host-local — the plan .md lives
-# in ~/.claude/plans and the tmux log in ~/.tmux-logs on the slot's host, neither of
-# which csync syncs — so the verb must run THERE. Host auto-inferred (_dev_remote_
-# resolve); no TTY → print a hint and still return 0 (do not fall through to a local
-# "No such session"). Mirrors _t_dev's auto-detect attach, but for non-attach verbs.
-_dev_remote_delegate() {
-  local repo="$1" slot="$2" verb="$3"; shift 3
-  (( ${#REMOTE_HOSTS} )) || return 1
-  [[ -n $repo ]] || return 1
-  _dev_local_slot_live "$repo" "$slot" && return 1
-  local res; res=$(_dev_remote_resolve "$repo" "$slot" 2>/dev/null) || return 1
-  [[ -n $res ]] || return 1
-  local host=${res%%$'\t'*} prepo=${${res#*$'\t'}%%$'\t'*} pslot=${res##*$'\t'}
-  local target="${REMOTE_HOSTS[$host]:-$host}"
-  if [[ ! -t 1 ]]; then
-    echo "t $verb: dev-${prepo}-${pslot} is live on $host — run it from a terminal (or \`t beam $prepo $pslot --from $host\` to pull it here)." >&2
-    return 0
-  fi
-  local rcmd="t $verb ${(q)prepo} ${(q)pslot}"; local a
-  for a in "$@"; do rcmd+=" ${(q)a}"; done
-  echo "→ $host:dev-${prepo}-${pslot}" >&2
-  _term_title "$host: $verb $prepo $pslot"
-  ssh -t "$target" "zsh -lic ${(q)rcmd}"
-  _term_title ""
-}
-
 # _dev_remote_kill <repo> <slot> <force> — `dev -r kill <repo> [slot]`: resolve a live
 # REMOTE slot (host auto-inferred / fzf-picked, _dev_remote_resolve) and tear it down
 # ON that host by running `dev kill <repo> <slot>` there over ssh -t (so its confirm

@@ -2736,21 +2736,29 @@ PY
 }
 
 # _tbeam_kill_owner — stop the dev-<repo>-<slot> tmux session on THIS machine that
-# owns the session id in $TB_SID (matched on the CLAUDE_RESUME_ID stamp), if one
-# is live. This is what turns tbeam from a copy into a MOVE: once a session has
-# landed on the far side, its origin-side owner is killed so exactly one live
-# claude owns the id — two live owners of one transcript have no lock and diverge
-# (the same invariant tpush/tpop protect). Shared dotfiles code so the caller can
-# run it on the *remote* origin over ssh; the id rides in $TB_SID (env, not args)
-# to dodge nested ssh-quoting, exactly like _tbeam_land. kill-session only SIGHUPs
-# claude, but the transcript is appended live and already synced, so nothing is
-# lost. Echoes the killed session name as its last line (caller reports it);
-# silent, returns nonzero, if the id isn't live in any local dev slot.
+# owns the session id in $TB_SID, if one is live. This is what turns tbeam from a
+# copy into a MOVE: once a session has landed on the far side, its origin-side
+# owner is killed so exactly one live claude owns the id — two live owners of one
+# transcript have no lock and diverge (the same invariant tpush/tpop protect).
+# Shared dotfiles code so the caller can run it on the *remote* origin over ssh;
+# the id rides in $TB_SID (env, not args) to dodge nested ssh-quoting, exactly
+# like _tbeam_land. kill-session only SIGHUPs claude, but the transcript is
+# appended live and already synced, so nothing is lost. Echoes the killed session
+# name as its last line (caller reports it); silent, returns nonzero, if the id
+# isn't live in any local dev slot.
+#
+# Slot id resolution must match _dev_session_rows: use _dev_session_sid (registry-
+# first, with the stamp validated against the slot's repo) rather than the raw
+# CLAUDE_RESUME_ID stamp. Otherwise a stale stamp (e.g. cross-repo pane reuse) on
+# the still-live origin slot would cause this to silently fail to find the owner
+# while _dev_pull, which already resolved the authoritative id via _dev_session_rows,
+# resumes locally — leaving two live owners on the same transcript.
 _tbeam_kill_owner() {
-  local sid="$TB_SID" s
+  local sid="$TB_SID" s slot_sid
   [[ -n $sid ]] || return 1
   for s in ${(f)"$(tmux list-sessions -F '#{session_name}' 2>/dev/null | grep '^dev-')"}; do
-    if [[ "$(tmux show-environment -t "$s" CLAUDE_RESUME_ID 2>/dev/null | cut -d= -f2)" == "$sid" ]]; then
+    slot_sid=$(_dev_session_sid "$s")
+    if [[ "$slot_sid" == "$sid" ]]; then
       tmux kill-session -t "$s" 2>/dev/null && { print -r -- "$s"; return 0; }
     fi
   done

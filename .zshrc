@@ -3084,7 +3084,7 @@ t() {
 # The host paths dispatch via _dev_remote_open with the original gh-style args (minus
 # --host / -r), so H's own `t open` re-parses them from ITS $PWD.
 _t_open() {
-  local -a a rest; local arg want_host= host= remote= isnew=
+  local -a a rest; local arg want_host= host= remote= isnew= local_only=
   for arg in "$@"; do
     if [[ -n $want_host ]]; then host=$arg; want_host=; continue; fi
     case "$arg" in
@@ -3096,11 +3096,19 @@ _t_open() {
       --new|new)         a+=(new); isnew=1 ;;
       --fg)              a+=(-f) ;;
       -r|--remote)       remote=1; a+=(-r) ;;
-      -l|--local|--here) a+=(--local) ;;
+      -l|--local|--here) local_only=1; a+=(--local) ;;
       *)                 a+=("$arg") ;;
     esac
   done
   [[ -n $want_host ]] && { echo "t open: --host requires a value" >&2; return 2; }
+
+  # -l/--local/--here and -r/--remote are opposite intents — reject the combination
+  # here too, so the `-r --new` default-host shortcut below cannot silently win over a
+  # user-forced local. (_t_dev re-checks the same for its fall-through path.)
+  if [[ -n $local_only && -n $remote ]]; then
+    echo "t open: --local/--here and -r/--remote are mutually exclusive" >&2
+    return 2
+  fi
 
   # `-r --new` with no --host: START fresh on the default remote host. (Plain `-r`
   # with no --new falls through to _t_dev's cross-host ATTACH; --host below wins if set.)

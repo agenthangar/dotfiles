@@ -3020,9 +3020,13 @@ _t_beam() {
     fi
     local session="dev-${repo_arg}-${slot}"
     tmux has-session -t "$session" 2>/dev/null || { echo "tbeam: no such session: $session" >&2; return 1; }
-    sid=$(tmux show-environment -t "$session" CLAUDE_RESUME_ID 2>/dev/null | cut -d= -f2)
+    # Authoritative id (registry-first, stamp validated against the slot's repo) —
+    # must match _tbeam_kill_owner's resolution, or a stale cross-repo stamp on the
+    # origin slot would beam transcript X while the slot is actually running Y,
+    # leaving the live slot un-killed and two owners on Y after the remote resumes.
+    local dir; dir=$(tmux display-message -p -t "$session" '#{session_path}' 2>/dev/null)
+    sid=$(_dev_session_sid "$session" "$dir")
     if [[ -z $sid ]]; then                          # pre-hook fallback: newest transcript in the dir
-      local dir; dir=$(tmux display-message -p -t "$session" '#{session_path}')
       local -a tx=( "$HOME/.claude/projects/${dir//\//-}"/*.jsonl(Nom[1]) )
       sid=${${tx[1]:t}%.jsonl}
     fi
@@ -3083,7 +3087,14 @@ _t_beam() {
         kill -TERM "$fgpid" 2>/dev/null
         local n=0
         while kill -0 "$fgpid" 2>/dev/null && (( n++ < 100 )); do sleep 0.05; done
-        echo "✂ Stopped the local foreground copy (pid $fgpid) — moved to $host"
+        if kill -0 "$fgpid" 2>/dev/null; then
+          # Owner ignored SIGTERM (or is wedged) — warn rather than claim success,
+          # mirroring _dev_adopt_fg: the remote is about to take over, so two live
+          # claudes may briefly share the id and the transcript can interleave.
+          echo "warning: local foreground copy (pid $fgpid) didn't exit; $host resuming anyway — transcript may interleave." >&2
+        else
+          echo "✂ Stopped the local foreground copy (pid $fgpid) — moved to $host"
+        fi
       fi
     fi
   fi

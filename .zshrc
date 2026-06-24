@@ -232,7 +232,7 @@ dots() {
 # are machine-specific, so they live in ~/.zshrc.local (not committed); this file
 # just declares the array and sources that override. See .zshrc.local.example.
 #   DEV_REPOS[api]="$HOME/code/my-api"
-typeset -gA DEV_REPOS DEV_BRANCHES REMOTE_HOSTS
+typeset -gA DEV_REPOS DEV_BRANCHES REMOTE_HOSTS DEV_WORKTREE
 [[ -f "$HOME/.zshrc.local" ]] && source "$HOME/.zshrc.local"
 
 # DEV_BRANCH — the global default branch `dev`/`_dev_new_session` check out (and
@@ -241,6 +241,17 @@ typeset -gA DEV_REPOS DEV_BRANCHES REMOTE_HOSTS
 # file win if it set it.
 : ${DEV_BRANCH:=dev/claude-1}
 
+# DEV_WORKTREE — worktree-per-session controls. Every NEW dev session gets its own
+# git worktree on its own branch (dev/<basename>-<slot>) freshly branched off
+# origin/main, so siblings never share a tree or a branch (the structural fix for the
+# "weird situations" the old single shared dev/claude-1 tree caused). DEV_WORKTREE_ROOT
+# is where those worktrees live (a central dir OUTSIDE every repo's tree, so it pollutes
+# nothing); DEV_WORKTREE_DEFAULT is the global on/off; the DEV_WORKTREE assoc array (keyed
+# like DEV_BRANCHES) is the per-repo opt-out — DEV_WORKTREE[repo]=0 keeps a repo on the old
+# shared-tree path (+ _dev_repo_prepare). Override any of these in ~/.zshrc.local.
+: ${DEV_WORKTREE_ROOT:=$HOME/code/.worktrees}
+: ${DEV_WORKTREE_DEFAULT:=1}
+
 # DEV_BRANCHES — per-repo branch overrides, keyed by the same alias as DEV_REPOS.
 # A repo with no entry falls back to $DEV_BRANCH; e.g. a repo whose workflow
 # commits straight to main wants DEV_BRANCHES[myrepo]=main. Set in
@@ -248,6 +259,48 @@ typeset -gA DEV_REPOS DEV_BRANCHES REMOTE_HOSTS
 # _dev_branch_for <repo> — branch `dev` uses for <repo>: its DEV_BRANCHES
 # override if set, else the global $DEV_BRANCH.
 _dev_branch_for() { print -r -- "${DEV_BRANCHES[$1]:-$DEV_BRANCH}" }
+
+# Worktree-per-session helpers. The path + branch are derived from the repo's BASENAME
+# (${DEV_REPOS[repo]:t}), not the alias, so they are identical on every host (a dir is
+# `dot` here and `dotfiles` there, but its basename `dotfiles` is stable) — which keeps
+# cross-host resolution (tbeam, _dev_remote_resolve) coherent.
+# _dev_worktree_enabled <repo> — true unless this repo (or the global default) opts out.
+_dev_worktree_enabled() {
+  local v=${DEV_WORKTREE[$1]:-}
+  [[ -n $v ]] || v=${DEV_WORKTREE_DEFAULT:-1}
+  [[ $v != 0 && $v != no && $v != off && $v != false ]]
+}
+# _dev_worktree_path <repo> <slot> — disk location of the slot's worktree.
+_dev_worktree_path()   { print -r -- "${DEV_WORKTREE_ROOT}/${DEV_REPOS[$1]:t}/$2" }
+# _dev_worktree_branch <repo> <slot> — the slot's dedicated branch.
+_dev_worktree_branch() { print -r -- "dev/${DEV_REPOS[$1]:t}-$2" }
+
+# _dev_worktree_create <repo> <slot> — idempotently materialize the slot's worktree and
+# print its path. Reattach is free: an already-present worktree is reused as-is (no
+# re-fetch, no re-branch). A fresh slot branches off the just-fetched origin/main; a slot
+# whose tmux died but whose branch lingered (kill-without-merge) resumes that branch. On
+# failure (e.g. the branch is checked out in another worktree — should not happen with one
+# branch per slot) it prints nothing and returns 1 so the caller can fall back to the
+# shared-tree path. Runs git against the repo's (possibly shared) .git via -C.
+_dev_worktree_create() {
+  local repo="$1" slot="$2"
+  local repodir="${DEV_REPOS[$repo]}"
+  local wt br; wt="$(_dev_worktree_path "$repo" "$slot")"; br="$(_dev_worktree_branch "$repo" "$slot")"
+  if [[ -e "$wt/.git" ]]; then          # already materialized → reuse (idempotent)
+    print -r -- "$wt"; return 0
+  fi
+  git -C "$repodir" worktree prune 2>/dev/null    # clear any stale registration first
+  git -C "$repodir" fetch -q origin 2>/dev/null   # refresh origin/main before branching
+  if git -C "$repodir" show-ref --verify --quiet "refs/heads/$br"; then
+    git -C "$repodir" worktree add -q "$wt" "$br" 2>/dev/null               # resume lingering local slot branch
+  elif git -C "$repodir" show-ref --verify --quiet "refs/remotes/origin/$br"; then
+    git -C "$repodir" worktree add -q -b "$br" "$wt" "origin/$br" 2>/dev/null # branch exists only on origin → create local tracking + check out
+  else
+    git -C "$repodir" worktree add -q -b "$br" "$wt" origin/main 2>/dev/null # fresh off main
+  fi
+  [[ -e "$wt/.git" ]] || return 1
+  print -r -- "$wt"
+}
 
 # _dev_repo_prepare <branch> — put a NEW session's checkout on <branch> without
 # TRAMPLING sibling sessions that share this working tree. Every dev-<repo>-* slot
@@ -322,7 +375,10 @@ _t_sync_config() {
     for k in ${(k)DEV_REPOS};    do print -r -- "DEV_REPOS[$k]=${(q)DEV_REPOS[$k]}"; done
     for k in ${(k)DEV_BRANCHES}; do print -r -- "DEV_BRANCHES[$k]=${(q)DEV_BRANCHES[$k]}"; done
     for k in ${(k)REMOTE_HOSTS}; do print -r -- "REMOTE_HOSTS[$k]=${(q)REMOTE_HOSTS[$k]}"; done
+    for k in ${(k)DEV_WORKTREE};  do print -r -- "DEV_WORKTREE[$k]=${(q)DEV_WORKTREE[$k]}"; done
     print -r -- "DEV_BRANCH=${(q)DEV_BRANCH}"
+    print -r -- "DEV_WORKTREE_ROOT=${(q)DEV_WORKTREE_ROOT}"
+    print -r -- "DEV_WORKTREE_DEFAULT=${(q)DEV_WORKTREE_DEFAULT}"
   } >| "$cache"
 }
 _t_sync_config
@@ -382,6 +438,70 @@ _clawsync_periodic() {
       && git -C "$dir" pull --ff-only --quiet ) >>"$HOME/Library/Logs/clawsync.log" 2>&1 &!
 }
 add-zsh-hook precmd _clawsync_periodic
+
+# Worktree sweep — reap per-session worktrees whose work has landed. A slot's worktree
+# + branch (dev/<basename>-<slot>) are removed only when BOTH hold: the tmux session is
+# dead (matched by session_path, never by name — dodges alias drift) AND the branch is
+# merged to main. Unmerged work is never destroyed (a killed-but-unmerged slot keeps its
+# worktree so reopening the slot resumes it). Same prompt-piggyback + stamp-gate as csync.
+# _dev_branch_merged <repodir> <branch> — true if <branch> has landed on main. Prefers
+# gh (a merged PR with this head branch — catches GitHub SQUASH-merges, which leave no
+# ancestor link so `git branch --merged`/merge-base miss them); an OPEN PR is a hard
+# not-merged. Falls back to the git-only ancestor test when gh is absent/unauth. Any
+# inconclusive answer is treated as NOT merged, so the sweep never deletes on a maybe.
+# Both paths pin the answer to the CURRENT branch tip: per-slot branch names are reused
+# after a sweep (`dev/<basename>-<slot>`), so an unrelated historical merged PR with the
+# same head, OR a freshly-created branch sitting exactly at origin/main with uncommitted
+# working-tree edits, must NOT be reported as merged — that would destroy live work.
+_dev_branch_merged() {
+  local repodir="$1" br="$2" tip merged_oid open main_oid
+  tip=$(git -C "$repodir" rev-parse --verify -q "refs/heads/$br" 2>/dev/null)
+  [[ -n $tip ]] || return 1                       # no local branch → nothing to compare
+  if command -v gh >/dev/null 2>&1; then
+    merged_oid=$(cd "$repodir" 2>/dev/null && gh pr list --head "$br" --state merged --json headRefOid -q '.[0].headRefOid' 2>/dev/null)
+    [[ -n $merged_oid && $merged_oid == "$tip" ]] && return 0   # this exact commit was merged
+    open=$(cd "$repodir" 2>/dev/null && gh pr list --head "$br" --state open --json number -q '.[0].number' 2>/dev/null)
+    [[ -n $open ]] && return 1
+  fi
+  git -C "$repodir" fetch -q origin main 2>/dev/null
+  main_oid=$(git -C "$repodir" rev-parse --verify -q refs/remotes/origin/main 2>/dev/null)
+  [[ -n $main_oid ]] || return 1
+  [[ "$tip" != "$main_oid" ]] || return 1         # branch == origin/main → no unique history yet; uncommitted edits may still be live
+  git -C "$repodir" merge-base --is-ancestor "$br" origin/main 2>/dev/null
+}
+# _dev_worktree_sweep_run — the actual reap (runs detached). Walks every
+# $DEV_WORKTREE_ROOT/<basename>/<slot> worktree; skips ones with a live tmux session
+# rooted there; removes the worktree + branch when merged.
+_dev_worktree_sweep_run() {
+  local root=$DEV_WORKTREE_ROOT
+  [[ -n $root && -d $root ]] || return
+  local -a livepaths
+  livepaths=("${(@f)$(tmux list-sessions -F '#{session_path}' 2>/dev/null)}")
+  local wt repo slot repodir br r
+  for wt in $root/*/*(N/); do                       # <basename>/<slot> dirs
+    [[ -e "$wt/.git" ]] || continue
+    (( ${livepaths[(Ie)$wt]} )) && continue         # live session here → keep
+    r=$(_dev_repo_of_dir "$wt"); repo=${r%%$'\t'*}; slot=${r#*$'\t'}
+    [[ -n $repo && -n $slot ]] || continue
+    repodir=${DEV_REPOS[$repo]}
+    [[ -n $repodir && -d $repodir ]] || continue
+    br=$(_dev_worktree_branch "$repo" "$slot")
+    _dev_branch_merged "$repodir" "$br" || continue
+    print -r -- "[$(strftime '%F %T' $EPOCHSECONDS 2>/dev/null)] sweep: $wt (branch $br merged)"
+    git -C "$repodir" worktree remove --force "$wt" 2>/dev/null \
+      && git -C "$repodir" branch -D "$br" 2>/dev/null
+    git -C "$repodir" worktree prune 2>/dev/null
+  done
+}
+_dev_worktree_sweep() {
+  [[ -n $DEV_WORKTREE_ROOT && -d $DEV_WORKTREE_ROOT ]] || return
+  local interval=600 stamp="$HOME/.cache/dev-worktree-sweep" now=$EPOCHSECONDS last=0
+  [[ -r "$stamp" ]] && last=$(<"$stamp")
+  (( now - last >= interval )) || return
+  print -r -- "$now" >| "$stamp"                    # stamp BEFORE the run (overlap guard)
+  ( _dev_worktree_sweep_run >>"$HOME/Library/Logs/dev-worktree-sweep.log" 2>&1 & )
+}
+add-zsh-hook precmd _dev_worktree_sweep
 
 # _tpaste_claude_ready <session> — return 0 once Claude is accepting input in
 # the session's pane, else return 1. tpaste polls this after launching a fresh
@@ -514,7 +634,12 @@ _t_paste() {
 
   # new session → bootstrap Claude, wait for it to come up, queue the path, attach
   echo "Starting $session for the file…"
-  _dev_new_session "$session" "${DEV_REPOS[$repo]}" "$(_dev_branch_for "$repo")"
+  local _pdir="${DEV_REPOS[$repo]}" _pskip=
+  if _dev_worktree_enabled "$repo"; then
+    local _pwt; _pwt="$(_dev_worktree_create "$repo" "$slot")"
+    [[ -n $_pwt ]] && { _pdir="$_pwt"; _pskip=1; }
+  fi
+  _dev_new_session "$session" "$_pdir" "$(_dev_branch_for "$repo")" "$_pskip"
 
   # wait (up to ~30s) for Claude's process to take over the pane; if the
   # readiness check never matches this degrades to a plain 30s wait
@@ -769,8 +894,8 @@ _dev_fg_rows() {
     [[ -r $reg/$pid ]] && IFS=$'\t' read -r sid cwd < "$reg/$pid"
     [[ -n $cwd ]] || cwd=$(lsof -a -p "$pid" -d cwd -Fn 2>/dev/null | sed -n 's/^n//p' | head -1)
     [[ -n $cwd ]] || continue
-    repo=${cwd:t}
-    for k in ${(k)DEV_REPOS}; do [[ ${DEV_REPOS[$k]} == $cwd ]] && { repo=$k; break; }; done
+    repo=$(_dev_repo_of_dir "$cwd" 2>/dev/null); repo=${repo%%$'\t'*}   # worktree-aware
+    [[ -n $repo ]] || repo=${cwd:t}                                     # fall back to basename
     # Label is "<repo>:<short-sid>" — the short Claude session id makes each
     # foreground row UNIQUE (two `dot` foreground claudes were both "dot:fg" before)
     # and is the handle `t open <id>` reattaches by. The colon marks an fg row (tmux
@@ -907,17 +1032,55 @@ _dev_adopt_fg() {
 # Shared by `dev list` and `dev ls`. With a <scope> dir arg, only sessions whose
 # working dir is that dir (or below) are listed — `dev ls` passes the current repo.
 #
-# _dev_cwd_repo_dir — print the DEV_REPOS directory that contains $PWD (exact match
-# or an ancestor; longest/most-specific wins), else nothing. The scope source for
-# `dev ls` — path-based, so it catches every slot in that repo regardless of which
-# alias keyed it (dot-* and dotfiles-* both root at ~/code/dotfiles).
-_dev_cwd_repo_dir() {
-  local k d best=
+# _dev_repo_of_dir <dir> — the single source of truth for "which repo does this path
+# belong to". Prints "<alias>\t<slot>": the DEV_REPOS alias, plus a slot number when
+# <dir> is a per-session worktree ($DEV_WORKTREE_ROOT/<basename>/<slot>); the slot is
+# empty for a canonical repo dir or a subdir of one. The basename is the stable key
+# (a dir is `dot` here, `dotfiles` there, but its basename is identical), so worktrees
+# resolve back to whatever alias is in use locally. Alias choice for a basename mirrors
+# _t_infer_repo's old rule: the key equal to the basename wins, else the shortest key.
+# Prints nothing / rc 1 outside any DEV_REPOS dir. Reused by every cwd→repo resolver
+# below (and the Python twin _repo_of_dir in bin/t) so worktree-awareness lives once.
+_dev_repo_of_dir() {
+  local dir="$1" base= slot= k best=
+  if [[ -n $DEV_WORKTREE_ROOT && $dir == $DEV_WORKTREE_ROOT/*/* ]]; then
+    local rest=${dir#$DEV_WORKTREE_ROOT/}   # <basename>/<slot>[/...]
+    base=${rest%%/*}; rest=${rest#*/}; slot=${rest%%/*}
+  else
+    local d bestlen=0                       # canonical dir or subdir; longest/most-specific wins
+    for k in ${(k)DEV_REPOS}; do
+      d=${DEV_REPOS[$k]}
+      [[ $dir == $d || $dir == $d/* ]] || continue
+      (( ${#d} > bestlen )) && { base=${d:t}; bestlen=${#d}; }
+    done
+    [[ -n $base ]] || return 1
+  fi
   for k in ${(k)DEV_REPOS}; do
-    d=${DEV_REPOS[$k]}
-    [[ $PWD == $d || $PWD == $d/* ]] && (( ${#d} > ${#best} )) && best=$d
+    [[ ${DEV_REPOS[$k]:t} == $base ]] || continue
+    [[ $k == $base ]] && { print -r -- "$k	$slot"; return 0 }
+    if [[ -z $best ]] || (( ${#k} < ${#best} )); then best=$k; fi
   done
-  [[ -n $best ]] && print -r -- "$best"
+  [[ -n $best ]] && { print -r -- "$best	$slot"; return 0 }
+  return 1
+}
+
+# _dev_dir_in_scope <dir> <scope> — true when <dir> belongs to the repo whose canonical
+# dir is <scope>: an exact/ancestor match OR a per-session worktree of that repo (which
+# lives under $DEV_WORKTREE_ROOT/<basename>/, not under <scope>). The scope filters in
+# `dev ls` use this so worktree sessions are listed under their repo, not dropped.
+_dev_dir_in_scope() {
+  local d="$1" scope="$2"
+  [[ $d == $scope || $d == $scope/* ]] && return 0
+  [[ -n $DEV_WORKTREE_ROOT && $d == $DEV_WORKTREE_ROOT/${scope:t}/* ]]
+}
+
+# _dev_cwd_repo_dir — print the canonical DEV_REPOS directory that contains $PWD (or
+# whose worktree contains $PWD), else nothing. The scope source for `dev ls`. Derived
+# from _dev_repo_of_dir so it is worktree-aware: standing inside a slot's worktree still
+# scopes `dev ls` to that repo.
+_dev_cwd_repo_dir() {
+  local r; r=$(_dev_repo_of_dir "$PWD") || return 0
+  [[ -n $r ]] && print -r -- "${DEV_REPOS[${r%%$'\t'*}]}"
 }
 
 # _t_infer_repo [slot] — the repo ALIAS implied by $PWD, for the repo-aware verb
@@ -943,7 +1106,7 @@ _t_infer_repo() {
   for pat in $pats; do
     for s in ${(f)"$(tmux list-sessions -F '#{session_name}' 2>/dev/null | grep -- "^dev-.*-${pat}\$")"}; do
       p=$(tmux display-message -p -t "$s" '#{session_path}' 2>/dev/null)
-      if [[ $p == $dir || $p == $dir/* ]]; then
+      if _dev_dir_in_scope "$p" "$dir"; then           # exact, subdir, or a worktree of the repo
         s=${s#dev-}; print -r -- "${s%-*}"; return 0   # last dash splits off the slot
       fi
     done
@@ -969,13 +1132,16 @@ _dev_list() {
     while IFS= read -r _s; do
       [[ -n $_s ]] || continue
       _d=$(tmux display-message -p -t "$_s" '#{session_path}' 2>/dev/null)
-      [[ $_d == $scope || $_d == $scope/* ]] && kept+=("$_s")
+      _dev_dir_in_scope "$_d" "$scope" && kept+=("$_s")
     done <<< "$names"
     names=${(F)kept}
   fi
-  # Foreground (non-tmux) claudes, same scope (rows carry cwd in field 2).
+  # Foreground (non-tmux) claudes, same scope (rows carry cwd in field 2). Worktree
+  # paths ($DEV_WORKTREE_ROOT/<basename>/...) count as the repo too — the wt clause.
   local fgrows; fgrows=$(_dev_fg_rows 2>/dev/null)
-  [[ -n $scope && -n $fgrows ]] && fgrows=$(print -r -- "$fgrows" | awk -F'\t' -v d="$scope" '$2==d || index($2, d"/")==1')
+  [[ -n $scope && -n $fgrows ]] && fgrows=$(print -r -- "$fgrows" | awk -F'\t' \
+    -v d="$scope" -v wt="${DEV_WORKTREE_ROOT}/${scope:t}" \
+    '$2==d || index($2, d"/")==1 || index($2, wt"/")==1')
   if [[ -z "$names" && -z "$fgrows" ]]; then
     echo "No dev sessions running${scope:+ in ${scope:t} (dev ls --all for every repo)}."
     return 0
@@ -1139,8 +1305,12 @@ _dev_list_remote() {
   local scope="$1"
   local rows; rows=$(_dev_rows_all)
   # Scope to the current repo dir (rows carry cwd in field 3; repos share the same
-  # ~/code path on every machine, so a local scope filters remote rows too).
-  [[ -n $scope ]] && rows=$(print -r -- "$rows" | awk -F'\t' -v d="$scope" '$3==d || index($3, d"/")==1')
+  # ~/code path on every machine, so a local scope filters remote rows too). Worktree
+  # paths ($DEV_WORKTREE_ROOT/<basename>/...) count as the repo too (wt clause); the
+  # worktree root is the same path on every host, like ~/code.
+  [[ -n $scope ]] && rows=$(print -r -- "$rows" | awk -F'\t' \
+    -v d="$scope" -v wt="${DEV_WORKTREE_ROOT}/${scope:t}" \
+    '$3==d || index($3, d"/")==1 || index($3, wt"/")==1')
   if [[ -z $rows ]]; then
     echo "No dev sessions running${scope:+ in ${scope:t} (dev ls -r --all for every repo)}${scope:+,} on this machine or any reachable host."
     return 0
@@ -1301,12 +1471,15 @@ _dev_kill() {
   _dev_kill_one "$session" "$force"
 }
 
-# _dev_new_session <session> <dir> [branch] — create a detached tmux session in
-# <dir>, start logging, and launch Claude on <branch> (default $DEV_BRANCH).
+# _dev_new_session <session> <dir> [branch] [skip_prepare] — create a detached tmux
+# session in <dir>, start logging, and launch Claude on <branch> (default $DEV_BRANCH).
 # Callers pass the repo's resolved branch (see _dev_branch_for) since the repo
 # alias isn't recoverable from <session> reliably. Shared by `dev` and `tpaste`
 # so the bootstrap (branch dance, geometry, logging) lives in one place; callers
 # attach (or not) and deliver input themselves afterwards.
+# skip_prepare (non-empty) suppresses the in-pane _dev_repo_prepare branch dance —
+# set it in worktree mode, where <dir> is the slot's own worktree already on its
+# branch off main, so there is no shared tree and no sibling to trample.
 #
 # We *pre-assign* Claude's session id (a lowercased uuidgen) and pass it as
 # `claude --session-id`, then stash it on the tmux session as CLAUDE_RESUME_ID —
@@ -1316,7 +1489,7 @@ _dev_kill() {
 # one. uuidgen is uppercase but Claude stores ids lowercase, so we lowercase to
 # keep the transcript filename glob (`<sid>.jsonl`) matching.
 _dev_new_session() {
-  local session="$1" dir="$2" branch="${3:-$DEV_BRANCH}"
+  local session="$1" dir="$2" branch="${3:-$DEV_BRANCH}" skip_prepare="${4:-}"
   local logfile="$HOME/.tmux-logs/${session}.log"
   local sid; sid="$(uuidgen | tr 'A-Z' 'a-z')"
   mkdir -p "$HOME/.tmux-logs"
@@ -1334,7 +1507,9 @@ _dev_new_session() {
   # (single-window) tmux session instead of leaving an idle prompt behind. Fires
   # on any exit (clean or crash); crash output survives in the pipe-pane logfile
   # (`t read`). `t pop` kill-sessions the slot itself, so the exit is moot there.
-  tmux send-keys -t "$session" "_dev_repo_prepare ${(q)branch}; claude --session-id $sid; exit" Enter
+  local prep="_dev_repo_prepare ${(q)branch}; "
+  [[ -n $skip_prepare ]] && prep=    # worktree mode: <dir> is already on its branch
+  tmux send-keys -t "$session" "${prep}claude --session-id $sid; exit" Enter
 }
 
 # dev — open/reattach a Claude Code tmux session (local or on another host)
@@ -1455,11 +1630,29 @@ _t_dev() {
   # DEV_REPOS dir this leaves repo empty and the usage below explains.
   # `t open 4 --new` lands here as `repo=4 slot=new` (--new became a positional in
   # _t_open) — the explicit numeric slot still wins, the redundant keyword drops.
+  local _bare_repo=
+  [[ -z $repo ]] && _bare_repo=1
   if [[ -z ${DEV_REPOS[$repo]:-} && ( $repo == <-> || $repo == new || $repo == fg ) \
         && ( -z $slot || $slot == new || $slot == fg ) ]]; then
-    slot=$repo; repo=
+    slot=$repo; repo=; _bare_repo=1
   fi
   [[ -z $repo ]] && repo=$(_t_infer_repo "$slot")
+
+  # Worktree-aware bare open: standing inside a per-session worktree
+  # ($DEV_WORKTREE_ROOT/<basename>/<slot>) defaults the slot to ITS slot, so
+  # `t open` from that dir targets the matching session instead of the lowest
+  # free gap. Only when the repo was inferred from $PWD (no explicit repo arg) —
+  # an explicit `t open <other-repo>` from inside an unrelated repo's worktree
+  # must not adopt that worktree's slot. _dev_repo_of_dir prints "<alias>\t<slot>"
+  # (slot empty for a canonical repo dir or subdir, populated for a worktree
+  # path) — same source `t read` already uses for cwd→slot inference in bin/t.
+  if [[ -z $slot && -n $repo && -n $_bare_repo ]]; then
+    local _wsr _wss
+    _wsr=$(_dev_repo_of_dir "$PWD" 2>/dev/null) && {
+      _wss=${_wsr#*$'\t'}
+      [[ -n $_wss ]] && slot=$_wss
+    }
+  fi
 
   # repo→path map: see the global DEV_REPOS (defined near the cd shortcuts)
 
@@ -1563,18 +1756,40 @@ _t_dev() {
       _t_pop "$repo" "$slot"
       return
     fi
+    # Fresh inline claude. In worktree mode give it an isolated worktree too, keyed
+    # to a slot number (the named one, else the next free) so it can't collide with a
+    # tmux slot's worktree; on failure/opt-out fall back to the shared tree + prepare.
+    local skip_prepare=
+    if _dev_worktree_enabled "$repo"; then
+      local _wslot="$slot"
+      if [[ -z $_wslot || $_wslot == new ]]; then
+        _wslot=1
+        while tmux has-session -t "dev-${repo}-${_wslot}" 2>/dev/null \
+              || [[ -e "$(_dev_worktree_path "$repo" "$_wslot")/.git" ]]; do (( _wslot++ )); done
+      fi
+      local _wt; _wt="$(_dev_worktree_create "$repo" "$_wslot")"
+      [[ -n $_wt ]] && { dir="$_wt"; skip_prepare=1; }
+    fi
     echo "Starting claude in $dir (no tmux)"
     cd "$dir" || return 1
-    _dev_repo_prepare "$branch"
+    [[ -n $skip_prepare ]] || _dev_repo_prepare "$branch"
     claude
     return
   fi
 
   # `dev <repo> new` — force the next never-used slot (skip reattaching to an
-  # existing unattached session); always spins up a fresh Claude.
+  # existing unattached session); always spins up a fresh Claude. In worktree mode
+  # also skip slots whose worktree dir still exists on disk (e.g. kill-without-merge
+  # left dev/<basename>-<n> behind): _dev_worktree_create is idempotent and would
+  # REUSE that tree + branch, contradicting `new`. Mirrors the --fg path's check.
   if [[ "$slot" == new ]]; then
     local n=1
-    while tmux has-session -t "dev-${repo}-${n}" 2>/dev/null; do (( n++ )); done
+    if _dev_worktree_enabled "$repo"; then
+      while tmux has-session -t "dev-${repo}-${n}" 2>/dev/null \
+            || [[ -e "$(_dev_worktree_path "$repo" "$n")/.git" ]]; do (( n++ )); done
+    else
+      while tmux has-session -t "dev-${repo}-${n}" 2>/dev/null; do (( n++ )); done
+    fi
     slot=$n
   fi
 
@@ -1624,8 +1839,19 @@ _t_dev() {
     tmux pipe-pane -t "$session" -o "cat >> $logfile"
     tmux attach-session -t "$session"
   else
+    # Worktree mode: this slot gets its OWN worktree on dev/<basename>-<slot> off
+    # main, so it shares no tree with siblings. _dev_worktree_create is idempotent —
+    # a slot whose tmux died but whose worktree lingers is reused in place (work
+    # preserved). On failure (or a per-repo opt-out) fall back to the shared tree +
+    # the in-pane branch dance.
+    local skip_prepare=
+    if _dev_worktree_enabled "$repo"; then
+      local _wt; _wt="$(_dev_worktree_create "$repo" "$slot")"
+      if [[ -n $_wt ]]; then dir="$_wt"; skip_prepare=1
+      else echo "↷ worktree setup failed for $repo $slot — using shared tree $dir" >&2; fi
+    fi
     echo "Starting $session in $dir (logging to $logfile)"
-    _dev_new_session "$session" "$dir" "$branch"
+    _dev_new_session "$session" "$dir" "$branch" "$skip_prepare"
     tmux attach-session -t "$session"
   fi
 }
@@ -1660,13 +1886,18 @@ _dev_remote_resolve() {
   # repo/slot pair (`dot:a4aa5f6a` has no `-`) and `_dev_remote_attach`/
   # `_dev_remote_delegate` would ssh with a malformed `t` command.
   local dir="${DEV_REPOS[$repo]:-}"
+  # Worktree-aware: a slot's session may root at $DEV_WORKTREE_ROOT/<basename>/<slot>
+  # (per-session worktree) instead of the canonical repo dir. The basename + worktree
+  # root are stable across hosts (same as _dev_dir_in_scope), so accept either path
+  # — else live worktree slots silently miss and `t open` mints a duplicate locally.
+  local base="${dir:t}" wtr="${DEV_WORKTREE_ROOT:-}"
   local match
   if [[ -z $repo ]]; then
     match=$rows                                                  # bare → all remote
   elif [[ -n $dir && -n $slot ]]; then
-    match=$(print -r -- "$rows" | awk -F'\t' -v d="$dir" -v s="$slot" '$3==d && $4 !~ /:/ && $4 ~ ("-" s "$")')
+    match=$(print -r -- "$rows" | awk -F'\t' -v d="$dir" -v s="$slot" -v wtr="$wtr" -v b="$base" '($3==d || (wtr != "" && b != "" && index($3, wtr "/" b "/") == 1)) && $4 !~ /:/ && $4 ~ ("-" s "$")')
   elif [[ -n $dir ]]; then
-    match=$(print -r -- "$rows" | awk -F'\t' -v d="$dir" '$3==d && $4 !~ /:/')
+    match=$(print -r -- "$rows" | awk -F'\t' -v d="$dir" -v wtr="$wtr" -v b="$base" '($3==d || (wtr != "" && b != "" && index($3, wtr "/" b "/") == 1)) && $4 !~ /:/')
   elif [[ -n $slot ]]; then
     match=$(print -r -- "$rows" | awk -F'\t' -v w="${repo}-${slot}" '$4==w')
   else
@@ -1979,6 +2210,12 @@ _dev_pull() {
   local cwd=${${row#*$'\t'}%%$'\t'*}
   local fslot=${${${row#*$'\t'}#*$'\t'}%%$'\t'*}
   [[ -n $sid && $sid != - ]] || { echo "dev: $host/$fslot has no active conversation to pull" >&2; return 1; }
+  # Worktree mode: $cwd is the origin's per-session worktree (same root on every host).
+  # Materialize it locally from its branch on origin if absent, rather than hard-failing.
+  if [[ ! -d $cwd ]]; then
+    local _pr _ps; _pr=$(_dev_repo_of_dir "$cwd"); _ps=${_pr#*$'\t'}; _pr=${_pr%%$'\t'*}
+    [[ -n $_pr && -n $_ps ]] && _dev_worktree_enabled "$_pr" && _dev_worktree_create "$_pr" "$_ps" >/dev/null
+  fi
   [[ -d $cwd ]] || { echo "dev: $cwd doesn't exist here — clone/sync the repo first." >&2; return 1; }
 
   echo "⟳ Pulling ${sid[1,8]}… ($cwd) from $host → here"
@@ -2421,28 +2658,38 @@ _dev_resume_session() {
 #     raw `tmux attach` hint for these derived keys.
 #   • Slot: first dev-<repo>-<n> with no running session (mirrors `dev`).
 _dev_slot_for_cwd() {
-  local cwd="$1" key match
-  # Find the DEV_REPOS key for this cwd. Prefer an exact path match; otherwise
-  # accept a subdir/worktree of a repo (cwd under "$path/"). Longest matching
-  # path wins so a nested repo beats its parent.
-  local best_len=0
-  for key in ${(k)DEV_REPOS}; do
-    local repodir="${DEV_REPOS[$key]}"
-    if [[ "$cwd" == "$repodir" || "$cwd" == "$repodir"/* ]]; then
-      (( ${#repodir} > best_len )) && { match="$key"; best_len=${#repodir}; }
-    fi
-  done
-  # No DEV_REPOS match → derive a key from the dir's basename so ANY session is
-  # resumable (e.g. ~/code/dotfiles → "dotfiles"). Such a session still appears
-  # in `dev list`, but dev/tread validate against DEV_REPOS and won't know
-  # the key — so tpush prints a raw `tmux attach` hint for it instead.
-  if [[ -z "$match" ]]; then
+  local cwd="$1" match slot=
+  # Resolve the DEV_REPOS alias (and a worktree's own slot, if any) via the shared
+  # resolver — handles exact dirs, subdirs, AND per-session worktrees uniformly.
+  local r; r=$(_dev_repo_of_dir "$cwd")
+  if [[ -n $r ]]; then
+    match=${r%%$'\t'*}; slot=${r#*$'\t'}
+  else
+    # No DEV_REPOS match → derive a key from the dir's basename so ANY session is
+    # resumable (e.g. ~/code/dotfiles → "dotfiles"). Such a session still appears
+    # in `dev list`, but dev/tread validate against DEV_REPOS and won't know
+    # the key — so tpush prints a raw `tmux attach` hint for it instead.
     match="${cwd:t}"                       # :t = basename
     match="${match//[^A-Za-z0-9_-]/-}"     # sanitise for a tmux session name
   fi
   [[ -n "$match" ]] || return 1
 
-  # Next free slot: first dev-<repo>-<n> with no running session (mirrors `dev`).
+  # A worktree path names its own slot: that's the ONLY slot whose cwd is this dir
+  # (one worktree per slot). Free → use it; taken → FAIL rather than fall into the
+  # generic scan, which would return a different slot number while cwd stays pinned
+  # to this worktree — pairing the new slot with another slot's checkout/branch and
+  # colliding with the live owner already in it. Callers handle the "couldn't map".
+  # "Taken" is judged by session_path, not by name alone: an unrelated dev-<repo>-<n>
+  # session rooted elsewhere (a stale shared-tree slot from before worktree-per-session,
+  # or a same-named session in another checkout) does NOT own this worktree, so the
+  # slot is still ours to claim.
+  if [[ -n $slot ]]; then
+    local existing_path
+    existing_path=$(tmux display-message -p -t "dev-${match}-${slot}" '#{session_path}' 2>/dev/null)
+    [[ -n $existing_path && ${existing_path:A} == ${cwd:A} ]] && return 1
+    print -r -- "$match $slot"; return 0
+  fi
+  # Else next free slot: first dev-<repo>-<n> with no running session (mirrors `dev`).
   local n=1
   while (( n <= 20 )); do
     tmux has-session -t "dev-${match}-${n}" 2>/dev/null || { print -r -- "$match $n"; return 0; }
@@ -2843,6 +3090,14 @@ _tbeam_kill_owner() {
 # first-class dev-<repo>-<slot> that dev/tread/tpop already understand. fg mode
 # just resumes the conversation in this ssh session's foreground.
 _tbeam_land() {
+  # Worktree mode: TB_CWD is the origin's per-session worktree path. The worktree root
+  # is the same on every host, so if it does not exist here yet, materialize the slot's
+  # worktree from its branch on origin (else fresh off main) before landing. (Unpushed
+  # working-tree edits at beam time are NOT carried — see the tbeam note in CLAUDE.md.)
+  if [[ ! -d $TB_CWD ]]; then
+    local _br _bs; _br=$(_dev_repo_of_dir "$TB_CWD"); _bs=${_br#*$'\t'}; _br=${_br%%$'\t'*}
+    [[ -n $_br && -n $_bs ]] && _dev_worktree_enabled "$_br" && _dev_worktree_create "$_br" "$_bs" >/dev/null
+  fi
   cd "$TB_CWD" 2>/dev/null || { echo "tbeam: $TB_CWD not found on ${HOST:-this host}" >&2; return 1; }
   if [[ "$TB_MODE" == fg ]]; then
     exec claude -r "$TB_SID"                     # owns this ssh TTY; dies with it

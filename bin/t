@@ -51,7 +51,9 @@ ZSH_PRELUDE = "setopt no_monitor no_notify 2>/dev/null; "
 
 # ─── config ──────────────────────────────────────────────────────────────────
 
-_CFG_LINE = re.compile(r"^(DEV_REPOS|DEV_BRANCHES|REMOTE_HOSTS)\[([^\]]+)\]=(.*)$|^(DEV_BRANCH)=(.*)$")
+_CFG_LINE = re.compile(
+    r"^(DEV_REPOS|DEV_BRANCHES|REMOTE_HOSTS|DEV_WORKTREE)\[([^\]]+)\]=(.*)$"
+    r"|^(DEV_BRANCH|DEV_WORKTREE_ROOT|DEV_WORKTREE_DEFAULT)=(.*)$")
 
 
 def _unquote(v):
@@ -72,6 +74,9 @@ class Config:
         self.branches = {}   # alias -> branch
         self.hosts = {}      # alias -> ssh target
         self.branch = "dev/claude-1"
+        self.worktree = {}   # alias -> opt-out flag (0/no/off → shared-tree)
+        self.worktree_root = os.path.join(HOME, "code", ".worktrees")
+        self.worktree_default = "1"
         self._load()
 
     def _load(self):
@@ -87,18 +92,46 @@ class Config:
             if m.group(1):
                 arr, key, val = m.group(1), m.group(2), _unquote(m.group(3))
                 {"DEV_REPOS": self.repos, "DEV_BRANCHES": self.branches,
-                 "REMOTE_HOSTS": self.hosts}[arr][key] = val
-            elif m.group(4):
+                 "REMOTE_HOSTS": self.hosts, "DEV_WORKTREE": self.worktree}[arr][key] = val
+            elif m.group(4) == "DEV_BRANCH":
                 self.branch = _unquote(m.group(5))
+            elif m.group(4) == "DEV_WORKTREE_ROOT":
+                self.worktree_root = _unquote(m.group(5))
+            elif m.group(4) == "DEV_WORKTREE_DEFAULT":
+                self.worktree_default = _unquote(m.group(5))
+
+    def repo_of_dir(self, cwd):
+        """(alias, slot) for a path — the Python twin of zsh _dev_repo_of_dir. slot is
+        the worktree's own slot ($DEV_WORKTREE_ROOT/<basename>/<slot>), else "". Alias
+        choice mirrors zsh: the key equal to the basename wins, else the shortest key.
+        (None, None) when no repo matches."""
+        base, slot = None, ""
+        root = self.worktree_root
+        if root and cwd.startswith(root + "/"):
+            parts = cwd[len(root) + 1:].split("/")
+            if len(parts) >= 2:
+                base, slot = parts[0], parts[1]
+        if base is None:
+            best = ""
+            for path in self.repos.values():
+                if cwd == path or cwd.startswith(path + "/"):
+                    if len(path) > len(best):
+                        best = path
+            if not best:
+                return (None, None)
+            base = os.path.basename(best)
+        matches = [k for k, v in self.repos.items() if os.path.basename(v) == base]
+        if not matches:
+            return (None, None)
+        if base in matches:
+            return (base, slot)
+        return (min(matches, key=len), slot)
 
     def repo_dir_for_cwd(self, cwd):
-        """Longest DEV_REPOS path that is cwd or an ancestor of it, else ''."""
-        best = ""
-        for path in self.repos.values():
-            if cwd == path or cwd.startswith(path + "/"):
-                if len(path) > len(best):
-                    best = path
-        return best
+        """Canonical DEV_REPOS dir for cwd (or for the worktree containing it), else ''.
+        Worktree-aware via repo_of_dir."""
+        alias, _ = self.repo_of_dir(cwd)
+        return self.repos.get(alias, "") if alias else ""
 
 
 # ─── shell-out helpers ─────────────────────────────────────────────────────────
@@ -159,10 +192,16 @@ def _parse_rows(text, host_prefixed=False):
     return rows
 
 
-def _scope_filter(rows, scope):
+def _scope_filter(rows, scope, wt_scope=""):
+    """Keep rows whose cwd is under <scope> OR under <wt_scope> (the repo's worktree
+    root $DEV_WORKTREE_ROOT/<basename>, where per-session worktrees live)."""
     if not scope:
         return rows
-    return [r for r in rows if r["cwd"] == scope or r["cwd"].startswith(scope + "/")]
+    def ok(c):
+        if c == scope or c.startswith(scope + "/"):
+            return True
+        return bool(wt_scope) and c.startswith(wt_scope + "/")
+    return [r for r in rows if ok(r["cwd"])]
 
 
 def _header(st, scope):
@@ -176,16 +215,17 @@ def _header(st, scope):
 
 def cmd_ls(cfg, args):
     scope = "" if args.all else cfg.repo_dir_for_cwd(os.getcwd())
+    wt_scope = os.path.join(cfg.worktree_root, os.path.basename(scope)) if scope else ""
     st = Style()
     if args.remote:
-        rows = _scope_filter(_parse_rows(zsh_capture("_dev_rows_all"), host_prefixed=True), scope)
+        rows = _scope_filter(_parse_rows(zsh_capture("_dev_rows_all"), host_prefixed=True), scope, wt_scope)
         if not rows:
             where = f" in {os.path.basename(scope)} (t ls -r --all for every repo)," if scope else ""
             print(f"No dev sessions running{where} on this machine or any reachable host.")
             return 0
         _render_remote(rows, scope, st)
     else:
-        rows = _scope_filter(_parse_rows(zsh_capture("_dev_session_rows")), scope)
+        rows = _scope_filter(_parse_rows(zsh_capture("_dev_session_rows")), scope, wt_scope)
         if not rows:
             where = f" in {os.path.basename(scope)}" if scope else ""
             hints = ([f"t ls --all for every repo"] if scope else []) + \
@@ -389,6 +429,12 @@ def cmd_read(cfg, args):
     # first slot's log.
     if repo is not None and repo.isdigit() and not slot:
         repo, slot = None, repo
+    # Inside a slot's worktree with no slot given → default to that worktree's slot
+    # (so bare `t read` in ~/code/.worktrees/<repo>/3 reads slot 3, not slot 1).
+    if not slot:
+        _wa, _ws = cfg.repo_of_dir(os.getcwd())
+        if _ws:
+            slot = _ws
     if not repo:
         repo = _infer_repo(cfg, slot or "1")
     if not repo or repo not in cfg.repos:

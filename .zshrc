@@ -519,25 +519,13 @@ _tpaste_claude_ready() {
   return 1
 }
 
-# tpaste — paste an iCloud Drive screenshot/doc path into a dev tmux session
-#
-# Usage: tpaste [-n] [repo] [slot]
-#
-# Commands:
-#   tpaste          fzf-pick a file, new session for the repo you're standing in
-#   tpaste 3        pick a file, paste into this repo's slot 3 (repo from $PWD)
-#   tpaste api      pick a file, start a new api session and queue it
-#   tpaste api 3    pick a file, paste into dev-api-3 (creating it if needed)
-#
-# Options:
-#   -n, --newest   skip the picker; take the newest file by mtime (fast path)
-#   -p, --pick     accepted for back-compat (the picker is now the default)
-#
-# Covers images (png/jpg/jpeg/heic) and docs (pdf/txt/md/csv/docx) in the iCloud
-# Drive root, newest first. The picker opens whenever there is a TTY + fzf; with
-# neither (or -n) it falls back to the newest file. Press Enter to send it.
+# _t_paste [-n] [-p] [repo] [slot] — the `t paste` verb: paste an iCloud Drive screenshot/doc
+# path into a dev tmux session. Covers images (png/jpg/jpeg/heic) and docs (pdf/txt/md/csv/
+# docx) in the iCloud Drive root, newest first; fzf-picks when there is a TTY + fzf, else (or
+# with -n) falls back to the newest file. -p/--pick is a back-compat no-op (the picker is the
+# default). User-facing help lives in bin/t (`t paste -h`) — the shim routes -h there, so this
+# helper takes none of its own.
 _t_paste() {
-  [[ "$1" == -h || "$1" == --help ]] && { _help_for _t_paste; return 0; }
   # The picker is the default; -n/--newest forces the no-prompt fast path.
   # -p/--pick is kept as a no-op so old muscle memory/scripts still work.
   local newest=0 arg
@@ -1074,6 +1062,27 @@ _dev_dir_in_scope() {
   [[ -n $DEV_WORKTREE_ROOT && $d == $DEV_WORKTREE_ROOT/${scope:t}/* ]]
 }
 
+# _dev_ensure_session_cwd <cwd> — print a directory in which a session recorded at <cwd>
+# can be resumed, materializing it on demand. <cwd> still present → echo it unchanged.
+# <cwd> is a per-session worktree that is ABSENT here — a transcript synced from another
+# machine (only the branch + transcript travel, never the ephemeral worktree) or a slot
+# whose worktree was reaped after merge — → rebuild it from its branch on origin via
+# _dev_worktree_create and echo the (identical) path, so `claude -r` lands on the same cwd
+# the transcript recorded. Returns 1 when <cwd> is gone and is not a recoverable worktree
+# (a non-DEV dir, or a worktree-opt-out repo) so the caller can error. This is what
+# restores manual resume-through-sync under worktree-per-session: the worktree dir is
+# ephemeral, but its branch + transcript are durable, so we rebuild the dir when needed —
+# the same engine tbeam's _tbeam_land / _dev_pull already use on the receive side.
+_dev_ensure_session_cwd() {
+  local cwd="$1"
+  [[ -d $cwd ]] && { print -r -- "$cwd"; return 0; }
+  local r repo slot; r=$(_dev_repo_of_dir "$cwd") || return 1
+  repo=${r%%$'\t'*}; slot=${r#*$'\t'}
+  [[ -n $repo && -n $slot ]] || return 1   # not a worktree path → nothing to rebuild
+  _dev_worktree_enabled "$repo" || return 1
+  _dev_worktree_create "$repo" "$slot"     # prints the rebuilt path, or returns 1
+}
+
 # _dev_cwd_repo_dir — print the canonical DEV_REPOS directory that contains $PWD (or
 # whose worktree contains $PWD), else nothing. The scope source for `dev ls`. Derived
 # from _dev_repo_of_dir so it is worktree-aware: standing inside a slot's worktree still
@@ -1512,42 +1521,14 @@ _dev_new_session() {
   tmux send-keys -t "$session" "${prep}claude --session-id $sid; exit" Enter
 }
 
-# dev — open/reattach a Claude Code tmux session (local or on another host)
-#
-# Usage: dev <repo> [slot|new] [-f]
-#        dev -r [repo [slot]]
-#
-# Commands:
-#   dev <repo> [slot|new]        open/reattach (slot 1-4, or 'new' to force fresh)
-#   dev <id> | <repo> fg|<id>    reattach a foreground (:fg) session here (claude -r;
-#                                stops its terminal-bound owner — matches how it runs);
-#                                <id> is the short hex id `t ls` shows (dot:a4aa5f6a)
-#   dev -r [repo [slot]]         attach a slot that's live on another $REMOTE_HOSTS
-#                                host (host auto-inferred; fzf-pick if several match)
-#   dev list | ls [-r] [-a]      list dev sessions (attached + active context),
-#                                scoped to the repo you're in; -a/--all for every
-#                                repo; -r spans every $REMOTE_HOSTS host (cross-host)
-#   dev kill <repo> <slot|all>   tear down a session  [-y to skip the confirm]
-#   dev -r kill <repo> [slot]    tear down a slot on its $REMOTE_HOSTS host instead
-#
-# Options:
-#   -f, --fg     no tmux: foreground-RESUME the named slot if it's live (≡ tpop),
-#                else git setup + a fresh claude inline (alias: --no-tmux)
-#   -y, --yes    dev kill: skip the "Claude is live" confirm (alias: --force)
-#                A slot that is not live HERE but is live on a $REMOTE_HOSTS host is
-#                found automatically and attached IN PLACE there (host inferred) — no
-#                flag needed; a live LOCAL slot always wins. open never MOVES a session
-#                between machines — that is `tbeam` (send) / `tbeam --from` (receive).
-#   -r, --remote  FORCE the remote branch even when a local slot exists; with `ls`
-#                 list every host; with `kill` kill it there; bare `t open -r` picks
-#   -l, --local   FORCE this machine: skip the remote auto-attach probe, so a slot
-#                 live only on another host is left there and a fresh LOCAL slot is
-#                 opened instead (alias: --here; --here --fg = local foreground)
-#
-# repo is a key of DEV_REPOS (configured in ~/.zshrc.local). The checked-out branch
-# is per-repo (DEV_BRANCHES[repo], else $DEV_BRANCH). dev kill matches session names,
-# so it also reaches orphaned sessions whose repo alias is gone (dev kill dotfiles 1).
-# Surveying what's live everywhere is `dev ls -r`; sending a session away is `tbeam`.
+# _t_dev — the engine behind `t open`: open/reattach a Claude Code tmux session, local or on
+# another host. Resolves the repo from $PWD when called bare, and a slot that is live only on
+# another $REMOTE_HOSTS host is found and attached IN PLACE there (host inferred) — a live LOCAL
+# slot always wins, and open never MOVES a session between machines (that is `t beam`). Handles
+# --new (fresh), --fg (no tmux: foreground-resume the slot if live, else a fresh inline claude),
+# -r/--host (remote), and -l/--local (force this machine). repo is a DEV_REPOS key; the branch
+# is per-repo (DEV_BRANCHES[repo], else $DEV_BRANCH). User-facing help lives in bin/t
+# (`t open -h`); the t() shim routes -h there, so this helper takes none of its own.
 _t_dev() {
   local no_tmux= force= remote= all= local_only=
   local -a pos
@@ -1558,7 +1539,6 @@ _t_dev() {
   # stray -f on a kill is just an inert no-op rather than a silent force.
   for arg in "$@"; do
     case "$arg" in
-      -h|--help)         _help_for _t_dev; return 0 ;;
       -f|--fg|--no-tmux) no_tmux=1 ;;
       -y|--yes|--force)  force=1 ;;
       -r|--remote)       remote=1 ;;
@@ -2268,21 +2248,12 @@ _dev_pull() {
 
 # (tread removed — `t read` is reimplemented natively in bin/t.)
 
-# tplan — render the plan a Claude session wrote
-#
-# Usage: tplan [repo|session] [slot] | --all
-#
-# Commands:
-#   tplan            inside Claude: THIS session; else fzf-pick scoped to $PWD
-#   tplan api 1      the session running in tmux dev-api-1
-#   tplan dev-web-2  that tmux session by full name
-#   tplan --all      fzf-pick across every project
-#
-# Resolves a session like the dev/tpop family, then renders the last plan it
-# saved (an absolute ~/.claude/plans/<slug>.md path in the transcript). glow
-# word-wraps for narrow mobile terminals (Termius), falling back to less.
+# _t_plan — the `t plan` verb: render the last plan a Claude session wrote. Resolves a session
+# like the `t pop` family (repo+slot, a full dev-<repo>-<slot> name, or inside Claude the
+# current session, --all to fzf-pick every project), then renders the last ~/.claude/plans/
+# <slug>.md path referenced in its transcript — glow word-wraps for narrow mobile terminals,
+# falling back to less. User-facing help lives in bin/t (`t plan -h`); the shim routes -h there.
 _t_plan() {
-  [[ "$1" == -h || "$1" == --help ]] && { _help_for _t_plan; return 0; }
   local sid
   if [[ "$1" == "--all" || "$1" == "-a" ]]; then
     local row
@@ -2357,20 +2328,13 @@ _t_plan() {
   fi
 }
 
-# tfind — find the Claude session working on something you describe
-#
-# Usage: tfind [-k] <query…>
-#
-# Options:
-#   -k, --keyword   skip Sonnet; fast offline keyword ranking (works with no CLI)
-#
-# Semantic search, not grep: a keyword pass over titles + your prompts gathers
-# candidates (padded with recent sessions so divergent phrasing still gets a shot),
-# then Sonnet ranks the genuinely-relevant ones and your fzf pick foreground-resumes
-# (the same landing as tpop). Falls back to keyword order if the claude CLI is
-# unreachable. Searches every project — use dev/tpush/tpop when you know the slot.
+# _t_find — the `t find` verb: find the Claude session working on something you describe.
+# Semantic search, not grep: a keyword pass over titles + your prompts gathers candidates
+# (padded with recent sessions so divergent phrasing still gets a shot), Sonnet ranks the
+# genuinely-relevant ones (falling back to keyword order when the claude CLI is unreachable),
+# and your fzf pick foreground-resumes (the same landing as `t pop`). Searches every project.
+# User-facing help lives in bin/t (`t find -h`); the t() shim routes -h there.
 _t_find() {
-  [[ "$1" == -h || "$1" == --help ]] && { _help_for _t_find; return 0; }
   local keyword=
   [[ "$1" == "-k" || "$1" == "--keyword" ]] && { keyword=1; shift; }
   [[ -n "$1" ]] || { echo "Usage: tfind [-k] <words describing the session>"; return 1; }
@@ -2388,7 +2352,15 @@ _t_find() {
   local sid cwd
   sid=${row%%$'\t'*}
   cwd=${${row#*$'\t'}%%$'\t'*}
-  [[ -d $cwd ]] || { echo "Session's directory no longer exists: $cwd"; return 1; }
+  # Resume-through-sync: a picked session may be a per-session worktree absent here (created
+  # on another machine, or reaped after merge). Rebuild it from its branch rather than failing.
+  # _dev_ensure_session_cwd prints nothing on failure, so capture into a temp and only overwrite
+  # $cwd on success — else the error message below would have lost the session path (matches the
+  # same fix in _t_push).
+  local resolved
+  resolved=$(_dev_ensure_session_cwd "$cwd") \
+    || { echo "Session's directory no longer exists and could not be rebuilt: $cwd" >&2; return 1; }
+  cwd=$resolved
   echo "Resuming claude -r ${sid[1,8]}… in $cwd"
   cd "$cwd" && claude -r "$sid"
 }
@@ -2534,12 +2506,36 @@ _claude_session_rows() {
   local projects="$HOME/.claude/projects"
   [[ -d $projects ]] || { echo "No Claude sessions at $projects" >&2; return 1; }
   local filter="${1:-}" query="${2:-}"
+  # Worktree-aware scoping: a per-session worktree's recorded cwd lives under
+  # DEV_WORKTREE_ROOT, NOT under the repo dir, so a raw-$PWD prefix match would hide every
+  # worktree session of the repo you are standing in — including one synced from another
+  # machine, where only the branch + transcript travel (the worktree dir never does). So
+  # resolve the filter to its canonical repo dir (works whether $PWD is the repo or one of
+  # its worktrees) and hand python both that dir and DEV_WORKTREE_ROOT so it also matches
+  # the repo's worktrees (mirrors _dev_dir_in_scope). Non-DEV dirs keep the raw prefix.
+  if [[ -n $filter ]]; then
+    local _r; _r=$(_dev_repo_of_dir "$filter" 2>/dev/null)
+    [[ -n $_r ]] && filter="${DEV_REPOS[${_r%%$'\t'*}]}"
+  fi
 
-  python3 - "$projects" "$filter" "$query" <<'PY'
+  DEV_WORKTREE_ROOT="$DEV_WORKTREE_ROOT" python3 - "$projects" "$filter" "$query" <<'PY'
 import json, os, sys, glob, datetime
 root = sys.argv[1]
 filt = sys.argv[2] if len(sys.argv) > 2 else ''
 query = sys.argv[3] if len(sys.argv) > 3 else ''
+# DEV_WORKTREE_ROOT lets the scope test treat a per-session worktree
+# ($DEV_WORKTREE_ROOT/<repo-basename>/<slot>) as belonging to its repo — the twin of the
+# zsh _dev_dir_in_scope, so the repo-scoped picker shows worktree (incl. synced) sessions.
+wt_root = os.environ.get('DEV_WORKTREE_ROOT', '')
+def _in_scope(cwd):
+    if not filt:
+        return True
+    cwd = cwd or ''
+    if cwd == filt or cwd.startswith(filt + os.sep):
+        return True
+    if wt_root and cwd.startswith(os.path.join(wt_root, os.path.basename(filt.rstrip('/'))) + os.sep):
+        return True
+    return False
 # Query terms, minus a few stopwords so "redesign of portfolio tab" matches on
 # the words that carry meaning, not "of". Short tokens like "ui"/"db" survive.
 STOP = {'of','the','a','an','to','on','in','for','and','is','it','with','at'}
@@ -2581,7 +2577,7 @@ for f in glob.glob(os.path.join(root, '*', '*.jsonl')):
                 except ValueError: pass
     except OSError:
         continue
-    if filt and not (cwd == filt or (cwd or '').startswith(filt + os.sep)):
+    if not _in_scope(cwd):
         continue
     # ── Relevance scoring (search mode) ──────────────────────────────────────
     # The tunable heart of `tfind`: how much each match counts. A term in the
@@ -2757,23 +2753,16 @@ _tpush_claude_pid() {
   return 1
 }
 
-# tpush — push a Claude session into a detached background tmux session
-#
-# Usage: tpush [-p] [-a]
-#
-# Options:
-#   -p, --pick   force the picker even when a current session is detectable
-#   -a, --all    picker across every project (default: scoped to $PWD)
-#
-# Inside Claude (CLAUDE_CODE_SESSION_ID set): grabs THIS session + $PWD — how /tmux
-# backgrounds the current chat. From a plain shell: fzf-pick a session. Resumes via
-# `claude -r` into a dev-named slot; attach with the printed command. Refuses to
-# nest when already in tmux. Inverse of tpop.
+# _t_push — the `t push` verb: push a Claude session into a detached background tmux slot.
+# Inside Claude (CLAUDE_CODE_SESSION_ID set) it grabs THIS session + $PWD; from a plain shell
+# it fzf-picks one (scoped to $PWD, -a for every project, -p to force the picker). Resumes via
+# `claude -r` into a dev-named slot; refuses to nest when already in tmux. Inverse of `t pop`.
+# User-facing help lives in bin/t (`t push -h`); the t() shim routes -h there, so the -h case
+# in the loop below is gone (it could never be reached).
 _t_push() {
   local pick= all= a
   for a in "$@"; do
     case "$a" in
-      -h|--help) _help_for _t_push; return 0 ;;
       -p|--pick) pick=1 ;;
       -a|--all)  pick=1; all=1 ;;   # --all implies the picker, unfiltered
     esac
@@ -2796,7 +2785,14 @@ _t_push() {
     cwd=${${row#*$'\t'}%%$'\t'*}
   fi
 
-  [[ -d $cwd ]] || { echo "Session's directory no longer exists: $cwd"; return 1; }
+  # Resume-through-sync: a session picked from a synced transcript may be a per-session
+  # worktree that does not exist here (it was created on another machine, or reaped after
+  # merge). Rebuild it from its branch rather than hard-failing; only a truly unrecoverable
+  # dir (non-DEV, or worktree-opt-out repo) errors out.
+  local resolved
+  resolved=$(_dev_ensure_session_cwd "$cwd") \
+    || { echo "Session's directory no longer exists and could not be rebuilt: $cwd" >&2; return 1; }
+  cwd=$resolved
 
   # Already backgrounded? If this exact conversation is running under any slot,
   # reuse it rather than spawning a duplicate. _dev_resume_session stashes
@@ -2885,19 +2881,12 @@ _t_push() {
   fi
 }
 
-# tpop — pull a tmux'd Claude session back to the foreground
-#
-# Usage: tpop [repo|session] [slot]
-#
-# Commands:
-#   tpop            the dev session for the current dir
-#   tpop api 3      dev-api-3
-#   tpop dev-web-1  that session by full name
-#
-# Kills the tmux session and resumes its conversation here with `claude -r` (the
-# inverse of tpush). Run from a plain shell, not inside the session you're popping.
+# _t_pop — the `t pop` verb: pull a tmux'd Claude session back to the foreground. Targets the
+# dev session for the current dir when bare, `t pop api 3` (dev-api-3), or a full dev-<repo>-
+# <slot> name. Kills the tmux session and resumes its conversation here with `claude -r` (the
+# inverse of `t push`); run from a plain shell, not inside the session you are popping.
+# User-facing help lives in bin/t (`t pop -h`); the t() shim routes -h there.
 _t_pop() {
-  [[ "$1" == -h || "$1" == --help ]] && { _help_for _t_pop; return 0; }
   local session
   if [[ "$1" == dev-* ]]; then
     session="$1"
@@ -3113,42 +3102,15 @@ _tbeam_land() {
   print -r -- "$session"                        # last line: caller reads it for the hint
 }
 
-# tbeam — move a Claude session between machines (send by default; --from receives)
-#
-# Usage: tbeam [flags] [repo [slot]] [host]
-#        tbeam <repo>:<id> [host]                  (beam a foreground session)
-#        tbeam <repo> [slot] --from <host>        (pull a session HERE)
-#        tbeam [repo [slot]] --here               (pull HERE, auto-find the host)
-#
-# Arguments:
-#   repo        a DEV_REPOS key → beam that dev slot's session (like tpop/tplan);
-#               omit to beam THIS conversation (inside Claude) or fzf-pick
-#   repo:id     a FOREGROUND label from `t ls` (a claude run directly in a
-#               terminal) → beam that session by id (lands in tmux unless -f)
-#   slot        which dev-<repo>-<slot> (default: its first live slot)
-#   host        destination machine (default: $TBEAM_HOST). A bare positional is
-#               read as a host only when it isn't a DEV_REPOS key.
-#
-# Options:
-#   --from <host>       RECEIVE: pull <repo> [slot] from <host> onto THIS machine
-#                       (the mirror of the default send; repo required)
-#   --here              RECEIVE, auto-host: pull it back here without naming the host
-#                       (auto-detects where the slot is live; bare → pick any remote)
-#   -f, --fg            resume in the foreground, no tmux slot (dies if the shell
-#                       drops; needs a terminal, so not usable from inside Claude)
-#   -d, --detach        leave it running on <host>, just print how to attach
-#   -p, --pick          force the picker even when a session is detectable
-#   -a, --all           picker across every project
-#   -s, --session <id>  target a session by id or unique prefix, not the picker
-#
-# Like tpush, but across machines — and a MOVE, not a copy: after the session lands on
-# the far side, the origin's live owner is stopped so exactly one claude owns the id
-# (the same invariant tpush/tpop protect). Both directions are here: by default tbeam
-# SENDS THIS conversation (or an fzf pick) to <host>, lands it in a detached dev slot,
-# and ssh's you in; `--from <host>` RECEIVES — pulls a session that lives on <host> down
-# into a local dev slot. (To merely ATTACH a remote slot without moving it, use `t open
-# <repo> <slot>` — it auto-finds and attaches in place on its host.) The repo must exist
-# at the same ~/code path on both; the transcript is rsync'd before it resumes.
+# _t_beam — the `t beam` verb: move a Claude session between machines. Like `t push`, but across
+# machines — and a MOVE, not a copy: after the session lands on the far side the origin's live
+# owner is stopped so exactly one claude owns the id (the invariant `t push`/`t pop` protect).
+# Both directions live here: by default it SENDS THIS conversation (or an fzf pick) to a host
+# (--host, default $TBEAM_HOST), lands it in a detached dev slot, and ssh's you in; `--from
+# <host>` (or `--here` to auto-find the host) RECEIVES — pulls a session living on another host
+# down into a local slot. To merely ATTACH a remote slot without moving it, use `t open <repo>
+# <slot>`. The repo must exist at the same ~/code path on both; the transcript is rsync'd before
+# it resumes. User-facing help lives in bin/t (`t beam -h`); the t() shim routes -h there.
 _t_beam() {
   # while/shift (not for-in) so -s/--session can consume the following token as
   # its value; the `=`-joined forms (-s=… / --session=…) work too.
@@ -3156,7 +3118,6 @@ _t_beam() {
   local -a pos=()
   while (( $# )); do
     case "$1" in
-      -h|--help)            _help_for _t_beam; return 0 ;;
       -f|--fg)              fg=1 ;;
       -d|--detach)          detach=1 ;;
       -p|--pick)            pick=1 ;;
@@ -3327,12 +3288,17 @@ _t_beam() {
   fi
   [[ $sid == "$CLAUDE_CODE_SESSION_ID" && -n $CLAUDE_CODE_SESSION_ID ]] && self_move=1
   [[ -n $CLAUDE_CODE_SESSION_ID ]] && detach=1      # no TTY in Claude's Bash subprocess to ssh -t into
-  [[ -d $cwd ]] || { echo "tbeam: session's directory no longer exists: $cwd" >&2; return 1; }
-
-  # The far side resumes by cd'ing into the same path — bail early if it's absent.
-  if ! ssh "$host" "test -d ${(q)cwd}" 2>/dev/null; then
-    echo "tbeam: $cwd doesn't exist on $host — clone/sync the repo there first." >&2
-    return 1
+  # Resume-through-sync for the picker is handled on the FAR side: _tbeam_land materializes
+  # a missing per-session worktree from its branch before resuming. Don't rebuild it here —
+  # the send path only needs the cwd as a path string (for the transcript rsync + TB_CWD),
+  # and creating a local worktree would leave a stray checkout behind on a move. For the
+  # same reason, only require the cwd to pre-exist on the host for NON-worktree paths;
+  # worktree paths (under $DEV_WORKTREE_ROOT) are materialized by _tbeam_land.
+  if [[ -z $DEV_WORKTREE_ROOT || $cwd != $DEV_WORKTREE_ROOT/* ]]; then
+    if ! ssh "$host" "test -d ${(q)cwd}" 2>/dev/null; then
+      echo "tbeam: $cwd doesn't exist on $host — clone/sync the repo there first." >&2
+      return 1
+    fi
   fi
 
   echo "⟳ Beaming ${sid[1,8]}… ($cwd) → $host"

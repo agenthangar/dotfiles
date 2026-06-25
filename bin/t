@@ -617,7 +617,12 @@ examples:
 Run `t <verb> -h` for a verb's own flags.""")
     sub = p.add_subparsers(dest="verb", metavar="<verb>")
 
-    sp = sub.add_parser("open", help="open or reattach a session in a per-repo tmux slot")
+    sp = sub.add_parser("open", help="open or reattach a session in a per-repo tmux slot",
+        description="Open or reattach a Claude session in a per-repo tmux slot. Bare `t open` "
+            "(or a lone slot like `t open 3`) targets the repo your cwd is in. A slot that is "
+            "live only on another host is attached in place automatically — no flag needed. "
+            "`--new` forces a fresh session, `--fg` runs inline without a tmux slot, and "
+            "`-r`/`--host` open or attach on a remote host (`-r --new` starts one there).")
     sp.add_argument("repo", nargs="?", help="DEV_REPOS key, or a foreground session id/repo:id from `t ls`")
     sp.add_argument("slot", nargs="?", help="slot number, 'fg' (adopt a :fg session), or a session id")
     sp.add_argument("--new", action="store_true", help="force a fresh session")
@@ -626,27 +631,50 @@ Run `t <verb> -h` for a verb's own flags.""")
     sp.add_argument("-r", "--remote", action="store_true", help="remote: attach a live slot on any host; with --new, start one on the default host")
     sp.add_argument("--host", help="which host to open/attach on (sets the host for -r; default for --new: first $REMOTE_HOSTS)")
 
-    sp = sub.add_parser("ls", help="list dev sessions (attached + active context)")
+    sp = sub.add_parser("ls", help="list dev sessions (attached + active context)",
+        description="List live Claude dev sessions: whether each is attached, and whether it "
+            "has an active conversation loaded (vs. parked on the startup splash). Scoped to the "
+            "repo your cwd is in by default; `-a` widens to every repo, and `-r` spans every "
+            "$REMOTE_HOSTS machine in one table with a HOST column. Read-only — attach with "
+            "`t open`, move with `t beam`.")
     sp.add_argument("-r", "--remote", action="store_true", help="span every $REMOTE_HOSTS host")
     sp.add_argument("-a", "--all", action="store_true", help="every repo (not just the current)")
 
-    sp = sub.add_parser("kill", help="tear down a session")
-    sp.add_argument("repo", nargs="?")
-    sp.add_argument("slot", nargs="?")
+    sp = sub.add_parser("kill", help="tear down a session",
+        description="Tear down a dev session (kill its tmux slot). Names default to the cwd "
+            "repo, so `t kill 3` kills this repo's slot 3 and `t kill all` kills every slot for "
+            "it. Confirms first while a Claude is live unless `-y`; `-r` kills a slot on its "
+            "remote host instead.")
+    sp.add_argument("repo", nargs="?", help="DEV_REPOS key; defaults to the repo your cwd is in")
+    sp.add_argument("slot", nargs="?", help="slot number; a lone slot implies the cwd repo")
     sp.add_argument("-y", "--yes", action="store_true", help="skip the 'Claude is live' confirm")
     sp.add_argument("-r", "--remote", action="store_true", help="kill it on its host instead")
 
-    sp = sub.add_parser("push", help="push this session into a detached background tmux slot")
+    sp = sub.add_parser("push", help="push this session into a detached background tmux slot",
+        description="Push the current Claude session into a detached background tmux slot — "
+            "frees this terminal while the conversation keeps running. Inside Claude it "
+            "backgrounds THIS chat (and exits it for you); from a plain shell it fzf-picks a "
+            "session (scoped to the cwd repo, `-a` for every project). Bring it back with "
+            "`t pop`. Inverse of `t pop`.")
     sp.add_argument("-p", "--pick", action="store_true", help="force the picker")
     sp.add_argument("-a", "--all", action="store_true", help="picker across every project")
 
-    sp = sub.add_parser("pop", help="pull a tmux'd session back to the foreground")
-    sp.add_argument("repo", nargs="?")
-    sp.add_argument("slot", nargs="?")
+    sp = sub.add_parser("pop", help="pull a tmux'd session back to the foreground",
+        description="Pull a backgrounded (tmux'd) session back into THIS terminal and resume it "
+            "in the foreground. Names default to the cwd repo, so `t pop` picks this repo's slot "
+            "and `t pop api 3` pulls dev-api-3. Inverse of `t push`.")
+    sp.add_argument("repo", nargs="?", help="DEV_REPOS key; defaults to the repo your cwd is in")
+    sp.add_argument("slot", nargs="?", help="slot number; a lone slot implies the cwd repo")
 
-    sp = sub.add_parser("beam", help="move a session between machines (send, or --from to receive)")
-    sp.add_argument("repo", nargs="?")
-    sp.add_argument("slot", nargs="?")
+    sp = sub.add_parser("beam", help="move a session between machines (send, or --from to receive)",
+        description="Move a Claude session between machines (a cross-host push/pop). By default "
+            "SENDS the resolved session to --host (default $TBEAM_HOST) and resumes it there; "
+            "`--from HOST` (or `--here` to auto-detect the host) RECEIVES — pulls a session "
+            "living on another host down into a local slot. It is a move, not a copy: the "
+            "origin's live owner is stopped so exactly one machine owns the conversation. The "
+            "repo must exist at the same path on both hosts.")
+    sp.add_argument("repo", nargs="?", help="DEV_REPOS key; defaults to the repo your cwd is in")
+    sp.add_argument("slot", nargs="?", help="slot number; a lone slot implies the cwd repo")
     sp.add_argument("--host", help="SEND destination machine (default: $TBEAM_HOST)")
     sp.add_argument("--from", dest="from_host", metavar="HOST", help="RECEIVE: pull <repo> [slot] from HOST to this machine")
     sp.add_argument("--here", action="store_true", help="RECEIVE (auto-host): pull it back here, auto-detecting which host it is on")
@@ -656,38 +684,71 @@ Run `t <verb> -h` for a verb's own flags.""")
     sp.add_argument("-a", "--all", action="store_true", help="picker across every project")
     sp.add_argument("-s", "--session", help="target a session by id or unique prefix")
 
-    sp = sub.add_parser("read", help="read a dev slot's scrollable tmux log")
-    sp.add_argument("repo", nargs="?")
-    sp.add_argument("slot", nargs="?")
+    sp = sub.add_parser("read", help="read a dev slot's scrollable tmux log",
+        description="Page a dev slot's captured tmux log (its scrollback) — handy for checking "
+            "on a backgrounded session without attaching. Defaults to `less`; `-d`/`--dump` "
+            "prints straight to stdout and `-n N`/`--tail` keeps only the last N lines (default "
+            "200, implies --dump) — both for phone terminals that can only touch-scroll native "
+            "output. Slot defaults to the cwd repo; a remote slot is read on its host.")
+    sp.add_argument("repo", nargs="?", help="DEV_REPOS key; defaults to the repo your cwd is in")
+    sp.add_argument("slot", nargs="?", help="slot number; a lone slot implies the cwd repo")
     sp.add_argument("-d", "--dump", action="store_true",
                     help="print to stdout (no less) so a mobile terminal can touch-scroll it")
     sp.add_argument("-n", "--tail", nargs="?", const=200, type=int, metavar="N",
                     help="dump only the last N lines to stdout (default 200; implies --dump)")
 
-    sp = sub.add_parser("plan", help="render the plan a session wrote")
-    sp.add_argument("repo", nargs="?")
-    sp.add_argument("slot", nargs="?")
+    sp = sub.add_parser("plan", help="render the plan a session wrote",
+        description="Render the plan a Claude session last wrote (the ExitPlanMode markdown). "
+            "Resolves the session like `t pop` — `t plan api 1`, a full dev-<repo>-<slot> name, "
+            "or inside Claude the current session — then displays it word-wrapped for narrow "
+            "(phone) terminals. `-a` fzf-picks across every project. A remote slot renders on "
+            "its host, where the plan file lives.")
+    sp.add_argument("repo", nargs="?", help="DEV_REPOS key; defaults to the repo your cwd is in")
+    sp.add_argument("slot", nargs="?", help="slot number; a lone slot implies the cwd repo")
     sp.add_argument("-a", "--all", action="store_true", help="fzf-pick across every project")
 
-    sp = sub.add_parser("paste", help="paste the latest iCloud screenshot/doc path into a session")
-    sp.add_argument("repo", nargs="?")
-    sp.add_argument("slot", nargs="?")
+    sp = sub.add_parser("paste", help="paste the latest iCloud screenshot/doc path into a session",
+        description="Paste the path of the latest iCloud screenshot/document into a session's "
+            "input — so a screenshot taken on your phone drops straight into a desktop Claude. "
+            "Takes the newest file by default; `-p` fzf-picks one, `-n` forces newest. Local-"
+            "only: it reads THIS machine's iCloud, so it is not delegated to a remote slot.")
+    sp.add_argument("repo", nargs="?", help="DEV_REPOS key; defaults to the repo your cwd is in")
+    sp.add_argument("slot", nargs="?", help="slot number; a lone slot implies the cwd repo")
     sp.add_argument("-p", "--pick", action="store_true", help="fzf-pick the file instead of taking the newest")
     sp.add_argument("-n", "--newest", action="store_true", help="skip the picker; take the newest file by mtime")
 
-    sp = sub.add_parser("find", help="semantic search across saved sessions, then resume")
+    sp = sub.add_parser("find", help="semantic search across saved sessions, then resume",
+        description="Semantic search across your saved Claude transcripts (\"which session was "
+            "working on X?\"), then resume the one you pick. A keyword pass builds a candidate "
+            "pool, Sonnet reranks it, and every failure path (no CLI, offline, timeout) falls "
+            "back to keyword order so the picker always populates. `-k` forces the offline "
+            "keyword path.")
     sp.add_argument("-k", "--keyword", action="store_true", help="offline keyword ranking (no Sonnet)")
-    sp.add_argument("query", nargs="*")
+    sp.add_argument("query", nargs="*", help="search terms (omit to browse recent sessions)")
 
-    sp = sub.add_parser("on", help="run a command on a remote host (or open a shell)")
-    sp.add_argument("host")
-    sp.add_argument("rest", nargs=argparse.REMAINDER)
+    sp = sub.add_parser("on", help="run a command on a remote host (or open a shell)",
+        description="Run a command on another machine over ssh, in a login+interactive shell so "
+            "the dev tooling and Homebrew are on PATH (e.g. `t on mini t ls`). With no command, "
+            "opens an interactive shell there. Hosts come from $REMOTE_HOSTS; an unknown name is "
+            "used as a literal ssh target.")
+    sp.add_argument("host", help="$REMOTE_HOSTS key, or a literal ssh target")
+    sp.add_argument("rest", nargs=argparse.REMAINDER, help="command to run (omit for an interactive shell)")
 
     # machine-readable / internal (hidden-ish; still have -h)
-    sub.add_parser("session-rows", help="machine-readable per-host scan (remote contract)")
-    sub.add_parser("land", help="(internal) resume a beamed session on this host")
-    sub.add_parser("kill-owner", help="(internal) stop the local owner of a session id")
-    rp = sub.add_parser("__resolve", help="(internal) resolve a shell action for the t() shim")
+    sub.add_parser("session-rows", help="machine-readable per-host scan (remote contract)",
+        description="Internal/machine-readable: emit one tab-separated row per live dev slot on "
+            "this host. Part of the cross-host remote contract `t ls -r` and `t beam` run over "
+            "ssh; not meant to be called directly.")
+    sub.add_parser("land", help="(internal) resume a beamed session on this host",
+        description="Internal: resume a just-beamed session on this (the receiving) host, "
+            "reading its parameters from TB_* env vars. Invoked over ssh by `t beam`; not for "
+            "direct use.")
+    sub.add_parser("kill-owner", help="(internal) stop the local owner of a session id",
+        description="Internal: stop the local live owner (dev slot) of a session id, enforcing "
+            "`t beam`'s one-live-owner-per-conversation invariant. Invoked over ssh; not for "
+            "direct use.")
+    rp = sub.add_parser("__resolve", help="(internal) resolve a shell action for the t() shim",
+        description="Internal: resolve a shell action for the t() zsh shim. Not for direct use.")
     rp.add_argument("rest", nargs=argparse.REMAINDER)
     return p
 

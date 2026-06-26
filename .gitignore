@@ -7,6 +7,11 @@
 __pycache__/
 *.pyc
 
+# pytest / coverage artifacts from the test suite (see tests/, pyproject.toml)
+.pytest_cache/
+.coverage
+htmlcov/
+
 # Per-machine/private shell config (real repo paths, hosts) — never committed.
 # It lives in $HOME, not the repo, but ignore it as defense-in-depth.
 .zshrc.local

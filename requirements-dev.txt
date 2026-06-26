@@ -1,0 +1,6 @@
+# Developer/CI-only test dependencies. NOT installed by install.sh — the
+# user-facing dotfiles stay dependency-free. Install with:
+#   pip install -r requirements-dev.txt
+# then run the suite with `python3 -m pytest`.
+pytest>=8,<9
+pytest-cov>=5,<7

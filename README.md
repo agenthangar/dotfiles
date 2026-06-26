@@ -145,6 +145,21 @@ It runs two ways, both wired by `install.sh`:
 
 Run it by hand anytime: `pii-scan` (all tracked files) or `pii-scan --staged`.
 
+## Tests
+
+The Python CLIs (`bin/t`, `bin/pr-watch`) have a `pytest` suite covering their
+pure logic (config parsing, path→repo resolution, the capture-pane ANSI stripper,
+PR triage). The test deps are **dev/CI-only** — `install.sh` never installs them.
+
+```sh
+pip install -r requirements-dev.txt
+python3 -m pytest                       # run the suite
+python3 -m pytest --cov --cov-report=term-missing   # with coverage
+```
+
+CI runs it as the `pytest` job, gated by `--cov-fail-under` (a ratchet that only
+goes up). The gate feeds the single required `CI` check like every other job.
+
 ## Install on a new machine
 
 **Requirements:** macOS · zsh · [Claude Code](https://claude.com/claude-code) ·

@@ -1,0 +1,45 @@
+# Config-only: pytest + coverage settings for the test suite. This is NOT a
+# packaging manifest — the repo ships no installable Python package; bin/t and
+# bin/pr-watch are standalone executables. No [build-system] table on purpose.
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.coverage.run]
+# Coverage attributes lines through each module's importlib-set __file__, so we
+# scope measurement to the two bin scripts under test (the */ prefix tolerates
+# the absolute CWD). This keeps the percentage about the code we test rather
+# than letting unmeasured Bash/zsh dilute it.
+include = ["*/bin/t", "*/bin/pr-watch"]
+
+[tool.coverage.report]
+# Exclude the subprocess/ssh/tmux/launchd shells and the argparse/CLI plumbing:
+# they are exercised end-to-end (and by shellcheck/manual runs), not unit-tested,
+# so measuring them would just dilute the signal on the pure logic we DO test.
+# A regex that matches a `def`/`class` header excludes that whole block, so this
+# scopes coverage to the deterministic helpers without touching the bin scripts.
+exclude_lines = [
+    "pragma: no cover",
+    "if __name__ == .__main__.:",
+    "def main\\(",
+    "def build_parser\\(",
+    "def cmd_",
+    # bin/t subprocess / rendering / tty glue
+    "def zsh_capture\\(",
+    "def _delegate\\(",
+    "def _try_remote_delegate\\(",
+    "def _set_term_title\\(",
+    "def _render_",
+    "def _header\\(",
+    "def _read_usage\\(",
+    "def _columns\\(",
+    "class Style",
+    # bin/pr-watch subprocess / launchd / notification glue
+    "def log\\(",
+    "def run\\(",
+    "def gh_json\\(",
+    "def tmux_alive\\(",
+    "def notify\\(",
+    "def spawn_fix\\(",
+    "def _launchctl\\(",
+]

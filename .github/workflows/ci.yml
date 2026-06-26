@@ -102,6 +102,28 @@ jobs:
         if: always()
         run: rm -f "$RUNNER_TEMP/scrub-rules.json"
 
+  # pytest suite for the pure logic in the Python bins (bin/t, bin/pr-watch).
+  # Coverage is scoped (in pyproject.toml) to those two files and excludes the
+  # subprocess/ssh/tmux/CLI glue, so --cov-fail-under guards the deterministic
+  # helpers we actually test. The threshold is a RATCHET: raise it as coverage
+  # grows, never lower it. (Set a few points below the measured value so a minor
+  # refactor does not spuriously fail; bump it after a meaningful coverage gain.)
+  pytest:
+    name: pytest
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install test deps
+        run: pip install -r requirements-dev.txt
+
+      - name: Run tests with coverage gate
+        run: pytest --cov --cov-report=term-missing --cov-fail-under=95
+
   # The single required status check. Turns green only when every job above
   # succeeds (or is legitimately skipped, e.g. pii-scan on fork/Dependabot PRs).
   # `if: always()` is load-bearing: without it the gate is itself skipped when a
@@ -110,7 +132,7 @@ jobs:
   ci:
     name: CI
     if: always()
-    needs: [shellcheck, gitleaks, pii-scan]
+    needs: [shellcheck, gitleaks, pii-scan, pytest]
     runs-on: ubuntu-latest
     steps:
       - name: Verify all required jobs passed

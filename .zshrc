@@ -302,6 +302,64 @@ _dev_worktree_create() {
   print -r -- "$wt"
 }
 
+# _dev_worktree_beam_push <wt> <host> — ON THE ORIGIN, carry the slot worktree's LIVE edits
+# with a beam. Beam otherwise moves only pushed commits + the transcript, stranding any
+# uncommitted work (the long-standing tbeam gap noted in CLAUDE.md). So before the move we
+# auto-commit ALL changes (tracked AND untracked) as a throwaway WIP commit and push the slot
+# branch to origin, where the destination fast-forwards to it (_dev_worktree_beam_sync). The
+# `[skip ci]` keeps a beam from burning CI on every hop; squash-merge collapses the WIP commits
+# at PR time. No-op unless <wt> is a per-session worktree (under $DEV_WORKTREE_ROOT): opt-out /
+# shared-tree repos are left exactly as before, so a commit here can never sweep up a sibling
+# slot's WIP (the trampling the worktree model exists to prevent). Shared dotfiles code — the
+# RECEIVE path (_dev_pull) runs it on the remote origin over ssh, so args fall back to TB_* env
+# (TB_WT/TB_HOST) to dodge nested-ssh quoting, exactly like _tbeam_land/_tbeam_kill_owner. A
+# failed push WARNS but never aborts the move: the WIP commit is safe in git on the origin, just
+# not yet on the destination — same degraded-not-lost contract as the foreground-kill warning.
+_dev_worktree_beam_push() {
+  local wt="${1:-$TB_WT}" host="${2:-$TB_HOST}"
+  [[ -n $DEV_WORKTREE_ROOT && $wt == ${DEV_WORKTREE_ROOT}/* && -e $wt/.git ]] || return 0
+  local br; br=$(git -C "$wt" symbolic-ref --short -q HEAD) || return 0
+  if [[ -n "$(git -C "$wt" status --porcelain 2>/dev/null)" ]]; then
+    git -C "$wt" add -A 2>/dev/null
+    git -C "$wt" commit -q -m "wip: beam to ${host:-another host} [skip ci]" 2>/dev/null
+  fi
+  if git -C "$wt" push -q origin "HEAD:${br}" 2>/dev/null; then
+    print -r -- "↑ carried ${br} → origin"
+  else
+    print -r -- "tbeam: couldn't push ${br} to origin — destination won't see your latest edits (push them manually)" >&2
+  fi
+}
+
+# _dev_worktree_beam_sync <wt> — ON THE DESTINATION, fast-forward the slot worktree to the
+# branch tip the origin just pushed (_dev_worktree_beam_push), so a beam's uncommitted edits
+# actually land. A FRESHLY created worktree is already at origin/<br> (no-op); an ALREADY-present
+# one — a reattach, or a prior beam left it behind — is reused as-is by _dev_worktree_create and
+# would otherwise be STALE. No-op outside a per-session worktree, mirroring _dev_worktree_beam_push.
+# Shared code (runs on whichever host receives the session, incl. over ssh from _tbeam_land).
+#
+# CONFLICT POLICY: fast-forward ONLY. The origin always commits-all + pushes before a move, so in
+# steady state both ends are clean at beam boundaries and the FF always applies. Divergence here
+# (this worktree holds a local commit that was never pushed) only happens under manual
+# interference, since a move leaves no live session on the destination — so it is WARNED, never
+# `reset --hard`, which would silently destroy that local commit. Matches the conservative house
+# style (the sweep's "any inconclusive answer = do NOT clobber", _dev_repo_prepare's refuse-not-stash).
+_dev_worktree_beam_sync() {
+  local wt="$1"
+  [[ -n $DEV_WORKTREE_ROOT && $wt == ${DEV_WORKTREE_ROOT}/* && -e $wt/.git ]] || return 0
+  local br; br=$(git -C "$wt" symbolic-ref --short -q HEAD) || return 0
+  git -C "$wt" fetch -q origin 2>/dev/null
+  local head ref
+  head=$(git -C "$wt" rev-parse -q HEAD 2>/dev/null)
+  ref=$(git -C "$wt" rev-parse -q --verify "origin/${br}" 2>/dev/null)
+  [[ -n $ref && $head != "$ref" ]] || return 0          # no remote branch, or already at the tip
+  if git -C "$wt" merge-base --is-ancestor "$head" "$ref" 2>/dev/null; then
+    git -C "$wt" merge -q --ff-only "origin/${br}" 2>/dev/null \
+      && print -r -- "↓ synced ${br} to the beamed edits"
+  else
+    print -r -- "tbeam: ${wt} diverged from origin/${br} — left as-is (resolve manually)" >&2
+  fi
+}
+
 # _dev_repo_prepare <branch> — put a NEW session's checkout on <branch> without
 # TRAMPLING sibling sessions that share this working tree. Every dev-<repo>-* slot
 # cd's into the SAME tree, so the old `git stash; checkout; pull` dance was
@@ -2190,6 +2248,10 @@ _dev_pull() {
   local cwd=${${row#*$'\t'}%%$'\t'*}
   local fslot=${${${row#*$'\t'}#*$'\t'}%%$'\t'*}
   [[ -n $sid && $sid != - ]] || { echo "dev: $host/$fslot has no active conversation to pull" >&2; return 1; }
+  # Carry the origin worktree's uncommitted edits with the move: commit-all + push its branch
+  # ON the remote (over ssh, work passed in TB_* env like _tbeam_land) so the local worktree can
+  # fast-forward to them below. The mirror of the SEND path's local _dev_worktree_beam_push.
+  ssh "$target" "TB_WT=${(q)cwd} TB_HOST=${(q)$(hostname -s)} zsh -lic _dev_worktree_beam_push" 2>/dev/null
   # Worktree mode: $cwd is the origin's per-session worktree (same root on every host).
   # Materialize it locally from its branch on origin if absent, rather than hard-failing.
   if [[ ! -d $cwd ]]; then
@@ -2197,6 +2259,7 @@ _dev_pull() {
     [[ -n $_pr && -n $_ps ]] && _dev_worktree_enabled "$_pr" && _dev_worktree_create "$_pr" "$_ps" >/dev/null
   fi
   [[ -d $cwd ]] || { echo "dev: $cwd doesn't exist here — clone/sync the repo first." >&2; return 1; }
+  _dev_worktree_beam_sync "$cwd"      # fast-forward to the edits the origin just pushed
 
   echo "⟳ Pulling ${sid[1,8]}… ($cwd) from $host → here"
   _tbeam_pull_transcript "$cwd" "$target" || return 1
@@ -3082,12 +3145,16 @@ _tbeam_kill_owner() {
 _tbeam_land() {
   # Worktree mode: TB_CWD is the origin's per-session worktree path. The worktree root
   # is the same on every host, so if it does not exist here yet, materialize the slot's
-  # worktree from its branch on origin (else fresh off main) before landing. (Unpushed
-  # working-tree edits at beam time are NOT carried — see the tbeam note in CLAUDE.md.)
+  # worktree from its branch on origin (else fresh off main) before landing. Uncommitted
+  # edits ride along too now: the origin commit-all + pushed before the move, and the
+  # _dev_worktree_beam_sync below fast-forwards this worktree to them.
   if [[ ! -d $TB_CWD ]]; then
     local _br _bs; _br=$(_dev_repo_of_dir "$TB_CWD"); _bs=${_br#*$'\t'}; _br=${_br%%$'\t'*}
     [[ -n $_br && -n $_bs ]] && _dev_worktree_enabled "$_br" && _dev_worktree_create "$_br" "$_bs" >/dev/null
   fi
+  # Fast-forward the worktree to the edits the origin just pushed (no-op for a freshly created
+  # one, already at the tip; the real work is when this worktree pre-existed and was reused stale).
+  _dev_worktree_beam_sync "$TB_CWD"
   cd "$TB_CWD" 2>/dev/null || { echo "tbeam: $TB_CWD not found on ${HOST:-this host}" >&2; return 1; }
   if [[ "$TB_MODE" == fg ]]; then
     exec claude -r "$TB_SID"                     # owns this ssh TTY; dies with it
@@ -3268,7 +3335,11 @@ _t_beam() {
       sid=${${tx[1]:t}%.jsonl}
     fi
     [[ -n $sid ]] || { echo "tbeam: couldn't find a session id for $session" >&2; return 1; }
-    cwd=${DEV_REPOS[$repo_arg]}
+    # The session's REAL dir is its tmux session_path ($dir) — the per-session worktree for
+    # a worktree repo, the dev clone for an opt-out one. Use it (not the canonical DEV_REPOS
+    # dir) so the transcript rsync + TB_CWD + the worktree push below all target where the
+    # session actually runs; fall back to the repo dir only if session_path is unreadable.
+    cwd=${dir:-${DEV_REPOS[$repo_arg]}}
   elif [[ -n $sid_arg ]]; then
     setopt local_options null_glob
     local -a tx=( "$HOME/.claude/projects"/*/"$sid_arg"*.jsonl )
@@ -3303,6 +3374,7 @@ _t_beam() {
   fi
 
   echo "⟳ Beaming ${sid[1,8]}… ($cwd) → $host"
+  _dev_worktree_beam_push "$cwd" "$host"        # carry uncommitted worktree edits ahead of the move
   _tbeam_sync_transcript "$cwd" "$host" || return 1
 
   # It's a MOVE, not a copy: now that the transcript is on $host, stop the origin

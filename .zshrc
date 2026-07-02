@@ -1265,10 +1265,11 @@ _dev_list() {
     printf '  %s %s     %-*s %s%s%s\n' "${g}●${r0}" "$cmark" $name_w "$_fslot" "$y" "$fsummary" "$r0"
   done <<< "$fgrows"
   # reattach legend: tmux slots via `t open <repo> <slot>`; a foreground (:fg) row is
-  # bound to its terminal, so it comes back foreground via `t open <id>` (shown
-  # only when the list actually has a :fg row).
+  # bound to its terminal, so it comes back foreground via `t open <id>`. Kill a :fg row
+  # (a foreground claude or a pr-watch `pr-*` session) with `t kill <id>` — it is not a
+  # dev slot, so `t kill <repo> <slot>` does not apply. Both shown only when a :fg row exists.
   local foot="reattach: t open <repo> <slot>"
-  [[ -n $fgrows ]] && foot+=" · foreground: t open <id>"
+  [[ -n $fgrows ]] && foot+=" · foreground: t open <id> · kill: t kill <id>"
   print -r -- ""
   print -r -- "  ${y}${foot}${r0}"
 }
@@ -1423,7 +1424,7 @@ _dev_list_remote() {
   # present — slot is field 4 of the prefixed rows).
   local foot="attach (auto-finds its host): t open <repo> <slot> · pull here: t beam <repo> <slot> --from <host>"
   print -r -- "$rows" | awk -F'\t' '$4 ~ /:/{f=1} END{exit !f}' \
-    && foot+=" · foreground: t on <host> t open <id>"
+    && foot+=" · foreground: t on <host> t open <id> · kill: t kill -r <id>"
   print -r -- ""
   print -r -- "  ${y}${foot}${r0}"
 }
@@ -1446,6 +1447,98 @@ _dev_kill_one() {
     print
   fi
   tmux kill-session -t "$session" 2>/dev/null && echo "Killed $session"
+}
+
+# _dev_tmux_session_of_pid <pid> — print the tmux session <pid> runs inside (walk its
+# ancestry until an ancestor is some pane's pid), else return 1. Lets _dev_kill_fg tell a
+# claude living in a NON-dev tmux session (e.g. pr-watch's `pr-dotfiles-N` — kill the
+# whole session) from a true no-tmux foreground claude (SIGTERM the process). The map is
+# built over ALL sessions, not just dev-*, precisely because these targets are non-dev.
+_dev_tmux_session_of_pid() {
+  local pid="$1" line up
+  [[ -n $pid ]] || return 1
+  local -A pane2sess
+  for line in ${(f)"$(tmux list-panes -a -F '#{pane_pid} #{session_name}' 2>/dev/null)"}; do
+    pane2sess[${line%% *}]=${line#* }
+  done
+  up=$pid
+  while [[ -n $up && $up != 1 ]]; do
+    [[ -n ${pane2sess[$up]} ]] && { print -r -- ${pane2sess[$up]}; return 0; }
+    up=$(ps -o ppid= -p $up 2>/dev/null | tr -d ' ')
+  done
+  return 1
+}
+
+# _dev_kill_fg <handle> [force] — kill FOREGROUND / non-dev-slot claude sessions: the
+# `<repo>:<id>` / `<repo>:fg` rows `t ls` shows via _dev_fg_rows (live claudes not owned
+# by a dev-<repo>-<slot> pane — true foreground claudes AND claudes in a non-dev tmux
+# session like pr-watch's `pr-dotfiles-N`). _dev_kill only tears down dev slots, so this
+# is the companion path for those rows — the gap that made `t kill dotfiles-pr47` report
+# "no session". Matches <handle> against the displayed label exactly (`repo:id`/`repo:fg`),
+# the label's repo part when that part is NOT itself a DEV_REPOS key (so `t kill
+# dotfiles-pr47` reaches `dotfiles-pr47:fg` while `t kill dotfiles` still lists dev
+# slots), or a bare short session-id prefix. Kill mechanics via _dev_tmux_session_of_pid:
+# a claude inside a tmux session → kill that session; a no-tmux claude → SIGTERM it (clean
+# exit, transcript stays resumable — the same signal tpush sends). Confirms once per
+# target while a conversation is live unless <force>. Returns 0 if it killed something, 1
+# if a row matched but was not killed (confirm declined / kill failed), 2 if nothing
+# matched — so _dev_kill only falls through to its "no session" path on a true miss (2),
+# not after a deliberate skip. The pid scan
+# mirrors _dev_fg_rows so the same rows are addressable; it deliberately excludes dev-slot
+# claudes and the claude THIS shell runs under (never kill the session you are typing in).
+_dev_kill_fg() {
+  local handle="$1" force="$2"
+  [[ -n $handle ]] || return 1
+  setopt local_options null_glob
+  local reg="${XDG_CACHE_HOME:-$HOME/.cache}/claude-sessions"
+  local -A inslot; local s p
+  for s in ${(f)"$(tmux list-sessions -F '#{session_name}' 2>/dev/null | grep '^dev-')"}; do
+    p=$(_dev_session_claude_pid "$s") && [[ -n $p ]] && inslot[$p]=1
+  done
+  local me up=$$
+  while [[ -n $up && $up != 1 ]]; do
+    [[ "$(ps -o comm= -p $up 2>/dev/null)" == claude ]] && { me=$up; break; }
+    up=$(ps -o ppid= -p $up 2>/dev/null | tr -d ' ')
+  done
+  local idpart="${handle##*:}"
+  local pid cwd repo sid label context title m tsess killed= matched=
+  local -a tx
+  for pid in ${(f)"$(ps -Axo pid,comm 2>/dev/null | awk '{n=$2; sub(/.*\//,"",n)} n=="claude"{print $1}')"}; do
+    [[ -n ${inslot[$pid]} || $pid == $me ]] && continue
+    sid= cwd=
+    [[ -r $reg/$pid ]] && IFS=$'\t' read -r sid cwd < "$reg/$pid"
+    [[ -n $cwd ]] || cwd=$(lsof -a -p "$pid" -d cwd -Fn 2>/dev/null | sed -n 's/^n//p' | head -1)
+    [[ -n $cwd ]] || continue
+    repo=$(_dev_repo_of_dir "$cwd" 2>/dev/null); repo=${repo%%$'\t'*}
+    [[ -n $repo ]] || repo=${cwd:t}
+    if [[ -n $sid && $sid != - ]]; then label="${repo}:${sid[1,8]}"; else label="${repo}:fg"; fi
+    m=
+    if [[ $handle == $label ]]; then m=1
+    elif [[ $handle == $repo && -z ${DEV_REPOS[$handle]:-} ]]; then m=1
+    elif [[ $handle != *:* && -n $sid && $sid != - && ${sid[1,${#handle}]} == $handle ]]; then m=1
+    fi
+    [[ -n $m ]] || continue
+    matched=1
+    context=idle
+    if [[ -n $sid && $sid != - ]]; then
+      tx=( "$HOME/.claude/projects"/*/"$sid".jsonl(N) )
+      [[ -n ${tx[1]} ]] && title=$(_transcript_title "${tx[1]}") && [[ -n $title ]] && context=active
+    fi
+    if [[ -z $force && $context == active ]]; then
+      read -q "REPLY?Kill $label? Claude is live there (context interrupted). [y/N] " \
+        || { print; echo "Skipped $label."; continue; }
+      print
+    fi
+    tsess=$(_dev_tmux_session_of_pid "$pid")
+    if [[ -n $tsess ]]; then
+      tmux kill-session -t "$tsess" 2>/dev/null && { echo "Killed $label (tmux session $tsess)"; killed=1; }
+    else
+      kill -TERM "$pid" 2>/dev/null && { echo "Killed $label (foreground pid $pid)"; killed=1; }
+    fi
+  done
+  [[ -n $killed ]] && return 0
+  [[ -n $matched ]] && return 1
+  return 2
 }
 
 # _dev_kill <repo> <slot|all> [force] — tear down dev-<repo>-<slot> sessions.
@@ -1496,6 +1589,7 @@ _dev_kill() {
       print -r -- "t kill — tear down a dev session (or all of a repo's)"
       print -r -- ""
       print -r -- "Usage: t kill [repo] <slot|all> [-y]   (no repo: the one \$PWD is in; --remote kills on its host)"
+      print -r -- "       t kill <id>                     (a foreground / :fg row from \`t ls\` — e.g. a pr-watch pr-* session)"
     } | _help_style
     return 1
   fi
@@ -1513,6 +1607,15 @@ _dev_kill() {
     # to look.
     if [[ -n $slot && $slot != all ]]; then
       _dev_remote_delegate "$repo" "$slot" kill ${force:+-y} && return
+    fi
+    # No dev slot here. The target may be a FOREGROUND / non-dev-slot claude — the
+    # `<repo>:<id>` / `:fg` rows `t ls` shows (a true foreground claude or a pr-watch
+    # `pr-*` session). Those never match the dev-slot grep above, so try that path
+    # before giving up (only for a slot-less handle — fg rows carry no slot number).
+    # rc 2 = no fg row matched → fall through; 0/1 = matched (killed / skipped) → done.
+    if [[ -z $slot ]]; then
+      _dev_kill_fg "$repo" "$force"; local _frc=$?
+      (( _frc != 2 )) && return $_frc
     fi
     echo "No sessions for '$repo' here."
     [[ -z $slot || $slot == all ]] && (( ${#REMOTE_HOSTS} )) && \
@@ -2156,6 +2259,45 @@ _dev_session_remote_fallback() {
   _dev_remote_delegate "$repo" "$slot" "$verb" "$@"
 }
 
+# _dev_remote_fg_kill <handle> <force> — the cross-host companion of _dev_kill_fg: kill a
+# FOREGROUND / non-dev-slot claude (`<repo>:<id>` / `:fg` row) living on a REMOTE host.
+# _dev_remote_resolve deliberately drops `:`-labelled rows, so those handles can't be
+# resolved as dev slots; here we scan _dev_rows_all (which DOES include each host's fg
+# rows) for the hosts carrying a match — exact label, the label's repo part (when <handle>
+# is not a local DEV_REPOS key), or a bare id prefix — then delegate `t kill <handle>` to
+# each host, letting its own _dev_kill_fg re-match and tear down every local target.
+# Hosts are de-duped so one `t kill dotfiles-pr47` reaches all of a host's matches in one
+# ssh. Returns 0 if every addressed host succeeded, 1 if a host was addressed but an ssh
+# failed, 2 if nothing matched — so _dev_remote_kill only falls through to the dev-slot
+# resolver on a true miss (2), not after a real (if failed) fg delegation.
+_dev_remote_fg_kill() {
+  local handle="$1" force="$2"
+  local idpart="${handle##*:}"
+  # _dev_rows_all columns: host(1) sid(2) cwd(3) label(4) state(5) context(6) summary(7).
+  # fg rows carry a `:` in the label; dev slots use `-`. isrepo!="" ⇒ <handle> is a real
+  # DEV_REPOS key, so the repo-part branch is suppressed (a bare `t kill -r dotfiles`
+  # must resolve dev slots, not a same-repo fg row).
+  local hosts; hosts=$(_dev_rows_all 2>/dev/null \
+    | awk -F'\t' -v h="$handle" -v idp="$idpart" -v isrepo="${DEV_REPOS[$handle]:+1}" '
+        $1 != "local" && $4 ~ /:/ {
+          repo=$4; sub(/:.*/, "", repo);
+          if ($4==h || (h==repo && isrepo=="") || (index(h,":")==0 && $2!="-" && index($2,idp)==1))
+            if (!seen[$1]++) print $1
+        }')
+  [[ -n $hosts ]] || return 2
+  local host rtarget rcmd rc=0
+  for host in ${(f)hosts}; do
+    rtarget="${REMOTE_HOSTS[$host]:-$host}"
+    rcmd="t kill ${(q)handle}"
+    [[ -n $force ]] && rcmd+=" -y"
+    echo "→ Killing foreground '$handle' on $host"
+    _term_title "$host: kill $handle"
+    ssh -t "$rtarget" "zsh -lic ${(qq)rcmd}" || rc=1
+  done
+  _term_title ""
+  return $rc
+}
+
 # _dev_remote_kill <repo> <slot> <force> — `dev -r kill <repo> [slot]`: resolve a live
 # REMOTE slot (host auto-inferred / fzf-picked, _dev_remote_resolve) and tear it down
 # ON that host by running `dev kill <repo> <slot>` there over ssh -t (so its confirm
@@ -2218,6 +2360,15 @@ _dev_remote_kill() {
     done
     _term_title ""
     return $rc
+  fi
+  # Foreground / non-dev-slot sessions (`<repo>:<id>` / `:fg` rows) live outside the
+  # dev-slot model _dev_remote_resolve handles (it excludes `:`-labelled rows), so try
+  # them first when no slot was named. On a hit we delegate to each host, whose own
+  # `t kill` re-runs the fg match and tears down its targets (see _dev_kill_fg). rc 2 =
+  # no fg row matched → fall through to the dev-slot resolver; 0/1 = handled → done.
+  if [[ -z $slot ]]; then
+    _dev_remote_fg_kill "$repo" "$force"; local _frc=$?
+    (( _frc != 2 )) && return $_frc
   fi
   local res; res=$(_dev_remote_resolve "$repo" "$slot") || return 1
   local host=${res%%$'\t'*} prepo=${${res#*$'\t'}%%$'\t'*} pslot=${res##*$'\t'}

@@ -643,9 +643,11 @@ Run `t <verb> -h` for a verb's own flags.""")
     sp = sub.add_parser("kill", help="tear down a session",
         description="Tear down a dev session (kill its tmux slot). Names default to the cwd "
             "repo, so `t kill 3` kills this repo's slot 3 and `t kill all` kills every slot for "
-            "it. Confirms first while a Claude is live unless `-y`; `-r` kills a slot on its "
-            "remote host instead.")
-    sp.add_argument("repo", nargs="?", help="DEV_REPOS key; defaults to the repo your cwd is in")
+            "it. A foreground / :fg row from `t ls` (a bare `claude`, or a pr-watch `pr-*` "
+            "session) is killed by its shown id/label — `t kill dotfiles-pr47:fg` or `t kill "
+            "<short-id>` — since it is not a dev slot. Confirms first while a Claude is live "
+            "unless `-y`; `-r` kills it on its remote host instead.")
+    sp.add_argument("repo", nargs="?", help="DEV_REPOS key (or a :fg id/label); defaults to the repo your cwd is in")
     sp.add_argument("slot", nargs="?", help="slot number; a lone slot implies the cwd repo")
     sp.add_argument("-y", "--yes", action="store_true", help="skip the 'Claude is live' confirm")
     sp.add_argument("-r", "--remote", action="store_true", help="kill it on its host instead")

@@ -148,9 +148,13 @@ resume_hint() {  # <ssh-prefix-or-empty> <chat-id> <cwd-or-empty>
   local cmd="cursor-agent --resume=$id"
   [[ -n "$cwd" ]] && cmd="cd $cwd && $cmd"
   if [[ -n "$where" ]]; then
-    echo "Resume it: $where \"zsh -lic '$cmd'\""
+    # Over ssh the login keychain is locked and cursor-agent refuses to start
+    # (its creds live there) — unlock first, in the same shell. Verified: the
+    # unlock does not propagate from another ssh shell's security session.
+    echo "Resume it: $where \"security unlock-keychain && zsh -lic '$cmd'\""
   else
     echo "Resume it: $cmd"
+    echo "  (over ssh, run: security unlock-keychain  first — cursor-agent's creds live in the locked login keychain)"
   fi
   # Not && — this is the script's last command on the send path, and the
   # failed test would become a spurious rc 1.
@@ -256,7 +260,9 @@ fi
 echo "✓ Chat $id landed on $host${rcwd:+ (workspace $rcwd)}."
 if (( attach )) && [[ -t 0 && -t 1 ]]; then
   # zsh -lic: cursor-agent installs to ~/.local/bin, which is on the
-  # interactive PATH — plain ssh would not see it.
-  exec ssh -t "$host" "zsh -lic 'cd ${rcwd:-~} && cursor-agent --resume=$id'"
+  # interactive PATH — plain ssh would not see it. unlock-keychain first:
+  # the ssh login keychain is locked and cursor-agent's creds live there
+  # (prompts for the host's login password on the ssh -t TTY).
+  exec ssh -t "$host" "security unlock-keychain && zsh -lic 'cd ${rcwd:-~} && cursor-agent --resume=$id'"
 fi
 resume_hint "ssh -t $host" "$id" "$rcwd"

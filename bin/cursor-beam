@@ -7,13 +7,16 @@
 #        cursor-beam --ls [--host <h>]           list chats here (or on a host)
 #
 # Arguments:
-#   chat-id      a chat directory name under ~/.cursor/chats/<ws-hash>/ (unique
-#                prefix ok); omitted = the most recently used chat
+#   chat-id      a chat id (unique prefix ok). Omitted = this directory's
+#                newest chat when $PWD is inside a chat's workspace (walks up
+#                like git), else the newest chat overall — so inside a project
+#                you never need an id, exactly like the repo-aware t verbs.
 #
 # Options:
 #   --host <h>   target host (default: $TBEAM_HOST, else first REMOTE_HOSTS key)
 #   --from <h>   reverse direction: pull the chat from <h> to this machine
-#   --ls         list chats instead of moving one
+#   --ls         list chats instead of moving one (id  workspace  when  title)
+#   -p, --pick   pick the chat in fzf (titles + workspaces — no ids needed)
 #   -a, --attach after sending, resume the chat on the host over ssh -t
 #   -h, --help   show this help
 #
@@ -41,7 +44,7 @@ case "${1:-}" in
   -h|--help) awk 'NR==1{next} !/^#/{exit} {sub(/^# ?/,""); print}' "$0"; exit 0 ;;
 esac
 
-chat_id="" host="" from="" do_ls=0 attach=0 do_resume=0
+chat_id="" host="" from="" do_ls=0 attach=0 do_resume=0 do_pick=0
 [[ "${1:-}" == "resume" || "${1:-}" == "open" ]] && { do_resume=1; shift; }
 while (( $# )); do
   case "$1" in
@@ -49,6 +52,7 @@ while (( $# )); do
     --from) from="${2:?--from needs a value}"; shift 2 ;;
     --ls)   do_ls=1; shift ;;
     -a|--attach) attach=1; shift ;;
+    -p|--pick) do_pick=1; shift ;;
     -*) echo "cursor-beam: unknown flag: $1 (-h for help)" >&2; exit 2 ;;
     *)  chat_id="$1"; shift ;;
   esac
@@ -67,6 +71,26 @@ chat_cwd() {  # <chat-dir>
   local meta="$1/meta.json"
   [[ -r "$meta" ]] || return 1
   python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("cwd",""))' "$meta" 2>/dev/null
+}
+
+chat_title() {  # <chat-dir> — the human title cursor-agent wrote (may be empty)
+  local meta="$1/meta.json"
+  [[ -r "$meta" ]] || return 0
+  python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("title",""))' "$meta" 2>/dev/null
+}
+
+# The workspace (hash dir) of $PWD, walking UP like git does — so a subdir of a
+# project still resolves to the chat started at its root. Nearest ancestor with
+# a chats dir wins.
+workspace_of_pwd() {
+  local d="$PWD" h
+  while :; do
+    h=$(md5 -qs "$d")
+    [[ -d "$CHATS/$h" ]] && { echo "$h"; return 0; }
+    [[ "$d" == "/" || "$d" == "$HOME" ]] && break
+    d=$(dirname "$d")
+  done
+  return 1
 }
 
 # Rewrite the cwd recorded in a chat's meta.json (after a cross-machine move —
@@ -112,11 +136,12 @@ translate_path() {  # <cwd> <from-home> <to-home>
   esac
 }
 
-# One row per chat: <chat-id>  <workspace or hash>  <last-used>. Newest first,
-# by the newest file in the chat dir (store.db while a chat is live; a chat
-# that has not had a conversation yet holds only meta.json — still listed).
+# One row per chat: <chat-id>  <workspace or hash>  <last-used>  <title>.
+# Newest first, by the newest file in the chat dir (store.db while a chat is
+# live; a chat that has not had a conversation yet holds only meta.json —
+# still listed). Also the picker's row source.
 list_chats() {
-  local dir ws cwd newest
+  local dir ws cwd newest title
   [[ -d "$CHATS" ]] || { echo "No cursor chats here (~/.cursor/chats is empty)."; return; }
   # shellcheck disable=SC2012
   { ls -dt "$CHATS"/*/*/ 2>/dev/null || true; } | while IFS= read -r dir; do
@@ -124,21 +149,36 @@ list_chats() {
     ws="$(basename "$(dirname "$dir")")"
     cwd="$(chat_cwd "$dir" || true)"
     [[ -n "$cwd" ]] || cwd="$(guess_cwd "$ws" || true)"
+    title="$(chat_title "$dir")"
     # shellcheck disable=SC2012
     newest=$(ls -t "$dir" 2>/dev/null | head -1)
-    printf '%s  %s  %s\n' "$(basename "$dir")" "${cwd:-hash:$ws}" \
-      "$(stat -f '%Sm' -t '%Y-%m-%d %H:%M' "$dir/${newest:-.}")"
+    printf '%s  %s  %s  %s\n' "$(basename "$dir")" "${cwd:-hash:$ws}" \
+      "$(stat -f '%Sm' -t '%Y-%m-%d %H:%M' "$dir/${newest:-.}")" "${title:-(untitled)}"
   done
 }
 
-# Resolve a chat dir under $CHATS: exact id, unique prefix, or (no id) the most
-# recently used chat. Prints the absolute dir.
+# fzf over list_chats rows (title + workspace visible — no id juggling).
+# Prints the picked chat id. Needs a TTY + fzf.
+pick_chat() {
+  [[ -t 0 && -t 1 ]] || { echo "cursor-beam: -p needs a terminal" >&2; return 1; }
+  command -v fzf >/dev/null || { echo "cursor-beam: -p needs fzf" >&2; return 1; }
+  local row
+  row=$(list_chats | fzf --prompt='cursor chat> ' --no-multi) || return 1
+  awk '{print $1}' <<<"$row"
+}
+
+# Resolve a chat dir under $CHATS: exact id, unique prefix, or (no id) the
+# newest chat — scoped to $PWD's workspace when standing in one (the t-family
+# repo-awareness: `t cursor` in ~/code/foo means foo's newest chat, not the
+# globally newest), else the globally newest. Prints the absolute dir.
 resolve_chat() {
-  local id="$1" matches
+  local id="$1" matches="" ws
   if [[ -n "$id" ]]; then
     matches=$(ls -dt "$CHATS"/*/"$id" "$CHATS"/*/"$id"* 2>/dev/null | awk '!seen[$0]++') || true
   else
-    matches=$(ls -dt "$CHATS"/*/*/ 2>/dev/null | head -1 | sed 's:/$::') || true
+    ws=$(workspace_of_pwd || true)
+    [[ -n "$ws" ]] && matches=$(ls -dt "$CHATS/$ws"/*/ 2>/dev/null | head -1 | sed 's:/$::') || true
+    [[ -n "$matches" ]] || matches=$(ls -dt "$CHATS"/*/*/ 2>/dev/null | head -1 | sed 's:/$::') || true
   fi
   [[ -n "$matches" ]] || { echo "cursor-beam: no chat matching '${id:-<latest>}' under $CHATS (--ls to list)" >&2; return 1; }
   if (( $(wc -l <<<"$matches") > 1 )); then
@@ -176,6 +216,7 @@ if (( do_resume )); then
   if [[ -n "$host" ]]; then
     exec ssh -t "$host" "security unlock-keychain && zsh -lic 't cursor resume ${chat_id}'"
   fi
+  if (( do_pick )); then chat_id=$(pick_chat) || exit 1; fi
   dir=$(resolve_chat "$chat_id")
   id="$(basename "$dir")"
   cwd="$(chat_cwd "$dir" || true)"
@@ -194,13 +235,26 @@ fi
 
 # ---- pull (--from) ----
 if [[ -n "$from" ]]; then
-  # Resolve on the far side: id/prefix match, else the host's most recent chat.
-  # bash -c, not the login shell: zsh aborts the whole command on any unmatched
-  # glob, bash hands it to ls where 2>/dev/null swallows it.
+  # Far $HOME + candidate dirs first: the no-id resolution needs the far home
+  # to translate $PWD into the far side's workspace hash.
+  info=$(ssh "$from" 'bash -c "printf \"%s\n\" \"\$HOME\"; ls -d ~/code/*/ ~/github/*/ /Users/Shared/*/ 2>/dev/null"; true')
+  remote_home=$(sed -n 1p <<<"$info")
+
+  # Resolve on the far side: id/prefix match; no id → the far side's newest
+  # chat in THIS directory's workspace ($PWD re-rooted at the far $HOME and
+  # md5'd — `t cursor --from h` in ~/code/foo pulls foo's chat), else the
+  # host's newest chat overall. bash -c, not the login shell: zsh aborts the
+  # whole command on any unmatched glob, bash hands it to ls where 2>/dev/null
+  # swallows it.
+  rdir=""
   if [[ -n "$chat_id" ]]; then
     rdir=$(ssh "$from" "bash -c 'ls -dt ~/.cursor/chats/*/$chat_id* 2>/dev/null | head -1'") || true
   else
-    rdir=$(ssh "$from" "bash -c 'ls -t ~/.cursor/chats/*/*/store.db 2>/dev/null | head -1 | xargs dirname 2>/dev/null'") || true
+    if [[ -n "$remote_home" ]]; then
+      pwd_rhash=$(md5 -qs "$(translate_path "$PWD" "$HOME" "$remote_home")")
+      rdir=$(ssh "$from" "bash -c 'ls -dt ~/.cursor/chats/$pwd_rhash/*/ 2>/dev/null | head -1'" | sed 's:/$::') || true
+    fi
+    [[ -n "$rdir" ]] || rdir=$(ssh "$from" "bash -c 'ls -dt ~/.cursor/chats/*/*/ 2>/dev/null | head -1'" | sed 's:/$::') || true
   fi
   [[ -n "$rdir" ]] || { echo "cursor-beam: no chat matching '${chat_id:-<latest>}' on $from" >&2; exit 1; }
   rhash="$(basename "$(dirname "$rdir")")"
@@ -212,8 +266,6 @@ if [[ -n "$from" ]]; then
   # string needs no remote execution. Unresolved → keep the hash verbatim.
   rmeta=$(ssh "$from" "cat ~/.cursor/chats/$rhash/$id/meta.json 2>/dev/null" || true)
   rcwd=$(python3 -c 'import json,sys; print(json.load(sys.stdin).get("cwd",""))' <<<"$rmeta" 2>/dev/null || true)
-  info=$(ssh "$from" 'bash -c "printf \"%s\n\" \"\$HOME\"; ls -d ~/code/*/ ~/github/*/ /Users/Shared/*/ 2>/dev/null"; true')
-  remote_home=$(sed -n 1p <<<"$info")
   if [[ -z "$rcwd" ]]; then
     while IFS= read -r d; do
       d="${d%/}"
@@ -243,6 +295,7 @@ fi
 # ---- send (default) ----
 host="${host:-$(default_host)}"
 [[ -n "$host" ]] || { echo "cursor-beam: no host (--host <h>, or set TBEAM_HOST / REMOTE_HOSTS)" >&2; exit 2; }
+if (( do_pick )); then chat_id=$(pick_chat) || exit 1; fi
 dir=$(resolve_chat "$chat_id")
 id="$(basename "$dir")"
 rel="${dir#"$CHATS"/}"

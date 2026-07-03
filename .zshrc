@@ -3896,8 +3896,8 @@ _t() {
   fi
   case ${words[2]} in
     cursor)
-      if (( CURRENT == 3 )); then _values 'chat / action' ls resume --from --host
-      else _values 'flag' --host --from -a --attach -h --help; fi ;;
+      if (( CURRENT == 3 )); then _values 'chat / action' ls resume -p --from --host
+      else _values 'flag' --host --from -p --pick -a --attach -h --help; fi ;;
     open|kill|read|plan|paste|beam)
       if   (( CURRENT == 3 )); then _values 'repo' ${(k)DEV_REPOS}
       elif (( CURRENT == 4 )); then _values 'slot' 1 2 3 4 new fg

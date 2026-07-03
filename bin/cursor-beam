@@ -164,9 +164,11 @@ resume_hint() {  # <ssh-prefix-or-empty> <chat-id> <cwd-or-empty>
 # ---- --ls ----
 if (( do_ls )); then
   if [[ -n "$host" ]]; then
-    # Needs the host's dotfiles current (install.sh there links cursor-beam);
-    # zsh -lic for the interactive PATH, same contract as the rest of the family.
-    exec ssh "$host" "zsh -lic 'cursor-beam --ls'"
+    # Via `t cursor`, not bare `cursor-beam`: ~/bin/t is already linked on every
+    # host and resolves cursor-beam as its realpath sibling, so a mere `dots`
+    # there suffices (a new bin symlink would need install.sh). zsh -lic for the
+    # interactive PATH, same contract as the rest of the family.
+    exec ssh "$host" "zsh -lic 't cursor ls'"
   fi
   list_chats
   exit 0

@@ -173,17 +173,20 @@ pick_chat() {
 # globally newest), else the globally newest. Prints the absolute dir.
 resolve_chat() {
   local id="$1" matches="" ws
+  # shellcheck disable=SC2012  # ls -dt is the point: newest-first by mtime
   if [[ -n "$id" ]]; then
     matches=$(ls -dt "$CHATS"/*/"$id" "$CHATS"/*/"$id"* 2>/dev/null | awk '!seen[$0]++') || true
   else
     ws=$(workspace_of_pwd || true)
+    # shellcheck disable=SC2012
     [[ -n "$ws" ]] && matches=$(ls -dt "$CHATS/$ws"/*/ 2>/dev/null | head -1 | sed 's:/$::') || true
+    # shellcheck disable=SC2012
     [[ -n "$matches" ]] || matches=$(ls -dt "$CHATS"/*/*/ 2>/dev/null | head -1 | sed 's:/$::') || true
   fi
   [[ -n "$matches" ]] || { echo "cursor-beam: no chat matching '${id:-<latest>}' under $CHATS (--ls to list)" >&2; return 1; }
   if (( $(wc -l <<<"$matches") > 1 )); then
     echo "cursor-beam: '$id' is ambiguous:" >&2
-    sed 's/^/  /' <<<"$matches" >&2
+    awk '{print "  " $0}' <<<"$matches" >&2
     return 1
   fi
   echo "$matches"
@@ -248,10 +251,12 @@ if [[ -n "$from" ]]; then
   # swallows it.
   rdir=""
   if [[ -n "$chat_id" ]]; then
+    # shellcheck disable=SC2029  # client-side expansion intended (id/hash into the remote cmd)
     rdir=$(ssh "$from" "bash -c 'ls -dt ~/.cursor/chats/*/$chat_id* 2>/dev/null | head -1'") || true
   else
     if [[ -n "$remote_home" ]]; then
       pwd_rhash=$(md5 -qs "$(translate_path "$PWD" "$HOME" "$remote_home")")
+      # shellcheck disable=SC2029
       rdir=$(ssh "$from" "bash -c 'ls -dt ~/.cursor/chats/$pwd_rhash/*/ 2>/dev/null | head -1'" | sed 's:/$::') || true
     fi
     [[ -n "$rdir" ]] || rdir=$(ssh "$from" "bash -c 'ls -dt ~/.cursor/chats/*/*/ 2>/dev/null | head -1'" | sed 's:/$::') || true
@@ -264,6 +269,7 @@ if [[ -n "$from" ]]; then
   # parsed locally — no remote-python quoting); fall back to reversing the
   # workspace hash against the far side's candidate dirs — md5 of a path
   # string needs no remote execution. Unresolved → keep the hash verbatim.
+  # shellcheck disable=SC2029
   rmeta=$(ssh "$from" "cat ~/.cursor/chats/$rhash/$id/meta.json 2>/dev/null" || true)
   rcwd=$(python3 -c 'import json,sys; print(json.load(sys.stdin).get("cwd",""))' <<<"$rmeta" 2>/dev/null || true)
   if [[ -z "$rcwd" ]]; then
@@ -320,6 +326,7 @@ else
 fi
 
 echo "⟳ Beaming chat $id → ${host}…"  # braced: see the bash-3.2 note above
+# shellcheck disable=SC2029  # client-side expansion intended
 ssh "$host" "mkdir -p ~/.cursor/chats/$rhash"
 rsync -a --update "$dir/" "$host:.cursor/chats/$rhash/$id/"
 # The copied meta.json still records THIS machine's cwd — rewrite it to the

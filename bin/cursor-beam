@@ -17,13 +17,16 @@
 #   -h, --help   show this help
 #
 # The cross-host cousin of tbeam for cursor-agent sessions. Chats live in
-# ~/.cursor/chats/<workspace-hash>/<chat-id>/store.db; the workspace hash is
-# md5 of the project cwd, which is identical on every machine (same ~/code
-# layout), so rsyncing the chat dir to the same path ports it. rsync is
-# -a --update with no --delete (a newer remote copy is never clobbered), and
-# csync converges the whole chats tree in the background — cursor-beam is the
-# immediate, targeted move. Like Claude, cursor-agent takes no lock on its
-# store: never drive one chat live on two machines at once.
+# ~/.cursor/chats/<workspace-hash>/<chat-id>/ (meta.json + store.db once a
+# conversation exists); the workspace hash is md5 of the ABSOLUTE project cwd,
+# which differs per machine when usernames differ — so the move translates:
+# the cwd (read from meta.json, else reversed from the hash) is re-rooted at
+# the destination's $HOME, the chat lands under md5 of that path, and the
+# meta.json cwd is rewritten to match. rsync is -a --update with no --delete
+# (a newer remote copy is never clobbered), and csync converges the whole
+# chats tree in the background — cursor-beam is the immediate, targeted move.
+# Like Claude, cursor-agent takes no lock on its store: never drive one chat
+# live on two machines at once.
 set -euo pipefail
 
 CHATS="$HOME/.cursor/chats"
@@ -52,9 +55,31 @@ default_host() {
   [[ -r "$T_CONFIG" ]] && sed -n 's/^REMOTE_HOSTS\[[^]]*\]=//p' "$T_CONFIG" | sort | head -1
 }
 
-# The workspace hash is md5 of the cwd path string. Not reversible, but the
-# candidate set is small: DEV_REPOS values plus the conventional code dirs.
-# Best-effort — an unguessed hash just means a less specific resume hint.
+# A chat's project cwd, from its meta.json — cursor-agent records it there in
+# plaintext ("cwd":"/Users/…"), so prefer that over reversing the hash.
+chat_cwd() {  # <chat-dir>
+  local meta="$1/meta.json"
+  [[ -r "$meta" ]] || return 1
+  python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("cwd",""))' "$meta" 2>/dev/null
+}
+
+# Rewrite the cwd recorded in a chat's meta.json (after a cross-machine move —
+# the origin's absolute path does not exist on the destination).
+patch_meta_cwd() {  # <chat-dir> <new-cwd>
+  local meta="$1/meta.json"
+  [[ -w "$meta" && -n "$2" ]] || return 0
+  python3 -c '
+import json, sys
+p, cwd = sys.argv[1], sys.argv[2]
+d = json.load(open(p))
+d["cwd"] = cwd
+json.dump(d, open(p, "w"), separators=(",", ":"))
+' "$meta" "$2"
+}
+
+# Fallback when a chat has no meta.json: the workspace hash is md5 of the cwd
+# path string. Not reversible, but the candidate set is small: DEV_REPOS values
+# plus the conventional code dirs. Best-effort.
 guess_cwd() {
   local hash="$1" d
   while IFS= read -r d; do
@@ -81,18 +106,22 @@ translate_path() {  # <cwd> <from-home> <to-home>
   esac
 }
 
-# One row per chat: <chat-id>  <workspace or hash>  <last-used>. Newest first
-# (store.db mtime — the file cursor-agent appends to while a chat is live).
+# One row per chat: <chat-id>  <workspace or hash>  <last-used>. Newest first,
+# by the newest file in the chat dir (store.db while a chat is live; a chat
+# that has not had a conversation yet holds only meta.json — still listed).
 list_chats() {
-  local db dir ws cwd
+  local dir ws cwd newest
   [[ -d "$CHATS" ]] || { echo "No cursor chats here (~/.cursor/chats is empty)."; return; }
   # shellcheck disable=SC2012
-  { ls -t "$CHATS"/*/*/store.db 2>/dev/null || true; } | while IFS= read -r db; do
-    dir="${db%/store.db}"
+  { ls -dt "$CHATS"/*/*/ 2>/dev/null || true; } | while IFS= read -r dir; do
+    dir="${dir%/}"
     ws="$(basename "$(dirname "$dir")")"
-    cwd="$(guess_cwd "$ws" || true)"
+    cwd="$(chat_cwd "$dir" || true)"
+    [[ -n "$cwd" ]] || cwd="$(guess_cwd "$ws" || true)"
+    # shellcheck disable=SC2012
+    newest=$(ls -t "$dir" 2>/dev/null | head -1)
     printf '%s  %s  %s\n' "$(basename "$dir")" "${cwd:-hash:$ws}" \
-      "$(stat -f '%Sm' -t '%Y-%m-%d %H:%M' "$db")"
+      "$(stat -f '%Sm' -t '%Y-%m-%d %H:%M' "$dir/${newest:-.}")"
   done
 }
 
@@ -103,7 +132,7 @@ resolve_chat() {
   if [[ -n "$id" ]]; then
     matches=$(ls -dt "$CHATS"/*/"$id" "$CHATS"/*/"$id"* 2>/dev/null | awk '!seen[$0]++') || true
   else
-    matches=$(ls -t "$CHATS"/*/*/store.db 2>/dev/null | head -1 | xargs -I{} dirname {}) || true
+    matches=$(ls -dt "$CHATS"/*/*/ 2>/dev/null | head -1 | sed 's:/$::') || true
   fi
   [[ -n "$matches" ]] || { echo "cursor-beam: no chat matching '${id:-<latest>}' under $CHATS (--ls to list)" >&2; return 1; }
   if (( $(wc -l <<<"$matches") > 1 )); then
@@ -123,7 +152,9 @@ resume_hint() {  # <ssh-prefix-or-empty> <chat-id> <cwd-or-empty>
   else
     echo "Resume it: $cmd"
   fi
-  [[ -z "$cwd" ]] && echo "  (from the chat's project dir)"
+  # Not && — this is the script's last command on the send path, and the
+  # failed test would become a spurious rc 1.
+  if [[ -z "$cwd" ]]; then echo "  (from the chat's project dir)"; fi
 }
 
 # ---- --ls ----
@@ -151,16 +182,20 @@ if [[ -n "$from" ]]; then
   rhash="$(basename "$(dirname "$rdir")")"
   id="$(basename "$rdir")"
 
-  # Reverse the far side's workspace hash HERE: md5 of a path string needs no
-  # remote execution, so one ssh fetches the far $HOME + candidate dirs and the
-  # matching is local. Unreversed hash → keep it verbatim (chat still lands).
+  # The chat's cwd: read it straight out of the far meta.json (fetched raw,
+  # parsed locally — no remote-python quoting); fall back to reversing the
+  # workspace hash against the far side's candidate dirs — md5 of a path
+  # string needs no remote execution. Unresolved → keep the hash verbatim.
+  rmeta=$(ssh "$from" "cat ~/.cursor/chats/$rhash/$id/meta.json 2>/dev/null" || true)
+  rcwd=$(python3 -c 'import json,sys; print(json.load(sys.stdin).get("cwd",""))' <<<"$rmeta" 2>/dev/null || true)
   info=$(ssh "$from" 'bash -c "printf \"%s\n\" \"\$HOME\"; ls -d ~/code/*/ ~/github/*/ /Users/Shared/*/ 2>/dev/null"; true')
-  remote_home=$(head -1 <<<"$info")
-  rcwd=""
-  while IFS= read -r d; do
-    d="${d%/}"
-    [[ -n "$d" && "$(md5 -qs "$d")" == "$rhash" ]] && { rcwd="$d"; break; }
-  done < <(tail -n +2 <<<"$info")
+  remote_home=$(sed -n 1p <<<"$info")
+  if [[ -z "$rcwd" ]]; then
+    while IFS= read -r d; do
+      d="${d%/}"
+      [[ -n "$d" && "$(md5 -qs "$d")" == "$rhash" ]] && { rcwd="$d"; break; }
+    done < <(tail -n +2 <<<"$info")
+  fi
   if [[ -n "$rcwd" ]]; then
     lcwd=$(translate_path "$rcwd" "$remote_home" "$HOME")
     lhash=$(md5 -qs "$lcwd")
@@ -169,8 +204,13 @@ if [[ -n "$from" ]]; then
   fi
 
   mkdir -p "$CHATS/$lhash"
-  echo "⟳ Pulling chat $id from $from…"
+  # ${from} braced: bash 3.2 (macOS default) swallows a following multibyte
+  # char (the …) into the variable name under set -u.
+  echo "⟳ Pulling chat $id from ${from}…"
   rsync -a --update "$from:.cursor/chats/$rhash/$id/" "$CHATS/$lhash/$id/"
+  # The recorded cwd is the ORIGIN's absolute path — rewrite it to the local
+  # one, or cursor-agent here associates the chat with a dir that cannot exist.
+  [[ "$lcwd" != "$rcwd" ]] && patch_meta_cwd "$CHATS/$lhash/$id" "$lcwd"
   echo "✓ Chat $id is here${lcwd:+ (workspace $lcwd)}. Close any live cursor-agent still driving it on $from first."
   resume_hint "" "$id" "$lcwd"
   exit 0
@@ -182,7 +222,8 @@ host="${host:-$(default_host)}"
 dir=$(resolve_chat "$chat_id")
 id="$(basename "$dir")"
 rel="${dir#"$CHATS"/}"
-cwd="$(guess_cwd "$(dirname "$rel")" || true)"
+cwd="$(chat_cwd "$dir" || true)"
+[[ -n "$cwd" ]] || cwd="$(guess_cwd "$(dirname "$rel")" || true)"
 
 # cursor-agent takes no lock on store.db — warn if a live local process looks
 # like it still owns this chat, so two machines never drive one chat at once.
@@ -201,9 +242,17 @@ else
   rcwd=""; rhash="$(dirname "$rel")"
 fi
 
-echo "⟳ Beaming chat $id → $host…"
+echo "⟳ Beaming chat $id → ${host}…"  # braced: see the bash-3.2 note above
 ssh "$host" "mkdir -p ~/.cursor/chats/$rhash"
 rsync -a --update "$dir/" "$host:.cursor/chats/$rhash/$id/"
+# The copied meta.json still records THIS machine's cwd — rewrite it to the
+# host's path. Patched in a local staging copy (JSON handling stays local),
+# then pushed with a plain rsync so it overrides the just-copied file.
+if [[ -n "$rcwd" && "$rcwd" != "$cwd" && -r "$dir/meta.json" ]]; then
+  stage=$(mktemp -d) && trap 'rm -rf "$stage"' EXIT
+  cp "$dir/meta.json" "$stage/" && patch_meta_cwd "$stage" "$rcwd"
+  rsync -a "$stage/meta.json" "$host:.cursor/chats/$rhash/$id/meta.json"
+fi
 echo "✓ Chat $id landed on $host${rcwd:+ (workspace $rcwd)}."
 if (( attach )) && [[ -t 0 && -t 1 ]]; then
   # zsh -lic: cursor-agent installs to ~/.local/bin, which is on the

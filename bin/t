@@ -747,9 +747,10 @@ Run `t <verb> -h` for a verb's own flags.""")
         description="Passthrough to cursor-beam: send/pull/list cursor-agent chats across "
             "machines, translating the md5-of-cwd workspace hash between differing $HOMEs. "
             "`t cursor ls` lists local chats (`--host <h>` for a remote's); `t cursor` sends "
-            "the newest chat to $TBEAM_HOST; `t cursor [id] --from <h>` pulls. Full flag "
-            "reference: cursor-beam -h. Cursor chats have no dev slot, so the other t verbs "
-            "do not apply to them.")
+            "the newest chat to $TBEAM_HOST; `t cursor [id] --from <h>` pulls; `t cursor "
+            "resume [id]` resumes one here (cd to its workspace + keychain unlock over ssh). "
+            "Full flag reference: cursor-beam -h. Cursor chats have no dev slot, so the "
+            "other t verbs do not apply to them.")
     sp.add_argument("rest", nargs=argparse.REMAINDER, help="args forwarded to cursor-beam (ls → --ls)")
 
     sp = sub.add_parser("on", help="run a command on a remote host (or open a shell)",

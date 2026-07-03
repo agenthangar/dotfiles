@@ -3,6 +3,7 @@
 #
 # Usage: cursor-beam [chat-id] [--host <h>]      send a chat to a host
 #        cursor-beam [chat-id] --from <h>        pull a chat from a host
+#        cursor-beam resume [chat-id]            resume a chat here (cd + cursor-agent)
 #        cursor-beam --ls [--host <h>]           list chats here (or on a host)
 #
 # Arguments:
@@ -15,6 +16,10 @@
 #   --ls         list chats instead of moving one
 #   -a, --attach after sending, resume the chat on the host over ssh -t
 #   -h, --help   show this help
+#
+# resume (alias: open) cds to the chat's workspace (from meta.json) and execs
+# cursor-agent --resume; over ssh it unlocks the login keychain first (cursor's
+# creds live there). resume --host <h> resumes on <h> instead.
 #
 # The cross-host cousin of tbeam for cursor-agent sessions. Chats live in
 # ~/.cursor/chats/<workspace-hash>/<chat-id>/ (meta.json + store.db once a
@@ -36,7 +41,8 @@ case "${1:-}" in
   -h|--help) awk 'NR==1{next} !/^#/{exit} {sub(/^# ?/,""); print}' "$0"; exit 0 ;;
 esac
 
-chat_id="" host="" from="" do_ls=0 attach=0
+chat_id="" host="" from="" do_ls=0 attach=0 do_resume=0
+[[ "${1:-}" == "resume" || "${1:-}" == "open" ]] && { do_resume=1; shift; }
 while (( $# )); do
   case "$1" in
     --host) host="${2:?--host needs a value}"; shift 2 ;;
@@ -143,22 +149,11 @@ resolve_chat() {
   echo "$matches"
 }
 
-resume_hint() {  # <ssh-prefix-or-empty> <chat-id> <cwd-or-empty>
-  local where="$1" id="$2" cwd="$3"
-  local cmd="cursor-agent --resume=$id"
-  [[ -n "$cwd" ]] && cmd="cd $cwd && $cmd"
-  if [[ -n "$where" ]]; then
-    # Over ssh the login keychain is locked and cursor-agent refuses to start
-    # (its creds live there) — unlock first, in the same shell. Verified: the
-    # unlock does not propagate from another ssh shell's security session.
-    echo "Resume it: $where \"security unlock-keychain && zsh -lic '$cmd'\""
-  else
-    echo "Resume it: $cmd"
-    echo "  (over ssh, run: security unlock-keychain  first — cursor-agent's creds live in the locked login keychain)"
-  fi
-  # Not && — this is the script's last command on the send path, and the
-  # failed test would become a spurious rc 1.
-  if [[ -z "$cwd" ]]; then echo "  (from the chat's project dir)"; fi
+resume_hint() {  # <chat-id> [host]
+  # `t cursor resume` does the cd + the over-ssh keychain unlock itself, so the
+  # hint is one uniform command (the keychain caveat lives in the resume path).
+  local id="$1" host="${2:-}"
+  echo "Resume it: t cursor resume $id${host:+ --host $host}"
 }
 
 # ---- --ls ----
@@ -172,6 +167,29 @@ if (( do_ls )); then
   fi
   list_chats
   exit 0
+fi
+
+# ---- resume (local) ----
+if (( do_resume )); then
+  # --host: resume it THERE instead (the chat must already live on the host).
+  # Via `t cursor`, dots-only like the remote --ls; unlock its keychain first.
+  if [[ -n "$host" ]]; then
+    exec ssh -t "$host" "security unlock-keychain && zsh -lic 't cursor resume ${chat_id}'"
+  fi
+  dir=$(resolve_chat "$chat_id")
+  id="$(basename "$dir")"
+  cwd="$(chat_cwd "$dir" || true)"
+  [[ -n "$cwd" ]] || cwd="$(guess_cwd "$(basename "$(dirname "$dir")")" || true)"
+  # A pulled chat's workspace may not exist here yet (the hash/meta are already
+  # translated to a local path) — an empty dir is all cursor-agent needs.
+  [[ -n "$cwd" && ! -d "$cwd" ]] && mkdir -p "$cwd"
+  cd "${cwd:-$HOME}"
+  # Over ssh the login keychain is locked and cursor-agent refuses to start —
+  # unlock first (prompts for this machine's login password on this TTY).
+  if [[ -n "${SSH_CONNECTION:-}${SSH_TTY:-}" ]]; then
+    security unlock-keychain || echo "⚠ keychain unlock failed — cursor-agent may refuse to start" >&2
+  fi
+  exec cursor-agent --resume="$id"
 fi
 
 # ---- pull (--from) ----
@@ -218,7 +236,7 @@ if [[ -n "$from" ]]; then
   # one, or cursor-agent here associates the chat with a dir that cannot exist.
   [[ "$lcwd" != "$rcwd" ]] && patch_meta_cwd "$CHATS/$lhash/$id" "$lcwd"
   echo "✓ Chat $id is here${lcwd:+ (workspace $lcwd)}. Close any live cursor-agent still driving it on $from first."
-  resume_hint "" "$id" "$lcwd"
+  resume_hint "$id"
   exit 0
 fi
 
@@ -267,4 +285,4 @@ if (( attach )) && [[ -t 0 && -t 1 ]]; then
   # (prompts for the host's login password on the ssh -t TTY).
   exec ssh -t "$host" "security unlock-keychain && zsh -lic 'cd ${rcwd:-~} && cursor-agent --resume=$id'"
 fi
-resume_hint "ssh -t $host" "$id" "$rcwd"
+resume_hint "$id" "$host"

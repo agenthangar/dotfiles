@@ -3637,7 +3637,7 @@ _t_beam() {
 #     internal session-rows/land/kill-owner) run straight through via `command t`
 #     (the `command` builtin reaches ~/bin/t past this function, dodging the
 #     name collision — same trick the claude() wrapper uses).
-#   • shell-bound verbs (open/pop/push/find) map to the existing zsh functions,
+#   • shell-bound verbs (open/pop/push/find/cd) map to the existing zsh functions,
 #     which ALREADY do the cd + `claude -r` in the current terminal and the tpush
 #     sentinel handoff correctly *because they run in the calling shell* — a bin
 #     subprocess cannot. No resolve protocol is needed: the shim just calls them.
@@ -3656,9 +3656,64 @@ t() {
     pop)   _t_pop "$@" ;;             # → cd + claude -r in THIS terminal
     push)  _t_push "$@" ;;            # → sentinel handoff; claude() wrapper spawns post-exit
     find)  _t_find "$@" ;;            # → rank/pick then cd + claude -r here
+    cd)    _t_cd "$@" ;;              # → cd THIS shell into a slot's worktree
     beam)  _t_beam_xlate "$@" ;;      # → _t_beam (host moves from --host to a positional)
     *)     command t "$verb" "$@" ;;  # ls/read/plan/paste/kill/on/session-rows/land/kill-owner
   esac
+}
+
+# _t_cd — cd the CALLING shell into a dev slot's worktree (gh-grammar `t cd [repo] [slot]`).
+#   t cd <repo> <slot>   → that slot's worktree ($DEV_WORKTREE_ROOT/<basename>/<slot>)
+#   t cd <slot>          → that slot of the repo cwd is in (mirrors t read/paste)
+#   t cd <repo>          → the repo's only worktree; several → fzf pick; none → the repo dir
+#   t cd                 → fzf-pick across every worktree on disk
+# Navigation only: it never creates a worktree (`t open` owns creation) and never
+# touches tmux — a missing slot is an error with the `t open` hint. The picker shows
+# the branch actually checked out in each worktree (worktrees parked on a non-dev/*
+# branch by hand are common), read via git, not derived from the slot name.
+_t_cd() {
+  emulate -L zsh
+  local repo="$1" slot="$2"
+  # slot-only shorthand: `t cd 4` ≡ slot 4 of the repo cwd is in
+  if [[ $repo == <-> && -z $slot ]]; then
+    slot=$repo
+    repo=$(_t_infer_repo "$slot") || {
+      echo "t cd: not inside a DEV_REPOS repo — name one: t cd <repo> $slot" >&2; return 1 }
+  fi
+  if [[ -n $repo && -z ${DEV_REPOS[$repo]:-} ]]; then
+    echo "t cd: unknown repo '$repo' (known: ${(k)DEV_REPOS})" >&2; return 1
+  fi
+  if [[ -n $repo && -n $slot ]]; then
+    local wt; wt=$(_dev_worktree_path "$repo" "$slot")
+    [[ -d $wt ]] || {
+      echo "t cd: no worktree at $wt  ('t open $repo $slot' creates one)" >&2; return 1 }
+    cd "$wt"; return
+  fi
+  # No slot: pick among the worktrees that exist on disk — the named repo's, else all.
+  local -a wts
+  if [[ -n $repo ]]; then
+    wts=("$DEV_WORKTREE_ROOT/${DEV_REPOS[$repo]:t}"/<->(N/n))
+    (( ${#wts} )) || { cd "${DEV_REPOS[$repo]}"; return }   # none yet → the repo itself
+  else
+    wts=("$DEV_WORKTREE_ROOT"/*/<->(N/n))
+    (( ${#wts} )) || {
+      echo "t cd: no worktrees under $DEV_WORKTREE_ROOT ('t open <repo>' creates one)" >&2; return 1 }
+  fi
+  (( ${#wts} == 1 )) && { cd "${wts[1]}"; return }
+  if [[ -t 0 && -t 1 ]] && command -v fzf >/dev/null 2>&1; then
+    local wt br line; local -a rows
+    for wt in "${wts[@]}"; do
+      br=$(git -C "$wt" branch --show-current 2>/dev/null)
+      rows+=("${wt}"$'\t'"${wt#$DEV_WORKTREE_ROOT/}"$'\t'"${br:-?}")
+    done
+    line=$(print -rl -- "${rows[@]}" \
+             | fzf --with-nth=2.. --delimiter='\t' --prompt='t cd > ' --height=40% --reverse) || return 1
+    cd "${line%%$'\t'*}"; return
+  fi
+  local -a short; short=("${wts[@]#$DEV_WORKTREE_ROOT/}")
+  print -rl -- "t cd: several worktrees — name one (t cd <repo> <slot>):" \
+    "${short[@]/#/  }" >&2
+  return 1
 }
 
 # _t_open — map gh-grammar `t open <repo> [slot] [--new|--fg|--remote] [--host H]`

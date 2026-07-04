@@ -592,11 +592,11 @@ def _read_usage(cfg):
 # ─── shell-bound verbs — handled by the t() zsh shim, not the bin ──────────────
 # These cd the calling shell / exec `claude -r` in the current terminal / hand off
 # the tpush sentinel — a subprocess cannot. The t() function in .zshrc intercepts
-# them and calls the _t_dev/_t_pop/_t_push/_t_resume/_t_find/_t_beam helpers. Reaching the bin
-# here means it was invoked DIRECTLY (e.g. `command t open`, or a context with no
+# them and calls the _t_dev/_t_pop/_t_push/_t_resume/_t_find/_t_beam/_t_cd helpers. Reaching
+# the bin here means it was invoked DIRECTLY (e.g. `command t open`, or a context with no
 # t() function) — which cannot perform the shell action.
 
-_SHELL_BOUND = {"open", "pop", "push", "resume", "beam", "find", "__resolve"}
+_SHELL_BOUND = {"open", "pop", "push", "resume", "beam", "find", "cd", "__resolve"}
 
 
 def cmd_pending(cfg, args):
@@ -626,6 +626,7 @@ examples:
   t push                  send the current session to a background tmux slot
   t pop api 3             pull dev-api-3 back to this terminal
   t resume api 3          revive dev-api-3's last conversation after it was closed
+  t cd ff 5               cd this shell into ff's slot-5 worktree (bare t cd: picker)
   t beam api --host mini  send a session to 'mini' and resume it there
   t find "auth refactor"  search saved sessions, then resume the pick
   t on mini ls            run a command on a remote host
@@ -701,6 +702,17 @@ Run `t <verb> -h` for a verb's own flags.""")
     sp.add_argument("-f", "--fg", action="store_true", help="resume inline in THIS terminal (no tmux slot)")
     sp.add_argument("-a", "--all", action="store_true", help="scan every worktree repo (the default outside a repo dir)")
     sp.add_argument("-r", "--remote", action="store_true", help="only slots live on a $REMOTE_HOSTS host (pick → attach in place there)")
+
+    sp = sub.add_parser("cd", help="cd this shell into a dev slot's worktree",
+        description="cd the calling shell into a dev slot's worktree "
+            "($DEV_WORKTREE_ROOT/<repo>/<slot>). Names default to the cwd repo, so `t cd 3` "
+            "jumps to this repo's slot 3. With no slot: the repo's only worktree, an fzf pick "
+            "when there are several (showing each worktree's checked-out branch), or the "
+            "canonical repo dir when it has none. Bare `t cd` picks across every worktree. "
+            "Navigation only — it never creates a worktree (`t open` does) and never touches "
+            "tmux.")
+    sp.add_argument("repo", nargs="?", help="DEV_REPOS key; defaults to the repo your cwd is in")
+    sp.add_argument("slot", nargs="?", help="slot number; a lone slot implies the cwd repo")
 
     sp = sub.add_parser("beam", help="move a session between machines (send, or --from to receive)",
         description="Move a Claude session between machines (a cross-host push/pop). By default "

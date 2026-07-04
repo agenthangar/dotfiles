@@ -149,14 +149,13 @@ nosleep() { [[ "$1" == -h || "$1" == --help ]] && { _help_for nosleep; return 0;
 # pull released updates whenever, in any order. (First run on an old single-tree
 # machine migrates it: moves the clone off main and sets the worktree up.)
 #
-# --dev (-d): flip the live surface to a DEV checkout instead — re-links from it
-# (catching new/renamed files) and reloads, so in-progress edits go live for testing
-# without merging. Run from inside a per-session worktree (a `t open dotfiles`
-# session's tree) it links THAT worktree, so the session's edits are testable live;
-# anywhere else it links the dev clone (current branch). Refuses the dev clone when
-# it sits CLEAN on its parking branch ($DEV_BRANCH) — nothing to test, only stale
-# content to regress to; --force overrides. A later plain `dots` flips live back to
-# the main worktree. Skips brew bundle.
+# --dev (-d): flip the live surface to the dotfiles checkout you are STANDING IN —
+# re-links from it (catching new/renamed files) and reloads, so its in-progress edits
+# go live for testing without merging. The cwd is the choice: the dev clone, or a
+# per-session worktree (`t cd dot <slot>`, then `dots --dev`). Anywhere else it
+# errors — no fallback, no guessing (and the live main worktree is refused; plain
+# `dots` manages that). A later plain `dots` flips live back to the main worktree.
+# Skips brew bundle.
 dots() {
   [[ "$1" == -h || "$1" == --help ]] && { _help_for dots; return 0; }
 
@@ -174,37 +173,37 @@ dots() {
   local mainwt="${DOTFILES_MAIN_WT:-$HOME/.local/share/dotfiles-main}"
 
   if [[ "$1" == --dev || "$1" == -d ]]; then
-    # Point the live symlinks at a dev checkout; relink, no brew. Source = the
-    # checkout $PWD is inside WHEN it shares the dotfiles .git (a per-session
-    # worktree from `t open dotfiles` — so cd <worktree> + `dots --dev` makes that
-    # session's edits live for testing, no merge needed); else the dev clone. The
-    # main worktree is excluded (it is the flip-BACK target, never a --dev source).
-    local src="$devclone" label="DEV clone" force=
-    [[ "$2" == --force || "$2" == -f ]] && force=1
-    local pwdtop pwdcommon
-    pwdtop=$(git -C "$PWD" rev-parse --show-toplevel 2>/dev/null)
-    if [[ -n $pwdtop && ${pwdtop:A} != ${mainwt:A} && ${pwdtop:A} != ${devclone:A} ]]; then
-      pwdcommon=$(git -C "$pwdtop" rev-parse --git-common-dir 2>/dev/null)
-      [[ $pwdcommon == /* ]] || pwdcommon="$pwdtop/$pwdcommon"
-      [[ ${pwdcommon:A} == ${commondir:A} ]] && { src="$pwdtop"; label="worktree ${pwdtop:t2}"; }
-    fi
-    local branch=$(git -C "$src" symbolic-ref --short -q HEAD)
-    # Parked-clone guard: the dev clone sitting CLEAN on its parking branch
-    # ($DEV_BRANCH) has nothing to test — worktrees own development now, and the
-    # parking branch drifts arbitrarily stale (its old commits were squash-merged
-    # under different SHAs, so no ancestor/merge test can tell "stale relic" from
-    # "unmerged work" — hence this deliberate, targeted rule instead). Linking it
-    # once silently uninstalled `t resume`. Dirty clone (in-progress edits — the
-    # point of --dev), any other branch (a deliberate checkout), and worktree
-    # sources are all untouched; --force overrides.
-    if [[ -z $force && ${src:A} == ${devclone:A} && "$branch" == "$DEV_BRANCH" ]] \
-       && [[ -z "$(git -C "$src" status --porcelain 2>/dev/null)" ]]; then
-      print -r -- "dots --dev: the dev clone is parked on ${branch} with no local edits — nothing to test," >&2
-      print -r -- "and its content is stale relative to released main (linking it regresses your live config)." >&2
-      print -r -- "  test a session's edits:  cd into its worktree (t cd <repo> <slot>) and rerun" >&2
-      print -r -- "  link the clone anyway:   dots --dev --force" >&2
+    # Link the live symlinks from the dotfiles checkout $PWD is in — the cwd IS
+    # the choice (the dev clone, a per-session worktree, any tree sharing the
+    # dotfiles .git), so `t cd dot 1` + `dots --dev` tests that session's edits
+    # live. No fallback: anywhere else it ERRORS instead of guessing (the old
+    # implicit dev-clone fallback silently linked the stale parked clone from any
+    # directory — that is how `t resume` once vanished with a ✓). The main
+    # worktree is refused too: it is the released surface plain `dots` manages,
+    # never a dev source.
+    local src pwdcommon
+    src=$(git -C "$PWD" rev-parse --show-toplevel 2>/dev/null)
+    if [[ -z $src ]]; then
+      print -r -- "dots --dev: not inside a git checkout — cd into a dotfiles checkout first (the dev clone, or a session worktree via \`t cd dot <slot>\`)." >&2
       return 1
     fi
+    pwdcommon=$(git -C "$src" rev-parse --git-common-dir 2>/dev/null)
+    [[ $pwdcommon == /* ]] || pwdcommon="$src/$pwdcommon"
+    if [[ ${pwdcommon:A} != ${commondir:A} ]]; then
+      print -r -- "dots --dev: $src is not a dotfiles checkout — cd into the dev clone or a dotfiles session worktree first." >&2
+      return 1
+    fi
+    if [[ ${src:A} == ${mainwt:A} ]]; then
+      print -r -- "dots --dev: this is the live main worktree — plain \`dots\` manages it; cd into the dev clone or a session worktree." >&2
+      return 1
+    fi
+    if [[ ! -x $src/install.sh ]]; then
+      print -r -- "dots --dev: $src has no runnable install.sh — malformed/ancient checkout, nothing to install." >&2
+      return 1
+    fi
+    local label="worktree ${src:t2}"
+    [[ ${src:A} == ${devclone:A} ]] && label="DEV clone"
+    local branch=$(git -C "$src" symbolic-ref --short -q HEAD)
     local out
     if out=$(DOTFILES_NO_BREW=1 DOTFILES_LINK_DEV=1 "$src/install.sh" 2>&1); then
       print -r -- "${g}✓${r0} ${y}live = ${label} (${c}${branch:-detached}${r0}${y}) — in-progress edits are live, reloaded${r0}"

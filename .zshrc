@@ -153,8 +153,10 @@ nosleep() { [[ "$1" == -h || "$1" == --help ]] && { _help_for nosleep; return 0;
 # (catching new/renamed files) and reloads, so in-progress edits go live for testing
 # without merging. Run from inside a per-session worktree (a `t open dotfiles`
 # session's tree) it links THAT worktree, so the session's edits are testable live;
-# anywhere else it links the dev clone (current branch). A later plain `dots` flips
-# live back to the main worktree. Skips brew bundle.
+# anywhere else it links the dev clone (current branch). Refuses the dev clone when
+# it sits CLEAN on its parking branch ($DEV_BRANCH) — nothing to test, only stale
+# content to regress to; --force overrides. A later plain `dots` flips live back to
+# the main worktree. Skips brew bundle.
 dots() {
   [[ "$1" == -h || "$1" == --help ]] && { _help_for dots; return 0; }
 
@@ -177,7 +179,8 @@ dots() {
     # worktree from `t open dotfiles` — so cd <worktree> + `dots --dev` makes that
     # session's edits live for testing, no merge needed); else the dev clone. The
     # main worktree is excluded (it is the flip-BACK target, never a --dev source).
-    local src="$devclone" label="DEV clone"
+    local src="$devclone" label="DEV clone" force=
+    [[ "$2" == --force || "$2" == -f ]] && force=1
     local pwdtop pwdcommon
     pwdtop=$(git -C "$PWD" rev-parse --show-toplevel 2>/dev/null)
     if [[ -n $pwdtop && ${pwdtop:A} != ${mainwt:A} && ${pwdtop:A} != ${devclone:A} ]]; then
@@ -186,6 +189,22 @@ dots() {
       [[ ${pwdcommon:A} == ${commondir:A} ]] && { src="$pwdtop"; label="worktree ${pwdtop:t2}"; }
     fi
     local branch=$(git -C "$src" symbolic-ref --short -q HEAD)
+    # Parked-clone guard: the dev clone sitting CLEAN on its parking branch
+    # ($DEV_BRANCH) has nothing to test — worktrees own development now, and the
+    # parking branch drifts arbitrarily stale (its old commits were squash-merged
+    # under different SHAs, so no ancestor/merge test can tell "stale relic" from
+    # "unmerged work" — hence this deliberate, targeted rule instead). Linking it
+    # once silently uninstalled `t resume`. Dirty clone (in-progress edits — the
+    # point of --dev), any other branch (a deliberate checkout), and worktree
+    # sources are all untouched; --force overrides.
+    if [[ -z $force && ${src:A} == ${devclone:A} && "$branch" == "$DEV_BRANCH" ]] \
+       && [[ -z "$(git -C "$src" status --porcelain 2>/dev/null)" ]]; then
+      print -r -- "dots --dev: the dev clone is parked on ${branch} with no local edits — nothing to test," >&2
+      print -r -- "and its content is stale relative to released main (linking it regresses your live config)." >&2
+      print -r -- "  test a session's edits:  cd into its worktree (t cd <repo> <slot>) and rerun" >&2
+      print -r -- "  link the clone anyway:   dots --dev --force" >&2
+      return 1
+    fi
     local out
     if out=$(DOTFILES_NO_BREW=1 DOTFILES_LINK_DEV=1 "$src/install.sh" 2>&1); then
       print -r -- "${g}✓${r0} ${y}live = ${label} (${c}${branch:-detached}${r0}${y}) — in-progress edits are live, reloaded${r0}"

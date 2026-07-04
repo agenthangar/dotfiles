@@ -149,10 +149,12 @@ nosleep() { [[ "$1" == -h || "$1" == --help ]] && { _help_for nosleep; return 0;
 # pull released updates whenever, in any order. (First run on an old single-tree
 # machine migrates it: moves the clone off main and sets the worktree up.)
 #
-# --dev (-d): flip the live surface to your DEV clone (current branch) instead —
-# re-links from it (catching new/renamed files) and reloads, so in-progress edits go
-# live for testing without merging. A later plain `dots` flips live back to the main
-# worktree. Skips brew bundle.
+# --dev (-d): flip the live surface to a DEV checkout instead — re-links from it
+# (catching new/renamed files) and reloads, so in-progress edits go live for testing
+# without merging. Run from inside a per-session worktree (a `t open dotfiles`
+# session's tree) it links THAT worktree, so the session's edits are testable live;
+# anywhere else it links the dev clone (current branch). A later plain `dots` flips
+# live back to the main worktree. Skips brew bundle.
 dots() {
   [[ "$1" == -h || "$1" == --help ]] && { _help_for dots; return 0; }
 
@@ -170,13 +172,25 @@ dots() {
   local mainwt="${DOTFILES_MAIN_WT:-$HOME/.local/share/dotfiles-main}"
 
   if [[ "$1" == --dev || "$1" == -d ]]; then
-    # Point the live symlinks at the dev clone (current branch); relink, no brew.
-    local branch=$(git -C "$devclone" symbolic-ref --short -q HEAD)
+    # Point the live symlinks at a dev checkout; relink, no brew. Source = the
+    # checkout $PWD is inside WHEN it shares the dotfiles .git (a per-session
+    # worktree from `t open dotfiles` — so cd <worktree> + `dots --dev` makes that
+    # session's edits live for testing, no merge needed); else the dev clone. The
+    # main worktree is excluded (it is the flip-BACK target, never a --dev source).
+    local src="$devclone" label="DEV clone"
+    local pwdtop pwdcommon
+    pwdtop=$(git -C "$PWD" rev-parse --show-toplevel 2>/dev/null)
+    if [[ -n $pwdtop && ${pwdtop:A} != ${mainwt:A} && ${pwdtop:A} != ${devclone:A} ]]; then
+      pwdcommon=$(git -C "$pwdtop" rev-parse --git-common-dir 2>/dev/null)
+      [[ $pwdcommon == /* ]] || pwdcommon="$pwdtop/$pwdcommon"
+      [[ ${pwdcommon:A} == ${commondir:A} ]] && { src="$pwdtop"; label="worktree ${pwdtop:t2}"; }
+    fi
+    local branch=$(git -C "$src" symbolic-ref --short -q HEAD)
     local out
-    if out=$(DOTFILES_NO_BREW=1 DOTFILES_LINK_DEV=1 "$devclone/install.sh" 2>&1); then
-      print -r -- "${g}✓${r0} ${y}live = DEV clone (${c}${branch}${r0}${y}) — in-progress edits are live, reloaded${r0}"
+    if out=$(DOTFILES_NO_BREW=1 DOTFILES_LINK_DEV=1 "$src/install.sh" 2>&1); then
+      print -r -- "${g}✓${r0} ${y}live = ${label} (${c}${branch:-detached}${r0}${y}) — in-progress edits are live, reloaded${r0}"
     else
-      print -r -- "${y}dots --dev — install.sh failed on ${c}${branch}${r0}${y}:${r0}"
+      print -r -- "${y}dots --dev — install.sh failed on ${c}${branch:-detached}${r0}${y}:${r0}"
       print -r -- "$out"
     fi
     source ~/.zshrc
@@ -2565,9 +2579,12 @@ _t_plan() {
 # refused here and pointed at the `t push -p` picker instead). Composes the existing
 # engines: _dev_worktree_path (slot → recorded cwd), _dev_ensure_session_cwd (rebuild
 # a reaped/synced-away worktree from its durable branch), _dev_resume_session (a
-# first-class dev slot, CLAUDE_RESUME_ID stamped so pop/plan keep working). No slot →
-# house picker convention: one candidate → use it, several → fzf, none → bail with a
-# hint; outside any DEV_REPOS dir a bare `t resume` scans EVERY worktree repo (the
+# first-class dev slot, CLAUDE_RESUME_ID stamped so pop/plan keep working). Candidates
+# are EVERY conversation saved in a dead slot's worktree (newest first — an old one is
+# still resumable), minus conversationless stubs (no real prompt → nothing to revive,
+# and their untitled rows masked real ones). House picker convention: one candidate →
+# use it, several → fzf, none → bail with a hint; outside any DEV_REPOS dir a bare
+# `t resume` scans EVERY worktree repo (the
 # `t ls` unscoped convention) with a repo column in the picker. A slot live on a
 # $REMOTE_HOSTS host is never resumed here (one-live-owner) — explicit ask attaches
 # in place there, a scan notes it. -f/--fg resumes inline in THIS terminal (t pop's
@@ -2646,16 +2663,22 @@ _t_resume() {
   local remote_rows=
   (( ${#REMOTE_HOSTS} )) && remote_rows=$(_dev_rows_all 2>/dev/null | awk -F'\t' '$1 != "local" && $4 !~ /:/')
 
-  # Candidates: dead slots whose worktree project dir holds a transcript. A slot
-  # whose worktree is LIVE (by path, local or remote) is not resumable —
-  # explicit ask attaches, scan skips. A slot whose tmux NAME is taken by a
-  # session rooted elsewhere is unresumable AND wrong to attach (see the
-  # collision branch below). NOTE: every `local` here is hoisted OUT of the
-  # loops — an assignmentless `local x` re-run on an already-local x does not
-  # redeclare, it PRINTS `x=value` (the `_ok=claw` junk-output bug).
+  # Candidates: dead slots whose worktree project dir holds a transcript —
+  # EVERY conversation in the slot, newest first, not just the newest .jsonl
+  # (an old conversation is still resumable; hiding it read as "resume lost my
+  # session"). Conversationless stubs (an open-then-exit, a beam artifact — no
+  # real user prompt, so _transcript_title prints nothing) are skipped: they
+  # rendered as untitled rows and, being newest, often masked the real
+  # conversation. A slot whose worktree is LIVE (by path, local or remote) is
+  # not resumable — explicit ask attaches, scan skips. A slot whose tmux NAME
+  # is taken by a session rooted elsewhere is unresumable AND wrong to attach
+  # (see the collision branch below). NOTE: every `local` here is hoisted OUT
+  # of the loops — an assignmentless `local x` re-run on an already-local x
+  # does not redeclare, it PRINTS `x=value` (the `_ok=claw` junk-output bug).
   local -a cands slots tx remote_note
   local -A remote_live_host remote_live_alias
   local n wt sid busy rhost _rdir _rbase _rhost _rn _ralias _ok _stale stale_path
+  local txf title when
   local _rwtr=${DEV_WORKTREE_ROOT:-}
   if [[ -n $slot ]]; then slots=($slot); else slots=({1..20}); fi
   for repo in $repos; do
@@ -2713,10 +2736,13 @@ _t_resume() {
         fi
         continue
       fi
-      tx=( "$HOME/.claude/projects/${wt//[^A-Za-z0-9]/-}"/*.jsonl(Nom[1]) )
-      [[ -n ${tx[1]} ]] || continue
-      sid=${${tx[1]:t}%.jsonl}
-      cands+=("$repo"$'\t'"$n"$'\t'"$sid"$'\t'"$wt"$'\t'"$(_transcript_title "${tx[1]}")")
+      tx=( "$HOME/.claude/projects/${wt//[^A-Za-z0-9]/-}"/*.jsonl(Nom) )
+      for txf in "${(@)tx}"; do
+        title=$(_transcript_title "$txf")
+        [[ -n $title ]] || continue        # conversationless stub — nothing to resume
+        when=$(stat -f '%Sm' -t '%b %d %H:%M' "$txf" 2>/dev/null)
+        cands+=("$repo"$'\t'"$n"$'\t'"${${txf:t}%.jsonl}"$'\t'"$wt"$'\t'"$when"$'\t'"$title")
+      done
     done
   done
   # Live-elsewhere slots surfaced by the scan (informational; they are not
@@ -2738,29 +2764,47 @@ _t_resume() {
     return 1
   fi
 
-  # Picker rows: repo(1) slot(2) sid(3) wt(4) title(5). All-repos mode shows the
-  # repo column; a single-repo scan keeps the old slot+title view.
-  local pick c nth fprompt; local -a f
-  if [[ -n $all_mode ]]; then nth='1,2,5' fprompt='resume> '; else nth='2,5' fprompt="resume $repo slot> "; fi
+  # Picker rows: repo(1) slot(2) sid(3) wt(4) when(5) title(6), plus one ALIGNED
+  # display column (7) appended here — fzf renders raw \t fields at literal tab
+  # stops (nothing lines up), so both fzf (--with-nth=7) and the no-fzf listing
+  # show the same pre-padded gh-style row: [repo]  slot  date  title. All-repos
+  # mode adds the repo column, padded to the widest alias in this candidate set.
+  local pick c fprompt; local -a f
+  local rw=0 i=1
+  if [[ -n $all_mode ]]; then
+    fprompt='resume> '
+    for c in "${(@)cands}"; do f=("${(@ps:\t:)c}"); (( ${#f[1]} > rw )) && rw=${#f[1]}; done
+  else
+    fprompt="resume $repo> "
+  fi
+  for c in "${(@)cands}"; do
+    f=("${(@ps:\t:)c}")
+    if [[ -n $all_mode ]]; then
+      cands[$i]+=$'\t'"$(printf '%-*s  %2s  %-12s  %s' "$rw" "$f[1]" "$f[2]" "$f[5]" "$f[6]")"
+    else
+      cands[$i]+=$'\t'"$(printf '%2s  %-12s  %s' "$f[2]" "$f[5]" "$f[6]")"
+    fi
+    (( i++ ))
+  done
   if (( $#cands == 1 )); then
     pick=${cands[1]}
   elif [[ -t 0 && -t 1 ]] && command -v fzf >/dev/null; then
-    pick=$(print -rl -- "${(@)cands}" | fzf --delimiter=$'\t' --with-nth=$nth --prompt="$fprompt") || return 1
+    pick=$(print -rl -- "${(@)cands}" | fzf --delimiter=$'\t' --with-nth=7 --no-hscroll --prompt="$fprompt") || return 1
     [[ -n $pick ]] || return 1
+  elif [[ -n $slot ]]; then
+    # Explicit slot but no TTY/fzf to pick with: the newest conversation IS the
+    # documented contract ("revive the slot's last conversation") — take it, and
+    # list the rest so a specific pick is one fzf-equipped call away.
+    pick=${cands[1]}
+    echo "Slot $slot has $#cands saved conversations — resuming the newest (run from a terminal to pick):" >&2
+    for c in "${(@)cands}"; do echo "  ${c##*$'\t'}" >&2; done
   else
     if [[ -n $all_mode ]]; then
-      echo "Several resumable slots — name one (t resume <repo> <slot>):" >&2
+      echo "Several resumable conversations — name one (t resume <repo> <slot>):" >&2
     else
-      echo "Several resumable slots for $repo — name one (t resume $repo <slot>):" >&2
+      echo "Several resumable conversations for $repo — name one (t resume $repo <slot>):" >&2
     fi
-    for c in "${(@)cands}"; do
-      f=("${(@ps:\t:)c}")
-      if [[ -n $all_mode ]]; then
-        printf '  %s %s  %s\n' "$f[1]" "$f[2]" "$f[5]" >&2
-      else
-        printf '  %s  %s\n' "$f[2]" "$f[5]" >&2
-      fi
-    done
+    for c in "${(@)cands}"; do echo "  ${c##*$'\t'}" >&2; done
     return 1
   fi
   f=("${(@ps:\t:)pick}")

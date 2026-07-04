@@ -2601,6 +2601,31 @@ _t_resume() {
     [[ -n $p ]] && live[${p:A}]=$s
   done
 
+  # Remote-live guard (one-live-owner invariant): a synced transcript here does
+  # NOT mean the slot is idle — its owning host may still be driving `claude -r`
+  # on that session id, and a second local `claude -r` would append to the same
+  # .jsonl with no locking and diverge the conversation. So build a map of slot
+  # numbers currently live on any $REMOTE_HOSTS host (matching this repo's dir
+  # OR its per-session-worktree path, same rule as _dev_remote_resolve so a
+  # `dev-dot-2` on mini matches `dev-dotfiles-2` here — both key one dir) and
+  # treat them like local-live below: explicit ask → attach in place on the
+  # remote (mirrors `t open`'s auto-detect); scan → skip so the candidate never
+  # surfaces. One _dev_rows_all fan-out; the remote alias is captured so the
+  # attach doesn't need a second scan via _dev_remote_resolve.
+  local -A remote_live_host remote_live_alias
+  if (( ${#REMOTE_HOSTS} )); then
+    local _rdir=${DEV_REPOS[$repo]} _rwtr=${DEV_WORKTREE_ROOT:-} _rbase=${${DEV_REPOS[$repo]}:t}
+    local _rhost _rn _ralias
+    while IFS=$'\t' read -r _rhost _rn _ralias; do
+      [[ -n $_rn ]] && { remote_live_host[$_rn]=$_rhost; remote_live_alias[$_rn]=$_ralias; }
+    done < <(_dev_rows_all 2>/dev/null | awk -F'\t' -v d="$_rdir" -v wtr="$_rwtr" -v b="$_rbase" '
+      $1 != "local" && $4 !~ /:/ && ($3==d || (wtr != "" && b != "" && index($3, wtr "/" b "/") == 1)) {
+        n = $4; sub(/^.*-/, "", n)
+        r = $4; sub(/-[^-]+$/, "", r)
+        print $1 "\t" n "\t" r
+      }')
+  fi
+
   # Candidates: dead slots whose worktree project dir holds a transcript. A slot
   # whose worktree is LIVE (by path) is not resumable — explicit ask attaches,
   # scan skips. A slot whose tmux NAME is taken by a session rooted elsewhere is
@@ -2615,6 +2640,16 @@ _t_resume() {
       if [[ -n $slot ]]; then
         echo "Slot $n is live ($busy) — attaching (resume only revives dead slots)."
         _t_dev "$repo" "$n"
+        return
+      fi
+      continue
+    fi
+    # Remote-live: same treatment as local live (see remote_live_* above).
+    local rhost=${remote_live_host[$n]:-}
+    if [[ -n $rhost ]]; then
+      if [[ -n $slot ]]; then
+        echo "Slot $n is live on $rhost — attaching (resume only revives dead slots)."
+        _dev_remote_attach "$rhost"$'\t'"${remote_live_alias[$n]}"$'\t'"$n" ""
         return
       fi
       continue

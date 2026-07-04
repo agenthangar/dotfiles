@@ -116,7 +116,7 @@ guess_cwd() {
     d="${d%/}"
     [[ -n "$d" && "$(md5 -qs "$d")" == "$hash" ]] && { echo "$d"; return 0; }
   done < <(
-    { [[ -r "$T_CONFIG" ]] && sed -n 's/^DEV_REPOS\[[^]]*\]=//p' "$T_CONFIG"; } || true
+    if [[ -r "$T_CONFIG" ]]; then sed -n 's/^DEV_REPOS\[[^]]*\]=//p' "$T_CONFIG"; fi
     ls -d "$HOME"/code/*/ "$HOME"/github/*/ /Users/Shared/*/ 2>/dev/null || true
   )
   return 1
@@ -178,8 +178,10 @@ resolve_chat() {
     matches=$(ls -dt "$CHATS"/*/"$id" "$CHATS"/*/"$id"* 2>/dev/null | awk '!seen[$0]++') || true
   else
     ws=$(workspace_of_pwd || true)
-    # shellcheck disable=SC2012
-    [[ -n "$ws" ]] && matches=$(ls -dt "$CHATS/$ws"/*/ 2>/dev/null | head -1 | sed 's:/$::') || true
+    if [[ -n "$ws" ]]; then
+      # shellcheck disable=SC2012
+      matches=$(ls -dt "$CHATS/$ws"/*/ 2>/dev/null | head -1 | sed 's:/$::') || true
+    fi
     # shellcheck disable=SC2012
     [[ -n "$matches" ]] || matches=$(ls -dt "$CHATS"/*/*/ 2>/dev/null | head -1 | sed 's:/$::') || true
   fi

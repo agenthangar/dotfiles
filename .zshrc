@@ -2641,16 +2641,22 @@ _t_plan() {
 # User-facing help lives in bin/t (`t resume -h`); the t() shim routes -h there.
 _t_resume() {
   setopt local_options null_glob bare_glob_qual
-  local a no_tmux= all_flag= remote_flag=; local -a pos
+  local a no_tmux= all_flag= remote_flag= days=30 _expect_days=; local -a pos
   for a in "$@"; do
+    if [[ -n $_expect_days ]]; then days=$a; _expect_days=; continue; fi
     case "$a" in
       -f|--fg)     no_tmux=1 ;;
       -a|--all)    all_flag=1 ;;
       -r|--remote) remote_flag=1 ;;
+      --days)      _expect_days=1 ;;
+      --days=*)    days=${a#--days=} ;;
       -*)          echo "t resume: unknown flag: $a (t resume -h for flags)" >&2; return 1 ;;
       *)           pos+=("$a") ;;
     esac
   done
+  if [[ $days != all && $days != <-> ]]; then
+    echo "t resume: --days takes a number of days or 'all' (got: ${days:-nothing})." >&2; return 1
+  fi
   local repo="${pos[1]:-}" slot="${pos[2]:-}"
   # Repo-aware defaults (mirrors t plan/paste): lone numeric arg is a SLOT of the
   # cwd repo; bare `t resume` infers the repo too — and OUTSIDE any DEV_REPOS dir
@@ -2733,6 +2739,12 @@ _t_resume() {
       _prc=$?
       if (( _prc == 0 || _prc == 23 )); then
         echo "⟳ pulled ${_h}'s latest transcripts" >&2
+        # Cache the host's short hostname (once) so the origin column below can
+        # translate a `<sid>.origin` stamp back to the friendly $REMOTE_HOSTS key.
+        if [[ ! -s $HOME/.cache/t/hostnames/$_h ]]; then
+          mkdir -p "$HOME/.cache/t/hostnames" 2>/dev/null
+          ssh -o ConnectTimeout=3 -o BatchMode=yes "$_tgt" hostname -s 2>/dev/null > "$HOME/.cache/t/hostnames/$_h"
+        fi
       else
         echo "t resume -r: $_h unreachable (rc=$_prc) — skipped; its newest transcripts may be missing here." >&2
       fi
@@ -2780,8 +2792,18 @@ _t_resume() {
   local -a cands slots tx
   local -A remote_live_host remote_live_alias remote_live_sum
   local n wt sid busy rhost _rdir _rbase _rhost _rn _ralias _rsum _ok _stale stale_path
-  local txf title when
+  local txf title when org orgf hf skipped=0
   local _rwtr=${DEV_WORKTREE_ROOT:-}
+  # Recency window (--days, default 30; 'all' disables) + this machine's short
+  # hostname, to blank the origin column for locally-run conversations.
+  local cutoff=0 selfhost=$(hostname -s 2>/dev/null)
+  [[ $days != all ]] && cutoff=$(( EPOCHSECONDS - days * 86400 ))
+  # origin → friendly $REMOTE_HOSTS key, via the hostname cache the -r pull
+  # populates (~/.cache/t/hostnames/<alias> = that host's `hostname -s`).
+  local -A host_alias; local _hcf
+  for _hcf in "$HOME"/.cache/t/hostnames/*(N); do
+    host_alias[$(<$_hcf)]=${_hcf:t}
+  done
   if [[ -n $slot ]]; then slots=($slot); else slots=({1..20}); fi
   for repo in $repos; do
     _rdir=${DEV_REPOS[$repo]}; _rbase=${_rdir:t}
@@ -2806,7 +2828,7 @@ _t_resume() {
           return
         fi
         # Scan: a live local slot is a labeled row (pick → attach).
-        cands+=("$repo"$'\t'"$n"$'\t'-$'\t'"$wt"$'\t'"● here"$'\t'"${local_sum[${busy#dev-}]:-(live session)}"$'\t'here$'\t'-)
+        cands+=("$repo"$'\t'"$n"$'\t'-$'\t'"$wt"$'\t'"● here"$'\t'"${local_sum[${busy#dev-}]:-(live session)}"$'\t'here$'\t'-$'\t'-)
         continue
       fi
       # Remote-live: same treatment as local live (see the scan note above).
@@ -2817,7 +2839,7 @@ _t_resume() {
           _dev_remote_attach "$rhost"$'\t'"${remote_live_alias[$n]}"$'\t'"$n" ""
           return
         fi
-        cands+=("$repo"$'\t'"$n"$'\t'-$'\t'"$wt"$'\t'"● on $rhost"$'\t'"${remote_live_sum[$n]:-(live session)}"$'\t'"$rhost"$'\t'"${remote_live_alias[$n]}")
+        cands+=("$repo"$'\t'"$n"$'\t'-$'\t'"$wt"$'\t'"● on $rhost"$'\t'"${remote_live_sum[$n]:-(live session)}"$'\t'"$rhost"$'\t'"${remote_live_alias[$n]}"$'\t'-)
         continue
       fi
       # Name-only collision: a dev-<alias>-${n} tmux session (any alias keying
@@ -2842,13 +2864,28 @@ _t_resume() {
       fi
       tx=( "$HOME/.claude/projects/${wt//[^A-Za-z0-9]/-}"/*.jsonl(Nom) )
       for txf in "${(@)tx}"; do
+        if (( cutoff )) && (( $(stat -f %m "$txf" 2>/dev/null || echo 0) < cutoff )); then
+          (( skipped++ )); continue        # outside the --days window
+        fi
         title=$(_transcript_title "$txf")
         [[ -n $title ]] || continue        # conversationless stub — nothing to resume
         when=$(stat -f '%Sm' -t '%b %d %H:%M' "$txf" 2>/dev/null)
-        cands+=("$repo"$'\t'"$n"$'\t'"${${txf:t}%.jsonl}"$'\t'"$wt"$'\t'"$when"$'\t'"$title"$'\t'-$'\t'-)
+        # Origin: which machine the conversation LAST RAN on — the <sid>.origin
+        # stamp claude-stamp-tmux writes next to the transcript (syncs with it).
+        # Blank for this machine / unstamped (pre-feature) transcripts; a raw
+        # hostname is translated to its $REMOTE_HOSTS key when the cache knows it.
+        org=; orgf="${txf%.jsonl}.origin"
+        if [[ -f $orgf ]]; then
+          org=$(<$orgf)
+          if [[ $org == $selfhost ]]; then org=
+          elif [[ -n ${host_alias[$org]:-} ]]; then org=${host_alias[$org]}
+          fi
+        fi
+        cands+=("$repo"$'\t'"$n"$'\t'"${${txf:t}%.jsonl}"$'\t'"$wt"$'\t'"$when"$'\t'"$title"$'\t'-$'\t'-$'\t'"${org[1,10]}")
       done
     done
   done
+  (( skipped )) && echo "(${skipped} older conversation(s) outside the last ${days}d hidden — t resume --days all shows them)" >&2
 
   if (( ! $#cands )); then
     if [[ -n $slot ]]; then
@@ -2864,28 +2901,45 @@ _t_resume() {
     return 1
   fi
 
-  # Picker rows: repo(1) slot(2) sid(3) wt(4) when(5) title(6) loc(7) alias(8) —
-  # loc/alias are `-` for a dead (resumable) row, `here` for a live local slot,
-  # or the host + remote alias for a slot live on a $REMOTE_HOSTS host (pick →
-  # attach in place, never a second owner). One ALIGNED display column (9) is
+  # Picker rows: repo(1) slot(2) sid(3) wt(4) when(5) title(6) loc(7) alias(8)
+  # origin(9) — loc/alias are `-` for a dead (resumable) row, `here` for a live
+  # local slot, or the host + remote alias for a slot live on a $REMOTE_HOSTS
+  # host (pick → attach in place, never a second owner); origin is the machine a
+  # dead conversation LAST RAN on (`-`/empty = here or unstamped — live rows name
+  # their host in the ● label instead). One ALIGNED display column (10) is
   # appended here — fzf renders raw \t fields at literal tab stops (nothing
-  # lines up), so both fzf (--with-nth=9) and the no-fzf listing show the same
-  # pre-padded gh-style row: [repo]  slot  date|●-where  title. All-repos mode
-  # adds the repo column, padded to the widest alias in this candidate set.
+  # lines up), so both fzf (--with-nth=10) and the no-fzf listing show the same
+  # pre-padded gh-style row: [repo]  slot  [origin]  date|●-where  title. The
+  # origin column only appears when some row has one (a single-machine setup
+  # never sees it); all-repos mode adds the repo column. Both pad to the widest
+  # value in this candidate set.
   local pick c fprompt; local -a f
-  local rw=0 i=1
+  local rw=0 ow=0 i=1
   if [[ -n $all_mode ]]; then
-    fprompt='resume> '
+    fprompt="resume (${days}d)> "
     for c in "${(@)cands}"; do f=("${(@ps:\t:)c}"); (( ${#f[1]} > rw )) && rw=${#f[1]}; done
   else
-    fprompt="resume $repo> "
+    fprompt="resume $repo (${days}d)> "
   fi
   for c in "${(@)cands}"; do
     f=("${(@ps:\t:)c}")
+    [[ ${f[9]:-} != - && -n ${f[9]:-} ]] && (( ${#f[9]} > ow )) && ow=${#f[9]}
+  done
+  for c in "${(@)cands}"; do
+    f=("${(@ps:\t:)c}")
+    org=${f[9]:-}; [[ $org == - ]] && org=
     if [[ -n $all_mode ]]; then
-      cands[$i]+=$'\t'"$(printf '%-*s  %2s  %-12s  %s' "$rw" "$f[1]" "$f[2]" "$f[5]" "$f[6]")"
+      if (( ow )); then
+        cands[$i]+=$'\t'"$(printf '%-*s  %2s  %-*s  %-12s  %s' "$rw" "$f[1]" "$f[2]" "$ow" "$org" "$f[5]" "$f[6]")"
+      else
+        cands[$i]+=$'\t'"$(printf '%-*s  %2s  %-12s  %s' "$rw" "$f[1]" "$f[2]" "$f[5]" "$f[6]")"
+      fi
     else
-      cands[$i]+=$'\t'"$(printf '%2s  %-12s  %s' "$f[2]" "$f[5]" "$f[6]")"
+      if (( ow )); then
+        cands[$i]+=$'\t'"$(printf '%2s  %-*s  %-12s  %s' "$f[2]" "$ow" "$org" "$f[5]" "$f[6]")"
+      else
+        cands[$i]+=$'\t'"$(printf '%2s  %-12s  %s' "$f[2]" "$f[5]" "$f[6]")"
+      fi
     fi
     (( i++ ))
   done
@@ -2897,7 +2951,7 @@ _t_resume() {
   if (( $#cands == 1 )) && f=("${(@ps:\t:)cands[1]}") && [[ $f[7] == - || -t 1 ]]; then
     pick=${cands[1]}
   elif [[ -t 0 && -t 1 ]] && command -v fzf >/dev/null; then
-    pick=$(print -rl -- "${(@)cands}" | fzf --delimiter=$'\t' --with-nth=9 --no-hscroll --prompt="$fprompt") || return 1
+    pick=$(print -rl -- "${(@)cands}" | fzf --delimiter=$'\t' --with-nth=10 --no-hscroll --prompt="$fprompt") || return 1
     [[ -n $pick ]] || return 1
   elif [[ -n $slot ]]; then
     # Explicit slot but no TTY/fzf to pick with: the newest conversation IS the

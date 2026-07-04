@@ -2818,10 +2818,12 @@ _t_resume() {
     if [[ -n $remote_flag ]]; then
       # NB: in all-repos mode $repo is a spent loop variable — don't name it.
       if [[ -n $all_mode ]]; then
-        echo "No live remote slots in any repo (t ls -r shows everything live; t open -r --new starts one)." >&2
+        echo "Nothing is live on any \$REMOTE_HOSTS host right now (-r lists LIVE remote slots, to attach in place)." >&2
       else
-        echo "No live remote slots for $repo (t ls -r shows everything live; t open -r --new starts one)." >&2
+        echo "No $repo slot is live on any \$REMOTE_HOSTS host right now (-r lists LIVE remote slots, to attach in place)." >&2
       fi
+      echo "Dead sessions' conversations sync here via csync — plain \`t resume\` lists them wherever they last ran." >&2
+      echo "Fresh remote session: t open <repo> -r --new · survey hosts: t ls -r" >&2
     elif [[ -n $slot ]]; then
       echo "No saved conversation for $repo slot $slot (nothing recorded in its worktree)." >&2
       echo "Fresh session: t open $repo $slot · full picker: t push -p" >&2

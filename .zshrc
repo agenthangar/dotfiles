@@ -3685,17 +3685,19 @@ _t_cd() {
   fi
   if [[ -n $repo && -n $slot ]]; then
     local wt; wt=$(_dev_worktree_path "$repo" "$slot")
-    [[ -d $wt ]] || {
+    [[ -e $wt/.git ]] || {
       echo "t cd: no worktree at $wt  ('t open $repo $slot' creates one)" >&2; return 1 }
     cd "$wt"; return
   fi
   # No slot: pick among the worktrees that exist on disk — the named repo's, else all.
+  # Match the rest of the worktree tooling (_dev_worktree_create / _dev_worktree_sweep_run):
+  # require .git so a leftover / hand-made numeric dir under $DEV_WORKTREE_ROOT is not offered.
   local -a wts
   if [[ -n $repo ]]; then
-    wts=("$DEV_WORKTREE_ROOT/${DEV_REPOS[$repo]:t}"/<->(N/n))
+    wts=("$DEV_WORKTREE_ROOT/${DEV_REPOS[$repo]:t}"/<->(N/ne:'[[ -e $REPLY/.git ]]':))
     (( ${#wts} )) || { cd "${DEV_REPOS[$repo]}"; return }   # none yet → the repo itself
   else
-    wts=("$DEV_WORKTREE_ROOT"/*/<->(N/n))
+    wts=("$DEV_WORKTREE_ROOT"/*/<->(N/ne:'[[ -e $REPLY/.git ]]':))
     (( ${#wts} )) || {
       echo "t cd: no worktrees under $DEV_WORKTREE_ROOT ('t open <repo>' creates one)" >&2; return 1 }
   fi

@@ -2603,18 +2603,23 @@ _t_plan() {
 # and their untitled rows masked real ones). House picker convention: one candidate →
 # use it, several → fzf, none → bail with a hint; outside any DEV_REPOS dir a bare
 # `t resume` scans EVERY worktree repo (the
-# `t ls` unscoped convention) with a repo column in the picker. A slot live on a
-# $REMOTE_HOSTS host is never resumed here (one-live-owner) — explicit ask attaches
-# in place there, a scan notes it. -f/--fg resumes inline in THIS terminal (t pop's
-# landing) instead of a slot.
+# `t ls` unscoped convention) with a repo column in the picker; -a/--all forces that
+# widening from anywhere (the `t ls -a` flag). LIVE slots — local or on a
+# $REMOTE_HOSTS host — appear as labeled rows ("● here" / "● on <host>") whose pick
+# ATTACHES in place instead of resuming (one-live-owner: a second `claude -r` on a
+# live id diverges the transcript); -r/--remote narrows to remote-live rows only.
+# -f/--fg resumes inline in THIS terminal (t pop's landing) instead of a slot.
 # User-facing help lives in bin/t (`t resume -h`); the t() shim routes -h there.
 _t_resume() {
   setopt local_options null_glob bare_glob_qual
-  local a no_tmux=; local -a pos
+  local a no_tmux= all_flag= remote_flag=; local -a pos
   for a in "$@"; do
     case "$a" in
-      -f|--fg) no_tmux=1 ;;
-      *)       pos+=("$a") ;;
+      -f|--fg)     no_tmux=1 ;;
+      -a|--all)    all_flag=1 ;;
+      -r|--remote) remote_flag=1 ;;
+      -*)          echo "t resume: unknown flag: $a (t resume -h for flags)" >&2; return 1 ;;
+      *)           pos+=("$a") ;;
     esac
   done
   local repo="${pos[1]:-}" slot="${pos[2]:-}"
@@ -2622,10 +2627,14 @@ _t_resume() {
   # cwd repo; bare `t resume` infers the repo too — and OUTSIDE any DEV_REPOS dir
   # it widens to EVERY worktree repo instead of erroring (the `t ls` unscoped
   # convention: no repo context → show everything; the picker grows a repo
-  # column). A lone numeric slot still demands a repo — "slot 3" of no
+  # column). -a/--all forces that widening even inside a repo dir (same flag as
+  # `t ls -a`). A lone numeric slot still demands a repo — "slot 3" of no
   # particular repo is a guess, and other verbs refuse the same way.
   local all_mode=
-  if [[ "$repo" == <-> && -z "$slot" ]]; then
+  if [[ -n $all_flag ]]; then
+    [[ -z $repo && -z $slot ]] || { echo "t resume: --all scans every worktree repo — drop '$repo${slot:+ $slot}'." >&2; return 1; }
+    all_mode=1
+  elif [[ "$repo" == <-> && -z "$slot" ]]; then
     slot=$repo
     repo=$(_t_infer_repo "$slot") || { echo "Not inside a DEV_REPOS dir — name the repo (t resume <repo> $slot)." >&2; return 1; }
   elif [[ -z "$repo" ]]; then
@@ -2665,21 +2674,31 @@ _t_resume() {
     [[ -n $p ]] && live[${p:A}]=$s
   done
 
-  # Remote-live guard (one-live-owner invariant): a synced transcript here does
-  # NOT mean the slot is idle — its owning host may still be driving `claude -r`
-  # on that session id, and a second local `claude -r` would append to the same
-  # .jsonl with no locking and diverge the conversation. ONE _dev_rows_all
-  # fan-out (fg rows, `:`-labelled, dropped here), then per-repo awk over the
-  # cached rows builds a slot→host map (matching the repo's dir OR its
-  # per-session-worktree path, same rule as _dev_remote_resolve so a `dev-dot-2`
-  # on mini matches `dev-dotfiles-2` here — both key one dir). Remote-live slots
-  # are treated like local-live below: explicit ask → attach in place on the
-  # remote (mirrors `t open`'s auto-detect); scan → not resumable, but NOTED (a
-  # session you're looking for may be live on mini — silence would read as
-  # "doesn't exist"). The remote alias is captured so the attach doesn't need a
-  # second scan via _dev_remote_resolve.
-  local remote_rows=
-  (( ${#REMOTE_HOSTS} )) && remote_rows=$(_dev_rows_all 2>/dev/null | awk -F'\t' '$1 != "local" && $4 !~ /:/')
+  # ONE live-slot scan (one-live-owner invariant): a synced transcript here does
+  # NOT mean the slot is idle — a local tmux slot or another host may still be
+  # driving `claude -r` on that session id, and a second `claude -r` would append
+  # to the same .jsonl with no locking and diverge the conversation. _dev_rows_all
+  # when $REMOTE_HOSTS exist (this machine + every host), else a local-only
+  # _dev_session_rows; fg rows (`:`-labelled) dropped. Live slots become LABELED
+  # PICKER ROWS below ("● here" / "● on <host>") whose pick ATTACHES in place
+  # instead of resuming — the picker itself says where everything is, rather than
+  # stderr notes nobody reads. The per-repo awk over the cached remote rows builds
+  # slot→host/alias/title maps (matching the repo's dir OR its per-session-worktree
+  # path, same rule as _dev_remote_resolve so a `dev-dot-2` on mini matches
+  # `dev-dotfiles-2` here — both key one dir); the alias is captured so an attach
+  # needs no second scan. -r/--remote narrows the picker to remote-live slots only.
+  local all_rows= remote_rows=
+  if (( ${#REMOTE_HOSTS} )); then
+    all_rows=$(_dev_rows_all 2>/dev/null | awk -F'\t' '$4 !~ /:/')
+  else
+    all_rows=$(_dev_session_rows 2>/dev/null | awk -F'\t' '$3 !~ /:/ {print "local\t" $0}')
+  fi
+  remote_rows=$(print -r -- "$all_rows" | awk -F'\t' '$1 != "local"')
+  # Local live titles, keyed by short session name (dev- prefix stripped).
+  local -A local_sum; local _lsn _lsum
+  while IFS=$'\t' read -r _lsn _lsum; do
+    [[ -n $_lsn ]] && local_sum[$_lsn]=$_lsum
+  done < <(print -r -- "$all_rows" | awk -F'\t' '$1 == "local" {print $4 "\t" $7}')
 
   # Candidates: dead slots whose worktree project dir holds a transcript —
   # EVERY conversation in the slot, newest first, not just the newest .jsonl
@@ -2693,23 +2712,23 @@ _t_resume() {
   # (see the collision branch below). NOTE: every `local` here is hoisted OUT
   # of the loops — an assignmentless `local x` re-run on an already-local x
   # does not redeclare, it PRINTS `x=value` (the `_ok=claw` junk-output bug).
-  local -a cands slots tx remote_note
-  local -A remote_live_host remote_live_alias
-  local n wt sid busy rhost _rdir _rbase _rhost _rn _ralias _ok _stale stale_path
+  local -a cands slots tx
+  local -A remote_live_host remote_live_alias remote_live_sum
+  local n wt sid busy rhost _rdir _rbase _rhost _rn _ralias _rsum _ok _stale stale_path
   local txf title when
   local _rwtr=${DEV_WORKTREE_ROOT:-}
   if [[ -n $slot ]]; then slots=($slot); else slots=({1..20}); fi
   for repo in $repos; do
     _rdir=${DEV_REPOS[$repo]}; _rbase=${_rdir:t}
-    remote_live_host=(); remote_live_alias=()
+    remote_live_host=(); remote_live_alias=(); remote_live_sum=()
     if [[ -n $remote_rows ]]; then
-      while IFS=$'\t' read -r _rhost _rn _ralias; do
-        [[ -n $_rn ]] && { remote_live_host[$_rn]=$_rhost; remote_live_alias[$_rn]=$_ralias; }
+      while IFS=$'\t' read -r _rhost _rn _ralias _rsum; do
+        [[ -n $_rn ]] && { remote_live_host[$_rn]=$_rhost; remote_live_alias[$_rn]=$_ralias; remote_live_sum[$_rn]=$_rsum; }
       done < <(print -r -- "$remote_rows" | awk -F'\t' -v d="$_rdir" -v wtr="$_rwtr" -v b="$_rbase" '
         ($3==d || (wtr != "" && b != "" && index($3, wtr "/" b "/") == 1)) {
           n = $4; sub(/^.*-/, "", n)
           r = $4; sub(/-[^-]+$/, "", r)
-          print $1 "\t" n "\t" r
+          print $1 "\t" n "\t" r "\t" $7
         }')
     fi
     for n in $slots; do
@@ -2721,9 +2740,12 @@ _t_resume() {
           _t_dev "$repo" "$n"
           return
         fi
+        # Scan: a live local slot is a labeled row (pick → attach), unless -r.
+        [[ -n $remote_flag ]] && continue
+        cands+=("$repo"$'\t'"$n"$'\t'-$'\t'"$wt"$'\t'"● here"$'\t'"${local_sum[${busy#dev-}]:-(live session)}"$'\t'here$'\t'-)
         continue
       fi
-      # Remote-live: same treatment as local live (see the guard note above).
+      # Remote-live: same treatment as local live (see the scan note above).
       rhost=${remote_live_host[$n]:-}
       if [[ -n $rhost ]]; then
         if [[ -n $slot ]]; then
@@ -2731,9 +2753,11 @@ _t_resume() {
           _dev_remote_attach "$rhost"$'\t'"${remote_live_alias[$n]}"$'\t'"$n" ""
           return
         fi
-        remote_note+=("$repo $n is live on $rhost — attach: t open $repo $n · pull here: t beam $repo $n --from $rhost")
+        cands+=("$repo"$'\t'"$n"$'\t'-$'\t'"$wt"$'\t'"● on $rhost"$'\t'"${remote_live_sum[$n]:-(live session)}"$'\t'"$rhost"$'\t'"${remote_live_alias[$n]}")
         continue
       fi
+      # Below here: dead slots (resumable transcripts) — excluded by -r/--remote.
+      [[ -n $remote_flag ]] && continue
       # Name-only collision: a dev-<alias>-${n} tmux session (any alias keying
       # this repo's dir — see _t_dev / _t_pop) exists but is rooted elsewhere
       # (not this slot's worktree — an old alias, opt-out shared tree, or a
@@ -2759,17 +2783,20 @@ _t_resume() {
         title=$(_transcript_title "$txf")
         [[ -n $title ]] || continue        # conversationless stub — nothing to resume
         when=$(stat -f '%Sm' -t '%b %d %H:%M' "$txf" 2>/dev/null)
-        cands+=("$repo"$'\t'"$n"$'\t'"${${txf:t}%.jsonl}"$'\t'"$wt"$'\t'"$when"$'\t'"$title")
+        cands+=("$repo"$'\t'"$n"$'\t'"${${txf:t}%.jsonl}"$'\t'"$wt"$'\t'"$when"$'\t'"$title"$'\t'-$'\t'-)
       done
     done
   done
-  # Live-elsewhere slots surfaced by the scan (informational; they are not
-  # resume candidates — the invariant forbids a second owner).
-  local note
-  for note in "${(@)remote_note}"; do echo "($note)" >&2; done
 
   if (( ! $#cands )); then
-    if [[ -n $slot ]]; then
+    if [[ -n $remote_flag ]]; then
+      # NB: in all-repos mode $repo is a spent loop variable — don't name it.
+      if [[ -n $all_mode ]]; then
+        echo "No live remote slots in any repo (t ls -r shows everything live; t open -r --new starts one)." >&2
+      else
+        echo "No live remote slots for $repo (t ls -r shows everything live; t open -r --new starts one)." >&2
+      fi
+    elif [[ -n $slot ]]; then
       echo "No saved conversation for $repo slot $slot (nothing recorded in its worktree)." >&2
       echo "Fresh session: t open $repo $slot · full picker: t push -p" >&2
     elif [[ -n $all_mode ]]; then
@@ -2782,11 +2809,14 @@ _t_resume() {
     return 1
   fi
 
-  # Picker rows: repo(1) slot(2) sid(3) wt(4) when(5) title(6), plus one ALIGNED
-  # display column (7) appended here — fzf renders raw \t fields at literal tab
-  # stops (nothing lines up), so both fzf (--with-nth=7) and the no-fzf listing
-  # show the same pre-padded gh-style row: [repo]  slot  date  title. All-repos
-  # mode adds the repo column, padded to the widest alias in this candidate set.
+  # Picker rows: repo(1) slot(2) sid(3) wt(4) when(5) title(6) loc(7) alias(8) —
+  # loc/alias are `-` for a dead (resumable) row, `here` for a live local slot,
+  # or the host + remote alias for a slot live on a $REMOTE_HOSTS host (pick →
+  # attach in place, never a second owner). One ALIGNED display column (9) is
+  # appended here — fzf renders raw \t fields at literal tab stops (nothing
+  # lines up), so both fzf (--with-nth=9) and the no-fzf listing show the same
+  # pre-padded gh-style row: [repo]  slot  date|●-where  title. All-repos mode
+  # adds the repo column, padded to the widest alias in this candidate set.
   local pick c fprompt; local -a f
   local rw=0 i=1
   if [[ -n $all_mode ]]; then
@@ -2807,7 +2837,7 @@ _t_resume() {
   if (( $#cands == 1 )); then
     pick=${cands[1]}
   elif [[ -t 0 && -t 1 ]] && command -v fzf >/dev/null; then
-    pick=$(print -rl -- "${(@)cands}" | fzf --delimiter=$'\t' --with-nth=7 --no-hscroll --prompt="$fprompt") || return 1
+    pick=$(print -rl -- "${(@)cands}" | fzf --delimiter=$'\t' --with-nth=9 --no-hscroll --prompt="$fprompt") || return 1
     [[ -n $pick ]] || return 1
   elif [[ -n $slot ]]; then
     # Explicit slot but no TTY/fzf to pick with: the newest conversation IS the
@@ -2827,6 +2857,18 @@ _t_resume() {
   fi
   f=("${(@ps:\t:)pick}")
   repo=$f[1]; slot=$f[2]; sid=$f[3]; wt=$f[4]
+  local loc="${f[7]:-}" lalias="${f[8]:-}"
+
+  # A LIVE row was picked: attach in place (local or on its host) — resuming it
+  # here would mint a second owner of the session id (see the scan note above).
+  if [[ $loc == here ]]; then
+    echo "Slot $slot is live locally — attaching."
+    _t_dev "$repo" "$slot"
+    return
+  elif [[ -n $loc && $loc != - ]]; then
+    _dev_remote_attach "$loc"$'\t'"$lalias"$'\t'"$slot" ""
+    return
+  fi
 
   # The recorded cwd is the transcript's lookup key: rebuild the worktree at the
   # IDENTICAL path when it was reaped/never existed here (branch + transcript are

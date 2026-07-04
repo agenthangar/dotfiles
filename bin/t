@@ -692,13 +692,15 @@ Run `t <verb> -h` for a verb's own flags.""")
             "in a fresh dev slot and attaches. Names default to "
             "the cwd repo; outside any repo dir a bare `t resume` scans every worktree repo. "
             "One candidate is taken, several fzf-pick (an explicit slot with no TTY takes the "
-            "newest). A live slot is attached "
-            "instead — including one live on another host (attached in place there; a scan "
-            "notes it). Worktree-per-session repos only (a shared tree's transcripts are "
+            "newest). LIVE slots appear as labeled rows — '● here' / '● on <host>' — and "
+            "picking one ATTACHES in place (locally or on its host) instead of resuming. "
+            "Worktree-per-session repos only (a shared tree's transcripts are "
             "ambiguous per-slot — use `t push -p` there).")
     sp.add_argument("repo", nargs="?", help="DEV_REPOS key; defaults to the repo your cwd is in")
     sp.add_argument("slot", nargs="?", help="slot number; a lone slot implies the cwd repo")
     sp.add_argument("-f", "--fg", action="store_true", help="resume inline in THIS terminal (no tmux slot)")
+    sp.add_argument("-a", "--all", action="store_true", help="scan every worktree repo (the default outside a repo dir)")
+    sp.add_argument("-r", "--remote", action="store_true", help="only slots live on a $REMOTE_HOSTS host (pick → attach in place there)")
 
     sp = sub.add_parser("beam", help="move a session between machines (send, or --from to receive)",
         description="Move a Claude session between machines (a cross-host push/pop). By default "

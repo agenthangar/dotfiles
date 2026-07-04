@@ -2630,10 +2630,13 @@ _t_plan() {
 # use it, several → fzf, none → bail with a hint; outside any DEV_REPOS dir a bare
 # `t resume` scans EVERY worktree repo (the
 # `t ls` unscoped convention) with a repo column in the picker; -a/--all forces that
-# widening from anywhere (the `t ls -a` flag). LIVE slots — local or on a
+# widening from anywhere (the `t ls -a` flag). -r/--remote PULLS the latest
+# transcripts from every $REMOTE_HOSTS host first (direct rsync — csync is periodic
+# and needs a prompt on the far side, so "resume what just died on the other
+# machine" cannot wait for it), then scans as usual. LIVE slots — local or on a
 # $REMOTE_HOSTS host — appear as labeled rows ("● here" / "● on <host>") whose pick
 # ATTACHES in place instead of resuming (one-live-owner: a second `claude -r` on a
-# live id diverges the transcript); -r/--remote narrows to remote-live rows only.
+# live id diverges the transcript).
 # -f/--fg resumes inline in THIS terminal (t pop's landing) instead of a slot.
 # User-facing help lives in bin/t (`t resume -h`); the t() shim routes -h there.
 _t_resume() {
@@ -2700,6 +2703,42 @@ _t_resume() {
     [[ -n $p ]] && live[${p:A}]=$s
   done
 
+  # -r/--remote: PULL the scan targets' transcripts from every $REMOTE_HOSTS host
+  # FIRST (direct rsync --update per worktree project dir — union rule: newer
+  # wins, nothing deleted; $HOME is identical across machines so the project-dir
+  # encoding matches verbatim), then scan as usual. This is what "resume the
+  # conversation that just died on the other machine" needs: csync's convergence
+  # is periodic AND driven by a precmd hook, so a headless host pushes nothing to
+  # iCloud until someone opens a shell THERE — the direct pull closes that
+  # window. A pulled conversation is then an ordinary candidate (a dead session
+  # has no home host). rc 23 = remote glob matched nothing (no sessions for that
+  # repo there) — not an error.
+  if [[ -n $remote_flag ]]; then
+    (( ${#REMOTE_HOSTS} )) || { echo "t resume -r: no REMOTE_HOSTS configured (set them in ~/.zshrc.local)." >&2; return 1; }
+    # Include filters, not a remote glob: the far side's login shell is zsh,
+    # whose nomatch ABORTS on a glob with no hits (rc 1 — read as "unreachable"
+    # for any repo with no sessions on that host). One rsync per host covers
+    # every scan target; rc 23 = source dir absent there (no claude yet) — fine.
+    local _h _tgt _enc _prc
+    local -a _incs
+    for repo in $repos; do
+      _enc=${${:-${DEV_WORKTREE_ROOT}/${DEV_REPOS[$repo]:t}}//[^A-Za-z0-9]/-}
+      _incs+=(--include="${_enc}-*/" --include="${_enc}-*/**")
+    done
+    for _h in ${(ko)REMOTE_HOSTS}; do
+      _tgt=${REMOTE_HOSTS[$_h]}
+      rsync -a --update --timeout=10 -e "ssh -o ConnectTimeout=3 -o BatchMode=yes" \
+        "${(@)_incs}" --exclude='*' \
+        "$_tgt:$HOME/.claude/projects/" "$HOME/.claude/projects/" 2>/dev/null
+      _prc=$?
+      if (( _prc == 0 || _prc == 23 )); then
+        echo "⟳ pulled ${_h}'s latest transcripts" >&2
+      else
+        echo "t resume -r: $_h unreachable (rc=$_prc) — skipped; its newest transcripts may be missing here." >&2
+      fi
+    done
+  fi
+
   # ONE live-slot scan (one-live-owner invariant): a synced transcript here does
   # NOT mean the slot is idle — a local tmux slot or another host may still be
   # driving `claude -r` on that session id, and a second `claude -r` would append
@@ -2712,7 +2751,7 @@ _t_resume() {
   # slot→host/alias/title maps (matching the repo's dir OR its per-session-worktree
   # path, same rule as _dev_remote_resolve so a `dev-dot-2` on mini matches
   # `dev-dotfiles-2` here — both key one dir); the alias is captured so an attach
-  # needs no second scan. -r/--remote narrows the picker to remote-live slots only.
+  # needs no second scan.
   local all_rows= remote_rows=
   if (( ${#REMOTE_HOSTS} )); then
     all_rows=$(_dev_rows_all 2>/dev/null | awk -F'\t' '$4 !~ /:/')
@@ -2766,8 +2805,7 @@ _t_resume() {
           _t_dev "$repo" "$n"
           return
         fi
-        # Scan: a live local slot is a labeled row (pick → attach), unless -r.
-        [[ -n $remote_flag ]] && continue
+        # Scan: a live local slot is a labeled row (pick → attach).
         cands+=("$repo"$'\t'"$n"$'\t'-$'\t'"$wt"$'\t'"● here"$'\t'"${local_sum[${busy#dev-}]:-(live session)}"$'\t'here$'\t'-)
         continue
       fi
@@ -2782,8 +2820,6 @@ _t_resume() {
         cands+=("$repo"$'\t'"$n"$'\t'-$'\t'"$wt"$'\t'"● on $rhost"$'\t'"${remote_live_sum[$n]:-(live session)}"$'\t'"$rhost"$'\t'"${remote_live_alias[$n]}")
         continue
       fi
-      # Below here: dead slots (resumable transcripts) — excluded by -r/--remote.
-      [[ -n $remote_flag ]] && continue
       # Name-only collision: a dev-<alias>-${n} tmux session (any alias keying
       # this repo's dir — see _t_dev / _t_pop) exists but is rooted elsewhere
       # (not this slot's worktree — an old alias, opt-out shared tree, or a
@@ -2815,16 +2851,7 @@ _t_resume() {
   done
 
   if (( ! $#cands )); then
-    if [[ -n $remote_flag ]]; then
-      # NB: in all-repos mode $repo is a spent loop variable — don't name it.
-      if [[ -n $all_mode ]]; then
-        echo "Nothing is live on any \$REMOTE_HOSTS host right now (-r lists LIVE remote slots, to attach in place)." >&2
-      else
-        echo "No $repo slot is live on any \$REMOTE_HOSTS host right now (-r lists LIVE remote slots, to attach in place)." >&2
-      fi
-      echo "Dead sessions' conversations sync here via csync — plain \`t resume\` lists them wherever they last ran." >&2
-      echo "Fresh remote session: t open <repo> -r --new · survey hosts: t ls -r" >&2
-    elif [[ -n $slot ]]; then
+    if [[ -n $slot ]]; then
       echo "No saved conversation for $repo slot $slot (nothing recorded in its worktree)." >&2
       echo "Fresh session: t open $repo $slot · full picker: t push -p" >&2
     elif [[ -n $all_mode ]]; then

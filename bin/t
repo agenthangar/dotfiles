@@ -701,7 +701,9 @@ Run `t <verb> -h` for a verb's own flags.""")
     sp.add_argument("slot", nargs="?", help="slot number; a lone slot implies the cwd repo")
     sp.add_argument("-f", "--fg", action="store_true", help="resume inline in THIS terminal (no tmux slot)")
     sp.add_argument("-a", "--all", action="store_true", help="scan every worktree repo (the default outside a repo dir)")
-    sp.add_argument("-r", "--remote", action="store_true", help="only slots live on a $REMOTE_HOSTS host (pick → attach in place there)")
+    sp.add_argument("-r", "--remote", action="store_true",
+        help="pull the latest transcripts from every $REMOTE_HOSTS host first (direct rsync; "
+             "csync is periodic and needs a shell on the far side), then scan as usual")
 
     sp = sub.add_parser("cd", help="cd this shell into a dev slot's worktree",
         description="cd the calling shell into a dev slot's worktree "

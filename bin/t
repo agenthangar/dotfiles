@@ -689,8 +689,10 @@ Run `t <verb> -h` for a verb's own flags.""")
             "deliberately starts fresh — this brings the chat back). Resolves the slot's own "
             "transcript via its per-session worktree, rebuilding a reaped worktree from its "
             "branch first, then resumes it in a fresh dev slot and attaches. Names default to "
-            "the cwd repo; no slot → one candidate is taken, several fzf-pick. A live slot is "
-            "attached instead. Worktree-per-session repos only (a shared tree's transcripts are "
+            "the cwd repo; outside any repo dir a bare `t resume` scans every worktree repo. "
+            "No slot → one candidate is taken, several fzf-pick. A live slot is attached "
+            "instead — including one live on another host (attached in place there; a scan "
+            "notes it). Worktree-per-session repos only (a shared tree's transcripts are "
             "ambiguous per-slot — use `t push -p` there).")
     sp.add_argument("repo", nargs="?", help="DEV_REPOS key; defaults to the repo your cwd is in")
     sp.add_argument("slot", nargs="?", help="slot number; a lone slot implies the cwd repo")

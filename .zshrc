@@ -4070,12 +4070,15 @@ alias h=help   # `h` is a shorthand for `help`
 # key for `on`), and slot/flags after. Pulls live from the ${(k)DEV_REPOS} /
 # ${(k)REMOTE_HOSTS} arrays so it stays current with ~/.zshrc.local.
 _t() {
-  local -a verbs=(open ls kill push pop resume beam read plan paste find on)
+  local -a verbs=(open ls kill push pop resume beam read plan paste find on cursor)
   if (( CURRENT == 2 )); then
     _describe -t verbs 't verb' verbs
     return
   fi
   case ${words[2]} in
+    cursor)
+      if (( CURRENT == 3 )); then _values 'chat / action' ls resume -p --from --host
+      else _values 'flag' --host --from -p --pick -a --attach -h --help; fi ;;
     open|kill|read|plan|paste|beam|resume)
       if   (( CURRENT == 3 )); then _values 'repo' ${(k)DEV_REPOS}
       elif (( CURRENT == 4 )); then _values 'slot' 1 2 3 4 new fg

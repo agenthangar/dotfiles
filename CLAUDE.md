@@ -54,6 +54,7 @@ Consequences:
 ./install.sh            # link all dotfiles into $HOME (idempotent; re-run to relink)
 t ls [-r] [-a]          # list Claude dev sessions (-r cross-host, -a all repos)
 t open [repo] [slot]    # open/reattach (repo defaults to cwd repo; --new, --fg, --remote); auto-attaches a remote-only slot in place
+t cd [repo] [slot]      # cd this shell into a slot's worktree (bare/one-arg: fzf pick; repo with no worktrees: its repo dir)
 t beam [repo] [slot] --from <host>   # pull a session from another machine to here (receive); omit --from to send
 t push | t pop          # move this session into / out of a detached tmux slot
 t resume [repo] [slot]  # revive a DEAD slot's last conversation (rebuilds a reaped worktree; --fg inline)

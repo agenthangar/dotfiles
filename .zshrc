@@ -2605,7 +2605,7 @@ _t_resume() {
   # whose worktree is LIVE (by path) is not resumable — explicit ask attaches,
   # scan skips. A slot whose tmux NAME is taken by a session rooted elsewhere is
   # unresumable AND wrong to attach (see the collision branch below).
-  local -a cands slots; local n wt sid busy lname
+  local -a cands slots; local n wt sid busy
   local -a tx
   if [[ -n $slot ]]; then slots=($slot); else slots=({1..20}); fi
   for n in $slots; do
@@ -2614,22 +2614,27 @@ _t_resume() {
     if [[ -n $busy ]]; then
       if [[ -n $slot ]]; then
         echo "Slot $n is live ($busy) — attaching (resume only revives dead slots)."
-        lname=${busy#dev-}
-        _t_dev "${lname%-*}" "$n"
+        _t_dev "$repo" "$n"
         return
       fi
       continue
     fi
-    # Name-only collision: a dev-${repo}-${n} tmux session exists but is rooted
-    # elsewhere (not this slot's worktree — an old alias, opt-out shared tree, or
-    # a stray). _dev_resume_session's `tmux new-session -s dev-${repo}-${n}` would
-    # fail on the duplicate name, and attaching the stale session would land the
-    # user in the wrong worktree with the wrong conversation. Refuse loudly on
-    # explicit ask; skip in scan mode.
-    if tmux has-session -t "dev-${repo}-${n}" 2>/dev/null; then
+    # Name-only collision: a dev-<alias>-${n} tmux session (any alias keying
+    # this repo's dir — see _t_dev / _t_pop) exists but is rooted elsewhere
+    # (not this slot's worktree — an old alias, opt-out shared tree, or a
+    # stray). _dev_resume_session's `tmux new-session -s dev-${repo}-${n}`
+    # would fail on the duplicate name, and attaching the stale session would
+    # land the user in the wrong worktree with the wrong conversation. Refuse
+    # loudly on explicit ask; skip in scan mode.
+    local _rdir=${DEV_REPOS[$repo]} _ok _stale=
+    for _ok in ${(k)DEV_REPOS}; do
+      [[ ${DEV_REPOS[$_ok]} != $_rdir ]] && continue
+      tmux has-session -t "dev-${_ok}-${n}" 2>/dev/null && { _stale="dev-${_ok}-${n}"; break; }
+    done
+    if [[ -n $_stale ]]; then
       if [[ -n $slot ]]; then
-        local stale_path=$(tmux display-message -p -t "dev-${repo}-${n}" '#{session_path}' 2>/dev/null)
-        echo "Slot $n's tmux name (dev-${repo}-${n}) is taken by a session rooted elsewhere${stale_path:+ ($stale_path)} — kill it (tmux kill-session -t dev-${repo}-${n}) before resuming." >&2
+        local stale_path=$(tmux display-message -p -t "$_stale" '#{session_path}' 2>/dev/null)
+        echo "Slot $n's tmux name ($_stale) is taken by a session rooted elsewhere${stale_path:+ ($stale_path)} — kill it (tmux kill-session -t $_stale) before resuming." >&2
         return 1
       fi
       continue

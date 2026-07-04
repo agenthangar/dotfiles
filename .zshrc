@@ -2862,7 +2862,12 @@ _t_resume() {
     fi
     (( i++ ))
   done
-  if (( $#cands == 1 )); then
+  # Sole candidate auto-picks — but only when it is DEAD (loc == -, resumed in
+  # place here) or we have a TTY. A sole LIVE row without a TTY would hit
+  # _t_dev / _dev_remote_attach, both of which need a terminal to attach; fall
+  # through to the listing branch so the message matches the multi-candidate
+  # no-fzf case instead of failing hard from inside the attach helper.
+  if (( $#cands == 1 )) && f=("${(@ps:\t:)cands[1]}") && [[ $f[7] == - || -t 1 ]]; then
     pick=${cands[1]}
   elif [[ -t 0 && -t 1 ]] && command -v fzf >/dev/null; then
     pick=$(print -rl -- "${(@)cands}" | fzf --delimiter=$'\t' --with-nth=9 --no-hscroll --prompt="$fprompt") || return 1

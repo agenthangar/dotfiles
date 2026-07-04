@@ -1515,7 +1515,7 @@ _dev_kill_fg() {
     m=
     if [[ $handle == $label ]]; then m=1
     elif [[ $handle == $repo && -z ${DEV_REPOS[$handle]:-} ]]; then m=1
-    elif [[ $handle != *:* && -n $sid && $sid != - && ${sid[1,${#handle}]} == $handle ]]; then m=1
+    elif [[ $handle != *:* && -z ${DEV_REPOS[$handle]:-} && -n $sid && $sid != - && ${sid[1,${#handle}]} == $handle ]]; then m=1
     fi
     [[ -n $m ]] || continue
     matched=1
@@ -2281,7 +2281,7 @@ _dev_remote_fg_kill() {
     | awk -F'\t' -v h="$handle" -v idp="$idpart" -v isrepo="${DEV_REPOS[$handle]:+1}" '
         $1 != "local" && $4 ~ /:/ {
           repo=$4; sub(/:.*/, "", repo);
-          if ($4==h || (h==repo && isrepo=="") || (index(h,":")==0 && $2!="-" && index($2,idp)==1))
+          if ($4==h || (h==repo && isrepo=="") || (index(h,":")==0 && isrepo=="" && $2!="-" && index($2,idp)==1))
             if (!seen[$1]++) print $1
         }')
   [[ -n $hosts ]] || return 2
@@ -2553,6 +2553,151 @@ _t_plan() {
     glow -p "$plan"
   else
     less "$plan"
+  fi
+}
+
+# _t_resume — the `t resume` verb: revive a DEAD dev slot's last conversation.
+# `t open` on a dead slot deliberately starts a FRESH claude (the worktree and its
+# uncommitted work are reused, but not the chat); this is the counterpart that brings
+# the chat back. Worktree-per-session is what makes it precise: each slot's worktree
+# is its own ~/.claude/projects/<enc> dir, so "this slot's newest transcript" cannot
+# be a sibling's (the ambiguity that plagues shared-tree repos — which are therefore
+# refused here and pointed at the `t push -p` picker instead). Composes the existing
+# engines: _dev_worktree_path (slot → recorded cwd), _dev_ensure_session_cwd (rebuild
+# a reaped/synced-away worktree from its durable branch), _dev_resume_session (a
+# first-class dev slot, CLAUDE_RESUME_ID stamped so pop/plan keep working). No slot →
+# house picker convention: one candidate → use it, several → fzf, none → bail with a
+# hint. -f/--fg resumes inline in THIS terminal (t pop's landing) instead of a slot.
+# User-facing help lives in bin/t (`t resume -h`); the t() shim routes -h there.
+_t_resume() {
+  setopt local_options null_glob bare_glob_qual
+  local a no_tmux=; local -a pos
+  for a in "$@"; do
+    case "$a" in
+      -f|--fg) no_tmux=1 ;;
+      *)       pos+=("$a") ;;
+    esac
+  done
+  local repo="${pos[1]:-}" slot="${pos[2]:-}"
+  # Repo-aware defaults (mirrors t plan/paste): lone numeric arg is a SLOT of the
+  # cwd repo; bare `t resume` infers the repo too.
+  if [[ "$repo" == <-> && -z "$slot" ]]; then
+    slot=$repo
+    repo=$(_t_infer_repo "$slot") || { echo "Not inside a DEV_REPOS dir — name the repo (t resume <repo> $slot)." >&2; return 1; }
+  elif [[ -z "$repo" ]]; then
+    repo=$(_t_infer_repo) || { echo "Not inside a DEV_REPOS dir — name the repo (t resume <repo> [slot])." >&2; return 1; }
+  fi
+  [[ -n ${DEV_REPOS[$repo]:-} ]] || { echo "Unknown repo: $repo (configured: ${(k)DEV_REPOS})" >&2; return 1; }
+  if ! _dev_worktree_enabled "$repo"; then
+    echo "t resume: $repo opts out of worktree-per-session, so its slots share one project dir and a slot's last conversation is ambiguous — pick one with \`t push -p\` instead." >&2
+    return 1
+  fi
+
+  # Live dev sessions by ROOTED PATH (any alias — dev-dot-2 and dev-dotfiles-2 can
+  # key one worktree), so a live slot is recognised however it was named.
+  local -A live; local s p
+  for s in ${(f)"$(tmux list-sessions -F '#{session_name}' 2>/dev/null | grep '^dev-')"}; do
+    p=$(tmux display-message -p -t "$s" '#{session_path}' 2>/dev/null)
+    [[ -n $p ]] && live[${p:A}]=$s
+  done
+
+  # Candidates: dead slots whose worktree project dir holds a transcript. A slot
+  # whose worktree is LIVE (by path) is not resumable — explicit ask attaches,
+  # scan skips. A slot whose tmux NAME is taken by a session rooted elsewhere is
+  # unresumable AND wrong to attach (see the collision branch below).
+  local -a cands slots; local n wt sid busy
+  local -a tx
+  if [[ -n $slot ]]; then slots=($slot); else slots=({1..20}); fi
+  for n in $slots; do
+    wt=$(_dev_worktree_path "$repo" "$n")
+    busy=${live[${wt:A}]:-}
+    if [[ -n $busy ]]; then
+      if [[ -n $slot ]]; then
+        echo "Slot $n is live ($busy) — attaching (resume only revives dead slots)."
+        _t_dev "$repo" "$n"
+        return
+      fi
+      continue
+    fi
+    # Name-only collision: a dev-<alias>-${n} tmux session (any alias keying
+    # this repo's dir — see _t_dev / _t_pop) exists but is rooted elsewhere
+    # (not this slot's worktree — an old alias, opt-out shared tree, or a
+    # stray). _dev_resume_session's `tmux new-session -s dev-${repo}-${n}`
+    # would fail on the duplicate name, and attaching the stale session would
+    # land the user in the wrong worktree with the wrong conversation. Refuse
+    # loudly on explicit ask; skip in scan mode.
+    local _rdir=${DEV_REPOS[$repo]} _ok _stale=
+    for _ok in ${(k)DEV_REPOS}; do
+      [[ ${DEV_REPOS[$_ok]} != $_rdir ]] && continue
+      tmux has-session -t "dev-${_ok}-${n}" 2>/dev/null && { _stale="dev-${_ok}-${n}"; break; }
+    done
+    if [[ -n $_stale ]]; then
+      if [[ -n $slot ]]; then
+        local stale_path=$(tmux display-message -p -t "$_stale" '#{session_path}' 2>/dev/null)
+        echo "Slot $n's tmux name ($_stale) is taken by a session rooted elsewhere${stale_path:+ ($stale_path)} — kill it (tmux kill-session -t $_stale) before resuming." >&2
+        return 1
+      fi
+      continue
+    fi
+    tx=( "$HOME/.claude/projects/${wt//[^A-Za-z0-9]/-}"/*.jsonl(Nom[1]) )
+    [[ -n ${tx[1]} ]] || continue
+    sid=${${tx[1]:t}%.jsonl}
+    cands+=("$n"$'\t'"$sid"$'\t'"$wt"$'\t'"$(_transcript_title "${tx[1]}")")
+  done
+
+  if (( ! $#cands )); then
+    if [[ -n $slot ]]; then
+      echo "No saved conversation for $repo slot $slot (nothing recorded in its worktree)." >&2
+    else
+      echo "Nothing to resume for $repo — no dead slot has a saved conversation." >&2
+    fi
+    echo "Fresh session: t open $repo${slot:+ $slot} · full picker: t push -p" >&2
+    return 1
+  fi
+
+  local pick c; local -a f
+  if (( $#cands == 1 )); then
+    pick=${cands[1]}
+  elif [[ -t 0 && -t 1 ]] && command -v fzf >/dev/null; then
+    pick=$(print -rl -- "${(@)cands}" | fzf --delimiter=$'\t' --with-nth=1,4 --prompt="resume $repo slot> ") || return 1
+    [[ -n $pick ]] || return 1
+  else
+    echo "Several resumable slots for $repo — name one (t resume $repo <slot>):" >&2
+    for c in "${(@)cands}"; do
+      f=("${(@ps:\t:)c}")
+      printf '  %s  %s\n' "$f[1]" "$f[4]" >&2
+    done
+    return 1
+  fi
+  f=("${(@ps:\t:)pick}")
+  slot=$f[1]; sid=$f[2]; wt=$f[3]
+
+  # The recorded cwd is the transcript's lookup key: rebuild the worktree at the
+  # IDENTICAL path when it was reaped/never existed here (branch + transcript are
+  # durable; the dir is not).
+  local cwd
+  cwd=$(_dev_ensure_session_cwd "$wt") || {
+    echo "Couldn't rebuild the worktree for $repo slot $slot ($wt) — is its dev/${${DEV_REPOS[$repo]}:t}-${slot} branch gone?" >&2
+    return 1
+  }
+
+  if [[ -n $no_tmux ]]; then
+    if [[ -n $TMUX && -n $CLAUDE_CODE_SESSION_ID ]]; then
+      echo "Run t resume --fg from a plain shell — it resumes the session in the foreground." >&2
+      return 1
+    fi
+    cd "$cwd" || return 1
+    claude -r "$sid"
+    return
+  fi
+
+  local session="dev-${repo}-${slot}"
+  echo "Resuming ${sid:0:8} in $session ($cwd)"
+  _dev_resume_session "$session" "$cwd" "$sid"
+  if [[ -z $TMUX && -t 0 && -t 1 ]]; then
+    tmux attach-session -t "$session"
+  else
+    echo "Attach with: t open $repo $slot"
   fi
 }
 
@@ -3637,7 +3782,7 @@ _t_beam() {
 #     internal session-rows/land/kill-owner) run straight through via `command t`
 #     (the `command` builtin reaches ~/bin/t past this function, dodging the
 #     name collision — same trick the claude() wrapper uses).
-#   • shell-bound verbs (open/pop/push/find) map to the existing zsh functions,
+#   • shell-bound verbs (open/pop/push/resume/find) map to the existing zsh functions,
 #     which ALREADY do the cd + `claude -r` in the current terminal and the tpush
 #     sentinel handoff correctly *because they run in the calling shell* — a bin
 #     subprocess cannot. No resolve protocol is needed: the shim just calls them.
@@ -3652,12 +3797,13 @@ t() {
   [[ -z $verb ]] && { command t; return; }
   shift
   case "$verb" in
-    open)  _t_open "$@" ;;            # → _t_dev (local / -r or auto-detect remote attach / -f / fg adopt)
-    pop)   _t_pop "$@" ;;             # → cd + claude -r in THIS terminal
-    push)  _t_push "$@" ;;            # → sentinel handoff; claude() wrapper spawns post-exit
-    find)  _t_find "$@" ;;            # → rank/pick then cd + claude -r here
-    beam)  _t_beam_xlate "$@" ;;      # → _t_beam (host moves from --host to a positional)
-    *)     command t "$verb" "$@" ;;  # ls/read/plan/paste/kill/on/session-rows/land/kill-owner
+    open)   _t_open "$@" ;;           # → _t_dev (local / -r or auto-detect remote attach / -f / fg adopt)
+    pop)    _t_pop "$@" ;;            # → cd + claude -r in THIS terminal
+    resume) _t_resume "$@" ;;         # → revive a dead slot's chat (rebuilds a reaped worktree; --fg → here)
+    push)   _t_push "$@" ;;           # → sentinel handoff; claude() wrapper spawns post-exit
+    find)   _t_find "$@" ;;           # → rank/pick then cd + claude -r here
+    beam)   _t_beam_xlate "$@" ;;     # → _t_beam (host moves from --host to a positional)
+    *)      command t "$verb" "$@" ;; # ls/read/plan/paste/kill/on/session-rows/land/kill-owner
   esac
 }
 
@@ -3889,7 +4035,7 @@ alias h=help   # `h` is a shorthand for `help`
 # key for `on`), and slot/flags after. Pulls live from the ${(k)DEV_REPOS} /
 # ${(k)REMOTE_HOSTS} arrays so it stays current with ~/.zshrc.local.
 _t() {
-  local -a verbs=(open ls kill push pop beam read plan paste find on cursor)
+  local -a verbs=(open ls kill push pop resume beam read plan paste find on cursor)
   if (( CURRENT == 2 )); then
     _describe -t verbs 't verb' verbs
     return
@@ -3898,7 +4044,7 @@ _t() {
     cursor)
       if (( CURRENT == 3 )); then _values 'chat / action' ls resume -p --from --host
       else _values 'flag' --host --from -p --pick -a --attach -h --help; fi ;;
-    open|kill|read|plan|paste|beam)
+    open|kill|read|plan|paste|beam|resume)
       if   (( CURRENT == 3 )); then _values 'repo' ${(k)DEV_REPOS}
       elif (( CURRENT == 4 )); then _values 'slot' 1 2 3 4 new fg
       else _values 'flag' --new --fg --remote -y --yes -a --all --host --from -d --detach -p --pick -s --session -h --help; fi ;;

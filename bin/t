@@ -592,11 +592,11 @@ def _read_usage(cfg):
 # ─── shell-bound verbs — handled by the t() zsh shim, not the bin ──────────────
 # These cd the calling shell / exec `claude -r` in the current terminal / hand off
 # the tpush sentinel — a subprocess cannot. The t() function in .zshrc intercepts
-# them and calls the _t_dev/_t_pop/_t_push/_t_find/_t_beam helpers. Reaching the bin
+# them and calls the _t_dev/_t_pop/_t_push/_t_resume/_t_find/_t_beam helpers. Reaching the bin
 # here means it was invoked DIRECTLY (e.g. `command t open`, or a context with no
 # t() function) — which cannot perform the shell action.
 
-_SHELL_BOUND = {"open", "pop", "push", "beam", "find", "__resolve"}
+_SHELL_BOUND = {"open", "pop", "push", "resume", "beam", "find", "__resolve"}
 
 
 def cmd_pending(cfg, args):
@@ -625,6 +625,7 @@ examples:
   t ls -r                 list live sessions across every machine
   t push                  send the current session to a background tmux slot
   t pop api 3             pull dev-api-3 back to this terminal
+  t resume api 3          revive dev-api-3's last conversation after it was closed
   t beam api --host mini  send a session to 'mini' and resume it there
   t find "auth refactor"  search saved sessions, then resume the pick
   t on mini ls            run a command on a remote host
@@ -682,6 +683,18 @@ Run `t <verb> -h` for a verb's own flags.""")
             "and `t pop api 3` pulls dev-api-3. Inverse of `t push`.")
     sp.add_argument("repo", nargs="?", help="DEV_REPOS key; defaults to the repo your cwd is in")
     sp.add_argument("slot", nargs="?", help="slot number; a lone slot implies the cwd repo")
+
+    sp = sub.add_parser("resume", help="revive a dead slot's last conversation",
+        description="Revive a DEAD dev slot's last conversation (`t open` on a dead slot "
+            "deliberately starts fresh — this brings the chat back). Resolves the slot's own "
+            "transcript via its per-session worktree, rebuilding a reaped worktree from its "
+            "branch first, then resumes it in a fresh dev slot and attaches. Names default to "
+            "the cwd repo; no slot → one candidate is taken, several fzf-pick. A live slot is "
+            "attached instead. Worktree-per-session repos only (a shared tree's transcripts are "
+            "ambiguous per-slot — use `t push -p` there).")
+    sp.add_argument("repo", nargs="?", help="DEV_REPOS key; defaults to the repo your cwd is in")
+    sp.add_argument("slot", nargs="?", help="slot number; a lone slot implies the cwd repo")
+    sp.add_argument("-f", "--fg", action="store_true", help="resume inline in THIS terminal (no tmux slot)")
 
     sp = sub.add_parser("beam", help="move a session between machines (send, or --from to receive)",
         description="Move a Claude session between machines (a cross-host push/pop). By default "

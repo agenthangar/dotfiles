@@ -2601,22 +2601,36 @@ _t_resume() {
     [[ -n $p ]] && live[${p:A}]=$s
   done
 
-  # Candidates: dead slots whose worktree project dir holds a transcript. A live
-  # slot (by path, or a same-named session rooted elsewhere — its NAME is taken
-  # either way) is not resumable: explicit ask → attach instead; scan → skip.
+  # Candidates: dead slots whose worktree project dir holds a transcript. A slot
+  # whose worktree is LIVE (by path) is not resumable — explicit ask attaches,
+  # scan skips. A slot whose tmux NAME is taken by a session rooted elsewhere is
+  # unresumable AND wrong to attach (see the collision branch below).
   local -a cands slots; local n wt sid busy lname
   local -a tx
   if [[ -n $slot ]]; then slots=($slot); else slots=({1..20}); fi
   for n in $slots; do
     wt=$(_dev_worktree_path "$repo" "$n")
     busy=${live[${wt:A}]:-}
-    [[ -z $busy ]] && tmux has-session -t "dev-${repo}-${n}" 2>/dev/null && busy="dev-${repo}-${n}"
     if [[ -n $busy ]]; then
       if [[ -n $slot ]]; then
         echo "Slot $n is live ($busy) — attaching (resume only revives dead slots)."
         lname=${busy#dev-}
         _t_dev "${lname%-*}" "$n"
         return
+      fi
+      continue
+    fi
+    # Name-only collision: a dev-${repo}-${n} tmux session exists but is rooted
+    # elsewhere (not this slot's worktree — an old alias, opt-out shared tree, or
+    # a stray). _dev_resume_session's `tmux new-session -s dev-${repo}-${n}` would
+    # fail on the duplicate name, and attaching the stale session would land the
+    # user in the wrong worktree with the wrong conversation. Refuse loudly on
+    # explicit ask; skip in scan mode.
+    if tmux has-session -t "dev-${repo}-${n}" 2>/dev/null; then
+      if [[ -n $slot ]]; then
+        local stale_path=$(tmux display-message -p -t "dev-${repo}-${n}" '#{session_path}' 2>/dev/null)
+        echo "Slot $n's tmux name (dev-${repo}-${n}) is taken by a session rooted elsewhere${stale_path:+ ($stale_path)} — kill it (tmux kill-session -t dev-${repo}-${n}) before resuming." >&2
+        return 1
       fi
       continue
     fi

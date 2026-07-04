@@ -151,11 +151,13 @@ nosleep() { [[ "$1" == -h || "$1" == --help ]] && { _help_for nosleep; return 0;
 #
 # --dev (-d): flip the live surface to the dotfiles checkout you are STANDING IN —
 # re-links from it (catching new/renamed files) and reloads, so its in-progress edits
-# go live for testing without merging. The cwd is the choice: the dev clone, or a
-# per-session worktree (`t cd dot <slot>`, then `dots --dev`). Anywhere else it
-# errors — no fallback, no guessing (and the live main worktree is refused; plain
-# `dots` manages that). A later plain `dots` flips live back to the main worktree.
-# Skips brew bundle.
+# go live for testing without merging. The cwd is the choice: a per-session worktree
+# (`t cd dot <slot>`, then `dots --dev`), or a dev clone with real work on it.
+# Anywhere else it errors — no fallback, no guessing. Refused as sources: any non-
+# dotfiles dir, the live main worktree (plain `dots` manages it), and the dev clone
+# parked CLEAN on $DEV_BRANCH (stale content, no in-progress work — the error lists
+# your session worktrees; --force overrides). A later plain `dots` flips live back
+# to the main worktree. Skips brew bundle.
 dots() {
   [[ "$1" == -h || "$1" == --help ]] && { _help_for dots; return 0; }
 
@@ -204,6 +206,30 @@ dots() {
     local label="worktree ${src:t2}"
     [[ ${src:A} == ${devclone:A} ]] && label="DEV clone"
     local branch=$(git -C "$src" symbolic-ref --short -q HEAD)
+    # A CLEAN dev clone parked on $DEV_BRANCH is not a valid source either: under
+    # worktree-per-session nothing is developed there — its content is whatever
+    # stale state the parking branch froze at (linking it has uninstalled `t
+    # resume` TWICE now), and ~/code/dotfiles is the cd-shortcut landing spot, so
+    # standing here by habit is exactly how the mistake happens. The real work
+    # lives in session worktrees — list them with their branches. A dirty clone
+    # or a non-parking branch is a deliberate dev state and links fine; --force
+    # overrides.
+    if [[ "$2" != --force && "$2" != -f && ${src:A} == ${devclone:A} && "$branch" == "$DEV_BRANCH" ]] \
+       && [[ -z "$(git -C "$src" status --porcelain 2>/dev/null)" ]]; then
+      print -r -- "dots --dev: this is the dev clone parked CLEAN on ${branch} — no in-progress work here, only stale content." >&2
+      local -a _wts; _wts=("${DEV_WORKTREE_ROOT:-$HOME/code/.worktrees}/${devclone:t}"/*(N/))
+      local _w
+      if (( ${#_wts} )); then
+        print -r -- "  session worktrees with real work:" >&2
+        for _w in "${(@)_wts}"; do
+          print -r -- "    cd $_w && dots --dev    [$(git -C "$_w" branch --show-current 2>/dev/null || echo '?')]" >&2
+        done
+      else
+        print -r -- "  no session worktrees yet — t open ${devclone:t} starts one (then cd its worktree + dots --dev)" >&2
+      fi
+      print -r -- "  link the parked clone anyway: dots --dev --force" >&2
+      return 1
+    fi
     local out
     if out=$(DOTFILES_NO_BREW=1 DOTFILES_LINK_DEV=1 "$src/install.sh" 2>&1); then
       print -r -- "${g}✓${r0} ${y}live = ${label} (${c}${branch:-detached}${r0}${y}) — in-progress edits are live, reloaded${r0}"

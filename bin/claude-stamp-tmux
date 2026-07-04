@@ -50,6 +50,16 @@ if [[ $comm == claude && -n $pid ]]; then
   mkdir -p "$reg" 2>/dev/null && printf '%s\t%s\n' "$sid" "$cwd" > "$reg/$pid" 2>/dev/null || true
 fi
 
+# Origin stamp: record WHICH MACHINE this session (last) ran on, next to its
+# transcript — `<sid>.origin` inside the project dir, so csync / `t resume -r`
+# carry it wherever the transcript syncs. Transcript .jsonl lines record no
+# hostname, so this file is the only provenance `t resume` has for its host
+# column. Resuming a synced conversation on another machine re-fires this hook
+# with the same sid and re-stamps it there — origin always means "last ran on".
+proj="$HOME/.claude/projects/$(printf '%s' "$cwd" | tr -c 'A-Za-z0-9' '-')"
+# shellcheck disable=SC2015  # best-effort; never fail the hook
+[[ -d $proj ]] && hostname -s > "$proj/$sid.origin" 2>/dev/null || true
+
 # shellcheck disable=SC2015  # best-effort stamp; never fail the hook
 [[ -n ${TMUX:-} ]] && tmux set-environment CLAUDE_RESUME_ID "$sid" 2>/dev/null || true
 exit 0

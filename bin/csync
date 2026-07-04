@@ -38,7 +38,10 @@ sync_pair() {
   # Operation timed out") instead of fetching them — and aborts. So force
   # evicted files local first: ask the daemon to fetch (brctl), then a plain
   # read() blocks until the bytes land.
-  echo "⟳ Materialising cloud-only files in $label…"
+  # ${label} braced: macOS bash 3.2 swallows a multibyte char right after "$var"
+  # into the variable name, and under set -u that dies as "label…: unbound
+  # variable" — which silently killed every csync run (same gotcha cursor-beam hit).
+  echo "⟳ Materialising cloud-only files in ${label}…"
   # Best-effort: brctl can exit non-zero (e.g. nothing to fetch) — never let that
   # abort the sync under set -e, so swallow its status with `|| true`.
   find "$icloud" -type f ! -name '.DS_Store' -exec brctl download {} + 2>/dev/null || true

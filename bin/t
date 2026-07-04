@@ -685,19 +685,27 @@ Run `t <verb> -h` for a verb's own flags.""")
     sp.add_argument("repo", nargs="?", help="DEV_REPOS key; defaults to the repo your cwd is in")
     sp.add_argument("slot", nargs="?", help="slot number; a lone slot implies the cwd repo")
 
-    sp = sub.add_parser("resume", help="revive a dead slot's last conversation",
-        description="Revive a DEAD dev slot's last conversation (`t open` on a dead slot "
-            "deliberately starts fresh — this brings the chat back). Resolves the slot's own "
-            "transcript via its per-session worktree, rebuilding a reaped worktree from its "
-            "branch first, then resumes it in a fresh dev slot and attaches. Names default to "
+    sp = sub.add_parser("resume", help="revive a dead slot's saved conversation",
+        description="Revive a DEAD dev slot's conversation (`t open` on a dead slot "
+            "deliberately starts fresh — this brings the chat back). Offers EVERY conversation "
+            "saved in the slot's own per-session worktree (newest first; conversationless stubs "
+            "skipped), rebuilding a reaped worktree from its branch first, then resumes the pick "
+            "in a fresh dev slot and attaches. Names default to "
             "the cwd repo; outside any repo dir a bare `t resume` scans every worktree repo. "
-            "No slot → one candidate is taken, several fzf-pick. A live slot is attached "
-            "instead — including one live on another host (attached in place there; a scan "
-            "notes it). Worktree-per-session repos only (a shared tree's transcripts are "
+            "One candidate is taken, several fzf-pick (an explicit slot with no TTY takes the "
+            "newest). LIVE slots appear as labeled rows — '● here' / '● on <host>' — and "
+            "picking one ATTACHES in place (locally or on its host) instead of resuming. "
+            "Worktree-per-session repos only (a shared tree's transcripts are "
             "ambiguous per-slot — use `t push -p` there).")
     sp.add_argument("repo", nargs="?", help="DEV_REPOS key; defaults to the repo your cwd is in")
     sp.add_argument("slot", nargs="?", help="slot number; a lone slot implies the cwd repo")
     sp.add_argument("-f", "--fg", action="store_true", help="resume inline in THIS terminal (no tmux slot)")
+    sp.add_argument("-a", "--all", action="store_true", help="scan every worktree repo (the default outside a repo dir)")
+    sp.add_argument("-r", "--remote", action="store_true",
+        help="pull the latest transcripts from every $REMOTE_HOSTS host first (direct rsync; "
+             "csync is periodic and needs a shell on the far side), then scan as usual")
+    sp.add_argument("--days", metavar="N", default="30",
+        help="recency window for conversations (default 30; 'all' for everything)")
 
     sp = sub.add_parser("cd", help="cd this shell into a dev slot's worktree",
         description="cd the calling shell into a dev slot's worktree "

@@ -149,10 +149,15 @@ nosleep() { [[ "$1" == -h || "$1" == --help ]] && { _help_for nosleep; return 0;
 # pull released updates whenever, in any order. (First run on an old single-tree
 # machine migrates it: moves the clone off main and sets the worktree up.)
 #
-# --dev (-d): flip the live surface to your DEV clone (current branch) instead —
-# re-links from it (catching new/renamed files) and reloads, so in-progress edits go
-# live for testing without merging. A later plain `dots` flips live back to the main
-# worktree. Skips brew bundle.
+# --dev (-d): flip the live surface to the dotfiles checkout you are STANDING IN —
+# re-links from it (catching new/renamed files) and reloads, so its in-progress edits
+# go live for testing without merging. The cwd is the choice: a per-session worktree
+# (`t cd dot <slot>`, then `dots --dev`), or a dev clone with real work on it.
+# Anywhere else it errors — no fallback, no guessing. Refused as sources: any non-
+# dotfiles dir, the live main worktree (plain `dots` manages it), and the dev clone
+# parked CLEAN on $DEV_BRANCH (stale content, no in-progress work — the error lists
+# your session worktrees; --force overrides). A later plain `dots` flips live back
+# to the main worktree. Skips brew bundle.
 dots() {
   [[ "$1" == -h || "$1" == --help ]] && { _help_for dots; return 0; }
 
@@ -170,13 +175,66 @@ dots() {
   local mainwt="${DOTFILES_MAIN_WT:-$HOME/.local/share/dotfiles-main}"
 
   if [[ "$1" == --dev || "$1" == -d ]]; then
-    # Point the live symlinks at the dev clone (current branch); relink, no brew.
-    local branch=$(git -C "$devclone" symbolic-ref --short -q HEAD)
+    # Link the live symlinks from the dotfiles checkout $PWD is in — the cwd IS
+    # the choice (the dev clone, a per-session worktree, any tree sharing the
+    # dotfiles .git), so `t cd dot 1` + `dots --dev` tests that session's edits
+    # live. No fallback: anywhere else it ERRORS instead of guessing (the old
+    # implicit dev-clone fallback silently linked the stale parked clone from any
+    # directory — that is how `t resume` once vanished with a ✓). The main
+    # worktree is refused too: it is the released surface plain `dots` manages,
+    # never a dev source.
+    local src pwdcommon
+    src=$(git -C "$PWD" rev-parse --show-toplevel 2>/dev/null)
+    if [[ -z $src ]]; then
+      print -r -- "dots --dev: not inside a git checkout — cd into a dotfiles checkout first (the dev clone, or a session worktree via \`t cd dot <slot>\`)." >&2
+      return 1
+    fi
+    pwdcommon=$(git -C "$src" rev-parse --git-common-dir 2>/dev/null)
+    [[ $pwdcommon == /* ]] || pwdcommon="$src/$pwdcommon"
+    if [[ ${pwdcommon:A} != ${commondir:A} ]]; then
+      print -r -- "dots --dev: $src is not a dotfiles checkout — cd into the dev clone or a dotfiles session worktree first." >&2
+      return 1
+    fi
+    if [[ ${src:A} == ${mainwt:A} ]]; then
+      print -r -- "dots --dev: this is the live main worktree — plain \`dots\` manages it; cd into the dev clone or a session worktree." >&2
+      return 1
+    fi
+    if [[ ! -x $src/install.sh ]]; then
+      print -r -- "dots --dev: $src has no runnable install.sh — malformed/ancient checkout, nothing to install." >&2
+      return 1
+    fi
+    local label="worktree ${src:t2}"
+    [[ ${src:A} == ${devclone:A} ]] && label="DEV clone"
+    local branch=$(git -C "$src" symbolic-ref --short -q HEAD)
+    # A CLEAN dev clone parked on $DEV_BRANCH is not a valid source either: under
+    # worktree-per-session nothing is developed there — its content is whatever
+    # stale state the parking branch froze at (linking it has uninstalled `t
+    # resume` TWICE now), and ~/code/dotfiles is the cd-shortcut landing spot, so
+    # standing here by habit is exactly how the mistake happens. The real work
+    # lives in session worktrees — list them with their branches. A dirty clone
+    # or a non-parking branch is a deliberate dev state and links fine; --force
+    # overrides.
+    if [[ "$2" != --force && "$2" != -f && ${src:A} == ${devclone:A} && "$branch" == "$DEV_BRANCH" ]] \
+       && [[ -z "$(git -C "$src" status --porcelain 2>/dev/null)" ]]; then
+      print -r -- "dots --dev: this is the dev clone parked CLEAN on ${branch} — no in-progress work here, only stale content." >&2
+      local -a _wts; _wts=("${DEV_WORKTREE_ROOT:-$HOME/code/.worktrees}/${devclone:t}"/*(N/))
+      local _w
+      if (( ${#_wts} )); then
+        print -r -- "  session worktrees with real work:" >&2
+        for _w in "${(@)_wts}"; do
+          print -r -- "    cd $_w && dots --dev    [$(git -C "$_w" branch --show-current 2>/dev/null || echo '?')]" >&2
+        done
+      else
+        print -r -- "  no session worktrees yet — t open ${devclone:t} starts one (then cd its worktree + dots --dev)" >&2
+      fi
+      print -r -- "  link the parked clone anyway: dots --dev --force" >&2
+      return 1
+    fi
     local out
-    if out=$(DOTFILES_NO_BREW=1 DOTFILES_LINK_DEV=1 "$devclone/install.sh" 2>&1); then
-      print -r -- "${g}✓${r0} ${y}live = DEV clone (${c}${branch}${r0}${y}) — in-progress edits are live, reloaded${r0}"
+    if out=$(DOTFILES_NO_BREW=1 DOTFILES_LINK_DEV=1 "$src/install.sh" 2>&1); then
+      print -r -- "${g}✓${r0} ${y}live = ${label} (${c}${branch:-detached}${r0}${y}) — in-progress edits are live, reloaded${r0}"
     else
-      print -r -- "${y}dots --dev — install.sh failed on ${c}${branch}${r0}${y}:${r0}"
+      print -r -- "${y}dots --dev — install.sh failed on ${c}${branch:-detached}${r0}${y}:${r0}"
       print -r -- "$out"
     fi
     source ~/.zshrc
@@ -2565,32 +2623,53 @@ _t_plan() {
 # refused here and pointed at the `t push -p` picker instead). Composes the existing
 # engines: _dev_worktree_path (slot → recorded cwd), _dev_ensure_session_cwd (rebuild
 # a reaped/synced-away worktree from its durable branch), _dev_resume_session (a
-# first-class dev slot, CLAUDE_RESUME_ID stamped so pop/plan keep working). No slot →
-# house picker convention: one candidate → use it, several → fzf, none → bail with a
-# hint; outside any DEV_REPOS dir a bare `t resume` scans EVERY worktree repo (the
-# `t ls` unscoped convention) with a repo column in the picker. A slot live on a
-# $REMOTE_HOSTS host is never resumed here (one-live-owner) — explicit ask attaches
-# in place there, a scan notes it. -f/--fg resumes inline in THIS terminal (t pop's
-# landing) instead of a slot.
+# first-class dev slot, CLAUDE_RESUME_ID stamped so pop/plan keep working). Candidates
+# are EVERY conversation saved in a dead slot's worktree (newest first — an old one is
+# still resumable), minus conversationless stubs (no real prompt → nothing to revive,
+# and their untitled rows masked real ones). House picker convention: one candidate →
+# use it, several → fzf, none → bail with a hint; outside any DEV_REPOS dir a bare
+# `t resume` scans EVERY worktree repo (the
+# `t ls` unscoped convention) with a repo column in the picker; -a/--all forces that
+# widening from anywhere (the `t ls -a` flag). -r/--remote PULLS the latest
+# transcripts from every $REMOTE_HOSTS host first (direct rsync — csync is periodic
+# and needs a prompt on the far side, so "resume what just died on the other
+# machine" cannot wait for it), then scans as usual. LIVE slots — local or on a
+# $REMOTE_HOSTS host — appear as labeled rows ("● here" / "● on <host>") whose pick
+# ATTACHES in place instead of resuming (one-live-owner: a second `claude -r` on a
+# live id diverges the transcript).
+# -f/--fg resumes inline in THIS terminal (t pop's landing) instead of a slot.
 # User-facing help lives in bin/t (`t resume -h`); the t() shim routes -h there.
 _t_resume() {
   setopt local_options null_glob bare_glob_qual
-  local a no_tmux=; local -a pos
+  local a no_tmux= all_flag= remote_flag= days=30 _expect_days=; local -a pos
   for a in "$@"; do
+    if [[ -n $_expect_days ]]; then days=$a; _expect_days=; continue; fi
     case "$a" in
-      -f|--fg) no_tmux=1 ;;
-      *)       pos+=("$a") ;;
+      -f|--fg)     no_tmux=1 ;;
+      -a|--all)    all_flag=1 ;;
+      -r|--remote) remote_flag=1 ;;
+      --days)      _expect_days=1 ;;
+      --days=*)    days=${a#--days=} ;;
+      -*)          echo "t resume: unknown flag: $a (t resume -h for flags)" >&2; return 1 ;;
+      *)           pos+=("$a") ;;
     esac
   done
+  if [[ $days != all && $days != <-> ]]; then
+    echo "t resume: --days takes a number of days or 'all' (got: ${days:-nothing})." >&2; return 1
+  fi
   local repo="${pos[1]:-}" slot="${pos[2]:-}"
   # Repo-aware defaults (mirrors t plan/paste): lone numeric arg is a SLOT of the
   # cwd repo; bare `t resume` infers the repo too — and OUTSIDE any DEV_REPOS dir
   # it widens to EVERY worktree repo instead of erroring (the `t ls` unscoped
   # convention: no repo context → show everything; the picker grows a repo
-  # column). A lone numeric slot still demands a repo — "slot 3" of no
+  # column). -a/--all forces that widening even inside a repo dir (same flag as
+  # `t ls -a`). A lone numeric slot still demands a repo — "slot 3" of no
   # particular repo is a guess, and other verbs refuse the same way.
   local all_mode=
-  if [[ "$repo" == <-> && -z "$slot" ]]; then
+  if [[ -n $all_flag ]]; then
+    [[ -z $repo && -z $slot ]] || { echo "t resume: --all scans every worktree repo — drop '$repo${slot:+ $slot}'." >&2; return 1; }
+    all_mode=1
+  elif [[ "$repo" == <-> && -z "$slot" ]]; then
     slot=$repo
     repo=$(_t_infer_repo "$slot") || { echo "Not inside a DEV_REPOS dir — name the repo (t resume <repo> $slot)." >&2; return 1; }
   elif [[ -z "$repo" ]]; then
@@ -2630,45 +2709,113 @@ _t_resume() {
     [[ -n $p ]] && live[${p:A}]=$s
   done
 
-  # Remote-live guard (one-live-owner invariant): a synced transcript here does
-  # NOT mean the slot is idle — its owning host may still be driving `claude -r`
-  # on that session id, and a second local `claude -r` would append to the same
-  # .jsonl with no locking and diverge the conversation. ONE _dev_rows_all
-  # fan-out (fg rows, `:`-labelled, dropped here), then per-repo awk over the
-  # cached rows builds a slot→host map (matching the repo's dir OR its
-  # per-session-worktree path, same rule as _dev_remote_resolve so a `dev-dot-2`
-  # on mini matches `dev-dotfiles-2` here — both key one dir). Remote-live slots
-  # are treated like local-live below: explicit ask → attach in place on the
-  # remote (mirrors `t open`'s auto-detect); scan → not resumable, but NOTED (a
-  # session you're looking for may be live on mini — silence would read as
-  # "doesn't exist"). The remote alias is captured so the attach doesn't need a
-  # second scan via _dev_remote_resolve.
-  local remote_rows=
-  (( ${#REMOTE_HOSTS} )) && remote_rows=$(_dev_rows_all 2>/dev/null | awk -F'\t' '$1 != "local" && $4 !~ /:/')
+  # -r/--remote: PULL the scan targets' transcripts from every $REMOTE_HOSTS host
+  # FIRST (direct rsync --update per worktree project dir — union rule: newer
+  # wins, nothing deleted; $HOME is identical across machines so the project-dir
+  # encoding matches verbatim), then scan as usual. This is what "resume the
+  # conversation that just died on the other machine" needs: csync's convergence
+  # is periodic AND driven by a precmd hook, so a headless host pushes nothing to
+  # iCloud until someone opens a shell THERE — the direct pull closes that
+  # window. A pulled conversation is then an ordinary candidate (a dead session
+  # has no home host). rc 23 = remote glob matched nothing (no sessions for that
+  # repo there) — not an error.
+  if [[ -n $remote_flag ]]; then
+    (( ${#REMOTE_HOSTS} )) || { echo "t resume -r: no REMOTE_HOSTS configured (set them in ~/.zshrc.local)." >&2; return 1; }
+    # Include filters, not a remote glob: the far side's login shell is zsh,
+    # whose nomatch ABORTS on a glob with no hits (rc 1 — read as "unreachable"
+    # for any repo with no sessions on that host). One rsync per host covers
+    # every scan target; rc 23 = source dir absent there (no claude yet) — fine.
+    local _h _tgt _enc _prc
+    local -a _incs
+    for repo in $repos; do
+      _enc=${${:-${DEV_WORKTREE_ROOT}/${DEV_REPOS[$repo]:t}}//[^A-Za-z0-9]/-}
+      _incs+=(--include="${_enc}-*/" --include="${_enc}-*/**")
+    done
+    for _h in ${(ko)REMOTE_HOSTS}; do
+      _tgt=${REMOTE_HOSTS[$_h]}
+      rsync -a --update --timeout=10 -e "ssh -o ConnectTimeout=3 -o BatchMode=yes" \
+        "${(@)_incs}" --exclude='*' \
+        "$_tgt:$HOME/.claude/projects/" "$HOME/.claude/projects/" 2>/dev/null
+      _prc=$?
+      if (( _prc == 0 || _prc == 23 )); then
+        echo "⟳ pulled ${_h}'s latest transcripts" >&2
+        # Cache the host's short hostname (once) so the origin column below can
+        # translate a `<sid>.origin` stamp back to the friendly $REMOTE_HOSTS key.
+        if [[ ! -s $HOME/.cache/t/hostnames/$_h ]]; then
+          mkdir -p "$HOME/.cache/t/hostnames" 2>/dev/null
+          ssh -o ConnectTimeout=3 -o BatchMode=yes "$_tgt" hostname -s 2>/dev/null > "$HOME/.cache/t/hostnames/$_h"
+        fi
+      else
+        echo "t resume -r: $_h unreachable (rc=$_prc) — skipped; its newest transcripts may be missing here." >&2
+      fi
+    done
+  fi
 
-  # Candidates: dead slots whose worktree project dir holds a transcript. A slot
-  # whose worktree is LIVE (by path, local or remote) is not resumable —
-  # explicit ask attaches, scan skips. A slot whose tmux NAME is taken by a
-  # session rooted elsewhere is unresumable AND wrong to attach (see the
-  # collision branch below). NOTE: every `local` here is hoisted OUT of the
-  # loops — an assignmentless `local x` re-run on an already-local x does not
-  # redeclare, it PRINTS `x=value` (the `_ok=claw` junk-output bug).
-  local -a cands slots tx remote_note
-  local -A remote_live_host remote_live_alias
-  local n wt sid busy rhost _rdir _rbase _rhost _rn _ralias _ok _stale stale_path
+  # ONE live-slot scan (one-live-owner invariant): a synced transcript here does
+  # NOT mean the slot is idle — a local tmux slot or another host may still be
+  # driving `claude -r` on that session id, and a second `claude -r` would append
+  # to the same .jsonl with no locking and diverge the conversation. _dev_rows_all
+  # when $REMOTE_HOSTS exist (this machine + every host), else a local-only
+  # _dev_session_rows; fg rows (`:`-labelled) dropped. Live slots become LABELED
+  # PICKER ROWS below ("● here" / "● on <host>") whose pick ATTACHES in place
+  # instead of resuming — the picker itself says where everything is, rather than
+  # stderr notes nobody reads. The per-repo awk over the cached remote rows builds
+  # slot→host/alias/title maps (matching the repo's dir OR its per-session-worktree
+  # path, same rule as _dev_remote_resolve so a `dev-dot-2` on mini matches
+  # `dev-dotfiles-2` here — both key one dir); the alias is captured so an attach
+  # needs no second scan.
+  local all_rows= remote_rows=
+  if (( ${#REMOTE_HOSTS} )); then
+    all_rows=$(_dev_rows_all 2>/dev/null | awk -F'\t' '$4 !~ /:/')
+  else
+    all_rows=$(_dev_session_rows 2>/dev/null | awk -F'\t' '$3 !~ /:/ {print "local\t" $0}')
+  fi
+  remote_rows=$(print -r -- "$all_rows" | awk -F'\t' '$1 != "local"')
+  # Local live titles, keyed by short session name (dev- prefix stripped).
+  local -A local_sum; local _lsn _lsum
+  while IFS=$'\t' read -r _lsn _lsum; do
+    [[ -n $_lsn ]] && local_sum[$_lsn]=$_lsum
+  done < <(print -r -- "$all_rows" | awk -F'\t' '$1 == "local" {print $4 "\t" $7}')
+
+  # Candidates: dead slots whose worktree project dir holds a transcript —
+  # EVERY conversation in the slot, newest first, not just the newest .jsonl
+  # (an old conversation is still resumable; hiding it read as "resume lost my
+  # session"). Conversationless stubs (an open-then-exit, a beam artifact — no
+  # real user prompt, so _transcript_title prints nothing) are skipped: they
+  # rendered as untitled rows and, being newest, often masked the real
+  # conversation. A slot whose worktree is LIVE (by path, local or remote) is
+  # not resumable — explicit ask attaches, scan skips. A slot whose tmux NAME
+  # is taken by a session rooted elsewhere is unresumable AND wrong to attach
+  # (see the collision branch below). NOTE: every `local` here is hoisted OUT
+  # of the loops — an assignmentless `local x` re-run on an already-local x
+  # does not redeclare, it PRINTS `x=value` (the `_ok=claw` junk-output bug).
+  local -a cands slots tx
+  local -A remote_live_host remote_live_alias remote_live_sum
+  local n wt sid busy rhost _rdir _rbase _rhost _rn _ralias _rsum _ok _stale stale_path
+  local txf title when org orgf hf skipped=0
   local _rwtr=${DEV_WORKTREE_ROOT:-}
+  # Recency window (--days, default 30; 'all' disables) + this machine's short
+  # hostname, to blank the origin column for locally-run conversations.
+  local cutoff=0 selfhost=$(hostname -s 2>/dev/null)
+  [[ $days != all ]] && cutoff=$(( EPOCHSECONDS - days * 86400 ))
+  # origin → friendly $REMOTE_HOSTS key, via the hostname cache the -r pull
+  # populates (~/.cache/t/hostnames/<alias> = that host's `hostname -s`).
+  local -A host_alias; local _hcf
+  for _hcf in "$HOME"/.cache/t/hostnames/*(N); do
+    host_alias[$(<$_hcf)]=${_hcf:t}
+  done
   if [[ -n $slot ]]; then slots=($slot); else slots=({1..20}); fi
   for repo in $repos; do
     _rdir=${DEV_REPOS[$repo]}; _rbase=${_rdir:t}
-    remote_live_host=(); remote_live_alias=()
+    remote_live_host=(); remote_live_alias=(); remote_live_sum=()
     if [[ -n $remote_rows ]]; then
-      while IFS=$'\t' read -r _rhost _rn _ralias; do
-        [[ -n $_rn ]] && { remote_live_host[$_rn]=$_rhost; remote_live_alias[$_rn]=$_ralias; }
+      while IFS=$'\t' read -r _rhost _rn _ralias _rsum; do
+        [[ -n $_rn ]] && { remote_live_host[$_rn]=$_rhost; remote_live_alias[$_rn]=$_ralias; remote_live_sum[$_rn]=$_rsum; }
       done < <(print -r -- "$remote_rows" | awk -F'\t' -v d="$_rdir" -v wtr="$_rwtr" -v b="$_rbase" '
         ($3==d || (wtr != "" && b != "" && index($3, wtr "/" b "/") == 1)) {
           n = $4; sub(/^.*-/, "", n)
           r = $4; sub(/-[^-]+$/, "", r)
-          print $1 "\t" n "\t" r
+          print $1 "\t" n "\t" r "\t" $7
         }')
     fi
     for n in $slots; do
@@ -2680,9 +2827,11 @@ _t_resume() {
           _t_dev "$repo" "$n"
           return
         fi
+        # Scan: a live local slot is a labeled row (pick → attach).
+        cands+=("$repo"$'\t'"$n"$'\t'-$'\t'"$wt"$'\t'"● here"$'\t'"${local_sum[${busy#dev-}]:-(live session)}"$'\t'here$'\t'-$'\t'-)
         continue
       fi
-      # Remote-live: same treatment as local live (see the guard note above).
+      # Remote-live: same treatment as local live (see the scan note above).
       rhost=${remote_live_host[$n]:-}
       if [[ -n $rhost ]]; then
         if [[ -n $slot ]]; then
@@ -2690,7 +2839,7 @@ _t_resume() {
           _dev_remote_attach "$rhost"$'\t'"${remote_live_alias[$n]}"$'\t'"$n" ""
           return
         fi
-        remote_note+=("$repo $n is live on $rhost — attach: t open $repo $n · pull here: t beam $repo $n --from $rhost")
+        cands+=("$repo"$'\t'"$n"$'\t'-$'\t'"$wt"$'\t'"● on $rhost"$'\t'"${remote_live_sum[$n]:-(live session)}"$'\t'"$rhost"$'\t'"${remote_live_alias[$n]}"$'\t'-)
         continue
       fi
       # Name-only collision: a dev-<alias>-${n} tmux session (any alias keying
@@ -2713,16 +2862,30 @@ _t_resume() {
         fi
         continue
       fi
-      tx=( "$HOME/.claude/projects/${wt//[^A-Za-z0-9]/-}"/*.jsonl(Nom[1]) )
-      [[ -n ${tx[1]} ]] || continue
-      sid=${${tx[1]:t}%.jsonl}
-      cands+=("$repo"$'\t'"$n"$'\t'"$sid"$'\t'"$wt"$'\t'"$(_transcript_title "${tx[1]}")")
+      tx=( "$HOME/.claude/projects/${wt//[^A-Za-z0-9]/-}"/*.jsonl(Nom) )
+      for txf in "${(@)tx}"; do
+        if (( cutoff )) && (( $(stat -f %m "$txf" 2>/dev/null || echo 0) < cutoff )); then
+          (( skipped++ )); continue        # outside the --days window
+        fi
+        title=$(_transcript_title "$txf")
+        [[ -n $title ]] || continue        # conversationless stub — nothing to resume
+        when=$(stat -f '%Sm' -t '%b %d %H:%M' "$txf" 2>/dev/null)
+        # Origin: which machine the conversation LAST RAN on — the <sid>.origin
+        # stamp claude-stamp-tmux writes next to the transcript (syncs with it).
+        # Blank for this machine / unstamped (pre-feature) transcripts; a raw
+        # hostname is translated to its $REMOTE_HOSTS key when the cache knows it.
+        org=; orgf="${txf%.jsonl}.origin"
+        if [[ -f $orgf ]]; then
+          org=$(<$orgf)
+          if [[ $org == $selfhost ]]; then org=
+          elif [[ -n ${host_alias[$org]:-} ]]; then org=${host_alias[$org]}
+          fi
+        fi
+        cands+=("$repo"$'\t'"$n"$'\t'"${${txf:t}%.jsonl}"$'\t'"$wt"$'\t'"$when"$'\t'"$title"$'\t'-$'\t'-$'\t'"${org[1,10]}")
+      done
     done
   done
-  # Live-elsewhere slots surfaced by the scan (informational; they are not
-  # resume candidates — the invariant forbids a second owner).
-  local note
-  for note in "${(@)remote_note}"; do echo "($note)" >&2; done
+  (( skipped )) && echo "(${skipped} older conversation(s) outside the last ${days}d hidden — t resume --days all shows them)" >&2
 
   if (( ! $#cands )); then
     if [[ -n $slot ]]; then
@@ -2738,33 +2901,88 @@ _t_resume() {
     return 1
   fi
 
-  # Picker rows: repo(1) slot(2) sid(3) wt(4) title(5). All-repos mode shows the
-  # repo column; a single-repo scan keeps the old slot+title view.
-  local pick c nth fprompt; local -a f
-  if [[ -n $all_mode ]]; then nth='1,2,5' fprompt='resume> '; else nth='2,5' fprompt="resume $repo slot> "; fi
-  if (( $#cands == 1 )); then
+  # Picker rows: repo(1) slot(2) sid(3) wt(4) when(5) title(6) loc(7) alias(8)
+  # origin(9) — loc/alias are `-` for a dead (resumable) row, `here` for a live
+  # local slot, or the host + remote alias for a slot live on a $REMOTE_HOSTS
+  # host (pick → attach in place, never a second owner); origin is the machine a
+  # dead conversation LAST RAN on (`-`/empty = here or unstamped — live rows name
+  # their host in the ● label instead). One ALIGNED display column (10) is
+  # appended here — fzf renders raw \t fields at literal tab stops (nothing
+  # lines up), so both fzf (--with-nth=10) and the no-fzf listing show the same
+  # pre-padded gh-style row: [repo]  slot  [origin]  date|●-where  title. The
+  # origin column only appears when some row has one (a single-machine setup
+  # never sees it); all-repos mode adds the repo column. Both pad to the widest
+  # value in this candidate set.
+  local pick c fprompt; local -a f
+  local rw=0 ow=0 i=1
+  if [[ -n $all_mode ]]; then
+    fprompt="resume (${days}d)> "
+    for c in "${(@)cands}"; do f=("${(@ps:\t:)c}"); (( ${#f[1]} > rw )) && rw=${#f[1]}; done
+  else
+    fprompt="resume $repo (${days}d)> "
+  fi
+  for c in "${(@)cands}"; do
+    f=("${(@ps:\t:)c}")
+    [[ ${f[9]:-} != - && -n ${f[9]:-} ]] && (( ${#f[9]} > ow )) && ow=${#f[9]}
+  done
+  for c in "${(@)cands}"; do
+    f=("${(@ps:\t:)c}")
+    org=${f[9]:-}; [[ $org == - ]] && org=
+    if [[ -n $all_mode ]]; then
+      if (( ow )); then
+        cands[$i]+=$'\t'"$(printf '%-*s  %2s  %-*s  %-12s  %s' "$rw" "$f[1]" "$f[2]" "$ow" "$org" "$f[5]" "$f[6]")"
+      else
+        cands[$i]+=$'\t'"$(printf '%-*s  %2s  %-12s  %s' "$rw" "$f[1]" "$f[2]" "$f[5]" "$f[6]")"
+      fi
+    else
+      if (( ow )); then
+        cands[$i]+=$'\t'"$(printf '%2s  %-*s  %-12s  %s' "$f[2]" "$ow" "$org" "$f[5]" "$f[6]")"
+      else
+        cands[$i]+=$'\t'"$(printf '%2s  %-12s  %s' "$f[2]" "$f[5]" "$f[6]")"
+      fi
+    fi
+    (( i++ ))
+  done
+  # Sole candidate auto-picks — but only when it is DEAD (loc == -, resumed in
+  # place here) or we have a TTY. A sole LIVE row without a TTY would hit
+  # _t_dev / _dev_remote_attach, both of which need a terminal to attach; fall
+  # through to the listing branch so the message matches the multi-candidate
+  # no-fzf case instead of failing hard from inside the attach helper.
+  if (( $#cands == 1 )) && f=("${(@ps:\t:)cands[1]}") && [[ $f[7] == - || -t 1 ]]; then
     pick=${cands[1]}
   elif [[ -t 0 && -t 1 ]] && command -v fzf >/dev/null; then
-    pick=$(print -rl -- "${(@)cands}" | fzf --delimiter=$'\t' --with-nth=$nth --prompt="$fprompt") || return 1
+    pick=$(print -rl -- "${(@)cands}" | fzf --delimiter=$'\t' --with-nth=10 --no-hscroll --prompt="$fprompt") || return 1
     [[ -n $pick ]] || return 1
+  elif [[ -n $slot ]]; then
+    # Explicit slot but no TTY/fzf to pick with: the newest conversation IS the
+    # documented contract ("revive the slot's last conversation") — take it, and
+    # list the rest so a specific pick is one fzf-equipped call away.
+    pick=${cands[1]}
+    echo "Slot $slot has $#cands saved conversations — resuming the newest (run from a terminal to pick):" >&2
+    for c in "${(@)cands}"; do echo "  ${c##*$'\t'}" >&2; done
   else
     if [[ -n $all_mode ]]; then
-      echo "Several resumable slots — name one (t resume <repo> <slot>):" >&2
+      echo "Several resumable conversations — name one (t resume <repo> <slot>):" >&2
     else
-      echo "Several resumable slots for $repo — name one (t resume $repo <slot>):" >&2
+      echo "Several resumable conversations for $repo — name one (t resume $repo <slot>):" >&2
     fi
-    for c in "${(@)cands}"; do
-      f=("${(@ps:\t:)c}")
-      if [[ -n $all_mode ]]; then
-        printf '  %s %s  %s\n' "$f[1]" "$f[2]" "$f[5]" >&2
-      else
-        printf '  %s  %s\n' "$f[2]" "$f[5]" >&2
-      fi
-    done
+    for c in "${(@)cands}"; do echo "  ${c##*$'\t'}" >&2; done
     return 1
   fi
   f=("${(@ps:\t:)pick}")
   repo=$f[1]; slot=$f[2]; sid=$f[3]; wt=$f[4]
+  local loc="${f[7]:-}" lalias="${f[8]:-}"
+
+  # A LIVE row was picked: attach in place (local or on its host) — resuming it
+  # here would mint a second owner of the session id (see the scan note above).
+  if [[ $loc == here ]]; then
+    echo "Slot $slot is live locally — attaching."
+    _t_dev "$repo" "$slot"
+    return
+  elif [[ -n $loc && $loc != - ]]; then
+    _dev_remote_attach "$loc"$'\t'"$lalias"$'\t'"$slot" ""
+    return
+  fi
 
   # The recorded cwd is the transcript's lookup key: rebuild the worktree at the
   # IDENTICAL path when it was reaped/never existed here (branch + transcript are

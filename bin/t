@@ -309,6 +309,21 @@ def cmd_kill_owner(cfg, args):
     os.execvp("zsh", ["zsh", "-lic", "_tbeam_kill_owner"])
 
 
+def cmd_cursor(cfg, args):
+    """Passthrough to bin/cursor-beam, the cursor-agent chat mover — cursor chats
+    have no dev slot/tmux, so the whole t machinery does not apply; this verb just
+    gives them the same front door. `t cursor ls` sugar maps to `cursor-beam --ls`;
+    everything else forwards verbatim. Resolved as a sibling of the real bin/t
+    (works from a repo checkout before install.sh links it), else from PATH."""
+    rest = list(args.rest)
+    if rest and rest[0] == "ls":
+        rest[0] = "--ls"
+    exe = os.path.join(os.path.dirname(os.path.realpath(__file__)), "cursor-beam")
+    if not os.path.isfile(exe):
+        exe = "cursor-beam"
+    os.execvp(exe, [exe] + rest)
+
+
 # ─── subprocess-safe verbs ─────────────────────────────────────────────────────
 
 def _set_term_title(text):
@@ -741,6 +756,16 @@ Run `t <verb> -h` for a verb's own flags.""")
     sp.add_argument("-k", "--keyword", action="store_true", help="offline keyword ranking (no Sonnet)")
     sp.add_argument("query", nargs="*", help="search terms (omit to browse recent sessions)")
 
+    sp = sub.add_parser("cursor", help="move Cursor CLI (cursor-agent) chats between machines",
+        description="Passthrough to cursor-beam: send/pull/list cursor-agent chats across "
+            "machines, translating the md5-of-cwd workspace hash between differing $HOMEs. "
+            "`t cursor ls` lists local chats (`--host <h>` for a remote's); `t cursor` sends "
+            "the newest chat to $TBEAM_HOST; `t cursor [id] --from <h>` pulls; `t cursor "
+            "resume [id]` resumes one here (cd to its workspace + keychain unlock over ssh). "
+            "Full flag reference: cursor-beam -h. Cursor chats have no dev slot, so the "
+            "other t verbs do not apply to them.")
+    sp.add_argument("rest", nargs=argparse.REMAINDER, help="args forwarded to cursor-beam (ls → --ls)")
+
     sp = sub.add_parser("on", help="run a command on a remote host (or open a shell)",
         description="Run a command on another machine over ssh, in a login+interactive shell so "
             "the dev tooling and Homebrew are on PATH (e.g. `t on mini t ls`). With no command, "
@@ -771,11 +796,17 @@ Run `t <verb> -h` for a verb's own flags.""")
 IMPLEMENTED = {
     "ls": cmd_ls, "session-rows": cmd_session_rows, "on": cmd_on, "read": cmd_read,
     "plan": cmd_plan, "paste": cmd_paste, "kill": cmd_kill,
-    "land": cmd_land, "kill-owner": cmd_kill_owner,
+    "land": cmd_land, "kill-owner": cmd_kill_owner, "cursor": cmd_cursor,
 }
 
 
 def main(argv):
+    # `cursor` dispatches BEFORE argparse: its args belong to cursor-beam, and
+    # argparse's REMAINDER rejects a LEADING flag (`t cursor --ls` errors before
+    # the remainder engages). Side benefit: `t cursor -h` shows cursor-beam's
+    # own help. The subparser still exists so `t -h` lists the verb.
+    if argv and argv[0] == "cursor":
+        return cmd_cursor(Config(), argparse.Namespace(rest=argv[1:]))
     parser = build_parser()
     args = parser.parse_args(argv)
     if not args.verb:

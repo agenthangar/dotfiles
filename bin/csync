@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# csync — two-way sync of Claude Code session history + saved plans with iCloud.
+# csync — two-way sync of Claude Code sessions + plans + Cursor CLI chats with iCloud.
 # One command, no direction: merges both ways (newest file wins, nothing
 # deleted) so every machine converges to the union of all sessions and plans.
 # Safe to run anytime; --update never clobbers a newer copy and no --delete means
@@ -63,4 +63,14 @@ sync_pair() {
 # tree closes that gap; csync converges plans the same union way as transcripts.
 sync_pair "$HOME/.claude/projects" "$icloud_base/claude-sessions" "sessions"
 sync_pair "$HOME/.claude/plans"    "$icloud_base/claude-plans"    "plans"
+
+# Cursor CLI (cursor-agent) chats: ~/.cursor/chats/<workspace-hash>/<chat-id>/.
+# Gated on either side already existing so machines that never ran cursor-agent
+# don't grow an empty tree — once one machine has chats (or the mirror exists),
+# every machine converges. Union-merge granularity is the whole store.db file
+# (newest wins), same caveat as transcripts: don't drive one chat live on two
+# machines at once. cursor-beam moves a single chat immediately over ssh.
+if [[ -d "$HOME/.cursor/chats" || -d "$icloud_base/cursor-chats" ]]; then
+  sync_pair "$HOME/.cursor/chats" "$icloud_base/cursor-chats" "cursor chats"
+fi
 echo "✓ csync complete"

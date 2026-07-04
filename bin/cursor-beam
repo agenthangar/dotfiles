@@ -1,0 +1,350 @@
+#!/usr/bin/env bash
+# cursor-beam — move a Cursor CLI (cursor-agent) chat between machines.
+#
+# Usage: cursor-beam [chat-id] [--host <h>]      send a chat to a host
+#        cursor-beam [chat-id] --from <h>        pull a chat from a host
+#        cursor-beam resume [chat-id]            resume a chat here (cd + cursor-agent)
+#        cursor-beam --ls [--host <h>]           list chats here (or on a host)
+#
+# Arguments:
+#   chat-id      a chat id (unique prefix ok). Omitted = this directory's
+#                newest chat when $PWD is inside a chat's workspace (walks up
+#                like git), else the newest chat overall — so inside a project
+#                you never need an id, exactly like the repo-aware t verbs.
+#
+# Options:
+#   --host <h>   target host (default: $TBEAM_HOST, else first REMOTE_HOSTS key)
+#   --from <h>   reverse direction: pull the chat from <h> to this machine
+#   --ls         list chats instead of moving one (id  workspace  when  title)
+#   -p, --pick   pick the chat in fzf (titles + workspaces — no ids needed)
+#   -a, --attach after sending, resume the chat on the host over ssh -t
+#   -h, --help   show this help
+#
+# resume (alias: open) cds to the chat's workspace (from meta.json) and execs
+# cursor-agent --resume; over ssh it unlocks the login keychain first (cursor's
+# creds live there). resume --host <h> resumes on <h> instead.
+#
+# The cross-host cousin of tbeam for cursor-agent sessions. Chats live in
+# ~/.cursor/chats/<workspace-hash>/<chat-id>/ (meta.json + store.db once a
+# conversation exists); the workspace hash is md5 of the ABSOLUTE project cwd,
+# which differs per machine when usernames differ — so the move translates:
+# the cwd (read from meta.json, else reversed from the hash) is re-rooted at
+# the destination's $HOME, the chat lands under md5 of that path, and the
+# meta.json cwd is rewritten to match. rsync is -a --update with no --delete
+# (a newer remote copy is never clobbered), and csync converges the whole
+# chats tree in the background — cursor-beam is the immediate, targeted move.
+# Like Claude, cursor-agent takes no lock on its store: never drive one chat
+# live on two machines at once.
+set -euo pipefail
+
+CHATS="$HOME/.cursor/chats"
+T_CONFIG="$HOME/.config/t/config.sh"
+
+case "${1:-}" in
+  -h|--help) awk 'NR==1{next} !/^#/{exit} {sub(/^# ?/,""); print}' "$0"; exit 0 ;;
+esac
+
+chat_id="" host="" from="" do_ls=0 attach=0 do_resume=0 do_pick=0
+[[ "${1:-}" == "resume" || "${1:-}" == "open" ]] && { do_resume=1; shift; }
+while (( $# )); do
+  case "$1" in
+    --host) host="${2:?--host needs a value}"; shift 2 ;;
+    --from) from="${2:?--from needs a value}"; shift 2 ;;
+    --ls)   do_ls=1; shift ;;
+    -a|--attach) attach=1; shift ;;
+    -p|--pick) do_pick=1; shift ;;
+    -*) echo "cursor-beam: unknown flag: $1 (-h for help)" >&2; exit 2 ;;
+    *)  chat_id="$1"; shift ;;
+  esac
+done
+
+# Default host: $TBEAM_HOST, else the alphabetically-first REMOTE_HOSTS entry in
+# the t config bridge (~/.config/t/config.sh) — same rule as _dev_default_host.
+default_host() {
+  if [[ -n "${TBEAM_HOST:-}" ]]; then echo "$TBEAM_HOST"; return; fi
+  [[ -r "$T_CONFIG" ]] && sed -n 's/^REMOTE_HOSTS\[[^]]*\]=//p' "$T_CONFIG" | sort | head -1
+}
+
+# A chat's project cwd, from its meta.json — cursor-agent records it there in
+# plaintext ("cwd":"/Users/…"), so prefer that over reversing the hash.
+chat_cwd() {  # <chat-dir>
+  local meta="$1/meta.json"
+  [[ -r "$meta" ]] || return 1
+  python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("cwd",""))' "$meta" 2>/dev/null
+}
+
+chat_title() {  # <chat-dir> — the human title cursor-agent wrote (may be empty)
+  local meta="$1/meta.json"
+  [[ -r "$meta" ]] || return 0
+  python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("title",""))' "$meta" 2>/dev/null
+}
+
+# The workspace (hash dir) of $PWD, walking UP like git does — so a subdir of a
+# project still resolves to the chat started at its root. Nearest ancestor with
+# a chats dir wins.
+workspace_of_pwd() {
+  local d="$PWD" h
+  while :; do
+    h=$(md5 -qs "$d")
+    [[ -d "$CHATS/$h" ]] && { echo "$h"; return 0; }
+    [[ "$d" == "/" || "$d" == "$HOME" ]] && break
+    d=$(dirname "$d")
+  done
+  return 1
+}
+
+# Rewrite the cwd recorded in a chat's meta.json (after a cross-machine move —
+# the origin's absolute path does not exist on the destination).
+patch_meta_cwd() {  # <chat-dir> <new-cwd>
+  local meta="$1/meta.json"
+  [[ -w "$meta" && -n "$2" ]] || return 0
+  python3 -c '
+import json, sys
+p, cwd = sys.argv[1], sys.argv[2]
+d = json.load(open(p))
+d["cwd"] = cwd
+json.dump(d, open(p, "w"), separators=(",", ":"))
+' "$meta" "$2"
+}
+
+# Fallback when a chat has no meta.json: the workspace hash is md5 of the cwd
+# path string. Not reversible, but the candidate set is small: DEV_REPOS values
+# plus the conventional code dirs. Best-effort.
+guess_cwd() {
+  local hash="$1" d
+  while IFS= read -r d; do
+    d="${d%/}"
+    [[ -n "$d" && "$(md5 -qs "$d")" == "$hash" ]] && { echo "$d"; return 0; }
+  done < <(
+    if [[ -r "$T_CONFIG" ]]; then sed -n 's/^DEV_REPOS\[[^]]*\]=//p' "$T_CONFIG"; fi
+    ls -d "$HOME"/code/*/ "$HOME"/github/*/ /Users/Shared/*/ 2>/dev/null || true
+  )
+  return 1
+}
+
+# Usernames differ across machines (e.g. ~ = /Users/mayank here, /Users/
+# mayankpahadia on the mini), and the workspace hash is md5 of the ABSOLUTE
+# cwd — so the same repo hashes differently per machine and a chat copied
+# verbatim would land in a workspace the far side's cursor-agent never looks
+# at. Translate: a $HOME-relative cwd is re-rooted at the other home
+# (machine-independent paths like /Users/Shared pass through), then re-hashed.
+translate_path() {  # <cwd> <from-home> <to-home>
+  local cwd="$1" from_home="$2" to_home="$3"
+  case "$cwd" in
+    "$from_home"/*) echo "$to_home/${cwd#"$from_home"/}" ;;
+    *) echo "$cwd" ;;
+  esac
+}
+
+# One row per chat: <chat-id>  <workspace or hash>  <last-used>  <title>.
+# Newest first, by the newest file in the chat dir (store.db while a chat is
+# live; a chat that has not had a conversation yet holds only meta.json —
+# still listed). Also the picker's row source.
+list_chats() {
+  local dir ws cwd newest title
+  [[ -d "$CHATS" ]] || { echo "No cursor chats here (~/.cursor/chats is empty)."; return; }
+  # shellcheck disable=SC2012
+  { ls -dt "$CHATS"/*/*/ 2>/dev/null || true; } | while IFS= read -r dir; do
+    dir="${dir%/}"
+    ws="$(basename "$(dirname "$dir")")"
+    cwd="$(chat_cwd "$dir" || true)"
+    [[ -n "$cwd" ]] || cwd="$(guess_cwd "$ws" || true)"
+    title="$(chat_title "$dir")"
+    # shellcheck disable=SC2012
+    newest=$(ls -t "$dir" 2>/dev/null | head -1)
+    printf '%s  %s  %s  %s\n' "$(basename "$dir")" "${cwd:-hash:$ws}" \
+      "$(stat -f '%Sm' -t '%Y-%m-%d %H:%M' "$dir/${newest:-.}")" "${title:-(untitled)}"
+  done
+}
+
+# fzf over list_chats rows (title + workspace visible — no id juggling).
+# Prints the picked chat id. Needs a TTY + fzf.
+pick_chat() {
+  [[ -t 0 && -t 1 ]] || { echo "cursor-beam: -p needs a terminal" >&2; return 1; }
+  command -v fzf >/dev/null || { echo "cursor-beam: -p needs fzf" >&2; return 1; }
+  local row
+  row=$(list_chats | fzf --prompt='cursor chat> ' --no-multi) || return 1
+  awk '{print $1}' <<<"$row"
+}
+
+# Resolve a chat dir under $CHATS: exact id, unique prefix, or (no id) the
+# newest chat — scoped to $PWD's workspace when standing in one (the t-family
+# repo-awareness: `t cursor` in ~/code/foo means foo's newest chat, not the
+# globally newest), else the globally newest. Prints the absolute dir.
+resolve_chat() {
+  local id="$1" matches="" ws
+  # shellcheck disable=SC2012  # ls -dt is the point: newest-first by mtime
+  if [[ -n "$id" ]]; then
+    matches=$(ls -dt "$CHATS"/*/"$id" "$CHATS"/*/"$id"* 2>/dev/null | awk '!seen[$0]++') || true
+  else
+    ws=$(workspace_of_pwd || true)
+    if [[ -n "$ws" ]]; then
+      # shellcheck disable=SC2012
+      matches=$(ls -dt "$CHATS/$ws"/*/ 2>/dev/null | head -1 | sed 's:/$::') || true
+    fi
+    # shellcheck disable=SC2012
+    [[ -n "$matches" ]] || matches=$(ls -dt "$CHATS"/*/*/ 2>/dev/null | head -1 | sed 's:/$::') || true
+  fi
+  [[ -n "$matches" ]] || { echo "cursor-beam: no chat matching '${id:-<latest>}' under $CHATS (--ls to list)" >&2; return 1; }
+  if (( $(wc -l <<<"$matches") > 1 )); then
+    echo "cursor-beam: '$id' is ambiguous:" >&2
+    awk '{print "  " $0}' <<<"$matches" >&2
+    return 1
+  fi
+  echo "$matches"
+}
+
+resume_hint() {  # <chat-id> [host]
+  # `t cursor resume` does the cd + the over-ssh keychain unlock itself, so the
+  # hint is one uniform command (the keychain caveat lives in the resume path).
+  local id="$1" host="${2:-}"
+  echo "Resume it: t cursor resume $id${host:+ --host $host}"
+}
+
+# ---- --ls ----
+if (( do_ls )); then
+  if [[ -n "$host" ]]; then
+    # Via `t cursor`, not bare `cursor-beam`: ~/bin/t is already linked on every
+    # host and resolves cursor-beam as its realpath sibling, so a mere `dots`
+    # there suffices (a new bin symlink would need install.sh). zsh -lic for the
+    # interactive PATH, same contract as the rest of the family.
+    exec ssh "$host" "zsh -lic 't cursor ls'"
+  fi
+  list_chats
+  exit 0
+fi
+
+# ---- resume (local) ----
+if (( do_resume )); then
+  # --host: resume it THERE instead (the chat must already live on the host).
+  # Via `t cursor`, dots-only like the remote --ls; unlock its keychain first.
+  if [[ -n "$host" ]]; then
+    exec ssh -t "$host" "security unlock-keychain && zsh -lic 't cursor resume ${chat_id}'"
+  fi
+  if (( do_pick )); then chat_id=$(pick_chat) || exit 1; fi
+  dir=$(resolve_chat "$chat_id")
+  id="$(basename "$dir")"
+  cwd="$(chat_cwd "$dir" || true)"
+  [[ -n "$cwd" ]] || cwd="$(guess_cwd "$(basename "$(dirname "$dir")")" || true)"
+  # A pulled chat's workspace may not exist here yet (the hash/meta are already
+  # translated to a local path) — an empty dir is all cursor-agent needs.
+  [[ -n "$cwd" && ! -d "$cwd" ]] && mkdir -p "$cwd"
+  cd "${cwd:-$HOME}"
+  # Over ssh the login keychain is locked and cursor-agent refuses to start —
+  # unlock first (prompts for this machine's login password on this TTY).
+  if [[ -n "${SSH_CONNECTION:-}${SSH_TTY:-}" ]]; then
+    security unlock-keychain || echo "⚠ keychain unlock failed — cursor-agent may refuse to start" >&2
+  fi
+  exec cursor-agent --resume="$id"
+fi
+
+# ---- pull (--from) ----
+if [[ -n "$from" ]]; then
+  # Far $HOME + candidate dirs first: the no-id resolution needs the far home
+  # to translate $PWD into the far side's workspace hash.
+  info=$(ssh "$from" 'bash -c "printf \"%s\n\" \"\$HOME\"; ls -d ~/code/*/ ~/github/*/ /Users/Shared/*/ 2>/dev/null"; true')
+  remote_home=$(sed -n 1p <<<"$info")
+
+  # Resolve on the far side: id/prefix match; no id → the far side's newest
+  # chat in THIS directory's workspace ($PWD re-rooted at the far $HOME and
+  # md5'd — `t cursor --from h` in ~/code/foo pulls foo's chat), else the
+  # host's newest chat overall. bash -c, not the login shell: zsh aborts the
+  # whole command on any unmatched glob, bash hands it to ls where 2>/dev/null
+  # swallows it.
+  rdir=""
+  if [[ -n "$chat_id" ]]; then
+    # shellcheck disable=SC2029  # client-side expansion intended (id/hash into the remote cmd)
+    rdir=$(ssh "$from" "bash -c 'ls -dt ~/.cursor/chats/*/$chat_id* 2>/dev/null | head -1'") || true
+  else
+    if [[ -n "$remote_home" ]]; then
+      pwd_rhash=$(md5 -qs "$(translate_path "$PWD" "$HOME" "$remote_home")")
+      # shellcheck disable=SC2029
+      rdir=$(ssh "$from" "bash -c 'ls -dt ~/.cursor/chats/$pwd_rhash/*/ 2>/dev/null | head -1'" | sed 's:/$::') || true
+    fi
+    [[ -n "$rdir" ]] || rdir=$(ssh "$from" "bash -c 'ls -dt ~/.cursor/chats/*/*/ 2>/dev/null | head -1'" | sed 's:/$::') || true
+  fi
+  [[ -n "$rdir" ]] || { echo "cursor-beam: no chat matching '${chat_id:-<latest>}' on $from" >&2; exit 1; }
+  rhash="$(basename "$(dirname "$rdir")")"
+  id="$(basename "$rdir")"
+
+  # The chat's cwd: read it straight out of the far meta.json (fetched raw,
+  # parsed locally — no remote-python quoting); fall back to reversing the
+  # workspace hash against the far side's candidate dirs — md5 of a path
+  # string needs no remote execution. Unresolved → keep the hash verbatim.
+  # shellcheck disable=SC2029
+  rmeta=$(ssh "$from" "cat ~/.cursor/chats/$rhash/$id/meta.json 2>/dev/null" || true)
+  rcwd=$(python3 -c 'import json,sys; print(json.load(sys.stdin).get("cwd",""))' <<<"$rmeta" 2>/dev/null || true)
+  if [[ -z "$rcwd" ]]; then
+    while IFS= read -r d; do
+      d="${d%/}"
+      [[ -n "$d" && "$(md5 -qs "$d")" == "$rhash" ]] && { rcwd="$d"; break; }
+    done < <(tail -n +2 <<<"$info")
+  fi
+  if [[ -n "$rcwd" ]]; then
+    lcwd=$(translate_path "$rcwd" "$remote_home" "$HOME")
+    lhash=$(md5 -qs "$lcwd")
+  else
+    lcwd=""; lhash="$rhash"
+  fi
+
+  mkdir -p "$CHATS/$lhash"
+  # ${from} braced: bash 3.2 (macOS default) swallows a following multibyte
+  # char (the …) into the variable name under set -u.
+  echo "⟳ Pulling chat $id from ${from}…"
+  rsync -a --update "$from:.cursor/chats/$rhash/$id/" "$CHATS/$lhash/$id/"
+  # The recorded cwd is the ORIGIN's absolute path — rewrite it to the local
+  # one, or cursor-agent here associates the chat with a dir that cannot exist.
+  [[ "$lcwd" != "$rcwd" ]] && patch_meta_cwd "$CHATS/$lhash/$id" "$lcwd"
+  echo "✓ Chat $id is here${lcwd:+ (workspace $lcwd)}. Close any live cursor-agent still driving it on $from first."
+  resume_hint "$id"
+  exit 0
+fi
+
+# ---- send (default) ----
+host="${host:-$(default_host)}"
+[[ -n "$host" ]] || { echo "cursor-beam: no host (--host <h>, or set TBEAM_HOST / REMOTE_HOSTS)" >&2; exit 2; }
+if (( do_pick )); then chat_id=$(pick_chat) || exit 1; fi
+dir=$(resolve_chat "$chat_id")
+id="$(basename "$dir")"
+rel="${dir#"$CHATS"/}"
+cwd="$(chat_cwd "$dir" || true)"
+[[ -n "$cwd" ]] || cwd="$(guess_cwd "$(dirname "$rel")" || true)"
+
+# cursor-agent takes no lock on store.db — warn if a live local process looks
+# like it still owns this chat, so two machines never drive one chat at once.
+if pgrep -f "cursor-agent.*$id" >/dev/null 2>&1; then
+  echo "⚠ A local cursor-agent process mentions this chat — close it before resuming on $host." >&2
+fi
+
+# Re-hash for the host: its $HOME (and so its md5-of-cwd workspace hash) may
+# differ. An unguessed cwd keeps the origin hash — the chat still transfers,
+# the workspace association is just not translated.
+remote_home=$(ssh "$host" 'printf %s "$HOME"')
+if [[ -n "$cwd" ]]; then
+  rcwd=$(translate_path "$cwd" "$HOME" "$remote_home")
+  rhash=$(md5 -qs "$rcwd")
+else
+  rcwd=""; rhash="$(dirname "$rel")"
+fi
+
+echo "⟳ Beaming chat $id → ${host}…"  # braced: see the bash-3.2 note above
+# shellcheck disable=SC2029  # client-side expansion intended
+ssh "$host" "mkdir -p ~/.cursor/chats/$rhash"
+rsync -a --update "$dir/" "$host:.cursor/chats/$rhash/$id/"
+# The copied meta.json still records THIS machine's cwd — rewrite it to the
+# host's path. Patched in a local staging copy (JSON handling stays local),
+# then pushed with a plain rsync so it overrides the just-copied file.
+if [[ -n "$rcwd" && "$rcwd" != "$cwd" && -r "$dir/meta.json" ]]; then
+  stage=$(mktemp -d) && trap 'rm -rf "$stage"' EXIT
+  cp "$dir/meta.json" "$stage/" && patch_meta_cwd "$stage" "$rcwd"
+  rsync -a "$stage/meta.json" "$host:.cursor/chats/$rhash/$id/meta.json"
+fi
+echo "✓ Chat $id landed on $host${rcwd:+ (workspace $rcwd)}."
+if (( attach )) && [[ -t 0 && -t 1 ]]; then
+  # zsh -lic: cursor-agent installs to ~/.local/bin, which is on the
+  # interactive PATH — plain ssh would not see it. unlock-keychain first:
+  # the ssh login keychain is locked and cursor-agent's creds live there
+  # (prompts for the host's login password on the ssh -t TTY).
+  exec ssh -t "$host" "security unlock-keychain && zsh -lic 'cd ${rcwd:-~} && cursor-agent --resume=$id'"
+fi
+resume_hint "$id" "$host"

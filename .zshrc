@@ -1515,7 +1515,7 @@ _dev_kill_fg() {
     m=
     if [[ $handle == $label ]]; then m=1
     elif [[ $handle == $repo && -z ${DEV_REPOS[$handle]:-} ]]; then m=1
-    elif [[ $handle != *:* && -n $sid && $sid != - && ${sid[1,${#handle}]} == $handle ]]; then m=1
+    elif [[ $handle != *:* && -z ${DEV_REPOS[$handle]:-} && -n $sid && $sid != - && ${sid[1,${#handle}]} == $handle ]]; then m=1
     fi
     [[ -n $m ]] || continue
     matched=1
@@ -2281,7 +2281,7 @@ _dev_remote_fg_kill() {
     | awk -F'\t' -v h="$handle" -v idp="$idpart" -v isrepo="${DEV_REPOS[$handle]:+1}" '
         $1 != "local" && $4 ~ /:/ {
           repo=$4; sub(/:.*/, "", repo);
-          if ($4==h || (h==repo && isrepo=="") || (index(h,":")==0 && $2!="-" && index($2,idp)==1))
+          if ($4==h || (h==repo && isrepo=="") || (index(h,":")==0 && isrepo=="" && $2!="-" && index($2,idp)==1))
             if (!seen[$1]++) print $1
         }')
   [[ -n $hosts ]] || return 2

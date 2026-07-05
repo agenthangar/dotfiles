@@ -2792,7 +2792,7 @@ _t_resume() {
   local -a cands slots tx
   local -A remote_live_host remote_live_alias remote_live_sum
   local n wt sid busy rhost _rdir _rbase _rhost _rn _ralias _rsum _ok _stale stale_path
-  local txf title when org orgf hf skipped=0
+  local txf title when ep org orgf hf skipped=0
   local _rwtr=${DEV_WORKTREE_ROOT:-}
   # Recency window (--days, default 30; 'all' disables) + this machine's short
   # hostname, to blank the origin column for locally-run conversations.
@@ -2827,8 +2827,10 @@ _t_resume() {
           _t_dev "$repo" "$n"
           return
         fi
-        # Scan: a live local slot is a labeled row (pick → attach).
-        cands+=("$repo"$'\t'"$n"$'\t'-$'\t'"$wt"$'\t'"● here"$'\t'"${local_sum[${busy#dev-}]:-(live session)}"$'\t'here$'\t'-$'\t'-)
+        # Scan: a live local slot is a labeled row (pick → attach). Sort key
+        # (field 1, stripped after the global sort below): a live session is
+        # "now", so the max sentinel pins it above every dead transcript.
+        cands+=(9999999999$'\t'"$repo"$'\t'"$n"$'\t'-$'\t'"$wt"$'\t'"● here"$'\t'"${local_sum[${busy#dev-}]:-(live session)}"$'\t'here$'\t'-$'\t'-)
         continue
       fi
       # Remote-live: same treatment as local live (see the scan note above).
@@ -2839,7 +2841,7 @@ _t_resume() {
           _dev_remote_attach "$rhost"$'\t'"${remote_live_alias[$n]}"$'\t'"$n" ""
           return
         fi
-        cands+=("$repo"$'\t'"$n"$'\t'-$'\t'"$wt"$'\t'"● on $rhost"$'\t'"${remote_live_sum[$n]:-(live session)}"$'\t'"$rhost"$'\t'"${remote_live_alias[$n]}"$'\t'-)
+        cands+=(9999999999$'\t'"$repo"$'\t'"$n"$'\t'-$'\t'"$wt"$'\t'"● on $rhost"$'\t'"${remote_live_sum[$n]:-(live session)}"$'\t'"$rhost"$'\t'"${remote_live_alias[$n]}"$'\t'-)
         continue
       fi
       # Name-only collision: a dev-<alias>-${n} tmux session (any alias keying
@@ -2864,7 +2866,8 @@ _t_resume() {
       fi
       tx=( "$HOME/.claude/projects/${wt//[^A-Za-z0-9]/-}"/*.jsonl(Nom) )
       for txf in "${(@)tx}"; do
-        if (( cutoff )) && (( $(stat -f %m "$txf" 2>/dev/null || echo 0) < cutoff )); then
+        ep=$(stat -f %m "$txf" 2>/dev/null || echo 0)   # sort key + --days gate
+        if (( cutoff && ep < cutoff )); then
           (( skipped++ )); continue        # outside the --days window
         fi
         title=$(_transcript_title "$txf")
@@ -2881,11 +2884,19 @@ _t_resume() {
           elif [[ -n ${host_alias[$org]:-} ]]; then org=${host_alias[$org]}
           fi
         fi
-        cands+=("$repo"$'\t'"$n"$'\t'"${${txf:t}%.jsonl}"$'\t'"$wt"$'\t'"$when"$'\t'"$title"$'\t'-$'\t'-$'\t'"${org[1,10]}")
+        cands+=("$ep"$'\t'"$repo"$'\t'"$n"$'\t'"${${txf:t}%.jsonl}"$'\t'"$wt"$'\t'"$when"$'\t'"$title"$'\t'-$'\t'-$'\t'"${org[1,10]}")
       done
     done
   done
   (( skipped )) && echo "(${skipped} older conversation(s) outside the last ${days}d hidden — t resume --days all shows them)" >&2
+
+  # ONE global newest-first order by session time (the leading epoch field),
+  # never grouped by repo — the loop above emits repo-by-repo, so without this
+  # all-repos mode read as blocks per repo. Live rows carry the max sentinel
+  # and pin to the top. (On) = descending numeric on the leading field, which
+  # is then stripped so the positional fields below stay 1-9.
+  cands=("${(@On)cands}")
+  cands=("${(@)cands#*$'\t'}")
 
   if (( ! $#cands )); then
     if [[ -n $slot ]]; then

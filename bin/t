@@ -688,7 +688,8 @@ Run `t <verb> -h` for a verb's own flags.""")
     sp = sub.add_parser("resume", help="revive a dead slot's saved conversation",
         description="Revive a DEAD dev slot's conversation (`t open` on a dead slot "
             "deliberately starts fresh — this brings the chat back). Offers EVERY conversation "
-            "saved in the slot's own per-session worktree (newest first; conversationless stubs "
+            "saved in the slot's own per-session worktree (one global newest-first list by "
+            "session time — never grouped by repo; live rows on top; conversationless stubs "
             "skipped), rebuilding a reaped worktree from its branch first, then resumes the pick "
             "in a fresh dev slot and attaches. Names default to "
             "the cwd repo; outside any repo dir a bare `t resume` scans every worktree repo. "

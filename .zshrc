@@ -2634,7 +2634,7 @@ _t_plan() {
 # transcripts from every $REMOTE_HOSTS host first (direct rsync — csync is periodic
 # and needs a prompt on the far side, so "resume what just died on the other
 # machine" cannot wait for it), then scans as usual. LIVE slots — local or on a
-# $REMOTE_HOSTS host — appear as labeled rows ("● here" / "● on <host>") whose pick
+# $REMOTE_HOSTS host — appear as labeled rows ("● active" / "● on <host>") whose pick
 # ATTACHES in place instead of resuming (one-live-owner: a second `claude -r` on a
 # live id diverges the transcript).
 # -f/--fg resumes inline in THIS terminal (t pop's landing) instead of a slot.
@@ -2757,7 +2757,7 @@ _t_resume() {
   # to the same .jsonl with no locking and diverge the conversation. _dev_rows_all
   # when $REMOTE_HOSTS exist (this machine + every host), else a local-only
   # _dev_session_rows; fg rows (`:`-labelled) dropped. Live slots become LABELED
-  # PICKER ROWS below ("● here" / "● on <host>") whose pick ATTACHES in place
+  # PICKER ROWS below ("● active" / "● on <host>") whose pick ATTACHES in place
   # instead of resuming — the picker itself says where everything is, rather than
   # stderr notes nobody reads. The per-repo awk over the cached remote rows builds
   # slot→host/alias/title maps (matching the repo's dir OR its per-session-worktree
@@ -2830,7 +2830,7 @@ _t_resume() {
         # Scan: a live local slot is a labeled row (pick → attach). Sort key
         # (field 1, stripped after the global sort below): a live session is
         # "now", so the max sentinel pins it above every dead transcript.
-        cands+=(9999999999$'\t'"$repo"$'\t'"$n"$'\t'-$'\t'"$wt"$'\t'"● here"$'\t'"${local_sum[${busy#dev-}]:-(live session)}"$'\t'here$'\t'-$'\t'-)
+        cands+=(9999999999$'\t'"$repo"$'\t'"$n"$'\t'-$'\t'"$wt"$'\t'"● active"$'\t'"${local_sum[${busy#dev-}]:-(live session)}"$'\t'here$'\t'-$'\t'-)
         continue
       fi
       # Remote-live: same treatment as local live (see the scan note above).
@@ -2913,8 +2913,9 @@ _t_resume() {
   fi
 
   # Picker rows: repo(1) slot(2) sid(3) wt(4) when(5) title(6) loc(7) alias(8)
-  # origin(9) — loc/alias are `-` for a dead (resumable) row, `here` for a live
-  # local slot, or the host + remote alias for a slot live on a $REMOTE_HOSTS
+  # origin(9) — loc/alias are `-` for a dead (resumable) row, the `here`
+  # sentinel (displayed "● active") for a live local slot, or the host + remote
+  # alias for a slot live on a $REMOTE_HOSTS
   # host (pick → attach in place, never a second owner); origin is the machine a
   # dead conversation LAST RAN on (`-`/empty = here or unstamped — live rows name
   # their host in the ● label instead). One ALIGNED display column (10) is

@@ -525,7 +525,9 @@ _dev_beam_land_cwd() {
   if [[ -n $sid ]]; then
     local pdir="$HOME/.claude/projects" encold="${cwd//[^A-Za-z0-9]/-}" encnew="${nwt//[^A-Za-z0-9]/-}" f
     mkdir -p "$pdir/$encnew"
-    for f in "$pdir/$encold/$sid"*(N); do cp -p "$f" "$pdir/$encnew/${f:t}"; done
+    # -R: the sid's files include a DIRECTORY named exactly <sid> (tool-results etc.,
+    # newer Claude Code), not just <sid>.jsonl/<sid>.origin — a plain cp skips it.
+    for f in "$pdir/$encold/$sid"*(N); do cp -Rp "$f" "$pdir/$encnew/${f:t}"; done
     [[ -e "$pdir/$encnew/$sid.jsonl" ]] || print -r -- "tbeam: no transcript for ${sid[1,8]}… under $encold — the relanded slot may not resume" >&2
   fi
   print -r -- "⚠ slot $slot is taken here ($why) — relanding as $repo $n ($nbr @ origin/$br)" >&2

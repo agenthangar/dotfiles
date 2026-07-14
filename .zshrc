@@ -672,10 +672,16 @@ _clawsync_periodic() {
 add-zsh-hook precmd _clawsync_periodic
 
 # Worktree sweep — reap per-session worktrees whose work has landed. A slot's worktree
-# + branch (dev/<basename>-<slot>) are removed only when BOTH hold: the tmux session is
-# dead (matched by session_path, never by name — dodges alias drift) AND the branch is
-# merged to main. Unmerged work is never destroyed (a killed-but-unmerged slot keeps its
-# worktree so reopening the slot resumes it). Same prompt-piggyback + stamp-gate as csync.
+# + branch (dev/<basename>-<slot>) are removed only when ALL THREE hold: the tmux session
+# is dead (matched by session_path, never by name — dodges alias drift), the branch is
+# merged to main, AND the working tree is clean. The clean gate exists because a merged
+# TIP says nothing about the WORKING TREE: after a PR merges, the slot lives on and the
+# next feature accumulates as uncommitted edits on the same branch (tip still == the
+# merged PR head) — a reboot then kills every tmux session, the sweep sees dead+merged,
+# and `worktree remove --force` erases the whole uncommitted feature (the 2026-07-14
+# incident: five slots reaped at once, one holding a day of unpushed work). Unmerged or
+# uncommitted work is never destroyed (a killed-but-unmerged slot keeps its worktree so
+# reopening the slot resumes it). Same prompt-piggyback + stamp-gate as csync.
 # _dev_branch_merged <repodir> <branch> — true if <branch> has landed on main. Prefers
 # gh (a merged PR with this head branch — catches GitHub SQUASH-merges, which leave no
 # ancestor link so `git branch --merged`/merge-base miss them); an OPEN PR is a hard
@@ -709,7 +715,7 @@ _dev_worktree_sweep_run() {
   [[ -n $root && -d $root ]] || return
   local -a livepaths
   livepaths=("${(@f)$(tmux list-sessions -F '#{session_path}' 2>/dev/null)}")
-  local wt repo slot repodir br r
+  local wt repo slot repodir br r dirt
   for wt in $root/*/*(N/); do                       # <basename>/<slot> dirs
     [[ -e "$wt/.git" ]] || continue
     (( ${livepaths[(Ie)$wt]} )) && continue         # live session here → keep
@@ -719,6 +725,12 @@ _dev_worktree_sweep_run() {
     [[ -n $repodir && -d $repodir ]] || continue
     br=$(_dev_worktree_branch "$repo" "$slot")
     _dev_branch_merged "$repodir" "$br" || continue
+    # Merged tip ≠ clean tree: post-merge uncommitted work sits on a merged sha, and
+    # `remove --force` (needed below because git refuses dirty removals) would erase it.
+    # Skip silently, like the gates above — dirty-on-merged is the normal keep-working
+    # state, not an anomaly worth a log line every pass. Unreadable status counts dirty.
+    dirt=$(git -C "$wt" status --porcelain 2>/dev/null) || dirt='?'
+    [[ -z $dirt ]] || continue
     print -r -- "[$(strftime '%F %T' $EPOCHSECONDS 2>/dev/null)] sweep: $wt (branch $br merged)"
     git -C "$repodir" worktree remove --force "$wt" 2>/dev/null \
       && git -C "$repodir" branch -D "$br" 2>/dev/null

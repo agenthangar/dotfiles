@@ -1,5 +1,22 @@
 export PATH="$HOME/bin:$HOME/.local/bin:$PATH"
 
+# Hardened hosts can ship a root-only /tmp (the openclaw gateway does: drwx------
+# root). That breaks every non-root temp-file user — zsh heredocs (TMPPREFIX),
+# mktemp, and tmux's socket dir — so fall back to a per-user tmp. TMUX_TMPDIR
+# matters most: the whole `t` slot machinery rides on tmux, and every t-driven
+# tmux call goes through `zsh -lic`, so setting it here keeps client + server on
+# one socket dir. No-op on a standard 1777 /tmp.
+# Gate on /tmp ITSELF, not $TMPDIR: TMPDIR is exported and inherited, but
+# TMPPREFIX is shell-local — a nested `zsh -lic` (how bin/t runs every helper)
+# inherits the writable TMPDIR, and a TMPDIR-based gate would skip this block
+# there, leaving the nested shell's heredocs pointed at the unwritable /tmp/zsh.
+if [[ ! -w /tmp ]]; then
+  export TMPDIR="${TMPDIR:-$HOME/.cache/tmp}"
+  mkdir -p "$TMPDIR" 2>/dev/null
+  TMPPREFIX="$TMPDIR/zsh"
+  export TMUX_TMPDIR="${TMUX_TMPDIR:-$TMPDIR}"
+fi
+
 # Initialize the completion system before sourcing anything that calls `compdef`
 # (e.g. a completion sourced from ~/.zshrc.local below). Without this, compdef is
 # undefined and sourcing such a completion errors with "command not found: compdef".
@@ -647,7 +664,21 @@ unset _host
 # once every 15 min, fire csync detached in the background. A stamp file gates
 # the interval (written *before* the run so overlapping shells don't double-fire).
 mkdir -p "$HOME/.cache" "$HOME/Library/Logs" 2>/dev/null
-zmodload zsh/datetime 2>/dev/null                     # $EPOCHSECONDS, no `date` fork
+zmodload zsh/datetime 2>/dev/null                     # $EPOCHSECONDS + strftime, no `date` fork
+# Only the zstat builtin (-F), NOT the module's `stat` — that would shadow the
+# system stat the rest of this file (and Linux hosts) call. zstat is the portable
+# mtime source: BSD `stat -f %m` and GNU `stat -c %Y` disagree, zstat is neither.
+zmodload -F zsh/stat b:zstat 2>/dev/null
+# _stat_birth <file> — file creation (birth) epoch, empty/rc1 when unknowable.
+# The one stat field zstat lacks; BSD spells it `-f %B`, GNU `-c %W` (which
+# prints 0 or - on filesystems that don't record it — treated as unknown).
+_stat_birth() {
+  local b
+  if [[ $OSTYPE == darwin* ]]; then b=$(command stat -f %B "$1" 2>/dev/null)
+  else b=$(command stat -c %W "$1" 2>/dev/null); fi
+  [[ -n $b && $b != 0 && $b != - ]] || return 1
+  print -r -- "$b"
+}
 autoload -Uz add-zsh-hook
 _csync_periodic() {
   local interval=900 stamp="$HOME/.cache/csync-last-run" now=$EPOCHSECONDS last=0
@@ -1035,12 +1066,16 @@ _dev_summary_for_pid() {
   local -a tx
   if [[ -n $cpid ]]; then
     start=$(ps -o lstart= -p "$cpid" 2>/dev/null)
-    start=$(date -j -f '%a %b %d %T %Y' "${start## #}" +%s 2>/dev/null)
+    if [[ $OSTYPE == darwin* ]]; then
+      start=$(date -j -f '%a %b %d %T %Y' "${start## #}" +%s 2>/dev/null)
+    else
+      start=$(date -d "${start## #}" +%s 2>/dev/null)   # GNU date parses lstart natively
+    fi
   fi
   if [[ -n $start ]]; then
     local f b best bestdiff diff
     for f in "$proj"/*.jsonl(N); do
-      b=$(stat -f %B "$f" 2>/dev/null) || continue
+      b=$(_stat_birth "$f") || continue
       (( b < start - 2 )) && continue                  # born before this claude → not ours
       diff=$(( b - start ))
       if [[ -z $bestdiff ]] || (( diff < bestdiff )); then bestdiff=$diff; best=$f; fi
@@ -1136,6 +1171,7 @@ _dev_fg_rows() {
     [[ -n ${inslot[$pid]} || $pid == $me ]] && continue
     sid= cwd=
     [[ -r $reg/$pid ]] && IFS=$'\t' read -r sid cwd < "$reg/$pid"
+    [[ -n $cwd ]] || cwd=$(readlink "/proc/$pid/cwd" 2>/dev/null)   # Linux: no lsof needed
     [[ -n $cwd ]] || cwd=$(lsof -a -p "$pid" -d cwd -Fn 2>/dev/null | sed -n 's/^n//p' | head -1)
     [[ -n $cwd ]] || continue
     repo=$(_dev_repo_of_dir "$cwd" 2>/dev/null); repo=${repo%%$'\t'*}   # worktree-aware
@@ -1317,6 +1353,15 @@ _dev_dir_in_scope() {
   [[ $d == $scope || $d == $scope/* ]] && return 0
   [[ -n $DEV_WORKTREE_ROOT && $d == $DEV_WORKTREE_ROOT/${scope:t}/* ]]
 }
+
+# _dev_homerel <path> — strip the machine-local home prefix (/Users/<u>/ on macOS,
+# /home/<u>/ on Linux) so REMOTE paths compare against local ones on hosts whose
+# $HOME differs (a Linux node is /home/<u>; Macs are /Users/<u>). The cross-host
+# key becomes the home-relative form (`code/dotfiles`); a path outside any home
+# passes through absolute. The awk twin used on remote-row cwds is
+#   { c=$3; sub(/^\/(Users|home)\/[^\/]+\//, "", c) }
+# — keep the two in sync. (Python twin: _homerel in bin/t.)
+_dev_homerel() { print -r -- "${1#/(Users|home)/*/}" }
 
 # _dev_ensure_session_cwd <cwd> — print a directory in which a session recorded at <cwd>
 # can be resumed, materializing it on demand. <cwd> still present → echo it unchanged.
@@ -1575,8 +1620,9 @@ _dev_list_remote() {
   # paths ($DEV_WORKTREE_ROOT/<basename>/...) count as the repo too (wt clause); the
   # worktree root is the same path on every host, like ~/code.
   [[ -n $scope ]] && rows=$(print -r -- "$rows" | awk -F'\t' \
-    -v d="$scope" -v wt="${DEV_WORKTREE_ROOT}/${scope:t}" \
-    '$3==d || index($3, d"/")==1 || index($3, wt"/")==1')
+    -v d="$(_dev_homerel "$scope")" -v wt="$(_dev_homerel "$DEV_WORKTREE_ROOT")/${scope:t}" \
+    '{ c=$3; sub(/^\/(Users|home)\/[^\/]+\//, "", c) }
+     c==d || index(c, d"/")==1 || index(c, wt"/")==1')
   if [[ -z $rows ]]; then
     echo "No dev sessions running${scope:+ in ${scope:t} (dev ls -r --all for every repo)}${scope:+,} on this machine or any reachable host."
     return 0
@@ -1695,6 +1741,7 @@ _dev_kill_fg() {
     [[ -n ${inslot[$pid]} || $pid == $me ]] && continue
     sid= cwd=
     [[ -r $reg/$pid ]] && IFS=$'\t' read -r sid cwd < "$reg/$pid"
+    [[ -n $cwd ]] || cwd=$(readlink "/proc/$pid/cwd" 2>/dev/null)   # Linux: no lsof needed
     [[ -n $cwd ]] || cwd=$(lsof -a -p "$pid" -d cwd -Fn 2>/dev/null | sed -n 's/^n//p' | head -1)
     [[ -n $cwd ]] || continue
     repo=$(_dev_repo_of_dir "$cwd" 2>/dev/null); repo=${repo%%$'\t'*}
@@ -2234,9 +2281,9 @@ _dev_remote_resolve() {
   if [[ -z $repo ]]; then
     match=$rows                                                  # bare → all remote
   elif [[ -n $dir && -n $slot ]]; then
-    match=$(print -r -- "$rows" | awk -F'\t' -v d="$dir" -v s="$slot" -v wtr="$wtr" -v b="$base" '($3==d || (wtr != "" && b != "" && index($3, wtr "/" b "/") == 1)) && $4 !~ /:/ && $4 ~ ("-" s "$")')
+    match=$(print -r -- "$rows" | awk -F'\t' -v d="$(_dev_homerel "$dir")" -v s="$slot" -v wtr="$(_dev_homerel "$wtr")" -v b="$base" '{ c=$3; sub(/^\/(Users|home)\/[^\/]+\//, "", c) } (c==d || (wtr != "" && b != "" && index(c, wtr "/" b "/") == 1)) && $4 !~ /:/ && $4 ~ ("-" s "$")')
   elif [[ -n $dir ]]; then
-    match=$(print -r -- "$rows" | awk -F'\t' -v d="$dir" -v wtr="$wtr" -v b="$base" '($3==d || (wtr != "" && b != "" && index($3, wtr "/" b "/") == 1)) && $4 !~ /:/')
+    match=$(print -r -- "$rows" | awk -F'\t' -v d="$(_dev_homerel "$dir")" -v wtr="$(_dev_homerel "$wtr")" -v b="$base" '{ c=$3; sub(/^\/(Users|home)\/[^\/]+\//, "", c) } (c==d || (wtr != "" && b != "" && index(c, wtr "/" b "/") == 1)) && $4 !~ /:/')
   elif [[ -n $slot ]]; then
     match=$(print -r -- "$rows" | awk -F'\t' -v w="${repo}-${slot}" '$4==w')
   else
@@ -2520,7 +2567,9 @@ _dev_remote_kill() {
     local pairs
     if [[ -n $dir ]]; then
       pairs=$(_dev_rows_all 2>/dev/null \
-        | awk -F'\t' -v d="$dir" '$1 != "local" && $3==d && $4 !~ /:/ {
+        | awk -F'\t' -v d="$(_dev_homerel "$dir")" '
+          { c=$3; sub(/^\/(Users|home)\/[^\/]+\//, "", c) }
+          $1 != "local" && c==d && $4 !~ /:/ {
             a=$4; sub(/-[0-9]+$/, "", a);
             print $1 "\t" a
           }' | awk -F'\t' '!seen[$1]++')
@@ -2971,8 +3020,9 @@ _t_resume() {
     if [[ -n $remote_rows ]]; then
       while IFS=$'\t' read -r _rhost _rn _ralias _rsum; do
         [[ -n $_rn ]] && { remote_live_host[$_rn]=$_rhost; remote_live_alias[$_rn]=$_ralias; remote_live_sum[$_rn]=$_rsum; }
-      done < <(print -r -- "$remote_rows" | awk -F'\t' -v d="$_rdir" -v wtr="$_rwtr" -v b="$_rbase" '
-        ($3==d || (wtr != "" && b != "" && index($3, wtr "/" b "/") == 1)) {
+      done < <(print -r -- "$remote_rows" | awk -F'\t' -v d="$(_dev_homerel "$_rdir")" -v wtr="$(_dev_homerel "$_rwtr")" -v b="$_rbase" '
+        { c=$3; sub(/^\/(Users|home)\/[^\/]+\//, "", c) }
+        (c==d || (wtr != "" && b != "" && index(c, wtr "/" b "/") == 1)) {
           n = $4; sub(/^.*-/, "", n)
           r = $4; sub(/-[^-]+$/, "", r)
           print $1 "\t" n "\t" r "\t" $7
@@ -3026,14 +3076,14 @@ _t_resume() {
       fi
       tx=( "$HOME/.claude/projects/${wt//[^A-Za-z0-9]/-}"/*.jsonl(Nom) )
       for txf in "${(@)tx}"; do
-        ep=$(stat -f %m "$txf" 2>/dev/null || echo 0)   # sort key + --days gate
+        ep=$(zstat +mtime "$txf" 2>/dev/null || echo 0)   # sort key + --days gate
         # Effective recency = max(transcript mtime, opened stamp): resuming
         # writes nothing to the .jsonl, so without the stamp a just-reopened
         # conversation sorts — and --days-gates — as days old. Stamp newer →
         # the row is dated by the stamp and marked ↻.
         reopened=; opf="$opdir/${${txf:t}%.jsonl}"
         if [[ -f $opf ]]; then
-          opep=$(stat -f %m "$opf" 2>/dev/null || echo 0)
+          opep=$(zstat +mtime "$opf" 2>/dev/null || echo 0)
           (( opep > ep )) && { ep=$opep; reopened=1; }
         fi
         if (( cutoff && ep < cutoff )); then
@@ -3041,11 +3091,10 @@ _t_resume() {
         fi
         title=$(_transcript_title "$txf")
         [[ -n $title ]] || continue        # conversationless stub — nothing to resume
-        if [[ -n $reopened ]]; then
-          when="$(stat -f '%Sm' -t '%b %d %H:%M' "$opf" 2>/dev/null) ↻"
-        else
-          when=$(stat -f '%Sm' -t '%b %d %H:%M' "$txf" 2>/dev/null)
-        fi
+        # ep already reflects the reopened stamp (ep=opep above), so one
+        # strftime covers both branches; ↻ marks the stamp-dated rows.
+        when=; (( ep )) && when=$(strftime '%b %d %H:%M' "$ep" 2>/dev/null)
+        [[ -n $reopened && -n $when ]] && when+=" ↻"
         # PR-in-session tag: the LAST github.com …/pull/N URL in the transcript
         # (a `gh pr create` lands its URL in the tool output) names the
         # session's PR; append " · #N <state>" to the title. State is read from
@@ -3062,7 +3111,7 @@ _t_resume() {
           fi
           title+=" · #$prnum${prst:+ ${(L)prst}}"
           if [[ $prst != MERGED && $prst != CLOSED && -z ${_prspawned[$prkey]:-} ]]; then
-            prmt=$(stat -f %m "$prcf" 2>/dev/null || echo 0)
+            prmt=$(zstat +mtime "$prcf" 2>/dev/null || echo 0)
             if (( EPOCHSECONDS - prmt > 300 )); then
               _prspawned[$prkey]=1
               mkdir -p "$prdir" 2>/dev/null

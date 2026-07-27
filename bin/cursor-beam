@@ -65,6 +65,22 @@ default_host() {
   [[ -r "$T_CONFIG" ]] && sed -n 's/^REMOTE_HOSTS\[[^]]*\]=//p' "$T_CONFIG" | sort | head -1
 }
 
+# md5 of a STRING — BSD `md5 -qs` on macOS, coreutils md5sum on Linux. Must
+# yield the same digest on both (the workspace hash keys the chat dir per
+# machine); `md5 -s` hashes the bare string with no trailing newline, so the
+# md5sum side pipes via printf '%s'.
+md5s() {  # <string>
+  if command -v md5 >/dev/null 2>&1; then md5 -qs "$1"
+  else printf '%s' "$1" | md5sum | awk '{print $1}'; fi
+}
+
+# mtime as 'YYYY-mm-dd HH:MM' — BSD stat formats in one call; GNU date reads a
+# file mtime with -r (BSD date -r takes an epoch instead, hence the OS branch).
+mtime_fmt() {  # <path>
+  if [[ "$(uname)" == Darwin ]]; then stat -f '%Sm' -t '%Y-%m-%d %H:%M' "$1" 2>/dev/null
+  else date -r "$1" '+%Y-%m-%d %H:%M' 2>/dev/null; fi
+}
+
 # A chat's project cwd, from its meta.json — cursor-agent records it there in
 # plaintext ("cwd":"/Users/…"), so prefer that over reversing the hash.
 chat_cwd() {  # <chat-dir>
@@ -85,7 +101,7 @@ chat_title() {  # <chat-dir> — the human title cursor-agent wrote (may be empt
 workspace_of_pwd() {
   local d="$PWD" h
   while :; do
-    h=$(md5 -qs "$d")
+    h=$(md5s "$d")
     [[ -d "$CHATS/$h" ]] && { echo "$h"; return 0; }
     [[ "$d" == "/" || "$d" == "$HOME" ]] && break
     d=$(dirname "$d")
@@ -114,7 +130,7 @@ guess_cwd() {
   local hash="$1" d
   while IFS= read -r d; do
     d="${d%/}"
-    [[ -n "$d" && "$(md5 -qs "$d")" == "$hash" ]] && { echo "$d"; return 0; }
+    [[ -n "$d" && "$(md5s "$d")" == "$hash" ]] && { echo "$d"; return 0; }
   done < <(
     if [[ -r "$T_CONFIG" ]]; then sed -n 's/^DEV_REPOS\[[^]]*\]=//p' "$T_CONFIG"; fi
     ls -d "$HOME"/code/*/ "$HOME"/github/*/ /Users/Shared/*/ 2>/dev/null || true
@@ -153,7 +169,7 @@ list_chats() {
     # shellcheck disable=SC2012
     newest=$(ls -t "$dir" 2>/dev/null | head -1)
     printf '%s  %s  %s  %s\n' "$(basename "$dir")" "${cwd:-hash:$ws}" \
-      "$(stat -f '%Sm' -t '%Y-%m-%d %H:%M' "$dir/${newest:-.}")" "${title:-(untitled)}"
+      "$(mtime_fmt "$dir/${newest:-.}")" "${title:-(untitled)}"
   done
 }
 
@@ -219,7 +235,7 @@ if (( do_resume )); then
   # --host: resume it THERE instead (the chat must already live on the host).
   # Via `t cursor`, dots-only like the remote --ls; unlock its keychain first.
   if [[ -n "$host" ]]; then
-    exec ssh -t "$host" "security unlock-keychain && zsh -lic 't cursor resume ${chat_id}'"
+    exec ssh -t "$host" "zsh -lic 'if command -v security >/dev/null; then security unlock-keychain || exit 1; fi; t cursor resume ${chat_id}'"
   fi
   if (( do_pick )); then chat_id=$(pick_chat) || exit 1; fi
   dir=$(resolve_chat "$chat_id")
@@ -232,7 +248,7 @@ if (( do_resume )); then
   cd "${cwd:-$HOME}"
   # Over ssh the login keychain is locked and cursor-agent refuses to start —
   # unlock first (prompts for this machine's login password on this TTY).
-  if [[ -n "${SSH_CONNECTION:-}${SSH_TTY:-}" ]]; then
+  if [[ -n "${SSH_CONNECTION:-}${SSH_TTY:-}" ]] && command -v security >/dev/null 2>&1; then
     security unlock-keychain || echo "⚠ keychain unlock failed — cursor-agent may refuse to start" >&2
   fi
   exec cursor-agent --resume="$id"
@@ -257,7 +273,7 @@ if [[ -n "$from" ]]; then
     rdir=$(ssh "$from" "bash -c 'ls -dt ~/.cursor/chats/*/$chat_id* 2>/dev/null | head -1'") || true
   else
     if [[ -n "$remote_home" ]]; then
-      pwd_rhash=$(md5 -qs "$(translate_path "$PWD" "$HOME" "$remote_home")")
+      pwd_rhash=$(md5s "$(translate_path "$PWD" "$HOME" "$remote_home")")
       # shellcheck disable=SC2029
       rdir=$(ssh "$from" "bash -c 'ls -dt ~/.cursor/chats/$pwd_rhash/*/ 2>/dev/null | head -1'" | sed 's:/$::') || true
     fi
@@ -277,12 +293,12 @@ if [[ -n "$from" ]]; then
   if [[ -z "$rcwd" ]]; then
     while IFS= read -r d; do
       d="${d%/}"
-      [[ -n "$d" && "$(md5 -qs "$d")" == "$rhash" ]] && { rcwd="$d"; break; }
+      [[ -n "$d" && "$(md5s "$d")" == "$rhash" ]] && { rcwd="$d"; break; }
     done < <(tail -n +2 <<<"$info")
   fi
   if [[ -n "$rcwd" ]]; then
     lcwd=$(translate_path "$rcwd" "$remote_home" "$HOME")
-    lhash=$(md5 -qs "$lcwd")
+    lhash=$(md5s "$lcwd")
   else
     lcwd=""; lhash="$rhash"
   fi
@@ -322,7 +338,7 @@ fi
 remote_home=$(ssh "$host" 'printf %s "$HOME"')
 if [[ -n "$cwd" ]]; then
   rcwd=$(translate_path "$cwd" "$HOME" "$remote_home")
-  rhash=$(md5 -qs "$rcwd")
+  rhash=$(md5s "$rcwd")
 else
   rcwd=""; rhash="$(dirname "$rel")"
 fi
@@ -345,6 +361,6 @@ if (( attach )) && [[ -t 0 && -t 1 ]]; then
   # interactive PATH — plain ssh would not see it. unlock-keychain first:
   # the ssh login keychain is locked and cursor-agent's creds live there
   # (prompts for the host's login password on the ssh -t TTY).
-  exec ssh -t "$host" "security unlock-keychain && zsh -lic 'cd ${rcwd:-~} && cursor-agent --resume=$id'"
+  exec ssh -t "$host" "zsh -lic 'if command -v security >/dev/null; then security unlock-keychain || exit 1; fi; cd ${rcwd:-~} && cursor-agent --resume=$id'"
 fi
 resume_hint "$id" "$host"

@@ -263,6 +263,30 @@ def test_scope_filter_matches_worktree_root(t_mod):
     assert [r["cwd"] for r in kept] == ["/wt/dotfiles/3"]
 
 
+def test_scope_filter_matches_across_differing_homes(t_mod):
+    # A Linux host's $HOME is /home/<u> while the local scope is /Users/<u> —
+    # rows must match on the home-relative path (`code/dotfiles`), the same
+    # cross-host key _dev_homerel uses on the zsh side.
+    rows = [_row("/home/chris/code/dotfiles"),
+            _row("/home/chris/code/dotfiles/bin"),
+            _row("/home/chris/code/other")]
+    kept = t_mod._scope_filter(rows, "/Users/chris/code/dotfiles")
+    assert [r["cwd"] for r in kept] == ["/home/chris/code/dotfiles",
+                                        "/home/chris/code/dotfiles/bin"]
+
+
+def test_scope_filter_worktree_across_differing_homes(t_mod):
+    rows = [_row("/home/chris/code/.worktrees/dotfiles/3"), _row("/home/chris/x")]
+    kept = t_mod._scope_filter(rows, "/Users/chris/code/dotfiles",
+                               wt_scope="/Users/chris/code/.worktrees/dotfiles")
+    assert [r["cwd"] for r in kept] == ["/home/chris/code/.worktrees/dotfiles/3"]
+
+
+def test_homerel_non_home_paths_pass_through(t_mod):
+    assert t_mod._homerel("/opt/shared/repo") == "/opt/shared/repo"
+    assert t_mod._homerel("") == ""
+
+
 # ─── _infer_repo ─────────────────────────────────────────────────────────────────
 
 def test_infer_repo_no_repo_for_cwd(t_mod, tmp_path, monkeypatch):

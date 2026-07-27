@@ -8,7 +8,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-Personal macOS dotfiles: zsh config, utility scripts, and Claude Code config. No build system and no runtime dependencies — just shell files and a Bash install script. The only tests are a `pytest` suite for the pure logic in the Python bins (`bin/t`, `bin/pr-watch`), with CI-only dev deps; `install.sh` stays dependency-free.
+Personal macOS dotfiles: zsh config, utility scripts, and Claude Code config. No build system and no runtime dependencies — just shell files and a Bash install script. **Linux hosts are supported as remote nodes** (e.g. the openclaw gateway, Ubuntu): `install.sh` runs there (zsh + tmux from the system package manager; the launchd/Brewfile sections self-skip), and the whole `zsh -lic` remote contract (`on`, `t ls -r`, `t open -r`, beam landings) works against them. macOS-only surfaces guard themselves — csync (iCloud), sleep-manager (pmset), pr-watch (launchd), and cursor-beam's keychain unlock all bail or skip cleanly off-macOS. **Portability convention for new shell code:** never call BSD-flag `stat`/`date`/`md5` bare — use the zsh builtins (`zstat +mtime`, `strftime`, loaded in `.zshrc`) or the existing OS-branched helpers (`_stat_birth` in `.zshrc`; `md5s`/`mtime_fmt` in `cursor-beam`), and prefer `readlink /proc/<pid>/cwd` with an `lsof` fallback for process cwds. The only tests are a `pytest` suite for the pure logic in the Python bins (`bin/t`, `bin/pr-watch`), with CI-only dev deps; `install.sh` stays dependency-free.
 
 ## The worktree-separation model (read this first)
 

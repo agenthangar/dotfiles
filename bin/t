@@ -192,12 +192,26 @@ def _parse_rows(text, host_prefixed=False):
     return rows
 
 
+_HOME_PREFIX = re.compile(r"^/(?:Users|home)/[^/]+/")
+
+
+def _homerel(p):
+    """Strip the machine-local home prefix (/Users/<u>/ on macOS, /home/<u>/ on
+    Linux) so remote cwds compare against local scopes on hosts whose $HOME
+    differs — the cross-host key is the home-relative form (`code/dotfiles`).
+    Zsh twin: _dev_homerel in .zshrc; keep them in sync."""
+    return _HOME_PREFIX.sub("", p or "")
+
+
 def _scope_filter(rows, scope, wt_scope=""):
     """Keep rows whose cwd is under <scope> OR under <wt_scope> (the repo's worktree
-    root $DEV_WORKTREE_ROOT/<basename>, where per-session worktrees live)."""
+    root $DEV_WORKTREE_ROOT/<basename>, where per-session worktrees live). Paths
+    are compared home-relative so remote rows from a differing-$HOME host match."""
     if not scope:
         return rows
+    scope, wt_scope = _homerel(scope), _homerel(wt_scope)
     def ok(c):
+        c = _homerel(c)
         if c == scope or c.startswith(scope + "/"):
             return True
         return bool(wt_scope) and c.startswith(wt_scope + "/")

@@ -1354,6 +1354,15 @@ _dev_dir_in_scope() {
   [[ -n $DEV_WORKTREE_ROOT && $d == $DEV_WORKTREE_ROOT/${scope:t}/* ]]
 }
 
+# _dev_homerel <path> — strip the machine-local home prefix (/Users/<u>/ on macOS,
+# /home/<u>/ on Linux) so REMOTE paths compare against local ones on hosts whose
+# $HOME differs (a Linux node is /home/<u>; Macs are /Users/<u>). The cross-host
+# key becomes the home-relative form (`code/dotfiles`); a path outside any home
+# passes through absolute. The awk twin used on remote-row cwds is
+#   { c=$3; sub(/^\/(Users|home)\/[^\/]+\//, "", c) }
+# — keep the two in sync. (Python twin: _homerel in bin/t.)
+_dev_homerel() { print -r -- "${1#/(Users|home)/*/}" }
+
 # _dev_ensure_session_cwd <cwd> — print a directory in which a session recorded at <cwd>
 # can be resumed, materializing it on demand. <cwd> still present → echo it unchanged.
 # <cwd> is a per-session worktree that is ABSENT here — a transcript synced from another
@@ -1611,8 +1620,9 @@ _dev_list_remote() {
   # paths ($DEV_WORKTREE_ROOT/<basename>/...) count as the repo too (wt clause); the
   # worktree root is the same path on every host, like ~/code.
   [[ -n $scope ]] && rows=$(print -r -- "$rows" | awk -F'\t' \
-    -v d="$scope" -v wt="${DEV_WORKTREE_ROOT}/${scope:t}" \
-    '$3==d || index($3, d"/")==1 || index($3, wt"/")==1')
+    -v d="$(_dev_homerel "$scope")" -v wt="$(_dev_homerel "$DEV_WORKTREE_ROOT")/${scope:t}" \
+    '{ c=$3; sub(/^\/(Users|home)\/[^\/]+\//, "", c) }
+     c==d || index(c, d"/")==1 || index(c, wt"/")==1')
   if [[ -z $rows ]]; then
     echo "No dev sessions running${scope:+ in ${scope:t} (dev ls -r --all for every repo)}${scope:+,} on this machine or any reachable host."
     return 0
@@ -2271,9 +2281,9 @@ _dev_remote_resolve() {
   if [[ -z $repo ]]; then
     match=$rows                                                  # bare → all remote
   elif [[ -n $dir && -n $slot ]]; then
-    match=$(print -r -- "$rows" | awk -F'\t' -v d="$dir" -v s="$slot" -v wtr="$wtr" -v b="$base" '($3==d || (wtr != "" && b != "" && index($3, wtr "/" b "/") == 1)) && $4 !~ /:/ && $4 ~ ("-" s "$")')
+    match=$(print -r -- "$rows" | awk -F'\t' -v d="$(_dev_homerel "$dir")" -v s="$slot" -v wtr="$(_dev_homerel "$wtr")" -v b="$base" '{ c=$3; sub(/^\/(Users|home)\/[^\/]+\//, "", c) } (c==d || (wtr != "" && b != "" && index(c, wtr "/" b "/") == 1)) && $4 !~ /:/ && $4 ~ ("-" s "$")')
   elif [[ -n $dir ]]; then
-    match=$(print -r -- "$rows" | awk -F'\t' -v d="$dir" -v wtr="$wtr" -v b="$base" '($3==d || (wtr != "" && b != "" && index($3, wtr "/" b "/") == 1)) && $4 !~ /:/')
+    match=$(print -r -- "$rows" | awk -F'\t' -v d="$(_dev_homerel "$dir")" -v wtr="$(_dev_homerel "$wtr")" -v b="$base" '{ c=$3; sub(/^\/(Users|home)\/[^\/]+\//, "", c) } (c==d || (wtr != "" && b != "" && index(c, wtr "/" b "/") == 1)) && $4 !~ /:/')
   elif [[ -n $slot ]]; then
     match=$(print -r -- "$rows" | awk -F'\t' -v w="${repo}-${slot}" '$4==w')
   else
@@ -2557,7 +2567,9 @@ _dev_remote_kill() {
     local pairs
     if [[ -n $dir ]]; then
       pairs=$(_dev_rows_all 2>/dev/null \
-        | awk -F'\t' -v d="$dir" '$1 != "local" && $3==d && $4 !~ /:/ {
+        | awk -F'\t' -v d="$(_dev_homerel "$dir")" '
+          { c=$3; sub(/^\/(Users|home)\/[^\/]+\//, "", c) }
+          $1 != "local" && c==d && $4 !~ /:/ {
             a=$4; sub(/-[0-9]+$/, "", a);
             print $1 "\t" a
           }' | awk -F'\t' '!seen[$1]++')
@@ -3008,8 +3020,9 @@ _t_resume() {
     if [[ -n $remote_rows ]]; then
       while IFS=$'\t' read -r _rhost _rn _ralias _rsum; do
         [[ -n $_rn ]] && { remote_live_host[$_rn]=$_rhost; remote_live_alias[$_rn]=$_ralias; remote_live_sum[$_rn]=$_rsum; }
-      done < <(print -r -- "$remote_rows" | awk -F'\t' -v d="$_rdir" -v wtr="$_rwtr" -v b="$_rbase" '
-        ($3==d || (wtr != "" && b != "" && index($3, wtr "/" b "/") == 1)) {
+      done < <(print -r -- "$remote_rows" | awk -F'\t' -v d="$(_dev_homerel "$_rdir")" -v wtr="$(_dev_homerel "$_rwtr")" -v b="$_rbase" '
+        { c=$3; sub(/^\/(Users|home)\/[^\/]+\//, "", c) }
+        (c==d || (wtr != "" && b != "" && index(c, wtr "/" b "/") == 1)) {
           n = $4; sub(/^.*-/, "", n)
           r = $4; sub(/-[^-]+$/, "", r)
           print $1 "\t" n "\t" r "\t" $7

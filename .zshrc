@@ -2383,29 +2383,63 @@ _claude_sessions_semantic() {
 
   python3 - "$projects" "$query" <<'PY' | fzf --delimiter=$'\t' --with-nth=3 --no-hscroll \
         --prompt="resume claude (sonnet: $query) > " --height=60% --reverse
-import json, os, sys, glob, datetime, subprocess, re
+import json, os, sys, glob, datetime, subprocess, re, time
 root, query = sys.argv[1], sys.argv[2]
 STOP = {'of','the','a','an','to','on','in','for','and','is','it','with','at'}
 qterms = [t for t in query.lower().split() if t not in STOP]
 # Effective recency = max(transcript mtime, last-opened stamp) — same signal as
 # _claude_session_rows, so the recent-session padding + display reflect resumes too.
-opened_dir = os.path.join(os.environ.get('XDG_CACHE_HOME')
-                          or os.path.expanduser('~/.cache'), 'claude-sessions', 'opened')
+cache_root = os.path.join(os.environ.get('XDG_CACHE_HOME')
+                          or os.path.expanduser('~/.cache'), 'claude-sessions')
+opened_dir = os.path.join(cache_root, 'opened')
 def _opened(sid):
     try: return os.path.getmtime(os.path.join(opened_dir, sid))
     except OSError: return 0
+# PR indicator — the compact twin of _claude_session_rows' (see its comments for
+# the policy: cache-only reads, detached gh refresh, terminal states forever).
+pr_dir = os.path.join(cache_root, 'pr')
+pr_re = re.compile(r'github\.com/([\w.-]+)/([\w.-]+)/pull/(\d+)')
+stale = []
+def pr_state(ref):
+    st, fresh = '', False
+    try:
+        fp = os.path.join(pr_dir, '#'.join(ref))
+        st = open(fp).read().strip()
+        fresh = time.time() - os.path.getmtime(fp) < 300
+    except OSError: pass
+    if st not in ('MERGED', 'CLOSED') and not fresh:
+        stale.append(ref)
+    return st if st in ('MERGED', 'CLOSED', 'OPEN') else ''
+def pr_refresh():
+    if stale:
+        try: os.makedirs(pr_dir, exist_ok=True)
+        except OSError: return
+    for owner, repo, num in stale[:8]:
+        fp = os.path.join(pr_dir, f'{owner}#{repo}#{num}')
+        cmd = (f'st=$(gh pr view "https://github.com/{owner}/{repo}/pull/{num}"'
+               f' --json state --jq .state 2>/dev/null) || st="?"; '
+               f'printf %s "$st" > "{fp}.$$.tmp" && mv "{fp}.$$.tmp" "{fp}"')
+        try:
+            subprocess.Popen(['/bin/sh', '-c', cmd], stdin=subprocess.DEVNULL,
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                             start_new_session=True)
+        except OSError:
+            break
 
 # ── Scan: title + your first few prompts per session (the "about" signal). ──
 sessions = []
 for f in glob.glob(os.path.join(root, '*', '*.jsonl')):
     sid = os.path.basename(f)[:-6]
-    cwd = title = ctitle = None
+    cwd = title = ctitle = pr = None
     prompts = []
     try:
         for line in open(f, errors='ignore'):
             if cwd is None and '"cwd"' in line:
                 try: cwd = json.loads(line).get('cwd')
                 except ValueError: pass
+            if '/pull/' in line:                        # last PR URL wins
+                m = pr_re.findall(line)
+                if m: pr = m[-1]
             if '"custom-title"' in line:
                 try:
                     t = json.loads(line).get('customTitle')
@@ -2430,8 +2464,14 @@ for f in glob.glob(os.path.join(root, '*', '*.jsonl')):
     head = ctitle or title or (prompts[0] if prompts else '') or '(no message)'
     mtime = os.path.getmtime(f)
     opened = _opened(sid)
+    prs = ''
+    if pr:
+        st = pr_state(pr)
+        prs = f" · #{pr[2]}{' ' + st.lower() if st else ''}"
     sessions.append({'sid': sid, 'cwd': cwd or '?', 'mtime': max(mtime, opened),
-                     'reopened': opened > mtime, 'head': head, 'prompts': prompts})
+                     'reopened': opened > mtime, 'head': head, 'prompts': prompts,
+                     'pr': prs})
+pr_refresh()
 
 # ── Retrieve: keyword pass for recall. Pad thin matches with recent sessions
 # so a query whose words diverge from the transcript still reaches the model. ──
@@ -2452,7 +2492,7 @@ def emit(rows):                                       # rows: (session, reason)
         when = datetime.datetime.fromtimestamp(s['mtime']).strftime('%m-%d %H:%M')
         short = os.path.basename(s['cwd']) if s['cwd'] != '?' else '?'
         mark = '↻ ' if s['reopened'] else '  '
-        disp = f"{when} {mark}{short:<16}  {' '.join(s['head'].split())[:60]}"
+        disp = f"{when} {mark}{short:<16}  {' '.join(s['head'].split())[:60]}{s['pr']}"
         if why: disp += f"   ⟵ {why}"
         print(f"{s['sid']}\t{s['cwd']}\t{disp}")
 
@@ -2509,7 +2549,9 @@ PY
 # With a <query> arg, every session is scored by how well the query terms match
 # its title + your prompts; non-matches are dropped and the list is ranked by
 # relevance, then recency (this is what `tfind` drives). Returns nonzero on no
-# pick / no fzf.
+# pick / no fzf. Rows carry two extra signals: ↻ marks a session opened more
+# recently than written (the claude-stamp-tmux opened/ stamp), and " · #N <state>"
+# tags a session whose transcript mentions a PR (cache-only state; see below).
 _claude_session_rows() {
   # Diagnostics go to stderr: this function's stdout is captured by the caller's
   # $(...), so a stdout error would be swallowed silently instead of shown.
@@ -2530,7 +2572,7 @@ _claude_session_rows() {
   fi
 
   DEV_WORKTREE_ROOT="$DEV_WORKTREE_ROOT" python3 - "$projects" "$filter" "$query" <<'PY'
-import json, os, sys, glob, datetime
+import json, os, sys, glob, datetime, re, subprocess, time
 root = sys.argv[1]
 filt = sys.argv[2] if len(sys.argv) > 2 else ''
 query = sys.argv[3] if len(sys.argv) > 3 else ''
@@ -2543,11 +2585,48 @@ wt_root = os.environ.get('DEV_WORKTREE_ROOT', '')
 # reopened five minutes ago sorts (and dates) as five minutes old even though its
 # last message is days old. Stamp newer than the transcript → the row is marked ↻
 # (recently opened, nothing new written yet).
-opened_dir = os.path.join(os.environ.get('XDG_CACHE_HOME')
-                          or os.path.expanduser('~/.cache'), 'claude-sessions', 'opened')
+cache_root = os.path.join(os.environ.get('XDG_CACHE_HOME')
+                          or os.path.expanduser('~/.cache'), 'claude-sessions')
+opened_dir = os.path.join(cache_root, 'opened')
 def _opened(sid):
     try: return os.path.getmtime(os.path.join(opened_dir, sid))
     except OSError: return 0
+# PR-in-session indicator: the LAST github.com …/pull/N URL in the transcript (a
+# `gh pr create` lands its URL in the tool output; last mention ≈ the PR the
+# session ended up on) tags the row " · #N <state>". State comes ONLY from the
+# pr/ cache — the picker never blocks on the network. Uncached/stale refs are
+# refreshed by DETACHED `gh pr view` children spawned after the scan, so state
+# appears on the NEXT invocation. MERGED/CLOSED are terminal (cached forever);
+# OPEN and lookup failures ('?') recheck after 5 min. Sibling of opened/ — the
+# pid-registry prune globs plain files only, so subdirs are never swept.
+pr_dir = os.path.join(cache_root, 'pr')
+pr_re = re.compile(r'github\.com/([\w.-]+)/([\w.-]+)/pull/(\d+)')
+stale = []
+def pr_state(ref):
+    st, fresh = '', False
+    try:
+        fp = os.path.join(pr_dir, '#'.join(ref))
+        st = open(fp).read().strip()
+        fresh = time.time() - os.path.getmtime(fp) < 300
+    except OSError: pass
+    if st not in ('MERGED', 'CLOSED') and not fresh:
+        stale.append(ref)
+    return st if st in ('MERGED', 'CLOSED', 'OPEN') else ''
+def pr_refresh():                     # fire-and-forget; bounded so a first scan
+    if stale:
+        try: os.makedirs(pr_dir, exist_ok=True)
+        except OSError: return
+    for owner, repo, num in stale[:8]:  # over many PRs can't fork-bomb gh
+        fp = os.path.join(pr_dir, f'{owner}#{repo}#{num}')
+        cmd = (f'st=$(gh pr view "https://github.com/{owner}/{repo}/pull/{num}"'
+               f' --json state --jq .state 2>/dev/null) || st="?"; '
+               f'printf %s "$st" > "{fp}.$$.tmp" && mv "{fp}.$$.tmp" "{fp}"')
+        try:
+            subprocess.Popen(['/bin/sh', '-c', cmd], stdin=subprocess.DEVNULL,
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                             start_new_session=True)
+        except OSError:
+            break
 def _in_scope(cwd):
     if not filt:
         return True
@@ -2566,13 +2645,16 @@ qterms = [t for t in query.lower().split() if t not in STOP]
 rows = []
 for f in glob.glob(os.path.join(root, '*', '*.jsonl')):
     sid = os.path.basename(f)[:-6]
-    cwd = msg = title = ctitle = None
+    cwd = msg = title = ctitle = pr = None
     umsgs = []                                          # all your prompts (search mode)
     try:
         for line in open(f, errors='ignore'):
             if cwd is None and '"cwd"' in line:
                 try: cwd = json.loads(line).get('cwd')
                 except ValueError: pass
+            if '/pull/' in line:                        # last PR URL wins
+                m = pr_re.findall(line)
+                if m: pr = m[-1]
             if '"custom-title"' in line:                # set by /rename — wins
                 try:
                     t = json.loads(line).get('customTitle')
@@ -2619,13 +2701,18 @@ for f in glob.glob(os.path.join(root, '*', '*.jsonl')):
     mtime = max(mtime, opened)
     short = os.path.basename(cwd) if cwd else '?'
     title = ' '.join((ctitle or title or msg or '(no message)').split())[:80]
-    rows.append((score, mtime, sid, cwd or '?', short, title, mark))
+    prs = ''
+    if pr:
+        st = pr_state(pr)
+        prs = f" · #{pr[2]}{' ' + st.lower() if st else ''}"
+    rows.append((score, mtime, sid, cwd or '?', short, title, mark, prs))
 # Primary key = relevance (0 for every row when not searching, so it collapses
 # to pure newest-first); tiebreak = recency.
 rows.sort(reverse=True)
-for score, mtime, sid, cwd, short, title, mark in rows:
+for score, mtime, sid, cwd, short, title, mark, prs in rows:
     when = datetime.datetime.fromtimestamp(mtime).strftime('%m-%d %H:%M')
-    print(f"{sid}\t{cwd}\t{when} {mark}{short:<18}  {title}")
+    print(f"{sid}\t{cwd}\t{when} {mark}{short:<18}  {title}{prs}")
+pr_refresh()
 PY
 }
 

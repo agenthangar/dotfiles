@@ -2784,6 +2784,11 @@ _t_plan() {
 # ATTACHES in place instead of resuming (one-live-owner: a second `claude -r` on a
 # live id diverges the transcript).
 # -f/--fg resumes inline in THIS terminal (t pop's landing) instead of a slot.
+# Dead rows carry the two shared picker signals (see _claude_session_rows and
+# claude-stamp-tmux jobs 3-4): recency/date = max(transcript mtime, last-opened
+# stamp) with ↻ marking opened-but-unwritten conversations, and a " · #N <state>"
+# tag for the last PR URL in the transcript (state cache-only, never a blocking
+# gh call).
 # User-facing help lives in bin/t (`t resume -h`); the t() shim routes -h there.
 _t_resume() {
   setopt local_options null_glob bare_glob_qual
@@ -2939,7 +2944,16 @@ _t_resume() {
   local -A remote_live_host remote_live_alias remote_live_sum
   local n wt sid busy rhost _rdir _rbase _rhost _rn _ralias _rsum _ok _stale stale_path
   local txf title when ep org orgf hf skipped=0
+  local reopened opf opep pru prp prkey prnum prst prcf prmt
   local _rwtr=${DEV_WORKTREE_ROOT:-}
+  # The two picker signals shared with _claude_session_rows/tfind (see the
+  # claude-stamp-tmux notes): opened/ = the last-opened stamps (recency =
+  # max(transcript, stamp), ↻ on stamp-newer rows); pr/ = the PR-state cache
+  # (cache-only reads — NEVER a blocking gh call — refreshed by detached
+  # children, once per PR per run, so state shows on the next invocation).
+  local opdir="${XDG_CACHE_HOME:-$HOME/.cache}/claude-sessions/opened"
+  local prdir="${XDG_CACHE_HOME:-$HOME/.cache}/claude-sessions/pr"
+  local -A _prspawned
   # Recency window (--days, default 30; 'all' disables) + this machine's short
   # hostname, to blank the origin column for locally-run conversations.
   local cutoff=0 selfhost=$(hostname -s 2>/dev/null)
@@ -3013,12 +3027,50 @@ _t_resume() {
       tx=( "$HOME/.claude/projects/${wt//[^A-Za-z0-9]/-}"/*.jsonl(Nom) )
       for txf in "${(@)tx}"; do
         ep=$(stat -f %m "$txf" 2>/dev/null || echo 0)   # sort key + --days gate
+        # Effective recency = max(transcript mtime, opened stamp): resuming
+        # writes nothing to the .jsonl, so without the stamp a just-reopened
+        # conversation sorts — and --days-gates — as days old. Stamp newer →
+        # the row is dated by the stamp and marked ↻.
+        reopened=; opf="$opdir/${${txf:t}%.jsonl}"
+        if [[ -f $opf ]]; then
+          opep=$(stat -f %m "$opf" 2>/dev/null || echo 0)
+          (( opep > ep )) && { ep=$opep; reopened=1; }
+        fi
         if (( cutoff && ep < cutoff )); then
           (( skipped++ )); continue        # outside the --days window
         fi
         title=$(_transcript_title "$txf")
         [[ -n $title ]] || continue        # conversationless stub — nothing to resume
-        when=$(stat -f '%Sm' -t '%b %d %H:%M' "$txf" 2>/dev/null)
+        if [[ -n $reopened ]]; then
+          when="$(stat -f '%Sm' -t '%b %d %H:%M' "$opf" 2>/dev/null) ↻"
+        else
+          when=$(stat -f '%Sm' -t '%b %d %H:%M' "$txf" 2>/dev/null)
+        fi
+        # PR-in-session tag: the LAST github.com …/pull/N URL in the transcript
+        # (a `gh pr create` lands its URL in the tool output) names the
+        # session's PR; append " · #N <state>" to the title. State is read from
+        # the pr/ cache only; MERGED/CLOSED are terminal, anything else stale
+        # (>5 min) spawns ONE detached gh refresh for the next run.
+        pru=$(grep -ao 'github\.com/[A-Za-z0-9_.-]*/[A-Za-z0-9_.-]*/pull/[0-9]*' "$txf" 2>/dev/null | tail -1)
+        if [[ -n $pru ]]; then
+          prp=${pru#github.com/}; prp=${prp/\/pull\//\/}
+          prkey=${prp//\//#}; prnum=${pru##*/}
+          prcf="$prdir/$prkey"; prst=
+          if [[ -f $prcf ]]; then
+            prst=$(<$prcf)
+            [[ $prst == MERGED || $prst == CLOSED || $prst == OPEN ]] || prst=
+          fi
+          title+=" · #$prnum${prst:+ ${(L)prst}}"
+          if [[ $prst != MERGED && $prst != CLOSED && -z ${_prspawned[$prkey]:-} ]]; then
+            prmt=$(stat -f %m "$prcf" 2>/dev/null || echo 0)
+            if (( EPOCHSECONDS - prmt > 300 )); then
+              _prspawned[$prkey]=1
+              mkdir -p "$prdir" 2>/dev/null
+              ( { prst=$(gh pr view "https://$pru" --json state --jq .state 2>/dev/null) || prst="?"
+                  print -rn -- "$prst" > "$prcf.$$.tmp" && mv -f "$prcf.$$.tmp" "$prcf"; } & ) 2>/dev/null
+            fi
+          fi
+        fi
         # Origin: which machine the conversation LAST RAN on — the <sid>.origin
         # stamp claude-stamp-tmux writes next to the transcript (syncs with it).
         # Blank for this machine / unstamped (pre-feature) transcripts; a raw
@@ -3088,15 +3140,15 @@ _t_resume() {
     org=${f[9]:-}; [[ $org == - ]] && org=
     if [[ -n $all_mode ]]; then
       if (( ow )); then
-        cands[$i]+=$'\t'"$(printf '%-*s  %2s  %-*s  %-12s  %s' "$rw" "$f[1]" "$f[2]" "$ow" "$org" "$f[5]" "$f[6]")"
+        cands[$i]+=$'\t'"$(printf '%-*s  %2s  %-*s  %-14s  %s' "$rw" "$f[1]" "$f[2]" "$ow" "$org" "$f[5]" "$f[6]")"
       else
-        cands[$i]+=$'\t'"$(printf '%-*s  %2s  %-12s  %s' "$rw" "$f[1]" "$f[2]" "$f[5]" "$f[6]")"
+        cands[$i]+=$'\t'"$(printf '%-*s  %2s  %-14s  %s' "$rw" "$f[1]" "$f[2]" "$f[5]" "$f[6]")"
       fi
     else
       if (( ow )); then
-        cands[$i]+=$'\t'"$(printf '%2s  %-*s  %-12s  %s' "$f[2]" "$ow" "$org" "$f[5]" "$f[6]")"
+        cands[$i]+=$'\t'"$(printf '%2s  %-*s  %-14s  %s' "$f[2]" "$ow" "$org" "$f[5]" "$f[6]")"
       else
-        cands[$i]+=$'\t'"$(printf '%2s  %-12s  %s' "$f[2]" "$f[5]" "$f[6]")"
+        cands[$i]+=$'\t'"$(printf '%2s  %-14s  %s' "$f[2]" "$f[5]" "$f[6]")"
       fi
     fi
     (( i++ ))

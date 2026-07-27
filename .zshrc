@@ -2387,6 +2387,13 @@ import json, os, sys, glob, datetime, subprocess, re
 root, query = sys.argv[1], sys.argv[2]
 STOP = {'of','the','a','an','to','on','in','for','and','is','it','with','at'}
 qterms = [t for t in query.lower().split() if t not in STOP]
+# Effective recency = max(transcript mtime, last-opened stamp) — same signal as
+# _claude_session_rows, so the recent-session padding + display reflect resumes too.
+opened_dir = os.path.join(os.environ.get('XDG_CACHE_HOME')
+                          or os.path.expanduser('~/.cache'), 'claude-sessions', 'opened')
+def _opened(sid):
+    try: return os.path.getmtime(os.path.join(opened_dir, sid))
+    except OSError: return 0
 
 # ── Scan: title + your first few prompts per session (the "about" signal). ──
 sessions = []
@@ -2421,8 +2428,10 @@ for f in glob.glob(os.path.join(root, '*', '*.jsonl')):
     except OSError:
         continue
     head = ctitle or title or (prompts[0] if prompts else '') or '(no message)'
-    sessions.append({'sid': sid, 'cwd': cwd or '?', 'mtime': os.path.getmtime(f),
-                     'head': head, 'prompts': prompts})
+    mtime = os.path.getmtime(f)
+    opened = _opened(sid)
+    sessions.append({'sid': sid, 'cwd': cwd or '?', 'mtime': max(mtime, opened),
+                     'reopened': opened > mtime, 'head': head, 'prompts': prompts})
 
 # ── Retrieve: keyword pass for recall. Pad thin matches with recent sessions
 # so a query whose words diverge from the transcript still reaches the model. ──
@@ -2442,7 +2451,8 @@ def emit(rows):                                       # rows: (session, reason)
     for s, why in rows:
         when = datetime.datetime.fromtimestamp(s['mtime']).strftime('%m-%d %H:%M')
         short = os.path.basename(s['cwd']) if s['cwd'] != '?' else '?'
-        disp = f"{when}  {short:<16}  {' '.join(s['head'].split())[:60]}"
+        mark = '↻ ' if s['reopened'] else '  '
+        disp = f"{when} {mark}{short:<16}  {' '.join(s['head'].split())[:60]}"
         if why: disp += f"   ⟵ {why}"
         print(f"{s['sid']}\t{s['cwd']}\t{disp}")
 
@@ -2528,6 +2538,16 @@ query = sys.argv[3] if len(sys.argv) > 3 else ''
 # ($DEV_WORKTREE_ROOT/<repo-basename>/<slot>) as belonging to its repo — the twin of the
 # zsh _dev_dir_in_scope, so the repo-scoped picker shows worktree (incl. synced) sessions.
 wt_root = os.environ.get('DEV_WORKTREE_ROOT', '')
+# Last-opened stamps (claude-stamp-tmux job 3): resuming appends nothing to the
+# transcript, so recency = max(transcript mtime, opened-stamp mtime) — a session
+# reopened five minutes ago sorts (and dates) as five minutes old even though its
+# last message is days old. Stamp newer than the transcript → the row is marked ↻
+# (recently opened, nothing new written yet).
+opened_dir = os.path.join(os.environ.get('XDG_CACHE_HOME')
+                          or os.path.expanduser('~/.cache'), 'claude-sessions', 'opened')
+def _opened(sid):
+    try: return os.path.getmtime(os.path.join(opened_dir, sid))
+    except OSError: return 0
 def _in_scope(cwd):
     if not filt:
         return True
@@ -2594,15 +2614,18 @@ for f in glob.glob(os.path.join(root, '*', '*.jsonl')):
             continue
     # ─────────────────────────────────────────────────────────────────────────
     mtime = os.path.getmtime(f)
+    opened = _opened(sid)
+    mark = '↻ ' if opened > mtime else '  '
+    mtime = max(mtime, opened)
     short = os.path.basename(cwd) if cwd else '?'
     title = ' '.join((ctitle or title or msg or '(no message)').split())[:80]
-    rows.append((score, mtime, sid, cwd or '?', short, title))
+    rows.append((score, mtime, sid, cwd or '?', short, title, mark))
 # Primary key = relevance (0 for every row when not searching, so it collapses
 # to pure newest-first); tiebreak = recency.
 rows.sort(reverse=True)
-for score, mtime, sid, cwd, short, title in rows:
+for score, mtime, sid, cwd, short, title, mark in rows:
     when = datetime.datetime.fromtimestamp(mtime).strftime('%m-%d %H:%M')
-    print(f"{sid}\t{cwd}\t{when}  {short:<18}  {title}")
+    print(f"{sid}\t{cwd}\t{when} {mark}{short:<18}  {title}")
 PY
 }
 

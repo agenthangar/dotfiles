@@ -1,5 +1,18 @@
 export PATH="$HOME/bin:$HOME/.local/bin:$PATH"
 
+# Hardened hosts can ship a root-only /tmp (the openclaw gateway does: drwx------
+# root). That breaks every non-root temp-file user — zsh heredocs (TMPPREFIX),
+# mktemp, and tmux's socket dir — so fall back to a per-user tmp. TMUX_TMPDIR
+# matters most: the whole `t` slot machinery rides on tmux, and every t-driven
+# tmux call goes through `zsh -lic`, so setting it here keeps client + server on
+# one socket dir. No-op on a standard 1777 /tmp.
+if [[ ! -w "${TMPDIR:-/tmp}" ]]; then
+  export TMPDIR="$HOME/.cache/tmp"
+  mkdir -p "$TMPDIR" 2>/dev/null
+  TMPPREFIX="$TMPDIR/zsh"
+  export TMUX_TMPDIR="$TMPDIR"
+fi
+
 # Initialize the completion system before sourcing anything that calls `compdef`
 # (e.g. a completion sourced from ~/.zshrc.local below). Without this, compdef is
 # undefined and sourcing such a completion errors with "command not found: compdef".

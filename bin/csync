@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# csync — two-way sync of Claude Code session history + saved plans with iCloud.
+# csync — two-way sync of Claude Code sessions + plans + Cursor CLI chats with iCloud.
 # One command, no direction: merges both ways (newest file wins, nothing
 # deleted) so every machine converges to the union of all sessions and plans.
 # Safe to run anytime; --update never clobbers a newer copy and no --delete means
@@ -38,7 +38,10 @@ sync_pair() {
   # Operation timed out") instead of fetching them — and aborts. So force
   # evicted files local first: ask the daemon to fetch (brctl), then a plain
   # read() blocks until the bytes land.
-  echo "⟳ Materialising cloud-only files in $label…"
+  # ${label} braced: macOS bash 3.2 swallows a multibyte char right after "$var"
+  # into the variable name, and under set -u that dies as "label…: unbound
+  # variable" — which silently killed every csync run (same gotcha cursor-beam hit).
+  echo "⟳ Materialising cloud-only files in ${label}…"
   # Best-effort: brctl can exit non-zero (e.g. nothing to fetch) — never let that
   # abort the sync under set -e, so swallow its status with `|| true`.
   find "$icloud" -type f ! -name '.DS_Store' -exec brctl download {} + 2>/dev/null || true
@@ -63,4 +66,14 @@ sync_pair() {
 # tree closes that gap; csync converges plans the same union way as transcripts.
 sync_pair "$HOME/.claude/projects" "$icloud_base/claude-sessions" "sessions"
 sync_pair "$HOME/.claude/plans"    "$icloud_base/claude-plans"    "plans"
+
+# Cursor CLI (cursor-agent) chats: ~/.cursor/chats/<workspace-hash>/<chat-id>/.
+# Gated on either side already existing so machines that never ran cursor-agent
+# don't grow an empty tree — once one machine has chats (or the mirror exists),
+# every machine converges. Union-merge granularity is the whole store.db file
+# (newest wins), same caveat as transcripts: don't drive one chat live on two
+# machines at once. cursor-beam moves a single chat immediately over ssh.
+if [[ -d "$HOME/.cursor/chats" || -d "$icloud_base/cursor-chats" ]]; then
+  sync_pair "$HOME/.cursor/chats" "$icloud_base/cursor-chats" "cursor chats"
+fi
 echo "✓ csync complete"

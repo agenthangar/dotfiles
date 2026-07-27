@@ -96,14 +96,26 @@ _help_style() {
 # (and some terminals) start with SSH_AUTH_SOCK unset and `ssh-add` dies with
 # "Could not open a connection to your authentication agent". Pin the socket to
 # a stable path and start one agent only if none is reachable; every shell then
-# reuses it, so a key added once stays loaded until reboot. Passphrase + key
-# loading are handled lazily by ~/.ssh/config (AddKeysToAgent + UseKeychain).
+# reuses it, so a key added once stays loaded until reboot. An empty agent is
+# refilled from the macOS Keychain (--apple-load-keychain), so a reboot does
+# not bring back per-connection passphrase prompts — background ssh users
+# (worktree-sweep fetches, csync, pr-watch) prompt-spam the console otherwise.
+# Requires the passphrase to be IN the Keychain: one-time per machine, run
+#   ssh-add --apple-use-keychain ~/.ssh/id_ed25519
+# (UseKeychain in ~/.ssh/config only READS the Keychain; it never writes it.)
+# The load fails silently where the Keychain is locked (inbound ssh sessions).
 export SSH_AUTH_SOCK="$HOME/.ssh/agent.sock"
 ssh-add -l >/dev/null 2>&1
-if [ $? -eq 2 ]; then            # 2 = no agent reachable (1 = up but no keys)
-  rm -f "$SSH_AUTH_SOCK"         # clear any stale socket from a dead agent
-  ssh-agent -a "$SSH_AUTH_SOCK" >/dev/null 2>&1
-fi
+case $? in
+  2)                             # no agent reachable: spawn one, then fill it
+    rm -f "$SSH_AUTH_SOCK"       # clear any stale socket from a dead agent
+    ssh-agent -a "$SSH_AUTH_SOCK" >/dev/null 2>&1
+    ssh-add --apple-load-keychain >/dev/null 2>&1
+    ;;
+  1)                             # agent up but empty (e.g. keys were cleared)
+    ssh-add --apple-load-keychain >/dev/null 2>&1
+    ;;
+esac
 
 # prview — PR status at a glance: mergeability, merge state, per-check verdicts
 #
@@ -149,10 +161,15 @@ nosleep() { [[ "$1" == -h || "$1" == --help ]] && { _help_for nosleep; return 0;
 # pull released updates whenever, in any order. (First run on an old single-tree
 # machine migrates it: moves the clone off main and sets the worktree up.)
 #
-# --dev (-d): flip the live surface to your DEV clone (current branch) instead —
-# re-links from it (catching new/renamed files) and reloads, so in-progress edits go
-# live for testing without merging. A later plain `dots` flips live back to the main
-# worktree. Skips brew bundle.
+# --dev (-d): flip the live surface to the dotfiles checkout you are STANDING IN —
+# re-links from it (catching new/renamed files) and reloads, so its in-progress edits
+# go live for testing without merging. The cwd is the choice: a per-session worktree
+# (`t cd dot <slot>`, then `dots --dev`), or a dev clone with real work on it.
+# Anywhere else it errors — no fallback, no guessing. Refused as sources: any non-
+# dotfiles dir, the live main worktree (plain `dots` manages it), and the dev clone
+# parked CLEAN on $DEV_BRANCH (stale content, no in-progress work — the error lists
+# your session worktrees; --force overrides). A later plain `dots` flips live back
+# to the main worktree. Skips brew bundle.
 dots() {
   [[ "$1" == -h || "$1" == --help ]] && { _help_for dots; return 0; }
 
@@ -170,13 +187,66 @@ dots() {
   local mainwt="${DOTFILES_MAIN_WT:-$HOME/.local/share/dotfiles-main}"
 
   if [[ "$1" == --dev || "$1" == -d ]]; then
-    # Point the live symlinks at the dev clone (current branch); relink, no brew.
-    local branch=$(git -C "$devclone" symbolic-ref --short -q HEAD)
+    # Link the live symlinks from the dotfiles checkout $PWD is in — the cwd IS
+    # the choice (the dev clone, a per-session worktree, any tree sharing the
+    # dotfiles .git), so `t cd dot 1` + `dots --dev` tests that session's edits
+    # live. No fallback: anywhere else it ERRORS instead of guessing (the old
+    # implicit dev-clone fallback silently linked the stale parked clone from any
+    # directory — that is how `t resume` once vanished with a ✓). The main
+    # worktree is refused too: it is the released surface plain `dots` manages,
+    # never a dev source.
+    local src pwdcommon
+    src=$(git -C "$PWD" rev-parse --show-toplevel 2>/dev/null)
+    if [[ -z $src ]]; then
+      print -r -- "dots --dev: not inside a git checkout — cd into a dotfiles checkout first (the dev clone, or a session worktree via \`t cd dot <slot>\`)." >&2
+      return 1
+    fi
+    pwdcommon=$(git -C "$src" rev-parse --git-common-dir 2>/dev/null)
+    [[ $pwdcommon == /* ]] || pwdcommon="$src/$pwdcommon"
+    if [[ ${pwdcommon:A} != ${commondir:A} ]]; then
+      print -r -- "dots --dev: $src is not a dotfiles checkout — cd into the dev clone or a dotfiles session worktree first." >&2
+      return 1
+    fi
+    if [[ ${src:A} == ${mainwt:A} ]]; then
+      print -r -- "dots --dev: this is the live main worktree — plain \`dots\` manages it; cd into the dev clone or a session worktree." >&2
+      return 1
+    fi
+    if [[ ! -x $src/install.sh ]]; then
+      print -r -- "dots --dev: $src has no runnable install.sh — malformed/ancient checkout, nothing to install." >&2
+      return 1
+    fi
+    local label="worktree ${src:t2}"
+    [[ ${src:A} == ${devclone:A} ]] && label="DEV clone"
+    local branch=$(git -C "$src" symbolic-ref --short -q HEAD)
+    # A CLEAN dev clone parked on $DEV_BRANCH is not a valid source either: under
+    # worktree-per-session nothing is developed there — its content is whatever
+    # stale state the parking branch froze at (linking it has uninstalled `t
+    # resume` TWICE now), and ~/code/dotfiles is the cd-shortcut landing spot, so
+    # standing here by habit is exactly how the mistake happens. The real work
+    # lives in session worktrees — list them with their branches. A dirty clone
+    # or a non-parking branch is a deliberate dev state and links fine; --force
+    # overrides.
+    if [[ "$2" != --force && "$2" != -f && ${src:A} == ${devclone:A} && "$branch" == "$DEV_BRANCH" ]] \
+       && [[ -z "$(git -C "$src" status --porcelain 2>/dev/null)" ]]; then
+      print -r -- "dots --dev: this is the dev clone parked CLEAN on ${branch} — no in-progress work here, only stale content." >&2
+      local -a _wts; _wts=("${DEV_WORKTREE_ROOT:-$HOME/code/.worktrees}/${devclone:t}"/*(N/))
+      local _w
+      if (( ${#_wts} )); then
+        print -r -- "  session worktrees with real work:" >&2
+        for _w in "${(@)_wts}"; do
+          print -r -- "    cd $_w && dots --dev    [$(git -C "$_w" branch --show-current 2>/dev/null || echo '?')]" >&2
+        done
+      else
+        print -r -- "  no session worktrees yet — t open ${devclone:t} starts one (then cd its worktree + dots --dev)" >&2
+      fi
+      print -r -- "  link the parked clone anyway: dots --dev --force" >&2
+      return 1
+    fi
     local out
-    if out=$(DOTFILES_NO_BREW=1 DOTFILES_LINK_DEV=1 "$devclone/install.sh" 2>&1); then
-      print -r -- "${g}✓${r0} ${y}live = DEV clone (${c}${branch}${r0}${y}) — in-progress edits are live, reloaded${r0}"
+    if out=$(DOTFILES_NO_BREW=1 DOTFILES_LINK_DEV=1 "$src/install.sh" 2>&1); then
+      print -r -- "${g}✓${r0} ${y}live = ${label} (${c}${branch:-detached}${r0}${y}) — in-progress edits are live, reloaded${r0}"
     else
-      print -r -- "${y}dots --dev — install.sh failed on ${c}${branch}${r0}${y}:${r0}"
+      print -r -- "${y}dots --dev — install.sh failed on ${c}${branch:-detached}${r0}${y}:${r0}"
       print -r -- "$out"
     fi
     source ~/.zshrc
@@ -300,6 +370,180 @@ _dev_worktree_create() {
   fi
   [[ -e "$wt/.git" ]] || return 1
   print -r -- "$wt"
+}
+
+# _dev_worktree_beam_push <wt> <host> — ON THE ORIGIN, carry the slot worktree's LIVE edits
+# with a beam. Beam otherwise moves only pushed commits + the transcript, stranding any
+# uncommitted work (the long-standing tbeam gap noted in CLAUDE.md). So before the move we
+# auto-commit ALL changes (tracked AND untracked) as a throwaway WIP commit and push the slot
+# branch to origin, where the destination fast-forwards to it (_dev_worktree_beam_sync). The
+# `[skip ci]` keeps a beam from burning CI on every hop; squash-merge collapses the WIP commits
+# at PR time. No-op unless <wt> is a per-session worktree (under $DEV_WORKTREE_ROOT): opt-out /
+# shared-tree repos are left exactly as before, so a commit here can never sweep up a sibling
+# slot's WIP (the trampling the worktree model exists to prevent). Shared dotfiles code — the
+# RECEIVE path (_dev_pull) runs it on the remote origin over ssh, so args fall back to TB_* env
+# (TB_WT/TB_HOST) to dodge nested-ssh quoting, exactly like _tbeam_land/_tbeam_kill_owner. A
+# failed commit or push WARNS and returns 1 — it never aborts the move (the work is safe in
+# git/on disk on the origin, just not yet on the destination — same degraded-not-lost contract
+# as the foreground-kill warning) but callers surface it loudly, and the collision reland
+# (_dev_beam_land_cwd) refuses to reland from a branch that never reached origin. The commit is
+# VERIFIED (porcelain re-check), not assumed: a hook that rewrites or rejects can leave paths
+# uncommitted even when `git commit` was attempted.
+_dev_worktree_beam_push() {
+  local wt="${1:-$TB_WT}" host="${2:-$TB_HOST}" rc=0
+  [[ -n $DEV_WORKTREE_ROOT && $wt == ${DEV_WORKTREE_ROOT}/*/* && -e $wt/.git ]] || return 0
+  local br; br=$(git -C "$wt" symbolic-ref --short -q HEAD) || return 0
+  if [[ -n "$(git -C "$wt" status --porcelain 2>/dev/null)" ]]; then
+    git -C "$wt" add -A 2>/dev/null
+    git -C "$wt" commit -q -m "wip: beam to ${host:-another host} [skip ci]" 2>/dev/null
+    if [[ -n "$(git -C "$wt" status --porcelain 2>/dev/null)" ]]; then
+      print -r -- "tbeam: couldn't commit everything in ${wt} (pre-commit hook?) — destination won't see the uncommitted edits" >&2
+      rc=1
+      # Still push: any earlier committed-but-unpushed work on this branch should still reach origin.
+    fi
+  fi
+  if git -C "$wt" push -q origin "HEAD:${br}" 2>/dev/null; then
+    print -r -- "↑ carried ${br} → origin"
+  else
+    print -r -- "tbeam: couldn't push ${br} to origin — destination won't see your latest edits (push them manually)" >&2
+    rc=1
+  fi
+  return $rc
+}
+
+# _dev_worktree_beam_sync <wt> — ON THE DESTINATION, fast-forward the slot worktree to the
+# branch tip the origin just pushed (_dev_worktree_beam_push), so a beam's uncommitted edits
+# actually land. A FRESHLY created worktree is already at origin/<br> (no-op); an ALREADY-present
+# one — a reattach, or a prior beam left it behind — is reused as-is by _dev_worktree_create and
+# would otherwise be STALE. No-op outside a per-session worktree, mirroring _dev_worktree_beam_push.
+# Shared code (runs on whichever host receives the session, incl. over ssh from _tbeam_land).
+#
+# CONFLICT POLICY: fast-forward ONLY. The origin always commits-all + pushes before a move, so in
+# steady state both ends are clean at beam boundaries and the FF always applies. Divergence here
+# (this worktree holds a local commit that was never pushed) only happens under manual
+# interference, since a move leaves no live session on the destination — so it is WARNED, never
+# `reset --hard`, which would silently destroy that local commit. Matches the conservative house
+# style (the sweep's "any inconclusive answer = do NOT clobber", _dev_repo_prepare's refuse-not-stash).
+# Both beam landings route through _dev_beam_land_cwd FIRST, which relands a colliding worktree
+# (live owner / dirty / diverged) into a fresh slot — so this never runs against a live sibling's
+# checkout, and its warn paths are backstops for the cases the reland deliberately passes through.
+_dev_worktree_beam_sync() {
+  local wt="$1"
+  [[ -n $DEV_WORKTREE_ROOT && $wt == ${DEV_WORKTREE_ROOT}/*/* && -e $wt/.git ]] || return 0
+  local br; br=$(git -C "$wt" symbolic-ref --short -q HEAD) || return 0
+  local fetched=1
+  git -C "$wt" fetch -q origin 2>/dev/null || fetched=0
+  local head ref
+  head=$(git -C "$wt" rev-parse -q HEAD 2>/dev/null)
+  ref=$(git -C "$wt" rev-parse -q --verify "origin/${br}" 2>/dev/null)
+  # If fetch failed, origin/${br} may be stale — warn so a missed beam edit isn't silent —
+  # but still try the FF below in case the remote-tracking ref happens to be current.
+  (( fetched )) || print -r -- "tbeam: couldn't fetch origin in ${wt} — origin/${br} may be stale" >&2
+  [[ -n $ref && $head != "$ref" ]] || return 0          # no remote branch, or already at the tip
+  if git -C "$wt" merge-base --is-ancestor "$head" "$ref" 2>/dev/null; then
+    if git -C "$wt" merge -q --ff-only "origin/${br}" 2>/dev/null; then
+      print -r -- "↓ synced ${br} to the beamed edits"
+    else
+      print -r -- "tbeam: couldn't fast-forward ${wt} to origin/${br} — left as-is (sync manually)" >&2
+    fi
+  else
+    print -r -- "tbeam: ${wt} diverged from origin/${br} — left as-is (resolve manually)" >&2
+  fi
+}
+
+# _dev_beam_land_cwd <cwd> <sid> [origin-host] — decide WHERE a beamed session actually
+# lands, resolving the slot COLLISION case: the transcript records a per-session worktree
+# (say financial-forecast/5, beamed from another machine's ff-5), but THIS machine's slot 5
+# is already another session's — a live local dev session is rooted in it, or the dead
+# worktree/lingering branch holds a different line of work (uncommitted changes, or commits
+# that diverged from the beamed branch — two machines opening slot 5 independently create
+# colliding identities for different work, since path + branch are keyed on basename+slot
+# on purpose). Landing there would trample the local session (the old flow fast-forwarded a
+# LIVE sibling's checkout, then _dev_slot_for_cwd rightly refused the taken slot and the
+# whole pull aborted AFTER the origin copy was already stopped). Instead: RELAND into a
+# fresh slot — first slot with no live session, no worktree, and no dev/<basename>-<n>
+# branch locally OR on origin (an origin branch can be a slot live on a third machine);
+# create its worktree branched AT the beamed tip (origin/<br>, the commit-all
+# _dev_worktree_beam_push just carried, so the beamed edits land in the new slot); and copy
+# the sid's transcript files into the new path's project dir (`claude -r <sid>` only finds
+# transcripts under the project dir of the cwd it starts in). Copy, not move: the old
+# project dir is shared with the local sibling's conversations, and csync's union would
+# resurrect a moved file anyway — the stale duplicate is frozen and ages out.
+# Prints the landing cwd — <cwd> unchanged when there is no collision (incl. non-worktree
+# paths and a still-absent worktree, which the callers materialize exactly as before), the
+# new worktree when relanded. Human messages go to stderr (stdout is captured). Returns 1
+# only on an unresolvable collision: origin has no beamed branch to reland from (the
+# worktree push failed — the work is safe on the origin machine; revive it there), or no
+# free slot. Shared code: both landing sides route through it (_dev_pull locally,
+# _tbeam_land over ssh), so it needs `dots` on the host like the rest of the beam family.
+_dev_beam_land_cwd() {
+  local cwd="$1" sid="${2:-}" ohost="${3:-}"
+  [[ -n $DEV_WORKTREE_ROOT && $cwd == ${DEV_WORKTREE_ROOT}/*/* ]] || { print -r -- "$cwd"; return 0 }
+  local r repo slot; r=$(_dev_repo_of_dir "$cwd") || { print -r -- "$cwd"; return 0 }
+  repo=${r%%$'\t'*}; slot=${r#*$'\t'}
+  [[ -n $repo && -n $slot && -n ${DEV_REPOS[$repo]} ]] || { print -r -- "$cwd"; return 0 }
+  local repodir="${DEV_REPOS[$repo]}"
+  local br; br=$(_dev_worktree_branch "$repo" "$slot")
+  # Is the slot taken ($why non-empty)? Judged by CONTENT, not name: a live dev session
+  # ROOTED at this path (session_path, so alias drift can't hide it); else another
+  # session's leftover work — a dirty worktree, a worktree whose HEAD diverged from the
+  # beamed tip, or (worktree absent) a lingering local branch that diverged, which
+  # _dev_worktree_create would otherwise resume under the beamed conversation.
+  local why= s p
+  if [[ -e $cwd/.git ]]; then
+    for s in ${(f)"$(tmux list-sessions -F '#{session_name}' 2>/dev/null | grep '^dev-')"}; do
+      p=$(tmux display-message -p -t "$s" '#{session_path}' 2>/dev/null)
+      [[ -n $p && ${p:A} == ${cwd:A} ]] && { why="$s is live in it"; break }
+    done
+    if [[ -z $why && -n "$(git -C "$cwd" status --porcelain 2>/dev/null)" ]]; then
+      why="it holds another session's uncommitted work"
+    fi
+  fi
+  git -C "$repodir" fetch -q origin 2>/dev/null   # fresh origin/* for the divergence + reland checks
+  if [[ -z $why ]] && git -C "$repodir" show-ref --verify --quiet "refs/remotes/origin/$br"; then
+    if [[ -e $cwd/.git ]]; then
+      git -C "$cwd" merge-base --is-ancestor HEAD "origin/$br" 2>/dev/null \
+        || why="it diverged from origin/$br"
+    elif git -C "$repodir" show-ref --verify --quiet "refs/heads/$br"; then
+      git -C "$repodir" merge-base --is-ancestor "refs/heads/$br" "origin/$br" 2>/dev/null \
+        || why="its lingering local branch diverged from origin/$br"
+    fi
+  fi
+  [[ -n $why ]] || { print -r -- "$cwd"; return 0 }
+
+  # Collision → reland. The beamed content can only arrive via origin/<br>; without it a
+  # fresh slot would resume the conversation over none of its code. Bail with a revive
+  # hint (the origin copy is already stopped) rather than land something misleading.
+  if ! git -C "$repodir" show-ref --verify --quiet "refs/remotes/origin/$br"; then
+    print -r -- "tbeam: slot $slot is taken here ($why) and origin has no $br to reland from (worktree push failed?) — the work is still on the origin machine; revive it there${ohost:+: t on $ohost t resume $repo $slot}" >&2
+    return 1
+  fi
+  local n=1 nbr nwt
+  while (( n <= 99 )); do
+    nbr=$(_dev_worktree_branch "$repo" "$n"); nwt=$(_dev_worktree_path "$repo" "$n")
+    if ! _dev_local_slot_live "$repo" "$n" && [[ ! -e $nwt/.git ]] \
+       && ! git -C "$repodir" show-ref --verify --quiet "refs/heads/$nbr" \
+       && ! git -C "$repodir" show-ref --verify --quiet "refs/remotes/origin/$nbr"; then
+      break
+    fi
+    (( n++ ))
+  done
+  (( n <= 99 )) || { print -r -- "tbeam: no free slot to reland $repo into" >&2; return 1 }
+  git -C "$repodir" worktree prune 2>/dev/null
+  # --no-track: the new branch starts AT origin/<br> but must not track it, or a plain
+  # `git push` in the new slot would aim at the OLD slot's branch.
+  git -C "$repodir" worktree add -q --no-track -b "$nbr" "$nwt" "origin/$br" 2>/dev/null
+  [[ -e $nwt/.git ]] || { print -r -- "tbeam: couldn't create $nwt to reland into" >&2; return 1 }
+  if [[ -n $sid ]]; then
+    local pdir="$HOME/.claude/projects" encold="${cwd//[^A-Za-z0-9]/-}" encnew="${nwt//[^A-Za-z0-9]/-}" f
+    mkdir -p "$pdir/$encnew"
+    # -R: the sid's files include a DIRECTORY named exactly <sid> (tool-results etc.,
+    # newer Claude Code), not just <sid>.jsonl/<sid>.origin — a plain cp skips it.
+    for f in "$pdir/$encold/$sid"*(N); do cp -Rp "$f" "$pdir/$encnew/${f:t}"; done
+    [[ -e "$pdir/$encnew/$sid.jsonl" ]] || print -r -- "tbeam: no transcript for ${sid[1,8]}… under $encold — the relanded slot may not resume" >&2
+  fi
+  print -r -- "⚠ slot $slot is taken here ($why) — relanding as $repo $n ($nbr @ origin/$br)" >&2
+  print -r -- "$nwt"
 }
 
 # _dev_repo_prepare <branch> — put a NEW session's checkout on <branch> without
@@ -440,10 +684,16 @@ _clawsync_periodic() {
 add-zsh-hook precmd _clawsync_periodic
 
 # Worktree sweep — reap per-session worktrees whose work has landed. A slot's worktree
-# + branch (dev/<basename>-<slot>) are removed only when BOTH hold: the tmux session is
-# dead (matched by session_path, never by name — dodges alias drift) AND the branch is
-# merged to main. Unmerged work is never destroyed (a killed-but-unmerged slot keeps its
-# worktree so reopening the slot resumes it). Same prompt-piggyback + stamp-gate as csync.
+# + branch (dev/<basename>-<slot>) are removed only when ALL THREE hold: the tmux session
+# is dead (matched by session_path, never by name — dodges alias drift), the branch is
+# merged to main, AND the working tree is clean. The clean gate exists because a merged
+# TIP says nothing about the WORKING TREE: after a PR merges, the slot lives on and the
+# next feature accumulates as uncommitted edits on the same branch (tip still == the
+# merged PR head) — a reboot then kills every tmux session, the sweep sees dead+merged,
+# and `worktree remove --force` erases the whole uncommitted feature (the 2026-07-14
+# incident: five slots reaped at once, one holding a day of unpushed work). Unmerged or
+# uncommitted work is never destroyed (a killed-but-unmerged slot keeps its worktree so
+# reopening the slot resumes it). Same prompt-piggyback + stamp-gate as csync.
 # _dev_branch_merged <repodir> <branch> — true if <branch> has landed on main. Prefers
 # gh (a merged PR with this head branch — catches GitHub SQUASH-merges, which leave no
 # ancestor link so `git branch --merged`/merge-base miss them); an OPEN PR is a hard
@@ -477,7 +727,7 @@ _dev_worktree_sweep_run() {
   [[ -n $root && -d $root ]] || return
   local -a livepaths
   livepaths=("${(@f)$(tmux list-sessions -F '#{session_path}' 2>/dev/null)}")
-  local wt repo slot repodir br r
+  local wt repo slot repodir br r dirt
   for wt in $root/*/*(N/); do                       # <basename>/<slot> dirs
     [[ -e "$wt/.git" ]] || continue
     (( ${livepaths[(Ie)$wt]} )) && continue         # live session here → keep
@@ -487,6 +737,12 @@ _dev_worktree_sweep_run() {
     [[ -n $repodir && -d $repodir ]] || continue
     br=$(_dev_worktree_branch "$repo" "$slot")
     _dev_branch_merged "$repodir" "$br" || continue
+    # Merged tip ≠ clean tree: post-merge uncommitted work sits on a merged sha, and
+    # `remove --force` (needed below because git refuses dirty removals) would erase it.
+    # Skip silently, like the gates above — dirty-on-merged is the normal keep-working
+    # state, not an anomaly worth a log line every pass. Unreadable status counts dirty.
+    dirt=$(git -C "$wt" status --porcelain 2>/dev/null) || dirt='?'
+    [[ -z $dirt ]] || continue
     print -r -- "[$(strftime '%F %T' $EPOCHSECONDS 2>/dev/null)] sweep: $wt (branch $br merged)"
     git -C "$repodir" worktree remove --force "$wt" 2>/dev/null \
       && git -C "$repodir" branch -D "$br" 2>/dev/null
@@ -775,7 +1031,7 @@ PY
 _dev_summary_for_pid() {
   setopt local_options null_glob bare_glob_qual
   local dir="$1" cpid="$2"
-  local proj="$HOME/.claude/projects/${dir//\//-}" start
+  local proj="$HOME/.claude/projects/${dir//[^A-Za-z0-9]/-}" start
   local -a tx
   if [[ -n $cpid ]]; then
     start=$(ps -o lstart= -p "$cpid" 2>/dev/null)
@@ -823,7 +1079,7 @@ _dev_session_sid() {
   fi
   sid=$(tmux show-environment -t "$session" CLAUDE_RESUME_ID 2>/dev/null | cut -d= -f2)
   [[ -n $sid ]] || return 0
-  local -a tx=( "$HOME/.claude/projects/${dir//\//-}/$sid".jsonl(N) )
+  local -a tx=( "$HOME/.claude/projects/${dir//[^A-Za-z0-9]/-}/$sid".jsonl(N) )
   [[ -n ${tx[1]} ]] && print -r -- "$sid"
   return 0
 }
@@ -840,7 +1096,7 @@ _dev_session_summary() {
   if [[ -n $sid ]]; then
     # A valid id (registry or validated stamp) always has its transcript under this
     # slot's own project dir, since the dir IS the conversation's cwd.
-    local -a tx=( "$HOME/.claude/projects/${dir//\//-}/$sid".jsonl(N) )
+    local -a tx=( "$HOME/.claude/projects/${dir//[^A-Za-z0-9]/-}/$sid".jsonl(N) )
     [[ -n ${tx[1]} ]] && { _transcript_title "${tx[1]}"; return 0; }
   fi
   _dev_summary_for_pid "$dir" "$(_dev_session_claude_pid "$session")"
@@ -1197,10 +1453,11 @@ _dev_list() {
     printf '  %s %s     %-*s %s%s%s\n' "${g}●${r0}" "$cmark" $name_w "$_fslot" "$y" "$fsummary" "$r0"
   done <<< "$fgrows"
   # reattach legend: tmux slots via `t open <repo> <slot>`; a foreground (:fg) row is
-  # bound to its terminal, so it comes back foreground via `t open <id>` (shown
-  # only when the list actually has a :fg row).
+  # bound to its terminal, so it comes back foreground via `t open <id>`. Kill a :fg row
+  # (a foreground claude or a pr-watch `pr-*` session) with `t kill <id>` — it is not a
+  # dev slot, so `t kill <repo> <slot>` does not apply. Both shown only when a :fg row exists.
   local foot="reattach: t open <repo> <slot>"
-  [[ -n $fgrows ]] && foot+=" · foreground: t open <id>"
+  [[ -n $fgrows ]] && foot+=" · foreground: t open <id> · kill: t kill <id>"
   print -r -- ""
   print -r -- "  ${y}${foot}${r0}"
 }
@@ -1355,7 +1612,7 @@ _dev_list_remote() {
   # present — slot is field 4 of the prefixed rows).
   local foot="attach (auto-finds its host): t open <repo> <slot> · pull here: t beam <repo> <slot> --from <host>"
   print -r -- "$rows" | awk -F'\t' '$4 ~ /:/{f=1} END{exit !f}' \
-    && foot+=" · foreground: t on <host> t open <id>"
+    && foot+=" · foreground: t on <host> t open <id> · kill: t kill -r <id>"
   print -r -- ""
   print -r -- "  ${y}${foot}${r0}"
 }
@@ -1378,6 +1635,98 @@ _dev_kill_one() {
     print
   fi
   tmux kill-session -t "$session" 2>/dev/null && echo "Killed $session"
+}
+
+# _dev_tmux_session_of_pid <pid> — print the tmux session <pid> runs inside (walk its
+# ancestry until an ancestor is some pane's pid), else return 1. Lets _dev_kill_fg tell a
+# claude living in a NON-dev tmux session (e.g. pr-watch's `pr-dotfiles-N` — kill the
+# whole session) from a true no-tmux foreground claude (SIGTERM the process). The map is
+# built over ALL sessions, not just dev-*, precisely because these targets are non-dev.
+_dev_tmux_session_of_pid() {
+  local pid="$1" line up
+  [[ -n $pid ]] || return 1
+  local -A pane2sess
+  for line in ${(f)"$(tmux list-panes -a -F '#{pane_pid} #{session_name}' 2>/dev/null)"}; do
+    pane2sess[${line%% *}]=${line#* }
+  done
+  up=$pid
+  while [[ -n $up && $up != 1 ]]; do
+    [[ -n ${pane2sess[$up]} ]] && { print -r -- ${pane2sess[$up]}; return 0; }
+    up=$(ps -o ppid= -p $up 2>/dev/null | tr -d ' ')
+  done
+  return 1
+}
+
+# _dev_kill_fg <handle> [force] — kill FOREGROUND / non-dev-slot claude sessions: the
+# `<repo>:<id>` / `<repo>:fg` rows `t ls` shows via _dev_fg_rows (live claudes not owned
+# by a dev-<repo>-<slot> pane — true foreground claudes AND claudes in a non-dev tmux
+# session like pr-watch's `pr-dotfiles-N`). _dev_kill only tears down dev slots, so this
+# is the companion path for those rows — the gap that made `t kill dotfiles-pr47` report
+# "no session". Matches <handle> against the displayed label exactly (`repo:id`/`repo:fg`),
+# the label's repo part when that part is NOT itself a DEV_REPOS key (so `t kill
+# dotfiles-pr47` reaches `dotfiles-pr47:fg` while `t kill dotfiles` still lists dev
+# slots), or a bare short session-id prefix. Kill mechanics via _dev_tmux_session_of_pid:
+# a claude inside a tmux session → kill that session; a no-tmux claude → SIGTERM it (clean
+# exit, transcript stays resumable — the same signal tpush sends). Confirms once per
+# target while a conversation is live unless <force>. Returns 0 if it killed something, 1
+# if a row matched but was not killed (confirm declined / kill failed), 2 if nothing
+# matched — so _dev_kill only falls through to its "no session" path on a true miss (2),
+# not after a deliberate skip. The pid scan
+# mirrors _dev_fg_rows so the same rows are addressable; it deliberately excludes dev-slot
+# claudes and the claude THIS shell runs under (never kill the session you are typing in).
+_dev_kill_fg() {
+  local handle="$1" force="$2"
+  [[ -n $handle ]] || return 1
+  setopt local_options null_glob
+  local reg="${XDG_CACHE_HOME:-$HOME/.cache}/claude-sessions"
+  local -A inslot; local s p
+  for s in ${(f)"$(tmux list-sessions -F '#{session_name}' 2>/dev/null | grep '^dev-')"}; do
+    p=$(_dev_session_claude_pid "$s") && [[ -n $p ]] && inslot[$p]=1
+  done
+  local me up=$$
+  while [[ -n $up && $up != 1 ]]; do
+    [[ "$(ps -o comm= -p $up 2>/dev/null)" == claude ]] && { me=$up; break; }
+    up=$(ps -o ppid= -p $up 2>/dev/null | tr -d ' ')
+  done
+  local idpart="${handle##*:}"
+  local pid cwd repo sid label context title m tsess killed= matched=
+  local -a tx
+  for pid in ${(f)"$(ps -Axo pid,comm 2>/dev/null | awk '{n=$2; sub(/.*\//,"",n)} n=="claude"{print $1}')"}; do
+    [[ -n ${inslot[$pid]} || $pid == $me ]] && continue
+    sid= cwd=
+    [[ -r $reg/$pid ]] && IFS=$'\t' read -r sid cwd < "$reg/$pid"
+    [[ -n $cwd ]] || cwd=$(lsof -a -p "$pid" -d cwd -Fn 2>/dev/null | sed -n 's/^n//p' | head -1)
+    [[ -n $cwd ]] || continue
+    repo=$(_dev_repo_of_dir "$cwd" 2>/dev/null); repo=${repo%%$'\t'*}
+    [[ -n $repo ]] || repo=${cwd:t}
+    if [[ -n $sid && $sid != - ]]; then label="${repo}:${sid[1,8]}"; else label="${repo}:fg"; fi
+    m=
+    if [[ $handle == $label ]]; then m=1
+    elif [[ $handle == $repo && -z ${DEV_REPOS[$handle]:-} ]]; then m=1
+    elif [[ $handle != *:* && -z ${DEV_REPOS[$handle]:-} && -n $sid && $sid != - && ${sid[1,${#handle}]} == $handle ]]; then m=1
+    fi
+    [[ -n $m ]] || continue
+    matched=1
+    context=idle
+    if [[ -n $sid && $sid != - ]]; then
+      tx=( "$HOME/.claude/projects"/*/"$sid".jsonl(N) )
+      [[ -n ${tx[1]} ]] && title=$(_transcript_title "${tx[1]}") && [[ -n $title ]] && context=active
+    fi
+    if [[ -z $force && $context == active ]]; then
+      read -q "REPLY?Kill $label? Claude is live there (context interrupted). [y/N] " \
+        || { print; echo "Skipped $label."; continue; }
+      print
+    fi
+    tsess=$(_dev_tmux_session_of_pid "$pid")
+    if [[ -n $tsess ]]; then
+      tmux kill-session -t "$tsess" 2>/dev/null && { echo "Killed $label (tmux session $tsess)"; killed=1; }
+    else
+      kill -TERM "$pid" 2>/dev/null && { echo "Killed $label (foreground pid $pid)"; killed=1; }
+    fi
+  done
+  [[ -n $killed ]] && return 0
+  [[ -n $matched ]] && return 1
+  return 2
 }
 
 # _dev_kill <repo> <slot|all> [force] — tear down dev-<repo>-<slot> sessions.
@@ -1428,6 +1777,7 @@ _dev_kill() {
       print -r -- "t kill — tear down a dev session (or all of a repo's)"
       print -r -- ""
       print -r -- "Usage: t kill [repo] <slot|all> [-y]   (no repo: the one \$PWD is in; --remote kills on its host)"
+      print -r -- "       t kill <id>                     (a foreground / :fg row from \`t ls\` — e.g. a pr-watch pr-* session)"
     } | _help_style
     return 1
   fi
@@ -1445,6 +1795,15 @@ _dev_kill() {
     # to look.
     if [[ -n $slot && $slot != all ]]; then
       _dev_remote_delegate "$repo" "$slot" kill ${force:+-y} && return
+    fi
+    # No dev slot here. The target may be a FOREGROUND / non-dev-slot claude — the
+    # `<repo>:<id>` / `:fg` rows `t ls` shows (a true foreground claude or a pr-watch
+    # `pr-*` session). Those never match the dev-slot grep above, so try that path
+    # before giving up (only for a slot-less handle — fg rows carry no slot number).
+    # rc 2 = no fg row matched → fall through; 0/1 = matched (killed / skipped) → done.
+    if [[ -z $slot ]]; then
+      _dev_kill_fg "$repo" "$force"; local _frc=$?
+      (( _frc != 2 )) && return $_frc
     fi
     echo "No sessions for '$repo' here."
     [[ -z $slot || $slot == all ]] && (( ${#REMOTE_HOSTS} )) && \
@@ -2088,6 +2447,45 @@ _dev_session_remote_fallback() {
   _dev_remote_delegate "$repo" "$slot" "$verb" "$@"
 }
 
+# _dev_remote_fg_kill <handle> <force> — the cross-host companion of _dev_kill_fg: kill a
+# FOREGROUND / non-dev-slot claude (`<repo>:<id>` / `:fg` row) living on a REMOTE host.
+# _dev_remote_resolve deliberately drops `:`-labelled rows, so those handles can't be
+# resolved as dev slots; here we scan _dev_rows_all (which DOES include each host's fg
+# rows) for the hosts carrying a match — exact label, the label's repo part (when <handle>
+# is not a local DEV_REPOS key), or a bare id prefix — then delegate `t kill <handle>` to
+# each host, letting its own _dev_kill_fg re-match and tear down every local target.
+# Hosts are de-duped so one `t kill dotfiles-pr47` reaches all of a host's matches in one
+# ssh. Returns 0 if every addressed host succeeded, 1 if a host was addressed but an ssh
+# failed, 2 if nothing matched — so _dev_remote_kill only falls through to the dev-slot
+# resolver on a true miss (2), not after a real (if failed) fg delegation.
+_dev_remote_fg_kill() {
+  local handle="$1" force="$2"
+  local idpart="${handle##*:}"
+  # _dev_rows_all columns: host(1) sid(2) cwd(3) label(4) state(5) context(6) summary(7).
+  # fg rows carry a `:` in the label; dev slots use `-`. isrepo!="" ⇒ <handle> is a real
+  # DEV_REPOS key, so the repo-part branch is suppressed (a bare `t kill -r dotfiles`
+  # must resolve dev slots, not a same-repo fg row).
+  local hosts; hosts=$(_dev_rows_all 2>/dev/null \
+    | awk -F'\t' -v h="$handle" -v idp="$idpart" -v isrepo="${DEV_REPOS[$handle]:+1}" '
+        $1 != "local" && $4 ~ /:/ {
+          repo=$4; sub(/:.*/, "", repo);
+          if ($4==h || (h==repo && isrepo=="") || (index(h,":")==0 && isrepo=="" && $2!="-" && index($2,idp)==1))
+            if (!seen[$1]++) print $1
+        }')
+  [[ -n $hosts ]] || return 2
+  local host rtarget rcmd rc=0
+  for host in ${(f)hosts}; do
+    rtarget="${REMOTE_HOSTS[$host]:-$host}"
+    rcmd="t kill ${(q)handle}"
+    [[ -n $force ]] && rcmd+=" -y"
+    echo "→ Killing foreground '$handle' on $host"
+    _term_title "$host: kill $handle"
+    ssh -t "$rtarget" "zsh -lic ${(qq)rcmd}" || rc=1
+  done
+  _term_title ""
+  return $rc
+}
+
 # _dev_remote_kill <repo> <slot> <force> — `dev -r kill <repo> [slot]`: resolve a live
 # REMOTE slot (host auto-inferred / fzf-picked, _dev_remote_resolve) and tear it down
 # ON that host by running `dev kill <repo> <slot>` there over ssh -t (so its confirm
@@ -2151,6 +2549,15 @@ _dev_remote_kill() {
     _term_title ""
     return $rc
   fi
+  # Foreground / non-dev-slot sessions (`<repo>:<id>` / `:fg` rows) live outside the
+  # dev-slot model _dev_remote_resolve handles (it excludes `:`-labelled rows), so try
+  # them first when no slot was named. On a hit we delegate to each host, whose own
+  # `t kill` re-runs the fg match and tears down its targets (see _dev_kill_fg). rc 2 =
+  # no fg row matched → fall through to the dev-slot resolver; 0/1 = handled → done.
+  if [[ -z $slot ]]; then
+    _dev_remote_fg_kill "$repo" "$force"; local _frc=$?
+    (( _frc != 2 )) && return $_frc
+  fi
   local res; res=$(_dev_remote_resolve "$repo" "$slot") || return 1
   local host=${res%%$'\t'*} prepo=${${res#*$'\t'}%%$'\t'*} pslot=${res##*$'\t'}
   local target="${REMOTE_HOSTS[$host]:-$host}"
@@ -2190,22 +2597,47 @@ _dev_pull() {
   local cwd=${${row#*$'\t'}%%$'\t'*}
   local fslot=${${${row#*$'\t'}#*$'\t'}%%$'\t'*}
   [[ -n $sid && $sid != - ]] || { echo "dev: $host/$fslot has no active conversation to pull" >&2; return 1; }
-  # Worktree mode: $cwd is the origin's per-session worktree (same root on every host).
-  # Materialize it locally from its branch on origin if absent, rather than hard-failing.
-  if [[ ! -d $cwd ]]; then
-    local _pr _ps; _pr=$(_dev_repo_of_dir "$cwd"); _ps=${_pr#*$'\t'}; _pr=${_pr%%$'\t'*}
-    [[ -n $_pr && -n $_ps ]] && _dev_worktree_enabled "$_pr" && _dev_worktree_create "$_pr" "$_ps" >/dev/null
-  fi
-  [[ -d $cwd ]] || { echo "dev: $cwd doesn't exist here — clone/sync the repo first." >&2; return 1; }
 
   echo "⟳ Pulling ${sid[1,8]}… ($cwd) from $host → here"
-  _tbeam_pull_transcript "$cwd" "$target" || return 1
-
-  # It's a MOVE: stop the origin copy on <host> (the dev slot stamped with this id)
-  # so two live owners don't diverge — the same invariant tpush/tpop/tbeam protect.
+  # It's a MOVE: stop the origin copy on <host> FIRST, before snapshotting its
+  # worktree + transcript, so a still-live claude there can't keep editing files
+  # (the worktree push below would miss them) or appending to the transcript (the
+  # pull below would miss the tail) between the snapshot and the move — the same
+  # invariant tpush/tpop/tbeam protect.
   local killed
   killed=$(ssh "$target" "TB_SID=${(q)sid} zsh -lic _tbeam_kill_owner" 2>/dev/null | tail -1)
   [[ $killed == dev-* ]] && echo "✂ Stopped the live copy on $host ($killed)"
+
+  # Carry the origin worktree's uncommitted edits with the move: commit-all + push its branch
+  # ON the remote (over ssh, work passed in TB_* env like _tbeam_land) so the local worktree can
+  # fast-forward to them below. The mirror of the SEND path's local _dev_worktree_beam_push.
+  # Nonzero = the commit or push could not fully carry the work — land anyway (degraded, the
+  # edits stay safe on $host; the reland path re-verifies what it needs) but say so loudly.
+  if ! ssh "$target" "TB_WT=${(q)cwd} TB_HOST=${(q)$(hostname -s)} zsh -lic _dev_worktree_beam_push"; then
+    echo "⚠ $host couldn't fully commit/push the worktree — the landing may miss its latest edits (they remain on $host at $cwd)" >&2
+  fi
+
+  # Transcript first: the collision reland below copies this sid's files into the new
+  # slot's project dir, so they must be on local disk before the landing is decided.
+  _tbeam_pull_transcript "$cwd" "$target" || return 1
+
+  # Where does it land? Usually the recorded worktree (same path on every host); when THIS
+  # machine's same-numbered slot is another session's — live, dirty, or diverged — reland
+  # into a fresh slot instead of trampling it (_dev_beam_land_cwd, which also moves the
+  # transcript to the new slot's project dir).
+  local land; land=$(_dev_beam_land_cwd "$cwd" "$sid" "$host") || return 1
+  if [[ $land == "$cwd" ]]; then
+    # Worktree mode: $cwd is the origin's per-session worktree (same root on every host).
+    # Materialize it locally from its branch on origin if absent, rather than hard-failing.
+    if [[ ! -d $cwd ]]; then
+      local _pr _ps; _pr=$(_dev_repo_of_dir "$cwd"); _ps=${_pr#*$'\t'}; _pr=${_pr%%$'\t'*}
+      [[ -n $_pr && -n $_ps ]] && _dev_worktree_enabled "$_pr" && _dev_worktree_create "$_pr" "$_ps" >/dev/null
+    fi
+    [[ -d $cwd ]] || { echo "dev: $cwd doesn't exist here — clone/sync the repo first." >&2; return 1; }
+    _dev_worktree_beam_sync "$cwd"      # fast-forward to the edits the origin just pushed
+  else
+    cwd="$land"                          # relanded: resume in the fresh slot's worktree
+  fi
 
   # If this exact id is already running in a local dev slot, reuse it (one owner).
   local existing s
@@ -2300,7 +2732,7 @@ _t_plan() {
     sid=$(tmux show-environment -t "$session" CLAUDE_RESUME_ID 2>/dev/null | cut -d= -f2)
     if [[ -z $sid ]]; then
       local dir; dir=$(tmux display-message -p -t "$session" '#{session_path}')
-      local -a tx=( "$HOME/.claude/projects/${dir//\//-}"/*.jsonl(Nom[1]) )
+      local -a tx=( "$HOME/.claude/projects/${dir//[^A-Za-z0-9]/-}"/*.jsonl(Nom[1]) )
       sid=${${tx[1]:t}%.jsonl}
     fi
     [[ -n $sid ]] || { echo "Couldn't find a session id for $session." >&2; return 1; }
@@ -2325,6 +2757,417 @@ _t_plan() {
     glow -p "$plan"
   else
     less "$plan"
+  fi
+}
+
+# _t_resume — the `t resume` verb: revive a DEAD dev slot's last conversation.
+# `t open` on a dead slot deliberately starts a FRESH claude (the worktree and its
+# uncommitted work are reused, but not the chat); this is the counterpart that brings
+# the chat back. Worktree-per-session is what makes it precise: each slot's worktree
+# is its own ~/.claude/projects/<enc> dir, so "this slot's newest transcript" cannot
+# be a sibling's (the ambiguity that plagues shared-tree repos — which are therefore
+# refused here and pointed at the `t push -p` picker instead). Composes the existing
+# engines: _dev_worktree_path (slot → recorded cwd), _dev_ensure_session_cwd (rebuild
+# a reaped/synced-away worktree from its durable branch), _dev_resume_session (a
+# first-class dev slot, CLAUDE_RESUME_ID stamped so pop/plan keep working). Candidates
+# are EVERY conversation saved in a dead slot's worktree (newest first — an old one is
+# still resumable), minus conversationless stubs (no real prompt → nothing to revive,
+# and their untitled rows masked real ones). House picker convention: one candidate →
+# use it, several → fzf, none → bail with a hint; outside any DEV_REPOS dir a bare
+# `t resume` scans EVERY worktree repo (the
+# `t ls` unscoped convention) with a repo column in the picker; -a/--all forces that
+# widening from anywhere (the `t ls -a` flag). -r/--remote PULLS the latest
+# transcripts from every $REMOTE_HOSTS host first (direct rsync — csync is periodic
+# and needs a prompt on the far side, so "resume what just died on the other
+# machine" cannot wait for it), then scans as usual. LIVE slots — local or on a
+# $REMOTE_HOSTS host — appear as labeled rows ("● active" / "● on <host>") whose pick
+# ATTACHES in place instead of resuming (one-live-owner: a second `claude -r` on a
+# live id diverges the transcript).
+# -f/--fg resumes inline in THIS terminal (t pop's landing) instead of a slot.
+# User-facing help lives in bin/t (`t resume -h`); the t() shim routes -h there.
+_t_resume() {
+  setopt local_options null_glob bare_glob_qual
+  local a no_tmux= all_flag= remote_flag= days=30 _expect_days=; local -a pos
+  for a in "$@"; do
+    if [[ -n $_expect_days ]]; then days=$a; _expect_days=; continue; fi
+    case "$a" in
+      -f|--fg)     no_tmux=1 ;;
+      -a|--all)    all_flag=1 ;;
+      -r|--remote) remote_flag=1 ;;
+      --days)      _expect_days=1 ;;
+      --days=*)    days=${a#--days=} ;;
+      -*)          echo "t resume: unknown flag: $a (t resume -h for flags)" >&2; return 1 ;;
+      *)           pos+=("$a") ;;
+    esac
+  done
+  if [[ $days != all && $days != <-> ]]; then
+    echo "t resume: --days takes a number of days or 'all' (got: ${days:-nothing})." >&2; return 1
+  fi
+  local repo="${pos[1]:-}" slot="${pos[2]:-}"
+  # Repo-aware defaults (mirrors t plan/paste): lone numeric arg is a SLOT of the
+  # cwd repo; bare `t resume` infers the repo too — and OUTSIDE any DEV_REPOS dir
+  # it widens to EVERY worktree repo instead of erroring (the `t ls` unscoped
+  # convention: no repo context → show everything; the picker grows a repo
+  # column). -a/--all forces that widening even inside a repo dir (same flag as
+  # `t ls -a`). A lone numeric slot still demands a repo — "slot 3" of no
+  # particular repo is a guess, and other verbs refuse the same way.
+  local all_mode=
+  if [[ -n $all_flag ]]; then
+    [[ -z $repo && -z $slot ]] || { echo "t resume: --all scans every worktree repo — drop '$repo${slot:+ $slot}'." >&2; return 1; }
+    all_mode=1
+  elif [[ "$repo" == <-> && -z "$slot" ]]; then
+    slot=$repo
+    repo=$(_t_infer_repo "$slot") || { echo "Not inside a DEV_REPOS dir — name the repo (t resume <repo> $slot)." >&2; return 1; }
+  elif [[ -z "$repo" ]]; then
+    repo=$(_t_infer_repo) || all_mode=1
+  fi
+
+  # The scan targets: one named/inferred repo, or (all-repos mode) every
+  # worktree-enabled repo deduped by canonical dir — `dot` and `dotfiles` key one
+  # dir, so it is scanned once under its canonical alias (_dev_repo_of_dir's
+  # basename-first rule), not once per alias with duplicate candidates.
+  local -a repos
+  if [[ -n $all_mode ]]; then
+    local -A _seen; local _k _dirA _canon
+    for _k in ${(ko)DEV_REPOS}; do
+      _dirA=${DEV_REPOS[$_k]:A}
+      [[ -n ${_seen[$_dirA]:-} ]] && continue
+      _seen[$_dirA]=1
+      _canon=$(_dev_repo_of_dir "${DEV_REPOS[$_k]}") || continue
+      _canon=${_canon%%$'\t'*}
+      _dev_worktree_enabled "$_canon" && repos+=("$_canon")
+    done
+    (( $#repos )) || { echo "No worktree-enabled repos configured (configured: ${(k)DEV_REPOS})." >&2; return 1; }
+  else
+    [[ -n ${DEV_REPOS[$repo]:-} ]] || { echo "Unknown repo: $repo (configured: ${(k)DEV_REPOS})" >&2; return 1; }
+    if ! _dev_worktree_enabled "$repo"; then
+      echo "t resume: $repo opts out of worktree-per-session, so its slots share one project dir and a slot's last conversation is ambiguous — pick one with \`t push -p\` instead." >&2
+      return 1
+    fi
+    repos=($repo)
+  fi
+
+  # Live dev sessions by ROOTED PATH (any alias — dev-dot-2 and dev-dotfiles-2 can
+  # key one worktree), so a live slot is recognised however it was named.
+  local -A live; local s p
+  for s in ${(f)"$(tmux list-sessions -F '#{session_name}' 2>/dev/null | grep '^dev-')"}; do
+    p=$(tmux display-message -p -t "$s" '#{session_path}' 2>/dev/null)
+    [[ -n $p ]] && live[${p:A}]=$s
+  done
+
+  # -r/--remote: PULL the scan targets' transcripts from every $REMOTE_HOSTS host
+  # FIRST (direct rsync --update per worktree project dir — union rule: newer
+  # wins, nothing deleted; $HOME is identical across machines so the project-dir
+  # encoding matches verbatim), then scan as usual. This is what "resume the
+  # conversation that just died on the other machine" needs: csync's convergence
+  # is periodic AND driven by a precmd hook, so a headless host pushes nothing to
+  # iCloud until someone opens a shell THERE — the direct pull closes that
+  # window. A pulled conversation is then an ordinary candidate (a dead session
+  # has no home host). rc 23 = remote glob matched nothing (no sessions for that
+  # repo there) — not an error.
+  if [[ -n $remote_flag ]]; then
+    (( ${#REMOTE_HOSTS} )) || { echo "t resume -r: no REMOTE_HOSTS configured (set them in ~/.zshrc.local)." >&2; return 1; }
+    # Include filters, not a remote glob: the far side's login shell is zsh,
+    # whose nomatch ABORTS on a glob with no hits (rc 1 — read as "unreachable"
+    # for any repo with no sessions on that host). One rsync per host covers
+    # every scan target; rc 23 = source dir absent there (no claude yet) — fine.
+    local _h _tgt _enc _prc
+    local -a _incs
+    for repo in $repos; do
+      _enc=${${:-${DEV_WORKTREE_ROOT}/${DEV_REPOS[$repo]:t}}//[^A-Za-z0-9]/-}
+      _incs+=(--include="${_enc}-*/" --include="${_enc}-*/**")
+    done
+    for _h in ${(ko)REMOTE_HOSTS}; do
+      _tgt=${REMOTE_HOSTS[$_h]}
+      rsync -a --update --timeout=10 -e "ssh -o ConnectTimeout=3 -o BatchMode=yes" \
+        "${(@)_incs}" --exclude='*' \
+        "$_tgt:$HOME/.claude/projects/" "$HOME/.claude/projects/" 2>/dev/null
+      _prc=$?
+      if (( _prc == 0 || _prc == 23 )); then
+        echo "⟳ pulled ${_h}'s latest transcripts" >&2
+        # Cache the host's short hostname (once) so the origin column below can
+        # translate a `<sid>.origin` stamp back to the friendly $REMOTE_HOSTS key.
+        if [[ ! -s $HOME/.cache/t/hostnames/$_h ]]; then
+          mkdir -p "$HOME/.cache/t/hostnames" 2>/dev/null
+          ssh -o ConnectTimeout=3 -o BatchMode=yes "$_tgt" hostname -s 2>/dev/null > "$HOME/.cache/t/hostnames/$_h"
+        fi
+      else
+        echo "t resume -r: $_h unreachable (rc=$_prc) — skipped; its newest transcripts may be missing here." >&2
+      fi
+    done
+  fi
+
+  # ONE live-slot scan (one-live-owner invariant): a synced transcript here does
+  # NOT mean the slot is idle — a local tmux slot or another host may still be
+  # driving `claude -r` on that session id, and a second `claude -r` would append
+  # to the same .jsonl with no locking and diverge the conversation. _dev_rows_all
+  # when $REMOTE_HOSTS exist (this machine + every host), else a local-only
+  # _dev_session_rows; fg rows (`:`-labelled) dropped. Live slots become LABELED
+  # PICKER ROWS below ("● active" / "● on <host>") whose pick ATTACHES in place
+  # instead of resuming — the picker itself says where everything is, rather than
+  # stderr notes nobody reads. The per-repo awk over the cached remote rows builds
+  # slot→host/alias/title maps (matching the repo's dir OR its per-session-worktree
+  # path, same rule as _dev_remote_resolve so a `dev-dot-2` on mini matches
+  # `dev-dotfiles-2` here — both key one dir); the alias is captured so an attach
+  # needs no second scan.
+  local all_rows= remote_rows=
+  if (( ${#REMOTE_HOSTS} )); then
+    all_rows=$(_dev_rows_all 2>/dev/null | awk -F'\t' '$4 !~ /:/')
+  else
+    all_rows=$(_dev_session_rows 2>/dev/null | awk -F'\t' '$3 !~ /:/ {print "local\t" $0}')
+  fi
+  remote_rows=$(print -r -- "$all_rows" | awk -F'\t' '$1 != "local"')
+  # Local live titles, keyed by short session name (dev- prefix stripped).
+  local -A local_sum; local _lsn _lsum
+  while IFS=$'\t' read -r _lsn _lsum; do
+    [[ -n $_lsn ]] && local_sum[$_lsn]=$_lsum
+  done < <(print -r -- "$all_rows" | awk -F'\t' '$1 == "local" {print $4 "\t" $7}')
+
+  # Candidates: dead slots whose worktree project dir holds a transcript —
+  # EVERY conversation in the slot, newest first, not just the newest .jsonl
+  # (an old conversation is still resumable; hiding it read as "resume lost my
+  # session"). Conversationless stubs (an open-then-exit, a beam artifact — no
+  # real user prompt, so _transcript_title prints nothing) are skipped: they
+  # rendered as untitled rows and, being newest, often masked the real
+  # conversation. A slot whose worktree is LIVE (by path, local or remote) is
+  # not resumable — explicit ask attaches, scan skips. A slot whose tmux NAME
+  # is taken by a session rooted elsewhere is unresumable AND wrong to attach
+  # (see the collision branch below). NOTE: every `local` here is hoisted OUT
+  # of the loops — an assignmentless `local x` re-run on an already-local x
+  # does not redeclare, it PRINTS `x=value` (the `_ok=claw` junk-output bug).
+  local -a cands slots tx
+  local -A remote_live_host remote_live_alias remote_live_sum
+  local n wt sid busy rhost _rdir _rbase _rhost _rn _ralias _rsum _ok _stale stale_path
+  local txf title when ep org orgf hf skipped=0
+  local _rwtr=${DEV_WORKTREE_ROOT:-}
+  # Recency window (--days, default 30; 'all' disables) + this machine's short
+  # hostname, to blank the origin column for locally-run conversations.
+  local cutoff=0 selfhost=$(hostname -s 2>/dev/null)
+  [[ $days != all ]] && cutoff=$(( EPOCHSECONDS - days * 86400 ))
+  # origin → friendly $REMOTE_HOSTS key, via the hostname cache the -r pull
+  # populates (~/.cache/t/hostnames/<alias> = that host's `hostname -s`).
+  local -A host_alias; local _hcf
+  for _hcf in "$HOME"/.cache/t/hostnames/*(N); do
+    host_alias[$(<$_hcf)]=${_hcf:t}
+  done
+  if [[ -n $slot ]]; then slots=($slot); else slots=({1..20}); fi
+  for repo in $repos; do
+    _rdir=${DEV_REPOS[$repo]}; _rbase=${_rdir:t}
+    remote_live_host=(); remote_live_alias=(); remote_live_sum=()
+    if [[ -n $remote_rows ]]; then
+      while IFS=$'\t' read -r _rhost _rn _ralias _rsum; do
+        [[ -n $_rn ]] && { remote_live_host[$_rn]=$_rhost; remote_live_alias[$_rn]=$_ralias; remote_live_sum[$_rn]=$_rsum; }
+      done < <(print -r -- "$remote_rows" | awk -F'\t' -v d="$_rdir" -v wtr="$_rwtr" -v b="$_rbase" '
+        ($3==d || (wtr != "" && b != "" && index($3, wtr "/" b "/") == 1)) {
+          n = $4; sub(/^.*-/, "", n)
+          r = $4; sub(/-[^-]+$/, "", r)
+          print $1 "\t" n "\t" r "\t" $7
+        }')
+    fi
+    for n in $slots; do
+      wt=$(_dev_worktree_path "$repo" "$n")
+      busy=${live[${wt:A}]:-}
+      if [[ -n $busy ]]; then
+        if [[ -n $slot ]]; then
+          echo "Slot $n is live ($busy) — attaching (resume only revives dead slots)."
+          _t_dev "$repo" "$n"
+          return
+        fi
+        # Scan: a live local slot is a labeled row (pick → attach). Sort key
+        # (field 1, stripped after the global sort below): a live session is
+        # "now", so the max sentinel pins it above every dead transcript.
+        cands+=(9999999999$'\t'"$repo"$'\t'"$n"$'\t'-$'\t'"$wt"$'\t'"● active"$'\t'"${local_sum[${busy#dev-}]:-(live session)}"$'\t'here$'\t'-$'\t'-)
+        continue
+      fi
+      # Remote-live: same treatment as local live (see the scan note above).
+      rhost=${remote_live_host[$n]:-}
+      if [[ -n $rhost ]]; then
+        if [[ -n $slot ]]; then
+          echo "Slot $n is live on $rhost — attaching (resume only revives dead slots)."
+          _dev_remote_attach "$rhost"$'\t'"${remote_live_alias[$n]}"$'\t'"$n" ""
+          return
+        fi
+        cands+=(9999999999$'\t'"$repo"$'\t'"$n"$'\t'-$'\t'"$wt"$'\t'"● on $rhost"$'\t'"${remote_live_sum[$n]:-(live session)}"$'\t'"$rhost"$'\t'"${remote_live_alias[$n]}"$'\t'-)
+        continue
+      fi
+      # Name-only collision: a dev-<alias>-${n} tmux session (any alias keying
+      # this repo's dir — see _t_dev / _t_pop) exists but is rooted elsewhere
+      # (not this slot's worktree — an old alias, opt-out shared tree, or a
+      # stray). _dev_resume_session's `tmux new-session -s dev-${repo}-${n}`
+      # would fail on the duplicate name, and attaching the stale session would
+      # land the user in the wrong worktree with the wrong conversation. Refuse
+      # loudly on explicit ask; skip in scan mode.
+      _stale=
+      for _ok in ${(k)DEV_REPOS}; do
+        [[ ${DEV_REPOS[$_ok]} != $_rdir ]] && continue
+        tmux has-session -t "dev-${_ok}-${n}" 2>/dev/null && { _stale="dev-${_ok}-${n}"; break; }
+      done
+      if [[ -n $_stale ]]; then
+        if [[ -n $slot ]]; then
+          stale_path=$(tmux display-message -p -t "$_stale" '#{session_path}' 2>/dev/null)
+          echo "Slot $n's tmux name ($_stale) is taken by a session rooted elsewhere${stale_path:+ ($stale_path)} — kill it (tmux kill-session -t $_stale) before resuming." >&2
+          return 1
+        fi
+        continue
+      fi
+      tx=( "$HOME/.claude/projects/${wt//[^A-Za-z0-9]/-}"/*.jsonl(Nom) )
+      for txf in "${(@)tx}"; do
+        ep=$(stat -f %m "$txf" 2>/dev/null || echo 0)   # sort key + --days gate
+        if (( cutoff && ep < cutoff )); then
+          (( skipped++ )); continue        # outside the --days window
+        fi
+        title=$(_transcript_title "$txf")
+        [[ -n $title ]] || continue        # conversationless stub — nothing to resume
+        when=$(stat -f '%Sm' -t '%b %d %H:%M' "$txf" 2>/dev/null)
+        # Origin: which machine the conversation LAST RAN on — the <sid>.origin
+        # stamp claude-stamp-tmux writes next to the transcript (syncs with it).
+        # Blank for this machine / unstamped (pre-feature) transcripts; a raw
+        # hostname is translated to its $REMOTE_HOSTS key when the cache knows it.
+        org=; orgf="${txf%.jsonl}.origin"
+        if [[ -f $orgf ]]; then
+          org=$(<$orgf)
+          if [[ $org == $selfhost ]]; then org=
+          elif [[ -n ${host_alias[$org]:-} ]]; then org=${host_alias[$org]}
+          fi
+        fi
+        cands+=("$ep"$'\t'"$repo"$'\t'"$n"$'\t'"${${txf:t}%.jsonl}"$'\t'"$wt"$'\t'"$when"$'\t'"$title"$'\t'-$'\t'-$'\t'"${org[1,10]}")
+      done
+    done
+  done
+  (( skipped )) && echo "(${skipped} older conversation(s) outside the last ${days}d hidden — t resume --days all shows them)" >&2
+
+  # ONE global newest-first order by session time (the leading epoch field),
+  # never grouped by repo — the loop above emits repo-by-repo, so without this
+  # all-repos mode read as blocks per repo. Live rows carry the max sentinel
+  # and pin to the top. (On) = descending numeric on the leading field, which
+  # is then stripped so the positional fields below stay 1-9.
+  cands=("${(@On)cands}")
+  cands=("${(@)cands#*$'\t'}")
+
+  if (( ! $#cands )); then
+    if [[ -n $slot ]]; then
+      echo "No saved conversation for $repo slot $slot (nothing recorded in its worktree)." >&2
+      echo "Fresh session: t open $repo $slot · full picker: t push -p" >&2
+    elif [[ -n $all_mode ]]; then
+      echo "Nothing to resume — no dead slot in any worktree repo has a saved conversation." >&2
+      echo "Fresh session: t open <repo> · full picker: t push -p" >&2
+    else
+      echo "Nothing to resume for $repo — no dead slot has a saved conversation." >&2
+      echo "Fresh session: t open $repo · full picker: t push -p" >&2
+    fi
+    return 1
+  fi
+
+  # Picker rows: repo(1) slot(2) sid(3) wt(4) when(5) title(6) loc(7) alias(8)
+  # origin(9) — loc/alias are `-` for a dead (resumable) row, the `here`
+  # sentinel (displayed "● active") for a live local slot, or the host + remote
+  # alias for a slot live on a $REMOTE_HOSTS
+  # host (pick → attach in place, never a second owner); origin is the machine a
+  # dead conversation LAST RAN on (`-`/empty = here or unstamped — live rows name
+  # their host in the ● label instead). One ALIGNED display column (10) is
+  # appended here — fzf renders raw \t fields at literal tab stops (nothing
+  # lines up), so both fzf (--with-nth=10) and the no-fzf listing show the same
+  # pre-padded gh-style row: [repo]  slot  [origin]  date|●-where  title. The
+  # origin column only appears when some row has one (a single-machine setup
+  # never sees it); all-repos mode adds the repo column. Both pad to the widest
+  # value in this candidate set.
+  local pick c fprompt; local -a f
+  local rw=0 ow=0 i=1
+  if [[ -n $all_mode ]]; then
+    fprompt="resume (${days}d)> "
+    for c in "${(@)cands}"; do f=("${(@ps:\t:)c}"); (( ${#f[1]} > rw )) && rw=${#f[1]}; done
+  else
+    fprompt="resume $repo (${days}d)> "
+  fi
+  for c in "${(@)cands}"; do
+    f=("${(@ps:\t:)c}")
+    [[ ${f[9]:-} != - && -n ${f[9]:-} ]] && (( ${#f[9]} > ow )) && ow=${#f[9]}
+  done
+  for c in "${(@)cands}"; do
+    f=("${(@ps:\t:)c}")
+    org=${f[9]:-}; [[ $org == - ]] && org=
+    if [[ -n $all_mode ]]; then
+      if (( ow )); then
+        cands[$i]+=$'\t'"$(printf '%-*s  %2s  %-*s  %-12s  %s' "$rw" "$f[1]" "$f[2]" "$ow" "$org" "$f[5]" "$f[6]")"
+      else
+        cands[$i]+=$'\t'"$(printf '%-*s  %2s  %-12s  %s' "$rw" "$f[1]" "$f[2]" "$f[5]" "$f[6]")"
+      fi
+    else
+      if (( ow )); then
+        cands[$i]+=$'\t'"$(printf '%2s  %-*s  %-12s  %s' "$f[2]" "$ow" "$org" "$f[5]" "$f[6]")"
+      else
+        cands[$i]+=$'\t'"$(printf '%2s  %-12s  %s' "$f[2]" "$f[5]" "$f[6]")"
+      fi
+    fi
+    (( i++ ))
+  done
+  # Sole candidate auto-picks — but only when it is DEAD (loc == -, resumed in
+  # place here) or we have a TTY. A sole LIVE row without a TTY would hit
+  # _t_dev / _dev_remote_attach, both of which need a terminal to attach; fall
+  # through to the listing branch so the message matches the multi-candidate
+  # no-fzf case instead of failing hard from inside the attach helper.
+  if (( $#cands == 1 )) && f=("${(@ps:\t:)cands[1]}") && [[ $f[7] == - || -t 1 ]]; then
+    pick=${cands[1]}
+  elif [[ -t 0 && -t 1 ]] && command -v fzf >/dev/null; then
+    pick=$(print -rl -- "${(@)cands}" | fzf --delimiter=$'\t' --with-nth=10 --no-hscroll --prompt="$fprompt") || return 1
+    [[ -n $pick ]] || return 1
+  elif [[ -n $slot ]]; then
+    # Explicit slot but no TTY/fzf to pick with: the newest conversation IS the
+    # documented contract ("revive the slot's last conversation") — take it, and
+    # list the rest so a specific pick is one fzf-equipped call away.
+    pick=${cands[1]}
+    echo "Slot $slot has $#cands saved conversations — resuming the newest (run from a terminal to pick):" >&2
+    for c in "${(@)cands}"; do echo "  ${c##*$'\t'}" >&2; done
+  else
+    if [[ -n $all_mode ]]; then
+      echo "Several resumable conversations — name one (t resume <repo> <slot>):" >&2
+    else
+      echo "Several resumable conversations for $repo — name one (t resume $repo <slot>):" >&2
+    fi
+    for c in "${(@)cands}"; do echo "  ${c##*$'\t'}" >&2; done
+    return 1
+  fi
+  f=("${(@ps:\t:)pick}")
+  repo=$f[1]; slot=$f[2]; sid=$f[3]; wt=$f[4]
+  local loc="${f[7]:-}" lalias="${f[8]:-}"
+
+  # A LIVE row was picked: attach in place (local or on its host) — resuming it
+  # here would mint a second owner of the session id (see the scan note above).
+  if [[ $loc == here ]]; then
+    echo "Slot $slot is live locally — attaching."
+    _t_dev "$repo" "$slot"
+    return
+  elif [[ -n $loc && $loc != - ]]; then
+    _dev_remote_attach "$loc"$'\t'"$lalias"$'\t'"$slot" ""
+    return
+  fi
+
+  # The recorded cwd is the transcript's lookup key: rebuild the worktree at the
+  # IDENTICAL path when it was reaped/never existed here (branch + transcript are
+  # durable; the dir is not).
+  local cwd
+  cwd=$(_dev_ensure_session_cwd "$wt") || {
+    echo "Couldn't rebuild the worktree for $repo slot $slot ($wt) — is its dev/${${DEV_REPOS[$repo]}:t}-${slot} branch gone?" >&2
+    return 1
+  }
+
+  if [[ -n $no_tmux ]]; then
+    if [[ -n $TMUX && -n $CLAUDE_CODE_SESSION_ID ]]; then
+      echo "Run t resume --fg from a plain shell — it resumes the session in the foreground." >&2
+      return 1
+    fi
+    cd "$cwd" || return 1
+    claude -r "$sid"
+    return
+  fi
+
+  local session="dev-${repo}-${slot}"
+  echo "Resuming ${sid:0:8} in $session ($cwd)"
+  _dev_resume_session "$session" "$cwd" "$sid"
+  if [[ -z $TMUX && -t 0 && -t 1 ]]; then
+    tmux attach-session -t "$session"
+  else
+    echo "Attach with: t open $repo $slot"
   fi
 }
 
@@ -3079,7 +3922,7 @@ _t_pop() {
   sid=$(tmux show-environment -t "$session" CLAUDE_RESUME_ID 2>/dev/null | cut -d= -f2)
   if [[ -z $sid ]]; then
     # newest transcript for the dir: (N)ullglob, (om) order by mtime, [1] = first
-    local -a tx=( "$HOME/.claude/projects/${dir//\//-}"/*.jsonl(Nom[1]) )
+    local -a tx=( "$HOME/.claude/projects/${dir//[^A-Za-z0-9]/-}"/*.jsonl(Nom[1]) )
     sid=${${tx[1]:t}%.jsonl}
   fi
   [[ -n $sid ]] || { echo "Couldn't find a session id for $session ($dir)."; return 1; }
@@ -3107,7 +3950,8 @@ _t_pop() {
 
 # _tbeam_sync_transcript <cwd> <host> — copy a session's transcript dir to <host>
 # before it's resumed there. The conversation lives in
-# ~/.claude/projects/<cwd-with-slashes-as-dashes>/, and `claude -r <sid>` on the
+# ~/.claude/projects/<cwd-with-non-alnum-as-dashes>/ (/ and . alike → -, so a
+# worktree path under .worktrees encodes to --worktrees), and `claude -r <sid>` on the
 # far side can only resume what's already on its disk — so the bytes must land
 # first. csync/iCloud is the background convergence path; this is the immediate,
 # deterministic push for "beam it *now*".
@@ -3118,7 +3962,7 @@ _t_pop() {
 # (you'd worked there more recently) it's preserved rather than clobbered.
 _tbeam_sync_transcript() {
   local cwd="$1" host="$2"
-  local enc="${cwd//\//-}"                       # /a/b → -a-b, Claude's dir scheme
+  local enc="${cwd//[^A-Za-z0-9]/-}"             # /a/b → -a-b, Claude's dir scheme (/ AND . → -)
   local src="$HOME/.claude/projects/$enc/"
   [[ -d $src ]] || { echo "tbeam: no transcript dir for $cwd ($src)" >&2; return 1; }
   rsync -az --update --exclude='.DS_Store' -e ssh "$src" "$host:.claude/projects/$enc/"
@@ -3131,7 +3975,7 @@ _tbeam_sync_transcript() {
 # beam flows.
 _tbeam_pull_transcript() {
   local cwd="$1" host="$2"
-  local enc="${cwd//\//-}"                          # /a/b → -a-b, Claude's dir scheme
+  local enc="${cwd//[^A-Za-z0-9]/-}"                # /a/b → -a-b, Claude's dir scheme (/ AND . → -)
   local dst="$HOME/.claude/projects/$enc/"
   mkdir -p "$dst"
   rsync -az --update --exclude='.DS_Store' -e ssh "$host:.claude/projects/$enc/" "$dst"
@@ -3190,23 +4034,33 @@ _tbeam_kill_owner() {
 # first-class dev-<repo>-<slot> that dev/tread/tpop already understand. fg mode
 # just resumes the conversation in this ssh session's foreground.
 _tbeam_land() {
-  # Worktree mode: TB_CWD is the origin's per-session worktree path. The worktree root
-  # is the same on every host, so if it does not exist here yet, materialize the slot's
-  # worktree from its branch on origin (else fresh off main) before landing. (Unpushed
-  # working-tree edits at beam time are NOT carried — see the tbeam note in CLAUDE.md.)
-  if [[ ! -d $TB_CWD ]]; then
-    local _br _bs; _br=$(_dev_repo_of_dir "$TB_CWD"); _bs=${_br#*$'\t'}; _br=${_br%%$'\t'*}
-    [[ -n $_br && -n $_bs ]] && _dev_worktree_enabled "$_br" && _dev_worktree_create "$_br" "$_bs" >/dev/null
+  # Where does it land? Usually TB_CWD — the origin's per-session worktree path, same root
+  # on every host — but when THIS host's same-numbered slot is another session's (live,
+  # dirty, or diverged: the collision case), _dev_beam_land_cwd relands into a fresh slot,
+  # relocating the already-synced transcript with it (the sender ran _tbeam_sync_transcript
+  # before invoking us, so the sid's files are on disk either way).
+  local land; land=$(_dev_beam_land_cwd "$TB_CWD" "$TB_SID") || return 1
+  if [[ $land == "$TB_CWD" ]]; then
+    # Worktree mode: if TB_CWD does not exist here yet, materialize the slot's worktree
+    # from its branch on origin (else fresh off main) before landing. Uncommitted edits
+    # ride along too: the origin commit-all + pushed before the move, and the
+    # _dev_worktree_beam_sync below fast-forwards this worktree to them (no-op for a
+    # freshly created one; the real work is when it pre-existed and was reused stale).
+    if [[ ! -d $TB_CWD ]]; then
+      local _br _bs; _br=$(_dev_repo_of_dir "$TB_CWD"); _bs=${_br#*$'\t'}; _br=${_br%%$'\t'*}
+      [[ -n $_br && -n $_bs ]] && _dev_worktree_enabled "$_br" && _dev_worktree_create "$_br" "$_bs" >/dev/null
+    fi
+    _dev_worktree_beam_sync "$TB_CWD"
   fi
-  cd "$TB_CWD" 2>/dev/null || { echo "tbeam: $TB_CWD not found on ${HOST:-this host}" >&2; return 1; }
+  cd "$land" 2>/dev/null || { echo "tbeam: $land not found on ${HOST:-this host}" >&2; return 1; }
   if [[ "$TB_MODE" == fg ]]; then
     exec claude -r "$TB_SID"                     # owns this ssh TTY; dies with it
   fi
   local repo slot session
-  read -r repo slot < <(_dev_slot_for_cwd "$TB_CWD")
-  [[ -n $repo && -n $slot ]] || { echo "tbeam: couldn't map $TB_CWD to a dev slot" >&2; return 1; }
+  read -r repo slot < <(_dev_slot_for_cwd "$land")
+  [[ -n $repo && -n $slot ]] || { echo "tbeam: couldn't map $land to a dev slot" >&2; return 1; }
   session="dev-${repo}-${slot}"
-  _dev_resume_session "$session" "$TB_CWD" "$TB_SID"
+  _dev_resume_session "$session" "$land" "$TB_SID"
   if [[ -n $TB_ATTACH ]]; then
     exec tmux attach -t "$session"              # drop the ssh caller straight in
   fi
@@ -3374,11 +4228,15 @@ _t_beam() {
     local dir; dir=$(tmux display-message -p -t "$session" '#{session_path}' 2>/dev/null)
     sid=$(_dev_session_sid "$session" "$dir")
     if [[ -z $sid ]]; then                          # pre-hook fallback: newest transcript in the dir
-      local -a tx=( "$HOME/.claude/projects/${dir//\//-}"/*.jsonl(Nom[1]) )
+      local -a tx=( "$HOME/.claude/projects/${dir//[^A-Za-z0-9]/-}"/*.jsonl(Nom[1]) )
       sid=${${tx[1]:t}%.jsonl}
     fi
     [[ -n $sid ]] || { echo "tbeam: couldn't find a session id for $session" >&2; return 1; }
-    cwd=${DEV_REPOS[$repo_arg]}
+    # The session's REAL dir is its tmux session_path ($dir) — the per-session worktree for
+    # a worktree repo, the dev clone for an opt-out one. Use it (not the canonical DEV_REPOS
+    # dir) so the transcript rsync + TB_CWD + the worktree push below all target where the
+    # session actually runs; fall back to the repo dir only if session_path is unreadable.
+    cwd=${dir:-${DEV_REPOS[$repo_arg]}}
   elif [[ -n $sid_arg ]]; then
     setopt local_options null_glob
     local -a tx=( "$HOME/.claude/projects"/*/"$sid_arg"*.jsonl )
@@ -3413,17 +4271,19 @@ _t_beam() {
   fi
 
   echo "⟳ Beaming ${sid[1,8]}… ($cwd) → $host"
-  _tbeam_sync_transcript "$cwd" "$host" || return 1
-
-  # It's a MOVE, not a copy: now that the transcript is on $host, stop the origin
-  # (here) so the id has one live owner. Two cases for "the origin":
+  # It's a MOVE, not a copy: stop the origin BEFORE snapshotting code + transcript,
+  # so a still-live claude can't keep editing files in the worktree (the push below
+  # would miss those edits) or appending to the transcript (the sync below would
+  # miss the tail) between the snapshot and the move — leaving the destination to
+  # resume with stale code despite a newer transcript. Two cases for "the origin":
   #   • a LOCAL dev slot (picker mode, or an -s id that's live in a slot) — kill it
   #     now, before the blocking ssh -t branches below take over the terminal. We
   #     aren't attached to it, so this is safe. (self_move excludes the case where
   #     that slot is the very claude we're running inside.)
   #   • THIS foreground claude (self_move — a current-session move) — can't
   #     kill-session it; instead we SIGTERM it at the very end (see the detached
-  #     branch), mirroring tpush's auto-exit.
+  #     branch), mirroring tpush's auto-exit. No race here either: claude is
+  #     blocked executing this very command, so it can't edit files mid-beam.
   if [[ -z $self_move ]]; then
     local killed; killed=$(TB_SID=$sid _tbeam_kill_owner)
     if [[ $killed == dev-* ]]; then
@@ -3450,6 +4310,10 @@ _t_beam() {
       fi
     fi
   fi
+  if ! _dev_worktree_beam_push "$cwd" "$host"; then   # carry uncommitted worktree edits ahead of the move
+    echo "⚠ couldn't fully commit/push $cwd — $host may resume with stale code (the edits stay here)" >&2
+  fi
+  _tbeam_sync_transcript "$cwd" "$host" || return 1
 
   # Foreground mode: resume straight in the ssh session (needs a real terminal).
   if [[ -n $fg ]]; then
@@ -3506,7 +4370,7 @@ _t_beam() {
 #     internal session-rows/land/kill-owner) run straight through via `command t`
 #     (the `command` builtin reaches ~/bin/t past this function, dodging the
 #     name collision — same trick the claude() wrapper uses).
-#   • shell-bound verbs (open/pop/push/find) map to the existing zsh functions,
+#   • shell-bound verbs (open/pop/push/resume/find/cd) map to the existing zsh functions,
 #     which ALREADY do the cd + `claude -r` in the current terminal and the tpush
 #     sentinel handoff correctly *because they run in the calling shell* — a bin
 #     subprocess cannot. No resolve protocol is needed: the shim just calls them.
@@ -3521,13 +4385,71 @@ t() {
   [[ -z $verb ]] && { command t; return; }
   shift
   case "$verb" in
-    open)  _t_open "$@" ;;            # → _t_dev (local / -r or auto-detect remote attach / -f / fg adopt)
-    pop)   _t_pop "$@" ;;             # → cd + claude -r in THIS terminal
-    push)  _t_push "$@" ;;            # → sentinel handoff; claude() wrapper spawns post-exit
-    find)  _t_find "$@" ;;            # → rank/pick then cd + claude -r here
-    beam)  _t_beam_xlate "$@" ;;      # → _t_beam (host moves from --host to a positional)
-    *)     command t "$verb" "$@" ;;  # ls/read/plan/paste/kill/on/session-rows/land/kill-owner
+    open)   _t_open "$@" ;;           # → _t_dev (local / -r or auto-detect remote attach / -f / fg adopt)
+    pop)    _t_pop "$@" ;;            # → cd + claude -r in THIS terminal
+    resume) _t_resume "$@" ;;         # → revive a dead slot's chat (rebuilds a reaped worktree; --fg → here)
+    push)   _t_push "$@" ;;           # → sentinel handoff; claude() wrapper spawns post-exit
+    find)   _t_find "$@" ;;           # → rank/pick then cd + claude -r here
+    cd)     _t_cd "$@" ;;             # → cd THIS shell into a slot's worktree
+    beam)   _t_beam_xlate "$@" ;;     # → _t_beam (host moves from --host to a positional)
+    *)      command t "$verb" "$@" ;; # ls/read/plan/paste/kill/on/session-rows/land/kill-owner
   esac
+}
+
+# _t_cd — cd the CALLING shell into a dev slot's worktree (gh-grammar `t cd [repo] [slot]`).
+#   t cd <repo> <slot>   → that slot's worktree ($DEV_WORKTREE_ROOT/<basename>/<slot>)
+#   t cd <slot>          → that slot of the repo cwd is in (mirrors t read/paste)
+#   t cd <repo>          → the repo's only worktree; several → fzf pick; none → the repo dir
+#   t cd                 → fzf-pick across every worktree on disk
+# Navigation only: it never creates a worktree (`t open` owns creation) and never
+# touches tmux — a missing slot is an error with the `t open` hint. The picker shows
+# the branch actually checked out in each worktree (worktrees parked on a non-dev/*
+# branch by hand are common), read via git, not derived from the slot name.
+_t_cd() {
+  emulate -L zsh
+  local repo="$1" slot="$2"
+  # slot-only shorthand: `t cd 4` ≡ slot 4 of the repo cwd is in
+  if [[ $repo == <-> && -z $slot ]]; then
+    slot=$repo
+    repo=$(_t_infer_repo "$slot") || {
+      echo "t cd: not inside a DEV_REPOS repo — name one: t cd <repo> $slot" >&2; return 1 }
+  fi
+  if [[ -n $repo && -z ${DEV_REPOS[$repo]:-} ]]; then
+    echo "t cd: unknown repo '$repo' (known: ${(k)DEV_REPOS})" >&2; return 1
+  fi
+  if [[ -n $repo && -n $slot ]]; then
+    local wt; wt=$(_dev_worktree_path "$repo" "$slot")
+    [[ -e $wt/.git ]] || {
+      echo "t cd: no worktree at $wt  ('t open $repo $slot' creates one)" >&2; return 1 }
+    cd "$wt"; return
+  fi
+  # No slot: pick among the worktrees that exist on disk — the named repo's, else all.
+  # Match the rest of the worktree tooling (_dev_worktree_create / _dev_worktree_sweep_run):
+  # require .git so a leftover / hand-made numeric dir under $DEV_WORKTREE_ROOT is not offered.
+  local -a wts
+  if [[ -n $repo ]]; then
+    wts=("$DEV_WORKTREE_ROOT/${DEV_REPOS[$repo]:t}"/<->(N/ne:'[[ -e $REPLY/.git ]]':))
+    (( ${#wts} )) || { cd "${DEV_REPOS[$repo]}"; return }   # none yet → the repo itself
+  else
+    wts=("$DEV_WORKTREE_ROOT"/*/<->(N/ne:'[[ -e $REPLY/.git ]]':))
+    (( ${#wts} )) || {
+      echo "t cd: no worktrees under $DEV_WORKTREE_ROOT ('t open <repo>' creates one)" >&2; return 1 }
+  fi
+  (( ${#wts} == 1 )) && { cd "${wts[1]}"; return }
+  if [[ -t 0 && -t 1 ]] && command -v fzf >/dev/null 2>&1; then
+    local wt br line; local -a rows
+    for wt in "${wts[@]}"; do
+      br=$(git -C "$wt" branch --show-current 2>/dev/null)
+      rows+=("${wt}"$'\t'"${wt#$DEV_WORKTREE_ROOT/}"$'\t'"${br:-?}")
+    done
+    line=$(print -rl -- "${rows[@]}" \
+             | fzf --with-nth=2.. --delimiter='\t' --prompt='t cd > ' --height=40% --reverse) || return 1
+    cd "${line%%$'\t'*}"; return
+  fi
+  local -a short; short=("${wts[@]#$DEV_WORKTREE_ROOT/}")
+  print -rl -- "t cd: several worktrees — name one (t cd <repo> <slot>):" \
+    "${short[@]/#/  }" >&2
+  return 1
 }
 
 # _t_open — map gh-grammar `t open <repo> [slot] [--new|--fg|--remote] [--host H]`
@@ -3758,13 +4680,16 @@ alias h=help   # `h` is a shorthand for `help`
 # key for `on`), and slot/flags after. Pulls live from the ${(k)DEV_REPOS} /
 # ${(k)REMOTE_HOSTS} arrays so it stays current with ~/.zshrc.local.
 _t() {
-  local -a verbs=(open ls kill push pop beam read plan paste find on)
+  local -a verbs=(open ls kill push pop resume beam read plan paste find on cursor)
   if (( CURRENT == 2 )); then
     _describe -t verbs 't verb' verbs
     return
   fi
   case ${words[2]} in
-    open|kill|read|plan|paste|beam)
+    cursor)
+      if (( CURRENT == 3 )); then _values 'chat / action' ls resume -p --from --host
+      else _values 'flag' --host --from -p --pick -a --attach -h --help; fi ;;
+    open|kill|read|plan|paste|beam|resume)
       if   (( CURRENT == 3 )); then _values 'repo' ${(k)DEV_REPOS}
       elif (( CURRENT == 4 )); then _values 'slot' 1 2 3 4 new fg
       else _values 'flag' --new --fg --remote -y --yes -a --all --host --from -d --detach -p --pick -s --session -h --help; fi ;;

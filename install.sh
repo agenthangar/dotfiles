@@ -88,6 +88,7 @@ link() {
 link "$LINK_SRC/.zshrc"               "$HOME/.zshrc"
 link "$LINK_SRC/bin/sleep-manager"    "$HOME/bin/sleep-manager"
 link "$LINK_SRC/bin/csync"            "$HOME/bin/csync"
+link "$LINK_SRC/bin/cursor-beam"      "$HOME/bin/cursor-beam"
 link "$LINK_SRC/bin/pii-scan"         "$HOME/bin/pii-scan"
 link "$LINK_SRC/bin/claude-stamp-tmux" "$HOME/bin/claude-stamp-tmux"
 link "$LINK_SRC/bin/t"                "$HOME/bin/t"

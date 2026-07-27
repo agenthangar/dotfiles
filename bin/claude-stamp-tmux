@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# claude-stamp-tmux — SessionStart hook. Three jobs:
+# claude-stamp-tmux — SessionStart hook. Four jobs:
 #   1. (in tmux) stamp this Claude session's id onto its tmux session as
 #      CLAUDE_RESUME_ID, so tplan/tpop/dev can target the *exact* session even when
 #      several slots share one project dir.
@@ -11,10 +11,16 @@
 #   3. (always) touch a last-OPENED stamp, `opened/<session_id>`, in the same cache
 #      dir. Resuming a conversation appends nothing to its transcript, so transcript
 #      mtime alone leaves a just-reopened session looking days old in the resume
-#      pickers; _claude_session_rows / tfind rank by max(transcript mtime, this
-#      stamp) and mark opened-but-unwritten rows ↻. NOT written to the transcript
-#      itself: csync's conflict policy is newest-mtime-wins, so bumping transcript
-#      mtime on open would let a stale copy beat a fuller one from another machine.
+#      pickers; _claude_session_rows / tfind / `t resume` rank by max(transcript
+#      mtime, this stamp) and mark opened-but-unwritten rows ↻. NOT written to the
+#      transcript itself: csync's conflict policy is newest-mtime-wins, so bumping
+#      transcript mtime on open would let a stale copy beat a fuller one from
+#      another machine.
+#   4. (always) write an origin stamp — `<sid>.origin` = `hostname -s`, INTO the
+#      session's project dir next to its transcript, so it syncs wherever the
+#      transcript does (csync, `t resume -r`). Unlike the per-host opened/ stamp,
+#      provenance must travel: it feeds `t resume`'s origin column, and re-running
+#      elsewhere re-stamps it there — origin always means "last ran on".
 #
 # The tmux stamp fixes: tplan/tpop resolve a slot's session id from CLAUDE_RESUME_ID,
 # and when it's unset they fall back to "newest .jsonl by mtime in the project dir" —
@@ -62,6 +68,16 @@ if [[ $comm == claude && -n $pid ]]; then
   # shellcheck disable=SC2015  # best-effort write; the `|| true` is the intended catch-all
   mkdir -p "$reg" 2>/dev/null && printf '%s\t%s\n' "$sid" "$cwd" > "$reg/$pid" 2>/dev/null || true
 fi
+
+# Origin stamp: record WHICH MACHINE this session (last) ran on, next to its
+# transcript — `<sid>.origin` inside the project dir, so csync / `t resume -r`
+# carry it wherever the transcript syncs. Transcript .jsonl lines record no
+# hostname, so this file is the only provenance `t resume` has for its host
+# column. Resuming a synced conversation on another machine re-fires this hook
+# with the same sid and re-stamps it there — origin always means "last ran on".
+proj="$HOME/.claude/projects/$(printf '%s' "$cwd" | tr -c 'A-Za-z0-9' '-')"
+# shellcheck disable=SC2015  # best-effort; never fail the hook
+[[ -d $proj ]] && hostname -s > "$proj/$sid.origin" 2>/dev/null || true
 
 # shellcheck disable=SC2015  # best-effort stamp; never fail the hook
 [[ -n ${TMUX:-} ]] && tmux set-environment CLAUDE_RESUME_ID "$sid" 2>/dev/null || true

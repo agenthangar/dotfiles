@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# claude-stamp-tmux — SessionStart hook. Two jobs:
+# claude-stamp-tmux — SessionStart hook. Four jobs:
 #   1. (in tmux) stamp this Claude session's id onto its tmux session as
 #      CLAUDE_RESUME_ID, so tplan/tpop/dev can target the *exact* session even when
 #      several slots share one project dir.
@@ -8,6 +8,19 @@
 #      claude back to its session id, and thus its real transcript title. macOS won't
 #      let `dev ls` read another process's env, and csync scrambles transcript
 #      birthtimes, so the only reliable pid→session_id link is recorded here at start.
+#   3. (always) touch a last-OPENED stamp, `opened/<session_id>`, in the same cache
+#      dir. Resuming a conversation appends nothing to its transcript, so transcript
+#      mtime alone leaves a just-reopened session looking days old in the resume
+#      pickers; _claude_session_rows / tfind / `t resume` rank by max(transcript
+#      mtime, this stamp) and mark opened-but-unwritten rows ↻. NOT written to the
+#      transcript itself: csync's conflict policy is newest-mtime-wins, so bumping
+#      transcript mtime on open would let a stale copy beat a fuller one from
+#      another machine.
+#   4. (always) write an origin stamp — `<sid>.origin` = `hostname -s`, INTO the
+#      session's project dir next to its transcript, so it syncs wherever the
+#      transcript does (csync, `t resume -r`). Unlike the per-host opened/ stamp,
+#      provenance must travel: it feeds `t resume`'s origin column, and re-running
+#      elsewhere re-stamps it there — origin always means "last ran on".
 #
 # The tmux stamp fixes: tplan/tpop resolve a slot's session id from CLAUDE_RESUME_ID,
 # and when it's unset they fall back to "newest .jsonl by mtime in the project dir" —
@@ -35,6 +48,13 @@ except Exception:
 [[ -n $sid ]] || exit 0
 [[ -n $cwd ]] || cwd=$PWD
 
+reg="${XDG_CACHE_HOME:-$HOME/.cache}/claude-sessions"
+
+# Last-opened stamp: a subdir keeps sid stamps clear of the pid registry (whose
+# prune loop globs plain files only, so `opened/` is never swept as a dead pid).
+# shellcheck disable=SC2015  # best-effort stamp; never fail the hook
+mkdir -p "$reg/opened" 2>/dev/null && touch "$reg/opened/$sid" 2>/dev/null || true
+
 # Registry: key by the LIVE claude pid (an ancestor of this hook), so `dev ls` can
 # look it up for a running foreground claude. Walk up from $PPID to the nearest
 # process named `claude`; record under it. (`dev ls` prunes dead-pid entries.)
@@ -45,7 +65,6 @@ while [[ -n $pid && $pid != 1 && $n -lt 10 ]]; do
   pid=$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' '); n=$((n+1))
 done
 if [[ $comm == claude && -n $pid ]]; then
-  reg="${XDG_CACHE_HOME:-$HOME/.cache}/claude-sessions"
   # shellcheck disable=SC2015  # best-effort write; the `|| true` is the intended catch-all
   mkdir -p "$reg" 2>/dev/null && printf '%s\t%s\n' "$sid" "$cwd" > "$reg/$pid" 2>/dev/null || true
 fi

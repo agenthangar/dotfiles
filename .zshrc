@@ -6,11 +6,15 @@ export PATH="$HOME/bin:$HOME/.local/bin:$PATH"
 # matters most: the whole `t` slot machinery rides on tmux, and every t-driven
 # tmux call goes through `zsh -lic`, so setting it here keeps client + server on
 # one socket dir. No-op on a standard 1777 /tmp.
-if [[ ! -w "${TMPDIR:-/tmp}" ]]; then
-  export TMPDIR="$HOME/.cache/tmp"
+# Gate on /tmp ITSELF, not $TMPDIR: TMPDIR is exported and inherited, but
+# TMPPREFIX is shell-local — a nested `zsh -lic` (how bin/t runs every helper)
+# inherits the writable TMPDIR, and a TMPDIR-based gate would skip this block
+# there, leaving the nested shell's heredocs pointed at the unwritable /tmp/zsh.
+if [[ ! -w /tmp ]]; then
+  export TMPDIR="${TMPDIR:-$HOME/.cache/tmp}"
   mkdir -p "$TMPDIR" 2>/dev/null
   TMPPREFIX="$TMPDIR/zsh"
-  export TMUX_TMPDIR="$TMPDIR"
+  export TMUX_TMPDIR="${TMUX_TMPDIR:-$TMPDIR}"
 fi
 
 # Initialize the completion system before sourcing anything that calls `compdef`

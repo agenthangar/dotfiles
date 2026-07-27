@@ -647,7 +647,21 @@ unset _host
 # once every 15 min, fire csync detached in the background. A stamp file gates
 # the interval (written *before* the run so overlapping shells don't double-fire).
 mkdir -p "$HOME/.cache" "$HOME/Library/Logs" 2>/dev/null
-zmodload zsh/datetime 2>/dev/null                     # $EPOCHSECONDS, no `date` fork
+zmodload zsh/datetime 2>/dev/null                     # $EPOCHSECONDS + strftime, no `date` fork
+# Only the zstat builtin (-F), NOT the module's `stat` — that would shadow the
+# system stat the rest of this file (and Linux hosts) call. zstat is the portable
+# mtime source: BSD `stat -f %m` and GNU `stat -c %Y` disagree, zstat is neither.
+zmodload -F zsh/stat b:zstat 2>/dev/null
+# _stat_birth <file> — file creation (birth) epoch, empty/rc1 when unknowable.
+# The one stat field zstat lacks; BSD spells it `-f %B`, GNU `-c %W` (which
+# prints 0 or - on filesystems that don't record it — treated as unknown).
+_stat_birth() {
+  local b
+  if [[ $OSTYPE == darwin* ]]; then b=$(command stat -f %B "$1" 2>/dev/null)
+  else b=$(command stat -c %W "$1" 2>/dev/null); fi
+  [[ -n $b && $b != 0 && $b != - ]] || return 1
+  print -r -- "$b"
+}
 autoload -Uz add-zsh-hook
 _csync_periodic() {
   local interval=900 stamp="$HOME/.cache/csync-last-run" now=$EPOCHSECONDS last=0
@@ -1035,12 +1049,16 @@ _dev_summary_for_pid() {
   local -a tx
   if [[ -n $cpid ]]; then
     start=$(ps -o lstart= -p "$cpid" 2>/dev/null)
-    start=$(date -j -f '%a %b %d %T %Y' "${start## #}" +%s 2>/dev/null)
+    if [[ $OSTYPE == darwin* ]]; then
+      start=$(date -j -f '%a %b %d %T %Y' "${start## #}" +%s 2>/dev/null)
+    else
+      start=$(date -d "${start## #}" +%s 2>/dev/null)   # GNU date parses lstart natively
+    fi
   fi
   if [[ -n $start ]]; then
     local f b best bestdiff diff
     for f in "$proj"/*.jsonl(N); do
-      b=$(stat -f %B "$f" 2>/dev/null) || continue
+      b=$(_stat_birth "$f") || continue
       (( b < start - 2 )) && continue                  # born before this claude → not ours
       diff=$(( b - start ))
       if [[ -z $bestdiff ]] || (( diff < bestdiff )); then bestdiff=$diff; best=$f; fi
@@ -1136,6 +1154,7 @@ _dev_fg_rows() {
     [[ -n ${inslot[$pid]} || $pid == $me ]] && continue
     sid= cwd=
     [[ -r $reg/$pid ]] && IFS=$'\t' read -r sid cwd < "$reg/$pid"
+    [[ -n $cwd ]] || cwd=$(readlink "/proc/$pid/cwd" 2>/dev/null)   # Linux: no lsof needed
     [[ -n $cwd ]] || cwd=$(lsof -a -p "$pid" -d cwd -Fn 2>/dev/null | sed -n 's/^n//p' | head -1)
     [[ -n $cwd ]] || continue
     repo=$(_dev_repo_of_dir "$cwd" 2>/dev/null); repo=${repo%%$'\t'*}   # worktree-aware
@@ -1695,6 +1714,7 @@ _dev_kill_fg() {
     [[ -n ${inslot[$pid]} || $pid == $me ]] && continue
     sid= cwd=
     [[ -r $reg/$pid ]] && IFS=$'\t' read -r sid cwd < "$reg/$pid"
+    [[ -n $cwd ]] || cwd=$(readlink "/proc/$pid/cwd" 2>/dev/null)   # Linux: no lsof needed
     [[ -n $cwd ]] || cwd=$(lsof -a -p "$pid" -d cwd -Fn 2>/dev/null | sed -n 's/^n//p' | head -1)
     [[ -n $cwd ]] || continue
     repo=$(_dev_repo_of_dir "$cwd" 2>/dev/null); repo=${repo%%$'\t'*}
@@ -3026,14 +3046,14 @@ _t_resume() {
       fi
       tx=( "$HOME/.claude/projects/${wt//[^A-Za-z0-9]/-}"/*.jsonl(Nom) )
       for txf in "${(@)tx}"; do
-        ep=$(stat -f %m "$txf" 2>/dev/null || echo 0)   # sort key + --days gate
+        ep=$(zstat +mtime "$txf" 2>/dev/null || echo 0)   # sort key + --days gate
         # Effective recency = max(transcript mtime, opened stamp): resuming
         # writes nothing to the .jsonl, so without the stamp a just-reopened
         # conversation sorts — and --days-gates — as days old. Stamp newer →
         # the row is dated by the stamp and marked ↻.
         reopened=; opf="$opdir/${${txf:t}%.jsonl}"
         if [[ -f $opf ]]; then
-          opep=$(stat -f %m "$opf" 2>/dev/null || echo 0)
+          opep=$(zstat +mtime "$opf" 2>/dev/null || echo 0)
           (( opep > ep )) && { ep=$opep; reopened=1; }
         fi
         if (( cutoff && ep < cutoff )); then
@@ -3041,11 +3061,10 @@ _t_resume() {
         fi
         title=$(_transcript_title "$txf")
         [[ -n $title ]] || continue        # conversationless stub — nothing to resume
-        if [[ -n $reopened ]]; then
-          when="$(stat -f '%Sm' -t '%b %d %H:%M' "$opf" 2>/dev/null) ↻"
-        else
-          when=$(stat -f '%Sm' -t '%b %d %H:%M' "$txf" 2>/dev/null)
-        fi
+        # ep already reflects the reopened stamp (ep=opep above), so one
+        # strftime covers both branches; ↻ marks the stamp-dated rows.
+        when=; (( ep )) && when=$(strftime '%b %d %H:%M' "$ep" 2>/dev/null)
+        [[ -n $reopened && -n $when ]] && when+=" ↻"
         # PR-in-session tag: the LAST github.com …/pull/N URL in the transcript
         # (a `gh pr create` lands its URL in the tool output) names the
         # session's PR; append " · #N <state>" to the title. State is read from
@@ -3062,7 +3081,7 @@ _t_resume() {
           fi
           title+=" · #$prnum${prst:+ ${(L)prst}}"
           if [[ $prst != MERGED && $prst != CLOSED && -z ${_prspawned[$prkey]:-} ]]; then
-            prmt=$(stat -f %m "$prcf" 2>/dev/null || echo 0)
+            prmt=$(zstat +mtime "$prcf" 2>/dev/null || echo 0)
             if (( EPOCHSECONDS - prmt > 300 )); then
               _prspawned[$prkey]=1
               mkdir -p "$prdir" 2>/dev/null
@@ -3071,6 +3090,9 @@ _t_resume() {
             fi
           fi
         fi
+=======
+        when=; (( ep )) && when=$(strftime '%b %d %H:%M' "$ep" 2>/dev/null)
+>>>>>>> 979d8da (linux: support Linux hosts as remote nodes)
         # Origin: which machine the conversation LAST RAN on — the <sid>.origin
         # stamp claude-stamp-tmux writes next to the transcript (syncs with it).
         # Blank for this machine / unstamped (pre-feature) transcripts; a raw

@@ -3120,9 +3120,6 @@ _t_resume() {
             fi
           fi
         fi
-=======
-        when=; (( ep )) && when=$(strftime '%b %d %H:%M' "$ep" 2>/dev/null)
->>>>>>> 979d8da (linux: support Linux hosts as remote nodes)
         # Origin: which machine the conversation LAST RAN on — the <sid>.origin
         # stamp claude-stamp-tmux writes next to the transcript (syncs with it).
         # Blank for this machine / unstamped (pre-feature) transcripts; a raw

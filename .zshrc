@@ -96,14 +96,26 @@ _help_style() {
 # (and some terminals) start with SSH_AUTH_SOCK unset and `ssh-add` dies with
 # "Could not open a connection to your authentication agent". Pin the socket to
 # a stable path and start one agent only if none is reachable; every shell then
-# reuses it, so a key added once stays loaded until reboot. Passphrase + key
-# loading are handled lazily by ~/.ssh/config (AddKeysToAgent + UseKeychain).
+# reuses it, so a key added once stays loaded until reboot. An empty agent is
+# refilled from the macOS Keychain (--apple-load-keychain), so a reboot does
+# not bring back per-connection passphrase prompts — background ssh users
+# (worktree-sweep fetches, csync, pr-watch) prompt-spam the console otherwise.
+# Requires the passphrase to be IN the Keychain: one-time per machine, run
+#   ssh-add --apple-use-keychain ~/.ssh/id_ed25519
+# (UseKeychain in ~/.ssh/config only READS the Keychain; it never writes it.)
+# The load fails silently where the Keychain is locked (inbound ssh sessions).
 export SSH_AUTH_SOCK="$HOME/.ssh/agent.sock"
 ssh-add -l >/dev/null 2>&1
-if [ $? -eq 2 ]; then            # 2 = no agent reachable (1 = up but no keys)
-  rm -f "$SSH_AUTH_SOCK"         # clear any stale socket from a dead agent
-  ssh-agent -a "$SSH_AUTH_SOCK" >/dev/null 2>&1
-fi
+case $? in
+  2)                             # no agent reachable: spawn one, then fill it
+    rm -f "$SSH_AUTH_SOCK"       # clear any stale socket from a dead agent
+    ssh-agent -a "$SSH_AUTH_SOCK" >/dev/null 2>&1
+    ssh-add --apple-load-keychain >/dev/null 2>&1
+    ;;
+  1)                             # agent up but empty (e.g. keys were cleared)
+    ssh-add --apple-load-keychain >/dev/null 2>&1
+    ;;
+esac
 
 # prview — PR status at a glance: mergeability, merge state, per-check verdicts
 #

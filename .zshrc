@@ -2822,7 +2822,13 @@ _t_plan() {
 # are EVERY conversation saved in a dead slot's worktree (newest first — an old one is
 # still resumable), minus conversationless stubs (no real prompt → nothing to revive,
 # and their untitled rows masked real ones). House picker convention: one candidate →
-# use it, several → fzf, none → bail with a hint; outside any DEV_REPOS dir a bare
+# use it, several → fzf, none → bail with a hint. The fzf picker is MULTI-SELECT
+# (tab marks rows; plain Enter is the usual single pick): every marked DEAD row
+# revives into its own detached dev slot, the first revived (topmost = newest)
+# attaches, the rest print `t open` hints. A live mark is already open (noted, never
+# resumed — one-live-owner), a second conversation marked for a slot an earlier mark
+# just took is skipped (one tmux session per dev-<repo>-<slot> name), and --fg
+# refuses a multi-pick (one terminal, one inline claude); outside any DEV_REPOS dir a bare
 # `t resume` scans EVERY worktree repo (the
 # `t ls` unscoped convention) with a repo column in the picker; -a/--all forces that
 # widening from anywhere (the `t ls -a` flag). -r/--remote PULLS the latest
@@ -3210,7 +3216,8 @@ _t_resume() {
   if (( $#cands == 1 )) && f=("${(@ps:\t:)cands[1]}") && [[ $f[7] == - || -t 1 ]]; then
     pick=${cands[1]}
   elif [[ -t 0 && -t 1 ]] && command -v fzf >/dev/null; then
-    pick=$(print -rl -- "${(@)cands}" | fzf --delimiter=$'\t' --with-nth=10 --no-hscroll --prompt="$fprompt") || return 1
+    pick=$(print -rl -- "${(@)cands}" | fzf --multi --delimiter=$'\t' --with-nth=10 --no-hscroll \
+      --header='tab marks several — every mark revives, first attaches' --prompt="$fprompt") || return 1
     [[ -n $pick ]] || return 1
   elif [[ -n $slot ]]; then
     # Explicit slot but no TTY/fzf to pick with: the newest conversation IS the
@@ -3228,6 +3235,64 @@ _t_resume() {
     for c in "${(@)cands}"; do echo "  ${c##*$'\t'}" >&2; done
     return 1
   fi
+  # Multi-pick (only the fzf branch can produce one — $pick then holds one row
+  # per line, in LIST order, so the first row is the newest / a pinned live one).
+  # Revive every marked dead row detached, then attach the FIRST revived slot —
+  # a resume ends inside a session, same as a single pick; the rest are one
+  # `t open` away. Live marks are already open (one-live-owner: never a second
+  # `claude -r`) and a second conversation marked for a slot an earlier mark
+  # just took can't have the tmux name — both become hints, not errors, so one
+  # stray tab-mark never aborts the batch.
+  local -a picks; picks=("${(@f)pick}")
+  if (( $#picks > 1 )); then
+    if [[ -n $no_tmux ]]; then
+      echo "t resume --fg resumes ONE conversation inline in this terminal — mark a single row (or drop --fg)." >&2
+      return 1
+    fi
+    local -A mp_taken
+    local mp_first_repo= mp_first_slot= mp_cwd mp_session mp_loc
+    local -a mp_hints
+    for pick in "${(@)picks}"; do
+      f=("${(@ps:\t:)pick}")
+      repo=$f[1]; slot=$f[2]; sid=$f[3]; wt=$f[4]; mp_loc="${f[7]:-}"
+      if [[ $mp_loc == here ]]; then
+        echo "· $repo $slot is already live here — attach with: t open $repo $slot"
+        continue
+      elif [[ -n $mp_loc && $mp_loc != - ]]; then
+        echo "· $repo $slot is live on $mp_loc — attach with: t open $repo $slot"
+        continue
+      fi
+      if [[ -n ${mp_taken[$repo/$slot]:-} ]]; then
+        echo "· ${sid:0:8}: $repo slot $slot already revived by an earlier mark — skipped (t resume $repo $slot swaps it)." >&2
+        continue
+      fi
+      if ! mp_cwd=$(_dev_ensure_session_cwd "$wt"); then
+        echo "· $repo $slot: couldn't rebuild its worktree ($wt) — skipped." >&2
+        continue
+      fi
+      mp_taken[$repo/$slot]=1
+      mp_session="dev-${repo}-${slot}"
+      echo "Resuming ${sid:0:8} in $mp_session ($mp_cwd)"
+      _dev_resume_session "$mp_session" "$mp_cwd" "$sid"
+      if [[ -z $mp_first_repo ]]; then
+        mp_first_repo=$repo; mp_first_slot=$slot
+      else
+        mp_hints+=("t open $repo $slot")
+      fi
+    done
+    if [[ -z $mp_first_repo ]]; then
+      echo "Nothing revived — every marked row was already live or unrecoverable." >&2
+      return 1
+    fi
+    (( $#mp_hints )) && echo "Also revived — attach with: ${(j: · :)mp_hints}"
+    if [[ -z $TMUX && -t 0 && -t 1 ]]; then
+      tmux attach-session -t "dev-${mp_first_repo}-${mp_first_slot}"
+    else
+      echo "Attach with: t open $mp_first_repo $mp_first_slot"
+    fi
+    return
+  fi
+  pick=$picks[1]
   f=("${(@ps:\t:)pick}")
   repo=$f[1]; slot=$f[2]; sid=$f[3]; wt=$f[4]
   local loc="${f[7]:-}" lalias="${f[8]:-}"

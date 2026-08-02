@@ -237,7 +237,11 @@ install_pr_watch() {
         echo "Installed $plist (inert — run 'pr-watch enable' to arm the PR watcher)"
     fi
 }
-install_pr_watch "com.chrisobrien-ai.pr-watch.plist"
+if [[ "$(uname)" == "Darwin" ]]; then
+    install_pr_watch "com.chrisobrien-ai.pr-watch.plist"
+else
+    echo "Skipping pr-watch LaunchAgent (launchd is macOS-only)."
+fi
 
 # Install the Homebrew tools the shell config depends on (gh, jq, tmux, fzf, glow).
 # Idempotent — brew bundle skips anything already installed. Skipped entirely if
@@ -248,6 +252,11 @@ if [[ -n "${DOTFILES_NO_BREW:-}" ]]; then
 elif command -v brew >/dev/null 2>&1; then
     echo "Installing Homebrew packages from Brewfile..."
     brew bundle --file="$LINK_SRC/Brewfile"
+elif [[ "$(uname)" != "Darwin" ]]; then
+    # Linux host: no Brewfile — the shell config needs zsh + tmux (the remote
+    # `zsh -lic` contract) and degrades gracefully without the rest.
+    echo "Linux host — install the shell deps with your package manager, e.g.:"
+    echo "  sudo apt-get install -y zsh tmux fzf jq   (gh: https://cli.github.com)"
 else
     echo "Homebrew not found — skipping Brewfile. Install it from https://brew.sh,"
     echo "then re-run this script (or 'brew bundle') to get gh/jq/tmux/fzf/glow."

@@ -1,5 +1,22 @@
 export PATH="$HOME/bin:$HOME/.local/bin:$PATH"
 
+# Hardened hosts can ship a root-only /tmp (the openclaw gateway does: drwx------
+# root). That breaks every non-root temp-file user — zsh heredocs (TMPPREFIX),
+# mktemp, and tmux's socket dir — so fall back to a per-user tmp. TMUX_TMPDIR
+# matters most: the whole `t` slot machinery rides on tmux, and every t-driven
+# tmux call goes through `zsh -lic`, so setting it here keeps client + server on
+# one socket dir. No-op on a standard 1777 /tmp.
+# Gate on /tmp ITSELF, not $TMPDIR: TMPDIR is exported and inherited, but
+# TMPPREFIX is shell-local — a nested `zsh -lic` (how bin/t runs every helper)
+# inherits the writable TMPDIR, and a TMPDIR-based gate would skip this block
+# there, leaving the nested shell's heredocs pointed at the unwritable /tmp/zsh.
+if [[ ! -w /tmp ]]; then
+  export TMPDIR="${TMPDIR:-$HOME/.cache/tmp}"
+  mkdir -p "$TMPDIR" 2>/dev/null
+  TMPPREFIX="$TMPDIR/zsh"
+  export TMUX_TMPDIR="${TMUX_TMPDIR:-$TMPDIR}"
+fi
+
 # Initialize the completion system before sourcing anything that calls `compdef`
 # (e.g. a completion sourced from ~/.zshrc.local below). Without this, compdef is
 # undefined and sourcing such a completion errors with "command not found: compdef".
@@ -647,7 +664,21 @@ unset _host
 # once every 15 min, fire csync detached in the background. A stamp file gates
 # the interval (written *before* the run so overlapping shells don't double-fire).
 mkdir -p "$HOME/.cache" "$HOME/Library/Logs" 2>/dev/null
-zmodload zsh/datetime 2>/dev/null                     # $EPOCHSECONDS, no `date` fork
+zmodload zsh/datetime 2>/dev/null                     # $EPOCHSECONDS + strftime, no `date` fork
+# Only the zstat builtin (-F), NOT the module's `stat` — that would shadow the
+# system stat the rest of this file (and Linux hosts) call. zstat is the portable
+# mtime source: BSD `stat -f %m` and GNU `stat -c %Y` disagree, zstat is neither.
+zmodload -F zsh/stat b:zstat 2>/dev/null
+# _stat_birth <file> — file creation (birth) epoch, empty/rc1 when unknowable.
+# The one stat field zstat lacks; BSD spells it `-f %B`, GNU `-c %W` (which
+# prints 0 or - on filesystems that don't record it — treated as unknown).
+_stat_birth() {
+  local b
+  if [[ $OSTYPE == darwin* ]]; then b=$(command stat -f %B "$1" 2>/dev/null)
+  else b=$(command stat -c %W "$1" 2>/dev/null); fi
+  [[ -n $b && $b != 0 && $b != - ]] || return 1
+  print -r -- "$b"
+}
 autoload -Uz add-zsh-hook
 _csync_periodic() {
   local interval=900 stamp="$HOME/.cache/csync-last-run" now=$EPOCHSECONDS last=0
@@ -1035,12 +1066,16 @@ _dev_summary_for_pid() {
   local -a tx
   if [[ -n $cpid ]]; then
     start=$(ps -o lstart= -p "$cpid" 2>/dev/null)
-    start=$(date -j -f '%a %b %d %T %Y' "${start## #}" +%s 2>/dev/null)
+    if [[ $OSTYPE == darwin* ]]; then
+      start=$(date -j -f '%a %b %d %T %Y' "${start## #}" +%s 2>/dev/null)
+    else
+      start=$(date -d "${start## #}" +%s 2>/dev/null)   # GNU date parses lstart natively
+    fi
   fi
   if [[ -n $start ]]; then
     local f b best bestdiff diff
     for f in "$proj"/*.jsonl(N); do
-      b=$(stat -f %B "$f" 2>/dev/null) || continue
+      b=$(_stat_birth "$f") || continue
       (( b < start - 2 )) && continue                  # born before this claude → not ours
       diff=$(( b - start ))
       if [[ -z $bestdiff ]] || (( diff < bestdiff )); then bestdiff=$diff; best=$f; fi
@@ -1136,6 +1171,7 @@ _dev_fg_rows() {
     [[ -n ${inslot[$pid]} || $pid == $me ]] && continue
     sid= cwd=
     [[ -r $reg/$pid ]] && IFS=$'\t' read -r sid cwd < "$reg/$pid"
+    [[ -n $cwd ]] || cwd=$(readlink "/proc/$pid/cwd" 2>/dev/null)   # Linux: no lsof needed
     [[ -n $cwd ]] || cwd=$(lsof -a -p "$pid" -d cwd -Fn 2>/dev/null | sed -n 's/^n//p' | head -1)
     [[ -n $cwd ]] || continue
     repo=$(_dev_repo_of_dir "$cwd" 2>/dev/null); repo=${repo%%$'\t'*}   # worktree-aware
@@ -1317,6 +1353,15 @@ _dev_dir_in_scope() {
   [[ $d == $scope || $d == $scope/* ]] && return 0
   [[ -n $DEV_WORKTREE_ROOT && $d == $DEV_WORKTREE_ROOT/${scope:t}/* ]]
 }
+
+# _dev_homerel <path> — strip the machine-local home prefix (/Users/<u>/ on macOS,
+# /home/<u>/ on Linux) so REMOTE paths compare against local ones on hosts whose
+# $HOME differs (a Linux node is /home/<u>; Macs are /Users/<u>). The cross-host
+# key becomes the home-relative form (`code/dotfiles`); a path outside any home
+# passes through absolute. The awk twin used on remote-row cwds is
+#   { c=$3; sub(/^\/(Users|home)\/[^\/]+\//, "", c) }
+# — keep the two in sync. (Python twin: _homerel in bin/t.)
+_dev_homerel() { print -r -- "${1#/(Users|home)/*/}" }
 
 # _dev_ensure_session_cwd <cwd> — print a directory in which a session recorded at <cwd>
 # can be resumed, materializing it on demand. <cwd> still present → echo it unchanged.
@@ -1575,8 +1620,9 @@ _dev_list_remote() {
   # paths ($DEV_WORKTREE_ROOT/<basename>/...) count as the repo too (wt clause); the
   # worktree root is the same path on every host, like ~/code.
   [[ -n $scope ]] && rows=$(print -r -- "$rows" | awk -F'\t' \
-    -v d="$scope" -v wt="${DEV_WORKTREE_ROOT}/${scope:t}" \
-    '$3==d || index($3, d"/")==1 || index($3, wt"/")==1')
+    -v d="$(_dev_homerel "$scope")" -v wt="$(_dev_homerel "$DEV_WORKTREE_ROOT")/${scope:t}" \
+    '{ c=$3; sub(/^\/(Users|home)\/[^\/]+\//, "", c) }
+     c==d || index(c, d"/")==1 || index(c, wt"/")==1')
   if [[ -z $rows ]]; then
     echo "No dev sessions running${scope:+ in ${scope:t} (dev ls -r --all for every repo)}${scope:+,} on this machine or any reachable host."
     return 0
@@ -1695,6 +1741,7 @@ _dev_kill_fg() {
     [[ -n ${inslot[$pid]} || $pid == $me ]] && continue
     sid= cwd=
     [[ -r $reg/$pid ]] && IFS=$'\t' read -r sid cwd < "$reg/$pid"
+    [[ -n $cwd ]] || cwd=$(readlink "/proc/$pid/cwd" 2>/dev/null)   # Linux: no lsof needed
     [[ -n $cwd ]] || cwd=$(lsof -a -p "$pid" -d cwd -Fn 2>/dev/null | sed -n 's/^n//p' | head -1)
     [[ -n $cwd ]] || continue
     repo=$(_dev_repo_of_dir "$cwd" 2>/dev/null); repo=${repo%%$'\t'*}
@@ -2234,9 +2281,9 @@ _dev_remote_resolve() {
   if [[ -z $repo ]]; then
     match=$rows                                                  # bare → all remote
   elif [[ -n $dir && -n $slot ]]; then
-    match=$(print -r -- "$rows" | awk -F'\t' -v d="$dir" -v s="$slot" -v wtr="$wtr" -v b="$base" '($3==d || (wtr != "" && b != "" && index($3, wtr "/" b "/") == 1)) && $4 !~ /:/ && $4 ~ ("-" s "$")')
+    match=$(print -r -- "$rows" | awk -F'\t' -v d="$(_dev_homerel "$dir")" -v s="$slot" -v wtr="$(_dev_homerel "$wtr")" -v b="$base" '{ c=$3; sub(/^\/(Users|home)\/[^\/]+\//, "", c) } (c==d || (wtr != "" && b != "" && index(c, wtr "/" b "/") == 1)) && $4 !~ /:/ && $4 ~ ("-" s "$")')
   elif [[ -n $dir ]]; then
-    match=$(print -r -- "$rows" | awk -F'\t' -v d="$dir" -v wtr="$wtr" -v b="$base" '($3==d || (wtr != "" && b != "" && index($3, wtr "/" b "/") == 1)) && $4 !~ /:/')
+    match=$(print -r -- "$rows" | awk -F'\t' -v d="$(_dev_homerel "$dir")" -v wtr="$(_dev_homerel "$wtr")" -v b="$base" '{ c=$3; sub(/^\/(Users|home)\/[^\/]+\//, "", c) } (c==d || (wtr != "" && b != "" && index(c, wtr "/" b "/") == 1)) && $4 !~ /:/')
   elif [[ -n $slot ]]; then
     match=$(print -r -- "$rows" | awk -F'\t' -v w="${repo}-${slot}" '$4==w')
   else
@@ -2520,7 +2567,9 @@ _dev_remote_kill() {
     local pairs
     if [[ -n $dir ]]; then
       pairs=$(_dev_rows_all 2>/dev/null \
-        | awk -F'\t' -v d="$dir" '$1 != "local" && $3==d && $4 !~ /:/ {
+        | awk -F'\t' -v d="$(_dev_homerel "$dir")" '
+          { c=$3; sub(/^\/(Users|home)\/[^\/]+\//, "", c) }
+          $1 != "local" && c==d && $4 !~ /:/ {
             a=$4; sub(/-[0-9]+$/, "", a);
             print $1 "\t" a
           }' | awk -F'\t' '!seen[$1]++')
@@ -2790,6 +2839,11 @@ _t_plan() {
 # ATTACHES in place instead of resuming (one-live-owner: a second `claude -r` on a
 # live id diverges the transcript).
 # -f/--fg resumes inline in THIS terminal (t pop's landing) instead of a slot.
+# Dead rows carry the two shared picker signals (see _claude_session_rows and
+# claude-stamp-tmux jobs 3-4): recency/date = max(transcript mtime, last-opened
+# stamp) with ↻ marking opened-but-unwritten conversations, and a " · #N <state>"
+# tag for the last PR URL in the transcript (state cache-only, never a blocking
+# gh call).
 # User-facing help lives in bin/t (`t resume -h`); the t() shim routes -h there.
 _t_resume() {
   setopt local_options null_glob bare_glob_qual
@@ -2945,7 +2999,16 @@ _t_resume() {
   local -A remote_live_host remote_live_alias remote_live_sum
   local n wt sid busy rhost _rdir _rbase _rhost _rn _ralias _rsum _ok _stale stale_path
   local txf title when ep org orgf hf skipped=0
+  local reopened opf opep pru prp prkey prnum prst prcf prmt
   local _rwtr=${DEV_WORKTREE_ROOT:-}
+  # The two picker signals shared with _claude_session_rows/tfind (see the
+  # claude-stamp-tmux notes): opened/ = the last-opened stamps (recency =
+  # max(transcript, stamp), ↻ on stamp-newer rows); pr/ = the PR-state cache
+  # (cache-only reads — NEVER a blocking gh call — refreshed by detached
+  # children, once per PR per run, so state shows on the next invocation).
+  local opdir="${XDG_CACHE_HOME:-$HOME/.cache}/claude-sessions/opened"
+  local prdir="${XDG_CACHE_HOME:-$HOME/.cache}/claude-sessions/pr"
+  local -A _prspawned
   # Recency window (--days, default 30; 'all' disables) + this machine's short
   # hostname, to blank the origin column for locally-run conversations.
   local cutoff=0 selfhost=$(hostname -s 2>/dev/null)
@@ -2963,8 +3026,9 @@ _t_resume() {
     if [[ -n $remote_rows ]]; then
       while IFS=$'\t' read -r _rhost _rn _ralias _rsum; do
         [[ -n $_rn ]] && { remote_live_host[$_rn]=$_rhost; remote_live_alias[$_rn]=$_ralias; remote_live_sum[$_rn]=$_rsum; }
-      done < <(print -r -- "$remote_rows" | awk -F'\t' -v d="$_rdir" -v wtr="$_rwtr" -v b="$_rbase" '
-        ($3==d || (wtr != "" && b != "" && index($3, wtr "/" b "/") == 1)) {
+      done < <(print -r -- "$remote_rows" | awk -F'\t' -v d="$(_dev_homerel "$_rdir")" -v wtr="$(_dev_homerel "$_rwtr")" -v b="$_rbase" '
+        { c=$3; sub(/^\/(Users|home)\/[^\/]+\//, "", c) }
+        (c==d || (wtr != "" && b != "" && index(c, wtr "/" b "/") == 1)) {
           n = $4; sub(/^.*-/, "", n)
           r = $4; sub(/-[^-]+$/, "", r)
           print $1 "\t" n "\t" r "\t" $7
@@ -3018,13 +3082,50 @@ _t_resume() {
       fi
       tx=( "$HOME/.claude/projects/${wt//[^A-Za-z0-9]/-}"/*.jsonl(Nom) )
       for txf in "${(@)tx}"; do
-        ep=$(stat -f %m "$txf" 2>/dev/null || echo 0)   # sort key + --days gate
+        ep=$(zstat +mtime "$txf" 2>/dev/null || echo 0)   # sort key + --days gate
+        # Effective recency = max(transcript mtime, opened stamp): resuming
+        # writes nothing to the .jsonl, so without the stamp a just-reopened
+        # conversation sorts — and --days-gates — as days old. Stamp newer →
+        # the row is dated by the stamp and marked ↻.
+        reopened=; opf="$opdir/${${txf:t}%.jsonl}"
+        if [[ -f $opf ]]; then
+          opep=$(zstat +mtime "$opf" 2>/dev/null || echo 0)
+          (( opep > ep )) && { ep=$opep; reopened=1; }
+        fi
         if (( cutoff && ep < cutoff )); then
           (( skipped++ )); continue        # outside the --days window
         fi
         title=$(_transcript_title "$txf")
         [[ -n $title ]] || continue        # conversationless stub — nothing to resume
-        when=$(stat -f '%Sm' -t '%b %d %H:%M' "$txf" 2>/dev/null)
+        # ep already reflects the reopened stamp (ep=opep above), so one
+        # strftime covers both branches; ↻ marks the stamp-dated rows.
+        when=; (( ep )) && when=$(strftime '%b %d %H:%M' "$ep" 2>/dev/null)
+        [[ -n $reopened && -n $when ]] && when+=" ↻"
+        # PR-in-session tag: the LAST github.com …/pull/N URL in the transcript
+        # (a `gh pr create` lands its URL in the tool output) names the
+        # session's PR; append " · #N <state>" to the title. State is read from
+        # the pr/ cache only; MERGED/CLOSED are terminal, anything else stale
+        # (>5 min) spawns ONE detached gh refresh for the next run.
+        pru=$(grep -ao 'github\.com/[A-Za-z0-9_.-]*/[A-Za-z0-9_.-]*/pull/[0-9]*' "$txf" 2>/dev/null | tail -1)
+        if [[ -n $pru ]]; then
+          prp=${pru#github.com/}; prp=${prp/\/pull\//\/}
+          prkey=${prp//\//#}; prnum=${pru##*/}
+          prcf="$prdir/$prkey"; prst=
+          if [[ -f $prcf ]]; then
+            prst=$(<$prcf)
+            [[ $prst == MERGED || $prst == CLOSED || $prst == OPEN ]] || prst=
+          fi
+          title+=" · #$prnum${prst:+ ${(L)prst}}"
+          if [[ $prst != MERGED && $prst != CLOSED && -z ${_prspawned[$prkey]:-} ]]; then
+            prmt=$(zstat +mtime "$prcf" 2>/dev/null || echo 0)
+            if (( EPOCHSECONDS - prmt > 300 )); then
+              _prspawned[$prkey]=1
+              mkdir -p "$prdir" 2>/dev/null
+              ( { prst=$(gh pr view "https://$pru" --json state --jq .state 2>/dev/null) || prst="?"
+                  print -rn -- "$prst" > "$prcf.$$.tmp" && mv -f "$prcf.$$.tmp" "$prcf"; } & ) 2>/dev/null
+            fi
+          fi
+        fi
         # Origin: which machine the conversation LAST RAN on — the <sid>.origin
         # stamp claude-stamp-tmux writes next to the transcript (syncs with it).
         # Blank for this machine / unstamped (pre-feature) transcripts; a raw
@@ -3094,15 +3195,15 @@ _t_resume() {
     org=${f[9]:-}; [[ $org == - ]] && org=
     if [[ -n $all_mode ]]; then
       if (( ow )); then
-        cands[$i]+=$'\t'"$(printf '%-*s  %2s  %-*s  %-12s  %s' "$rw" "$f[1]" "$f[2]" "$ow" "$org" "$f[5]" "$f[6]")"
+        cands[$i]+=$'\t'"$(printf '%-*s  %2s  %-*s  %-14s  %s' "$rw" "$f[1]" "$f[2]" "$ow" "$org" "$f[5]" "$f[6]")"
       else
-        cands[$i]+=$'\t'"$(printf '%-*s  %2s  %-12s  %s' "$rw" "$f[1]" "$f[2]" "$f[5]" "$f[6]")"
+        cands[$i]+=$'\t'"$(printf '%-*s  %2s  %-14s  %s' "$rw" "$f[1]" "$f[2]" "$f[5]" "$f[6]")"
       fi
     else
       if (( ow )); then
-        cands[$i]+=$'\t'"$(printf '%2s  %-*s  %-12s  %s' "$f[2]" "$ow" "$org" "$f[5]" "$f[6]")"
+        cands[$i]+=$'\t'"$(printf '%2s  %-*s  %-14s  %s' "$f[2]" "$ow" "$org" "$f[5]" "$f[6]")"
       else
-        cands[$i]+=$'\t'"$(printf '%2s  %-12s  %s' "$f[2]" "$f[5]" "$f[6]")"
+        cands[$i]+=$'\t'"$(printf '%2s  %-14s  %s' "$f[2]" "$f[5]" "$f[6]")"
       fi
     fi
     (( i++ ))
@@ -3291,22 +3392,63 @@ _claude_sessions_semantic() {
 
   python3 - "$projects" "$query" <<'PY' | fzf --delimiter=$'\t' --with-nth=3 --no-hscroll \
         --prompt="resume claude (sonnet: $query) > " --height=60% --reverse
-import json, os, sys, glob, datetime, subprocess, re
+import json, os, sys, glob, datetime, subprocess, re, time
 root, query = sys.argv[1], sys.argv[2]
 STOP = {'of','the','a','an','to','on','in','for','and','is','it','with','at'}
 qterms = [t for t in query.lower().split() if t not in STOP]
+# Effective recency = max(transcript mtime, last-opened stamp) — same signal as
+# _claude_session_rows, so the recent-session padding + display reflect resumes too.
+cache_root = os.path.join(os.environ.get('XDG_CACHE_HOME')
+                          or os.path.expanduser('~/.cache'), 'claude-sessions')
+opened_dir = os.path.join(cache_root, 'opened')
+def _opened(sid):
+    try: return os.path.getmtime(os.path.join(opened_dir, sid))
+    except OSError: return 0
+# PR indicator — the compact twin of _claude_session_rows' (see its comments for
+# the policy: cache-only reads, detached gh refresh, terminal states forever).
+pr_dir = os.path.join(cache_root, 'pr')
+pr_re = re.compile(r'github\.com/([\w.-]+)/([\w.-]+)/pull/(\d+)')
+stale = []
+def pr_state(ref):
+    st, fresh = '', False
+    try:
+        fp = os.path.join(pr_dir, '#'.join(ref))
+        st = open(fp).read().strip()
+        fresh = time.time() - os.path.getmtime(fp) < 300
+    except OSError: pass
+    if st not in ('MERGED', 'CLOSED') and not fresh:
+        stale.append(ref)
+    return st if st in ('MERGED', 'CLOSED', 'OPEN') else ''
+def pr_refresh():
+    if stale:
+        try: os.makedirs(pr_dir, exist_ok=True)
+        except OSError: return
+    for owner, repo, num in stale[:8]:
+        fp = os.path.join(pr_dir, f'{owner}#{repo}#{num}')
+        cmd = (f'st=$(gh pr view "https://github.com/{owner}/{repo}/pull/{num}"'
+               f' --json state --jq .state 2>/dev/null) || st="?"; '
+               f'printf %s "$st" > "{fp}.$$.tmp" && mv "{fp}.$$.tmp" "{fp}"')
+        try:
+            subprocess.Popen(['/bin/sh', '-c', cmd], stdin=subprocess.DEVNULL,
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                             start_new_session=True)
+        except OSError:
+            break
 
 # ── Scan: title + your first few prompts per session (the "about" signal). ──
 sessions = []
 for f in glob.glob(os.path.join(root, '*', '*.jsonl')):
     sid = os.path.basename(f)[:-6]
-    cwd = title = ctitle = None
+    cwd = title = ctitle = pr = None
     prompts = []
     try:
         for line in open(f, errors='ignore'):
             if cwd is None and '"cwd"' in line:
                 try: cwd = json.loads(line).get('cwd')
                 except ValueError: pass
+            if '/pull/' in line:                        # last PR URL wins
+                m = pr_re.findall(line)
+                if m: pr = m[-1]
             if '"custom-title"' in line:
                 try:
                     t = json.loads(line).get('customTitle')
@@ -3329,8 +3471,16 @@ for f in glob.glob(os.path.join(root, '*', '*.jsonl')):
     except OSError:
         continue
     head = ctitle or title or (prompts[0] if prompts else '') or '(no message)'
-    sessions.append({'sid': sid, 'cwd': cwd or '?', 'mtime': os.path.getmtime(f),
-                     'head': head, 'prompts': prompts})
+    mtime = os.path.getmtime(f)
+    opened = _opened(sid)
+    prs = ''
+    if pr:
+        st = pr_state(pr)
+        prs = f" · #{pr[2]}{' ' + st.lower() if st else ''}"
+    sessions.append({'sid': sid, 'cwd': cwd or '?', 'mtime': max(mtime, opened),
+                     'reopened': opened > mtime, 'head': head, 'prompts': prompts,
+                     'pr': prs})
+pr_refresh()
 
 # ── Retrieve: keyword pass for recall. Pad thin matches with recent sessions
 # so a query whose words diverge from the transcript still reaches the model. ──
@@ -3350,7 +3500,8 @@ def emit(rows):                                       # rows: (session, reason)
     for s, why in rows:
         when = datetime.datetime.fromtimestamp(s['mtime']).strftime('%m-%d %H:%M')
         short = os.path.basename(s['cwd']) if s['cwd'] != '?' else '?'
-        disp = f"{when}  {short:<16}  {' '.join(s['head'].split())[:60]}"
+        mark = '↻ ' if s['reopened'] else '  '
+        disp = f"{when} {mark}{short:<16}  {' '.join(s['head'].split())[:60]}{s['pr']}"
         if why: disp += f"   ⟵ {why}"
         print(f"{s['sid']}\t{s['cwd']}\t{disp}")
 
@@ -3407,7 +3558,9 @@ PY
 # With a <query> arg, every session is scored by how well the query terms match
 # its title + your prompts; non-matches are dropped and the list is ranked by
 # relevance, then recency (this is what `tfind` drives). Returns nonzero on no
-# pick / no fzf.
+# pick / no fzf. Rows carry two extra signals: ↻ marks a session opened more
+# recently than written (the claude-stamp-tmux opened/ stamp), and " · #N <state>"
+# tags a session whose transcript mentions a PR (cache-only state; see below).
 _claude_session_rows() {
   # Diagnostics go to stderr: this function's stdout is captured by the caller's
   # $(...), so a stdout error would be swallowed silently instead of shown.
@@ -3428,7 +3581,7 @@ _claude_session_rows() {
   fi
 
   DEV_WORKTREE_ROOT="$DEV_WORKTREE_ROOT" python3 - "$projects" "$filter" "$query" <<'PY'
-import json, os, sys, glob, datetime
+import json, os, sys, glob, datetime, re, subprocess, time
 root = sys.argv[1]
 filt = sys.argv[2] if len(sys.argv) > 2 else ''
 query = sys.argv[3] if len(sys.argv) > 3 else ''
@@ -3436,6 +3589,53 @@ query = sys.argv[3] if len(sys.argv) > 3 else ''
 # ($DEV_WORKTREE_ROOT/<repo-basename>/<slot>) as belonging to its repo — the twin of the
 # zsh _dev_dir_in_scope, so the repo-scoped picker shows worktree (incl. synced) sessions.
 wt_root = os.environ.get('DEV_WORKTREE_ROOT', '')
+# Last-opened stamps (claude-stamp-tmux job 3): resuming appends nothing to the
+# transcript, so recency = max(transcript mtime, opened-stamp mtime) — a session
+# reopened five minutes ago sorts (and dates) as five minutes old even though its
+# last message is days old. Stamp newer than the transcript → the row is marked ↻
+# (recently opened, nothing new written yet).
+cache_root = os.path.join(os.environ.get('XDG_CACHE_HOME')
+                          or os.path.expanduser('~/.cache'), 'claude-sessions')
+opened_dir = os.path.join(cache_root, 'opened')
+def _opened(sid):
+    try: return os.path.getmtime(os.path.join(opened_dir, sid))
+    except OSError: return 0
+# PR-in-session indicator: the LAST github.com …/pull/N URL in the transcript (a
+# `gh pr create` lands its URL in the tool output; last mention ≈ the PR the
+# session ended up on) tags the row " · #N <state>". State comes ONLY from the
+# pr/ cache — the picker never blocks on the network. Uncached/stale refs are
+# refreshed by DETACHED `gh pr view` children spawned after the scan, so state
+# appears on the NEXT invocation. MERGED/CLOSED are terminal (cached forever);
+# OPEN and lookup failures ('?') recheck after 5 min. Sibling of opened/ — the
+# pid-registry prune globs plain files only, so subdirs are never swept.
+pr_dir = os.path.join(cache_root, 'pr')
+pr_re = re.compile(r'github\.com/([\w.-]+)/([\w.-]+)/pull/(\d+)')
+stale = []
+def pr_state(ref):
+    st, fresh = '', False
+    try:
+        fp = os.path.join(pr_dir, '#'.join(ref))
+        st = open(fp).read().strip()
+        fresh = time.time() - os.path.getmtime(fp) < 300
+    except OSError: pass
+    if st not in ('MERGED', 'CLOSED') and not fresh:
+        stale.append(ref)
+    return st if st in ('MERGED', 'CLOSED', 'OPEN') else ''
+def pr_refresh():                     # fire-and-forget; bounded so a first scan
+    if stale:
+        try: os.makedirs(pr_dir, exist_ok=True)
+        except OSError: return
+    for owner, repo, num in stale[:8]:  # over many PRs can't fork-bomb gh
+        fp = os.path.join(pr_dir, f'{owner}#{repo}#{num}')
+        cmd = (f'st=$(gh pr view "https://github.com/{owner}/{repo}/pull/{num}"'
+               f' --json state --jq .state 2>/dev/null) || st="?"; '
+               f'printf %s "$st" > "{fp}.$$.tmp" && mv "{fp}.$$.tmp" "{fp}"')
+        try:
+            subprocess.Popen(['/bin/sh', '-c', cmd], stdin=subprocess.DEVNULL,
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                             start_new_session=True)
+        except OSError:
+            break
 def _in_scope(cwd):
     if not filt:
         return True
@@ -3454,13 +3654,16 @@ qterms = [t for t in query.lower().split() if t not in STOP]
 rows = []
 for f in glob.glob(os.path.join(root, '*', '*.jsonl')):
     sid = os.path.basename(f)[:-6]
-    cwd = msg = title = ctitle = None
+    cwd = msg = title = ctitle = pr = None
     umsgs = []                                          # all your prompts (search mode)
     try:
         for line in open(f, errors='ignore'):
             if cwd is None and '"cwd"' in line:
                 try: cwd = json.loads(line).get('cwd')
                 except ValueError: pass
+            if '/pull/' in line:                        # last PR URL wins
+                m = pr_re.findall(line)
+                if m: pr = m[-1]
             if '"custom-title"' in line:                # set by /rename — wins
                 try:
                     t = json.loads(line).get('customTitle')
@@ -3502,15 +3705,23 @@ for f in glob.glob(os.path.join(root, '*', '*.jsonl')):
             continue
     # ─────────────────────────────────────────────────────────────────────────
     mtime = os.path.getmtime(f)
+    opened = _opened(sid)
+    mark = '↻ ' if opened > mtime else '  '
+    mtime = max(mtime, opened)
     short = os.path.basename(cwd) if cwd else '?'
     title = ' '.join((ctitle or title or msg or '(no message)').split())[:80]
-    rows.append((score, mtime, sid, cwd or '?', short, title))
+    prs = ''
+    if pr:
+        st = pr_state(pr)
+        prs = f" · #{pr[2]}{' ' + st.lower() if st else ''}"
+    rows.append((score, mtime, sid, cwd or '?', short, title, mark, prs))
 # Primary key = relevance (0 for every row when not searching, so it collapses
 # to pure newest-first); tiebreak = recency.
 rows.sort(reverse=True)
-for score, mtime, sid, cwd, short, title in rows:
+for score, mtime, sid, cwd, short, title, mark, prs in rows:
     when = datetime.datetime.fromtimestamp(mtime).strftime('%m-%d %H:%M')
-    print(f"{sid}\t{cwd}\t{when}  {short:<18}  {title}")
+    print(f"{sid}\t{cwd}\t{when} {mark}{short:<18}  {title}{prs}")
+pr_refresh()
 PY
 }
 

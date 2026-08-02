@@ -1,7 +1,8 @@
 # dotfiles
 
 > Personal macOS + zsh dotfiles, built around a toolkit for running **Claude Code**
-> in tmux — teleport, search, and sync sessions across machines.
+> in tmux — teleport, search, and sync sessions across machines. Linux hosts are
+> supported as remote nodes (macOS-only pieces skip themselves).
 
 The everyday shell config is here (aliases, PATH, completions), but the
 distinctive part is the **Claude Code session tooling**, unified under a single

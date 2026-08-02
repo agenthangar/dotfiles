@@ -2809,6 +2809,55 @@ _t_plan() {
   fi
 }
 
+# _dev_open_tab <cmd…> — run a command in a NEW tab of the local terminal app.
+# The tab engine for multi-pick `t resume` (each extra revived slot gets its own
+# tab running the ordinary `t open` attach). Terminal.app has no AppleScript
+# verb for tabs, so the tab is a System Events Cmd+T — which needs Terminal
+# granted Accessibility (System Settings → Privacy & Security) — and the script
+# POLLS the front window's tab count before `do script in front window` (that
+# phrasing targets the ACTIVE tab, which post-Cmd+T is the new one; a blind
+# delay would race slow tab creation). iTerm2 has a first-class tab API, no
+# Accessibility needed. Inside tmux the pane's $TERM_PROGRAM reads "tmux" — the
+# real app is recovered from the server's launch env (tmux show-environment -g).
+# rc 1 whenever a tab is impossible here — over ssh (the GUI is not where you
+# are), an unrecognized terminal, osascript refused — so callers print attach
+# hints instead.
+_dev_open_tab() {
+  local cmd="$*" tp=${TERM_PROGRAM:-}
+  [[ -z ${SSH_CONNECTION:-} ]] || return 1
+  if [[ -n ${TMUX:-} && ( -z $tp || $tp == tmux ) ]]; then
+    tp=$(tmux show-environment -g TERM_PROGRAM 2>/dev/null); tp=${tp#TERM_PROGRAM=}
+  fi
+  cmd=${cmd//\\/\\\\}; cmd=${cmd//\"/\\\"}
+  case $tp in
+    Apple_Terminal)
+      osascript >/dev/null 2>&1 <<EOS || return 1
+tell application "Terminal"
+  activate
+  set tabCount to count tabs of front window
+end tell
+tell application "System Events" to keystroke "t" using command down
+tell application "Terminal"
+  repeat 40 times
+    if (count tabs of front window) > tabCount then exit repeat
+    delay 0.05
+  end repeat
+  do script "$cmd" in front window
+end tell
+EOS
+      ;;
+    iTerm.app)
+      osascript >/dev/null 2>&1 <<EOS || return 1
+tell application "iTerm2"
+  tell current window to create tab with default profile
+  tell current session of current window to write text "$cmd"
+end tell
+EOS
+      ;;
+    *) return 1 ;;
+  esac
+}
+
 # _t_resume — the `t resume` verb: revive a DEAD dev slot's last conversation.
 # `t open` on a dead slot deliberately starts a FRESH claude (the worktree and its
 # uncommitted work are reused, but not the chat); this is the counterpart that brings
@@ -2826,7 +2875,9 @@ _t_plan() {
 # (space toggles a ✓ on rows, tab works too; plain Enter is the usual single
 # pick): every marked DEAD row
 # revives into its own detached dev slot, the first revived (topmost = newest)
-# attaches, the rest print `t open` hints. A live mark is already open (noted, never
+# attaches, the rest open in NEW terminal tabs (_dev_open_tab above; attach-hint
+# fallback when tabs are impossible — ssh, unrecognized terminal, no
+# Accessibility). A live mark is already open (noted, never
 # resumed — one-live-owner), a second conversation marked for a slot an earlier mark
 # just took is skipped (one tmux session per dev-<repo>-<slot> name), and --fg
 # refuses a multi-pick (one terminal, one inline claude); outside any DEV_REPOS dir a bare
@@ -3245,11 +3296,11 @@ _t_resume() {
   # Multi-pick (only the fzf branch can produce one — $pick then holds one row
   # per line, in LIST order, so the first row is the newest / a pinned live one).
   # Revive every marked dead row detached, then attach the FIRST revived slot —
-  # a resume ends inside a session, same as a single pick; the rest are one
-  # `t open` away. Live marks are already open (one-live-owner: never a second
-  # `claude -r`) and a second conversation marked for a slot an earlier mark
-  # just took can't have the tmux name — both become hints, not errors, so one
-  # stray tab-mark never aborts the batch.
+  # a resume ends inside a session, same as a single pick; the rest open in
+  # their own terminal tabs (attach-hint fallback). Live marks are already open
+  # (one-live-owner: never a second `claude -r`) and a second conversation
+  # marked for a slot an earlier mark just took can't have the tmux name —
+  # both become hints, not errors, so one stray mark never aborts the batch.
   local -a picks; picks=("${(@f)pick}")
   if (( $#picks > 1 )); then
     if [[ -n $no_tmux ]]; then
@@ -3257,8 +3308,8 @@ _t_resume() {
       return 1
     fi
     local -A mp_taken
-    local mp_first_repo= mp_first_slot= mp_cwd mp_session mp_loc
-    local -a mp_hints
+    local mp_first_repo= mp_first_slot= mp_cwd mp_session mp_loc mp_pair
+    local -a mp_rest mp_unopened
     for pick in "${(@)picks}"; do
       f=("${(@ps:\t:)pick}")
       repo=$f[1]; slot=$f[2]; sid=$f[3]; wt=$f[4]; mp_loc="${f[7]:-}"
@@ -3284,18 +3335,33 @@ _t_resume() {
       if [[ -z $mp_first_repo ]]; then
         mp_first_repo=$repo; mp_first_slot=$slot
       else
-        mp_hints+=("t open $repo $slot")
+        mp_rest+=("$repo $slot")
       fi
     done
     if [[ -z $mp_first_repo ]]; then
       echo "Nothing revived — every marked row was already live or unrecoverable." >&2
       return 1
     fi
-    (( $#mp_hints )) && echo "Also revived — attach with: ${(j: · :)mp_hints}"
+    # Every revived slot beyond the first opens in its OWN terminal tab, each
+    # running the ordinary `t open` attach (_dev_open_tab); the first attaches
+    # HERE as usual, so 4 marks end as 4 visible sessions. Tabs impossible —
+    # ssh, unrecognized terminal, osascript refused — falls back to attach
+    # hints, with a pointer at the two fixable causes when the GUI is local.
+    # Inside tmux / no TTY the first cannot attach here either, so it gets a
+    # tab too.
+    for mp_pair in "${(@)mp_rest}"; do
+      _dev_open_tab "t open $mp_pair" || mp_unopened+=("t open $mp_pair")
+    done
+    if (( $#mp_unopened )); then
+      echo "Also revived — attach with: ${(j: · :)mp_unopened}"
+      [[ -z ${SSH_CONNECTION:-} ]] \
+        && echo "(tabs need a local Terminal.app/iTerm2 GUI; Terminal.app also needs Accessibility — System Settings → Privacy & Security)" >&2
+    fi
     if [[ -z $TMUX && -t 0 && -t 1 ]]; then
       tmux attach-session -t "dev-${mp_first_repo}-${mp_first_slot}"
     else
-      echo "Attach with: t open $mp_first_repo $mp_first_slot"
+      _dev_open_tab "t open $mp_first_repo $mp_first_slot" \
+        || echo "Attach with: t open $mp_first_repo $mp_first_slot"
     fi
     return
   fi

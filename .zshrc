@@ -2823,7 +2823,8 @@ _t_plan() {
 # still resumable), minus conversationless stubs (no real prompt → nothing to revive,
 # and their untitled rows masked real ones). House picker convention: one candidate →
 # use it, several → fzf, none → bail with a hint. The fzf picker is MULTI-SELECT
-# (tab marks rows; plain Enter is the usual single pick): every marked DEAD row
+# (space toggles a ✓ on rows, tab works too; plain Enter is the usual single
+# pick): every marked DEAD row
 # revives into its own detached dev slot, the first revived (topmost = newest)
 # attaches, the rest print `t open` hints. A live mark is already open (noted, never
 # resumed — one-live-owner), a second conversation marked for a slot an earlier mark
@@ -3216,8 +3217,14 @@ _t_resume() {
   if (( $#cands == 1 )) && f=("${(@ps:\t:)cands[1]}") && [[ $f[7] == - || -t 1 ]]; then
     pick=${cands[1]}
   elif [[ -t 0 && -t 1 ]] && command -v fzf >/dev/null; then
-    pick=$(print -rl -- "${(@)cands}" | fzf --multi --delimiter=$'\t' --with-nth=10 --no-hscroll \
-      --header='tab marks several — every mark revives, first attaches' --prompt="$fprompt") || return 1
+    # Space toggles a ✓ mark (bound to toggle+down — the same action as fzf's
+    # default tab binding, so both work and marking a batch is spacebar-taps
+    # down the list). The cost: a literal space no longer types into the filter
+    # query — acceptable because fzf's fuzzy match crosses word gaps ("fixbug"
+    # still matches "fix bug").
+    pick=$(print -rl -- "${(@)cands}" | fzf --multi --marker='✓' --bind 'space:toggle+down' \
+      --delimiter=$'\t' --with-nth=10 --no-hscroll \
+      --header='space marks ✓ — every mark revives, first attaches' --prompt="$fprompt") || return 1
     [[ -n $pick ]] || return 1
   elif [[ -n $slot ]]; then
     # Explicit slot but no TTY/fzf to pick with: the newest conversation IS the

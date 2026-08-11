@@ -4631,6 +4631,11 @@ t() {
     find)   _t_find "$@" ;;           # → rank/pick then cd + claude -r here
     cd)     _t_cd "$@" ;;             # → cd THIS shell into a slot's worktree
     beam)   _t_beam_xlate "$@" ;;     # → _t_beam (host moves from --host to a positional)
+    # setup runs in the bin (it only edits ~/.zshrc.local), but on success the
+    # SHELL must reload so the new cd aliases, host shorthand functions, and the
+    # _t_sync_config cache go live at once (precedent: dots reloads every run).
+    # T_SETUP_SHIM tells the bin to skip its "source ~/.zshrc" hint.
+    setup)  T_SETUP_SHIM=1 command t setup "$@" && source ~/.zshrc ;;
     *)      command t "$verb" "$@" ;; # ls/read/plan/paste/kill/on/session-rows/land/kill-owner
   esac
 }
@@ -4861,8 +4866,8 @@ help() {
   # Per-section "how to add" hints (keyed by group title) — printed dim under the
   # rows for the generated sections, since those come from ~/.zshrc.local arrays.
   local -A hints=(
-    "Repo shortcuts (cd)" "+ add a repo: DEV_REPOS[key]=~/code/repo in ~/.zshrc.local"
-    "Remote machines"     "+ add a host: REMOTE_HOSTS[key]=user@host in ~/.zshrc.local"
+    "Repo shortcuts (cd)" "+ add a repo: t setup (or DEV_REPOS[key]=~/code/repo in ~/.zshrc.local)"
+    "Remote machines"     "+ add a host: t setup (or REMOTE_HOSTS[key]=user@host in ~/.zshrc.local)"
   )
 
   # Palette — bold, UPPERCASE section headers (man-page / `gh` convention; bold is
@@ -4919,7 +4924,7 @@ alias h=help   # `h` is a shorthand for `help`
 # key for `on`), and slot/flags after. Pulls live from the ${(k)DEV_REPOS} /
 # ${(k)REMOTE_HOSTS} arrays so it stays current with ~/.zshrc.local.
 _t() {
-  local -a verbs=(open ls kill push pop resume beam read plan paste find on cursor)
+  local -a verbs=(open ls kill push pop resume beam read plan paste find on cursor setup)
   if (( CURRENT == 2 )); then
     _describe -t verbs 't verb' verbs
     return
@@ -4940,6 +4945,8 @@ _t() {
       _values 'flag' -p --pick -a --all -h --help ;;
     find)
       _values 'flag' -k --keyword -h --help ;;
+    setup)
+      _files -/ ;;   # scan-dir arguments
   esac
 }
 _sleepmgr_cmd() { _arguments '1:command:(status disable enable help)' }

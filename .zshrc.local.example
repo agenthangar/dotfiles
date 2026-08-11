@@ -1,7 +1,8 @@
 # ~/.zshrc.local — per-machine config, sourced by ~/.zshrc if it exists.
 # NOT committed. install.sh copies this template to ~/.zshrc.local on a fresh
-# machine; edit that copy with your own values. DEV_REPOS is already declared
-# (typeset -gA) by the time this is sourced, so just add keys.
+# machine; edit that copy with your own values — or run `t setup`, which scans
+# for local checkouts + ssh hosts and appends the entries for you. DEV_REPOS is
+# already declared (typeset -gA) by the time this is sourced, so just add keys.
 
 # Repos you want `dev`, the bare `<key>` cd shortcuts, tread, tbeam, and tab
 # completion to know about. Key = short alias, value = absolute path.

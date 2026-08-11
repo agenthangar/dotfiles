@@ -26,6 +26,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+import time
 
 HOME = os.path.expanduser("~")
 CONFIG = os.path.join(os.environ.get("XDG_CONFIG_HOME", os.path.join(HOME, ".config")), "t", "config.sh")
@@ -603,6 +604,402 @@ def _read_usage(cfg):
         print("  (none yet — start one with 't open <repo> <slot>')")
 
 
+# ─── setup — onboard repos + hosts into ~/.zshrc.local ─────────────────────────
+# `t setup [dir …]` scans for git checkouts (default ~/code) and ~/.ssh/config
+# hosts, and appends the picks as DEV_REPOS/REMOTE_HOSTS lines to ~/.zshrc.local.
+# The local file is parsed with line regexes and NEVER sourced (same stance as the
+# config bridge header above); dedup unions the parsed live lines with the possibly
+# stale config cache — over-skipping is the safe direction for an appender. All
+# picks are staged in memory and land in ONE dated block at the end, so Ctrl-C
+# mid-flow writes nothing. Idempotent by dedup, not by marker: re-runs offer only
+# what is not yet registered.
+
+ZSHRC_LOCAL = os.path.join(HOME, ".zshrc.local")
+SSH_CONFIG = os.path.join(HOME, ".ssh", "config")
+
+_LOCAL_LINE = re.compile(r"^\s*(DEV_REPOS|REMOTE_HOSTS)\[([^\]]+)\]=(.*)$")
+_TBEAM_LINE = re.compile(r"^\s*export\s+TBEAM_HOST=")
+_BARE_HOST = re.compile(r"^[A-Za-z0-9@._:-]+$")
+_SETUP_KEY = re.compile(r"^[^\s\]=-][^\s\]=]*$")   # no whitespace/]/=; no leading -
+
+
+def _local_entries(text):
+    """Parse LIVE (uncommented) DEV_REPOS/REMOTE_HOSTS assignments and a TBEAM_HOST
+    export out of ~/.zshrc.local text. Returns (repos, hosts, tbeam_set) with raw
+    (still-quoted) values."""
+    repos, hosts, tbeam = {}, {}, False
+    for line in text.splitlines():
+        if _TBEAM_LINE.match(line):
+            tbeam = True
+            continue
+        m = _LOCAL_LINE.match(line)
+        if m:
+            (repos if m.group(1) == "DEV_REPOS" else hosts)[m.group(2)] = m.group(3).strip()
+    return repos, hosts, tbeam
+
+
+def _expand_home(rawval):
+    """Comparable absolute path for a raw ~/.zshrc.local value: strip one quoting
+    layer, then expand $HOME/${HOME}/~ (the forms the example file uses)."""
+    v = _unquote(rawval).replace("${HOME}", HOME).replace("$HOME", HOME)
+    return os.path.expanduser(v)
+
+
+def _scan_repos(dirs, skip_paths, max_depth=3):
+    """Git checkouts under dirs: a dir containing .git (dir OR file — worktrees and
+    submodules have a file) counts and is not descended into. Skips hidden dirs and
+    anything whose realpath is in skip_paths (registered repos, the worktree root).
+    Deduped by realpath (symlinked duplicates), sorted."""
+    skip = {os.path.realpath(p) for p in skip_paths}
+    found, seen = [], set()
+    for top in dirs:
+        for dirpath, dirnames, _ in os.walk(top):
+            real = os.path.realpath(dirpath)
+            if real in skip:
+                dirnames[:] = []
+                continue
+            if os.path.exists(os.path.join(dirpath, ".git")):
+                dirnames[:] = []
+                if real not in seen:
+                    seen.add(real)
+                    found.append(dirpath)
+                continue
+            rel = os.path.relpath(dirpath, top)
+            depth = 0 if rel == "." else rel.count(os.sep) + 1
+            if depth >= max_depth:
+                dirnames[:] = []
+                continue
+            dirnames[:] = sorted(d for d in dirnames if not d.startswith("."))
+    return sorted(found)
+
+
+def _propose_aliases(paths, taken):
+    """{path: alias} proposals + the set of paths whose alias needed disambiguating
+    (those get an interactive override prompt). Policy: basename; a collision with
+    a taken key or an earlier path qualifies with the parent dir (~/work/api →
+    work-api); still taken → numeric suffix on the QUALIFIED alias (work-api-2),
+    so the parent context survives."""
+    proposals, collided = {}, set()
+    used = set(taken)
+    for p in paths:
+        base = os.path.basename(p.rstrip(os.sep))
+        alias = base
+        if alias in used:
+            alias = f"{os.path.basename(os.path.dirname(p))}-{base}"
+            collided.add(p)
+        qualified, n = alias, 2
+        while alias in used:
+            alias = f"{qualified}-{n}"
+            n += 1
+            collided.add(p)
+        proposals[p] = alias
+        used.add(alias)
+    return proposals, collided
+
+
+def _propose_aliases_hosts(names, taken):
+    """{alias: target} for ssh-config Host names: alias = first dot-label
+    (studio.local → studio), the full name when that label is taken, skipped
+    entirely when both are. Returns (proposals, skipped-names)."""
+    out, skipped = {}, []
+    used = set(taken)
+    for n in names:
+        alias = n.split(".")[0]
+        if alias in used or alias in out:
+            alias = n
+        if alias in used or alias in out or not _SETUP_KEY.match(alias):
+            skipped.append(n)
+            continue
+        out[alias] = n
+        used.add(alias)
+    return out, skipped
+
+
+def _homeify(path):
+    """Render a repo path for ~/.zshrc.local: "$HOME/rel" under home (portable
+    across machines with differing usernames), else the quoted absolute path."""
+    if path == HOME or path.startswith(HOME + os.sep):
+        return f'"$HOME/{os.path.relpath(path, HOME)}"'
+    return f'"{path}"'
+
+
+def _hostval(target):
+    """Host values are written bare when shell-safe (matches the example file),
+    quoted otherwise."""
+    return target if _BARE_HOST.match(target) else f'"{target}"'
+
+
+def _setup_block(repos, hosts, tbeam, date):
+    """The exact text appended to ~/.zshrc.local: a dated provenance marker + one
+    assignment per pick (sorted for determinism). `date` is injected so the block
+    is testable byte-for-byte."""
+    lines = [f"# ── added by `t setup` ({date}) ──"]
+    lines += [f"DEV_REPOS[{k}]={_homeify(repos[k])}" for k in sorted(repos)]
+    lines += [f"REMOTE_HOSTS[{k}]={_hostval(hosts[k])}" for k in sorted(hosts)]
+    if tbeam:
+        lines.append(f"export TBEAM_HOST={_hostval(tbeam)}")
+    return "\n".join(lines) + "\n"
+
+
+def _parse_ssh_hosts(path, seen=None):
+    """Ordered, deduped Host names from an ssh config: keywords case-insensitive,
+    multi-pattern Host lines split, wildcard (*/?) and negated (!) patterns skipped
+    (drops the stock `Host *`), Include followed (expanduser, ~/.ssh-relative,
+    glob-expanded, cycle-safe via `seen`). Missing file → []."""
+    seen = set() if seen is None else seen
+    real = os.path.realpath(path)
+    if real in seen:
+        return []
+    seen.add(real)
+    try:
+        with open(path, errors="ignore") as fh:
+            lines = fh.readlines()
+    except OSError:
+        return []
+    hosts = []
+    for line in lines:
+        parts = line.strip().split(None, 1)
+        if len(parts) < 2 or parts[0].startswith("#"):
+            continue
+        key, rest = parts[0].lower(), parts[1]
+        if key == "include":
+            try:
+                pats = shlex.split(rest)
+            except ValueError:
+                pats = rest.split()
+            for pat in pats:
+                pat = os.path.expanduser(pat)
+                if not os.path.isabs(pat):
+                    pat = os.path.join(HOME, ".ssh", pat)
+                for inc in sorted(glob.glob(pat)):
+                    hosts.extend(_parse_ssh_hosts(inc, seen))
+        elif key == "host":
+            hosts.extend(n for n in rest.split()
+                         if "*" not in n and "?" not in n and not n.startswith("!"))
+    out = []
+    for h in hosts:
+        if h not in out:
+            out.append(h)
+    return out
+
+
+def _comment_stale(text, keys):
+    """Comment out exactly the named live DEV_REPOS[key]= lines (prefix marks
+    provenance, so the edit is recognizable and reversible); every other line
+    byte-identical."""
+    out = []
+    for line in text.splitlines(keepends=True):
+        m = _LOCAL_LINE.match(line)
+        if m and m.group(1) == "DEV_REPOS" and m.group(2) in keys:
+            out.append("# (stale — t setup) " + line)
+        else:
+            out.append(line)
+    return "".join(out)
+
+
+def _append_local(path, block):
+    """Append block to ~/.zshrc.local with a separating blank line, normalizing a
+    missing trailing newline first. An absent file (install.sh normally seeds it)
+    is created with a short header rather than failing."""
+    try:
+        with open(path, errors="ignore") as fh:
+            text = fh.read()
+    except OSError:
+        text = ("# ~/.zshrc.local — per-machine config, sourced by ~/.zshrc if it exists.\n"
+                "# Created by `t setup` (install.sh normally seeds it from .zshrc.local.example).\n")
+    if text and not text.endswith("\n"):
+        text += "\n"
+    with open(path, "w") as fh:
+        fh.write(text + "\n" + block)
+
+
+def _prompt(msg, default=""):
+    """input() wrapper: strip, empty → default, EOF → None (caller aborts cleanly)."""
+    try:
+        r = input(msg).strip()
+    except EOFError:
+        print()
+        return None
+    return r if r else default
+
+
+def _confirm(msg):
+    """[y/N] confirm — EOF, blank, and anything but y/yes are all No."""
+    r = _prompt(f"{msg} [y/N] ")
+    return bool(r) and r.lower() in ("y", "yes")
+
+
+def _fzf_pick(rows, header):
+    """Multi-select via fzf (space marks ✓, enter confirms — the same bindings as
+    the t resume picker; fzf draws on /dev/tty so a subprocess works fine). Picked
+    rows; [] on Esc/no-match; None when fzf is missing (caller falls back to
+    per-item prompts)."""
+    if not shutil.which("fzf"):
+        return None
+    r = subprocess.run(
+        ["fzf", "--multi", "--marker=✓", "--bind", "space:toggle+down",
+         "--header", header, "--prompt", "t setup> ", "--height=60%", "--reverse"],
+        input="\n".join(rows) + "\n", stdout=subprocess.PIPE, text=True)
+    return [ln for ln in r.stdout.splitlines() if ln] if r.returncode == 0 else []
+
+
+def cmd_setup(cfg, args):
+    """Interactive onboarding (see the section comment above). Phases: stale-entry
+    comment-out (the one in-place edit, own confirm) → repo picker → host picker +
+    manual loop → TBEAM_HOST offer → summary + single append + cache regen."""
+    try:
+        with open(ZSHRC_LOCAL, errors="ignore") as fh:
+            local_text = fh.read()
+    except OSError:
+        local_text = ""
+    f_repos, f_hosts, tbeam_set = _local_entries(local_text)
+
+    # dedup state: union of the live file lines and the (possibly stale) cache
+    reg_paths = ({os.path.realpath(_expand_home(v)) for v in f_repos.values()} |
+                 {os.path.realpath(v) for v in cfg.repos.values()})
+    taken_keys = set(f_repos) | set(cfg.repos)
+    host_keys = set(f_hosts) | set(cfg.hosts)
+    host_targets = {_unquote(v) for v in f_hosts.values()} | set(cfg.hosts.values())
+
+    # scan roots: args or ~/code; drop missing / worktree-rooted ones with a note
+    roots, wt_root = [], os.path.realpath(cfg.worktree_root)
+    for d in (args.dirs or [os.path.join(HOME, "code")]):
+        d = os.path.abspath(os.path.expanduser(d))
+        real = os.path.realpath(d)
+        if not os.path.isdir(d):
+            print(f"t setup: skipping {d} — not a directory", file=sys.stderr)
+        elif real == wt_root or real.startswith(wt_root + os.sep):
+            print(f"t setup: skipping {d} — per-session worktrees are managed by "
+                  f"`t open`, not DEV_REPOS", file=sys.stderr)
+        else:
+            roots.append(d)
+    if not roots:
+        print("t setup: no scannable directories", file=sys.stderr)
+        return 1
+
+    cands = _scan_repos(roots, reg_paths | {cfg.worktree_root})
+    proposals, collided = _propose_aliases(cands, taken_keys)
+    ssh_hosts = [h for h in _parse_ssh_hosts(SSH_CONFIG)
+                 if h not in host_keys and h not in host_targets]
+    stale = sorted(k for k, v in f_repos.items() if not os.path.isdir(_expand_home(v)))
+    tilde = lambda p: "~" + p[len(HOME):] if p.startswith(HOME) else p
+
+    if args.dry_run or not (sys.stdin.isatty() and sys.stdout.isatty()):
+        if stale:
+            print("stale DEV_REPOS entries (path missing): " + ", ".join(stale))
+        if not cands and not ssh_hosts:
+            print("nothing to offer — every discovered repo/host is already registered")
+        else:
+            hp, _ = _propose_aliases_hosts(ssh_hosts, host_keys)
+            print("would offer (shown as if everything were picked):\n")
+            print(_setup_block({a: p for p, a in proposals.items()}, hp, None,
+                               time.strftime("%Y-%m-%d")), end="")
+        if args.dry_run:
+            return 0
+        print("\nt setup is interactive — run it from a terminal (or use --dry-run)",
+              file=sys.stderr)
+        return 1
+
+    # phase 0: stale placeholders (the fresh-install api/web lines, moved repos)
+    if stale and _confirm(f"Comment out {len(stale)} stale DEV_REPOS "
+                          f"entr{'y' if len(stale) == 1 else 'ies'} whose path no "
+                          f"longer exists ({', '.join(stale)})?"):
+        local_text = _comment_stale(local_text, set(stale))
+        with open(ZSHRC_LOCAL, "w") as fh:
+            fh.write(local_text)
+        print(f"  commented out: {', '.join(stale)}")
+
+    # phase 1: repos
+    add_repos = {}
+    if not cands:
+        print(f"no unregistered git checkouts under {', '.join(tilde(r) for r in roots)}")
+    else:
+        width = max(len(a) for a in proposals.values())
+        display = {f"{proposals[p]:<{width}}  {tilde(p)}": p for p in cands}
+        rows = sorted(display)
+        picked = _fzf_pick(rows, "space marks ✓ — marked repos are added to DEV_REPOS")
+        if picked is None:
+            picked = [row for row in rows if _confirm(f"add {row.split()[0]} → {row.split()[-1]}?")]
+        for row in picked:
+            path = display[row]
+            alias, ask = proposals[path], path in collided
+            while True:
+                if ask:
+                    alias = _prompt(f"  alias for {tilde(path)} [{alias}]: ", alias)
+                    if alias is None:
+                        print("aborted — nothing appended", file=sys.stderr)
+                        return 1
+                if _SETUP_KEY.match(alias) and alias not in taken_keys:
+                    break
+                print(f"  '{alias}' is taken or not a valid key", file=sys.stderr)
+                ask = True
+            add_repos[alias] = path
+            taken_keys.add(alias)
+
+    # phase 2: hosts — ssh-config picks, then a manual alias=target loop
+    add_hosts = {}
+    if ssh_hosts:
+        hp, _ = _propose_aliases_hosts(ssh_hosts, host_keys)
+        by_alias = {a: t for a, t in hp.items()}
+        width = max(len(a) for a in by_alias)
+        display = {f"{a:<{width}}  {by_alias[a]}": a for a in by_alias}
+        rows = sorted(display)
+        picked = _fzf_pick(rows, "space marks ✓ — marked ~/.ssh/config hosts are added to REMOTE_HOSTS")
+        if picked is None:
+            picked = [row for row in rows if _confirm(f"add host {row.split()[0]}?")]
+        for row in picked:
+            a = display[row]
+            add_hosts[a] = by_alias[a]
+            host_keys.add(a)
+    while True:
+        ent = _prompt("add host (alias=target, blank to finish): ")
+        if not ent:
+            break
+        alias, _, target = ent.partition("=")
+        alias, target = alias.strip(), target.strip()
+        if not target:  # bare target → alias = first dot-label of the host part
+            target = alias
+            alias = target.split("@")[-1].split(".")[0]
+        if not _SETUP_KEY.match(alias) or alias in host_keys:
+            print(f"  '{alias}' is taken or not a valid key", file=sys.stderr)
+            continue
+        add_hosts[alias] = target
+        host_keys.add(alias)
+
+    # phase 3: TBEAM_HOST (default host for t beam / t cursor)
+    tbeam_target = None
+    known = {**{k: _unquote(v) for k, v in f_hosts.items()}, **cfg.hosts, **add_hosts}
+    if not tbeam_set and known:
+        default = next(iter(add_hosts), "")
+        r = _prompt(f"set TBEAM_HOST (default host for t beam)? alias, or blank to "
+                    f"skip [{default or 'skip'}]: ", default)
+        if r is None:
+            print("aborted — nothing appended", file=sys.stderr)
+            return 1
+        if r:
+            tbeam_target = known.get(r, r)
+
+    if not add_repos and not add_hosts and not tbeam_target:
+        print("nothing to add — everything discovered is already registered")
+        return 0
+
+    block = _setup_block(add_repos, add_hosts, tbeam_target, time.strftime("%Y-%m-%d"))
+    print("\nwill append to ~/.zshrc.local:\n")
+    print("".join(f"  {ln}\n" for ln in block.splitlines()), end="")
+    if not _confirm("append?"):
+        print("aborted — nothing appended", file=sys.stderr)
+        return 1
+    _append_local(ZSHRC_LOCAL, block)
+    # a fresh zsh -lic sources the updated ~/.zshrc.local; .zshrc's own
+    # _t_sync_config call then regenerates the (now-stale) config cache
+    zsh_capture("_t_sync_config")
+    print(f"✓ appended {len(add_repos)} repo(s), {len(add_hosts)} host(s)"
+          + (", TBEAM_HOST" if tbeam_target else ""))
+    if not os.environ.get("T_SETUP_SHIM"):
+        print("run `source ~/.zshrc` (or open a new shell) to make the new shortcuts live")
+    return 0
+
+
 # ─── shell-bound verbs — handled by the t() zsh shim, not the bin ──────────────
 # These cd the calling shell / exec `claude -r` in the current terminal / hand off
 # the tpush sentinel — a subprocess cannot. The t() function in .zshrc intercepts
@@ -644,6 +1041,7 @@ examples:
   t beam api --host mini  send a session to 'mini' and resume it there
   t find "auth refactor"  search saved sessions, then resume the pick
   t on mini ls            run a command on a remote host
+  t setup                 onboard this machine: register ~/code repos + ssh hosts
 
 Run `t <verb> -h` for a verb's own flags.""")
     sub = p.add_subparsers(dest="verb", metavar="<verb>")
@@ -817,6 +1215,19 @@ Run `t <verb> -h` for a verb's own flags.""")
     sp.add_argument("host", help="$REMOTE_HOSTS key, or a literal ssh target")
     sp.add_argument("rest", nargs=argparse.REMAINDER, help="command to run (omit for an interactive shell)")
 
+    sp = sub.add_parser("setup", help="register local repos and ssh hosts in ~/.zshrc.local",
+        description="Interactive onboarding for this machine's per-machine config. Scans for git "
+            "checkouts (default ~/code; name other dirs as arguments), offers unregistered ones "
+            "in a multi-select picker (space marks, enter confirms), parses ~/.ssh/config for "
+            "hosts, and appends the picks as DEV_REPOS/REMOTE_HOSTS entries to ~/.zshrc.local "
+            "(append-only; already-registered entries are skipped, so re-running is safe). Also "
+            "offers to comment out registered repos whose path no longer exists (the fresh-"
+            "install placeholders) and to set TBEAM_HOST. Run it from the shell — the t() shim "
+            "reloads your config afterward so the new cd shortcuts and host shorthands go live.")
+    sp.add_argument("dirs", nargs="*", help="directories to scan for git repos (default: ~/code)")
+    sp.add_argument("--dry-run", action="store_true",
+                    help="print what would be offered/appended, change nothing")
+
     # machine-readable / internal (hidden-ish; still have -h)
     sub.add_parser("session-rows", help="machine-readable per-host scan (remote contract)",
         description="Internal/machine-readable: emit one tab-separated row per live dev slot on "
@@ -838,7 +1249,7 @@ Run `t <verb> -h` for a verb's own flags.""")
 
 IMPLEMENTED = {
     "ls": cmd_ls, "session-rows": cmd_session_rows, "on": cmd_on, "read": cmd_read,
-    "plan": cmd_plan, "paste": cmd_paste, "kill": cmd_kill,
+    "plan": cmd_plan, "paste": cmd_paste, "kill": cmd_kill, "setup": cmd_setup,
     "land": cmd_land, "kill-owner": cmd_kill_owner, "cursor": cmd_cursor,
 }
 

@@ -926,8 +926,9 @@ def _setup_wizard(items, taken):
     The flow is select → name → write: steps repos → hosts → names → options →
     review, over the item model shared with the plain-prompt fallback. In a
     selection step space toggles, a adds a host by hand, enter advances; the
-    names step prompts once per picked entry (enter keeps the suggested alias,
-    typing overrides); q/esc/ctrl-c aborts with nothing written. Returns True on
+    names step prompts once per picked entry with the suggested alias PRE-FILLED
+    in the input line (edit in place, enter accepts); q/esc/ctrl-c aborts with
+    nothing written. Returns True on
     a confirmed review (items mutated in place), False on abort; raises when raw
     mode is unavailable → _setup_prompt_flow."""
     import select
@@ -952,16 +953,32 @@ def _setup_wizard(items, taken):
         return {"\r": "enter", "\n": "enter", " ": "space", "\x03": "abort",
                 "\x04": "abort", "": "abort"}.get(ch, ch)
 
-    def cooked_input(prompt, default="", erase=True):
-        # temporarily restore the line discipline so input() gives real editing
+    def cooked_input(prompt, default="", erase=True, prefill=None):
+        # Temporarily restore the line discipline so input() gives real editing.
+        # `prefill` puts the suggestion IN the input line, editable in place —
+        # the clearest "you can change this" signal there is (readline startup
+        # hook; on the rare build without readline it degrades to a [suggestion]
+        # prompt). Prompts here stay ANSI-free: once readline is loaded it does
+        # the cursor math for every input(), and escape codes break it.
         termios.tcsetattr(fd, termios.TCSADRAIN, old_attrs)
         out.write("\x1b[?25h")
         out.flush()
+        hooked = False
+        if prefill:
+            try:
+                import readline
+                readline.set_startup_hook(lambda: readline.insert_text(prefill))
+                hooked = True
+            except ImportError:
+                prompt = f"{prompt}[{prefill}] "
         try:
             s = input(prompt).strip()
         except EOFError:
             s = ""
         finally:
+            if hooked:
+                import readline
+                readline.set_startup_hook()
             tty.setcbreak(fd)
             out.write("\x1b[?25l")
             out.flush()
@@ -1033,10 +1050,10 @@ def _setup_wizard(items, taken):
                 it["checked"] = not it["checked"]
                 pos += 1
             elif it and k == "e" and it["kind"] == "tbeam":
-                it["value"] = cooked_input(f"{rail}  TBEAM_HOST target [{it['value']}]: ",
-                                           it["value"])
+                it["value"] = cooked_input("│  TBEAM_HOST target → ", it["value"],
+                                           prefill=it["value"])
             elif k == "a" and sec == "hosts":
-                ent = cooked_input(f"{rail}  add host (alias=target or user@host): ")
+                ent = cooked_input("│  add host (alias=target or user@host): ")
                 if not ent:
                     continue
                 alias, target = _parse_host_entry(ent, used_aliases())
@@ -1056,16 +1073,16 @@ def _setup_wizard(items, taken):
                    and it["kind"] in ("repo", "host")]
         if not targets:
             return True
-        out.write(f"{st.c}◆{st.r}  {st.b}names{st.r} {st.y}· enter keeps the "
-                  f"suggestion, or type your own{st.r}\n")
+        out.write(f"{st.c}◆{st.r}  {st.b}names{st.r} {st.y}· each name is sitting "
+                  f"in the input — edit it, or press enter to accept{st.r}\n")
         out.flush()
         lines = 1
         vw = min(max(len(_tilde(str(t["value"]))) for t in targets), width - 24)
         for it in targets:
             shown = _truncate(_tilde(str(it["value"])), vw)
             while True:
-                s = cooked_input(f"{rail}  {shown:<{vw}} [{it['alias']}]: ",
-                                 it["alias"], erase=False)
+                s = cooked_input(f"│  {shown:<{vw}} → ", it["alias"], erase=False,
+                                 prefill=it["alias"])
                 lines += 1
                 if s == it["alias"]:
                     break
@@ -1533,8 +1550,9 @@ Run `t <verb> -h` for a verb's own flags.""")
             "inline wizard over every git checkout found under the scan dirs (default ~/code) "
             "and every ~/.ssh/config host, with already-registered entries shown locked under a "
             "✓. The flow is select → name → write: space toggles, a adds a host by hand, enter "
-            "advances; a names step then confirms each picked alias (enter keeps the suggestion, "
-            "typing overrides), and the review step shows the exact block before y appends it to "
+            "advances; a names step then confirms each picked alias — the suggestion sits "
+            "pre-filled in the input line, edit it in place or press enter to accept — and the "
+            "review step shows the exact block before y appends it to "
             "~/.zshrc.local (append-only; "
             "re-running is safe — registered entries are never re-offered). Also offers to "
             "comment out registered repos whose path no longer exists (the fresh-install "

@@ -1000,7 +1000,9 @@ def _setup_wizard(items, taken):
         mark = f"{st.c}◼{st.r}" if it["checked"] else "◻"
         pre = f"{st.c}▸{st.r}" if cur else " "
         alias = (f"{st.b}{it['alias']:<{aw}}{st.r}" if cur else f"{it['alias']:<{aw}}")
-        return f"{rail}  {pre}{mark} {alias}  {st.y}{val}{st.r}"
+        # the cursor row advertises the rename key right where the eye is
+        tail = f"  {st.c}· e rename{st.r}" if cur and it.get("kind") in ("repo", "host") else ""
+        return f"{rail}  {pre}{mark} {alias}  {st.y}{val}{st.r}{tail}"
 
     painted = [0]
 
@@ -1049,6 +1051,15 @@ def _setup_wizard(items, taken):
             elif it and k == "space":
                 it["checked"] = not it["checked"]
                 pos += 1
+            elif it and k == "e" and it["kind"] in ("repo", "host"):
+                a = cooked_input(f"│  name for {_tilde(str(it['value']))} → ",
+                                 it["alias"], prefill=it["alias"])
+                if a != it["alias"]:
+                    if _SETUP_KEY.match(a) and a not in used_aliases(skip=it):
+                        it["alias"] = a
+                        it["checked"] = True   # renaming it means you want it
+                    else:
+                        msg = f"⚠ '{a}' is taken or not a valid key"
             elif it and k == "e" and it["kind"] == "tbeam":
                 it["value"] = cooked_input("│  TBEAM_HOST target → ", it["value"],
                                            prefill=it["value"])
@@ -1065,6 +1076,9 @@ def _setup_wizard(items, taken):
                 items.insert(at, {"t": "toggle", "sec": "hosts", "kind": "host",
                                   "alias": alias, "value": target, "checked": True})
                 pos = toggles().index(at)
+            else:
+                # a key that does nothing must SAY so — a silent no-op reads as broken
+                msg = f"⚠ no binding for that key — {hints}"
 
     def step_names():
         # naming is its own step AFTER selection (select → name → write): every
@@ -1127,7 +1141,7 @@ def _setup_wizard(items, taken):
     tty.setcbreak(fd)
     out.write("\x1b[?25l")
     try:
-        base = f"{st.y}space select · "
+        base = f"{st.y}space select · e rename · "
         ok = (step("repos", "repos", items[0]["label"].split("· ", 1)[-1],
                    base + "enter continue · q quit")
               and step("hosts", "hosts", "~/.ssh/config",

@@ -34,6 +34,10 @@ exclude_lines = [
     "def _read_usage\\(",
     "def _columns\\(",
     "class Style",
+    # bin/t interactive setup glue (fzf subprocess + input() prompts)
+    "def _fzf_pick\\(",
+    "def _prompt\\(",
+    "def _confirm\\(",
     # bin/pr-watch subprocess / launchd / notification glue
     "def log\\(",
     "def run\\(",

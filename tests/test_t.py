@@ -349,3 +349,259 @@ def test_infer_repo_shortest_alias_when_no_basename_match(t_mod, tmp_path, monke
     monkeypatch.setattr(t_mod, "HOME", str(tmp_path))
     monkeypatch.chdir(repo)
     assert t_mod._infer_repo(cfg) == "df"
+
+
+# ─── t setup: _local_entries ─────────────────────────────────────────────────────
+
+def test_local_entries_parses_live_lines(t_mod):
+    repos, hosts, tbeam = t_mod._local_entries("\n".join([
+        'DEV_REPOS[api]="$HOME/code/my-api"',
+        "REMOTE_HOSTS[mini]=chris@mini.local",
+        "export TBEAM_HOST=chris@mini.local",
+    ]))
+    assert repos == {"api": '"$HOME/code/my-api"'}
+    assert hosts == {"mini": "chris@mini.local"}
+    assert tbeam is True
+
+
+def test_local_entries_skips_commented_examples(t_mod):
+    # The shapes .zshrc.local.example ships commented out must not register.
+    repos, hosts, tbeam = t_mod._local_entries("\n".join([
+        "# DEV_REPOS[api]=$HOME/code/my-api",
+        "# REMOTE_HOSTS[mini]=my-mini",
+        "# export TBEAM_HOST=my-remote",
+        "  DEV_REPOS[web]=/code/web",   # leading whitespace is still live
+    ]))
+    assert repos == {"web": "/code/web"}
+    assert hosts == {} and tbeam is False
+
+
+def test_local_entries_empty_text(t_mod):
+    assert t_mod._local_entries("") == ({}, {}, False)
+
+
+# ─── t setup: _expand_home ───────────────────────────────────────────────────────
+
+def test_expand_home_forms(t_mod, monkeypatch):
+    monkeypatch.setattr(t_mod, "HOME", "/Users/me")
+    assert t_mod._expand_home('"$HOME/code/x"') == "/Users/me/code/x"
+    assert t_mod._expand_home("${HOME}/code/x") == "/Users/me/code/x"
+    assert t_mod._expand_home("/abs/path") == "/abs/path"
+
+
+def test_expand_home_tilde(t_mod):
+    assert t_mod._expand_home("~/code/x") == os.path.expanduser("~/code/x")
+
+
+# ─── t setup: _scan_repos ────────────────────────────────────────────────────────
+
+def _mk_repo(root, name, git_file=False):
+    d = root / name
+    d.mkdir(parents=True)
+    if git_file:
+        (d / ".git").write_text("gitdir: elsewhere")
+    else:
+        (d / ".git").mkdir()
+    return d
+
+
+def test_scan_repos_finds_git_dir_and_git_file(t_mod, tmp_path):
+    a = _mk_repo(tmp_path, "a")
+    b = _mk_repo(tmp_path, "b", git_file=True)   # worktree/submodule .git file
+    assert t_mod._scan_repos([str(tmp_path)], set()) == [str(a), str(b)]
+
+
+def test_scan_repos_prunes_below_repo_root(t_mod, tmp_path):
+    a = _mk_repo(tmp_path, "a")
+    _mk_repo(a, "vendored")   # nested repo inside a — never offered
+    assert t_mod._scan_repos([str(tmp_path)], set()) == [str(a)]
+
+
+def test_scan_repos_skips_hidden_and_skip_paths(t_mod, tmp_path):
+    a = _mk_repo(tmp_path, "a")
+    _mk_repo(tmp_path / ".worktrees", "hiddenrepo")   # under a hidden dir
+    reg = _mk_repo(tmp_path, "registered")
+    assert t_mod._scan_repos([str(tmp_path)], {str(reg)}) == [str(a)]
+
+
+def test_scan_repos_skips_registered_via_symlink(t_mod, tmp_path):
+    a = _mk_repo(tmp_path, "a")
+    link = tmp_path / "alink"
+    link.symlink_to(a)
+    # Registered under the symlinked path → the real path is still skipped.
+    assert t_mod._scan_repos([str(tmp_path)], {str(link)}) == []
+
+
+def test_scan_repos_depth_cap(t_mod, tmp_path):
+    deep = tmp_path / "l1" / "l2" / "l3"
+    _mk_repo(deep, "toodeep")
+    shallow = _mk_repo(tmp_path / "l1", "ok")
+    assert t_mod._scan_repos([str(tmp_path)], set()) == [str(shallow)]
+
+
+def test_scan_repos_missing_dir_yields_nothing(t_mod, tmp_path):
+    assert t_mod._scan_repos([str(tmp_path / "nope")], set()) == []
+
+
+def test_scan_repos_top_is_repo(t_mod, tmp_path):
+    a = _mk_repo(tmp_path, "a")
+    assert t_mod._scan_repos([str(a)], set()) == [str(a)]
+
+
+# ─── t setup: _propose_aliases / _propose_aliases_hosts ──────────────────────────
+
+def test_propose_aliases_basename(t_mod):
+    props, collided = t_mod._propose_aliases(["/code/api"], set())
+    assert props == {"/code/api": "api"} and collided == set()
+
+
+def test_propose_aliases_parent_qualifier_on_taken(t_mod):
+    props, collided = t_mod._propose_aliases(["/work/api"], {"api"})
+    assert props == {"/work/api": "work-api"}
+    assert collided == {"/work/api"}
+
+
+def test_propose_aliases_batch_duplicate(t_mod):
+    props, collided = t_mod._propose_aliases(["/code/api", "/work/api"], set())
+    assert props == {"/code/api": "api", "/work/api": "work-api"}
+    assert collided == {"/work/api"}
+
+
+def test_propose_aliases_suffixes_qualified_alias(t_mod):
+    # Qualified name also taken → numeric suffix on the QUALIFIED alias, keeping
+    # the parent context (work-api-2, not api-2).
+    props, collided = t_mod._propose_aliases(["/work/api"], {"api", "work-api"})
+    assert props == {"/work/api": "work-api-2"}
+    assert collided == {"/work/api"}
+
+
+def test_propose_aliases_hosts_dot_label(t_mod):
+    props, skipped = t_mod._propose_aliases_hosts(["studio.local", "mini"], set())
+    assert props == {"studio": "studio.local", "mini": "mini"}
+    assert skipped == []
+
+
+def test_propose_aliases_hosts_full_name_fallback_and_skip(t_mod):
+    props, skipped = t_mod._propose_aliases_hosts(
+        ["studio.local", "studio.remote"], {"studio"})
+    assert props == {"studio.local": "studio.local", "studio.remote": "studio.remote"}
+    props, skipped = t_mod._propose_aliases_hosts(["studio"], {"studio"})
+    assert props == {} and skipped == ["studio"]
+
+
+# ─── t setup: _homeify / _hostval / _setup_block ─────────────────────────────────
+
+def test_homeify_under_home(t_mod, monkeypatch):
+    monkeypatch.setattr(t_mod, "HOME", "/Users/me")
+    assert t_mod._homeify("/Users/me/code/x") == '"$HOME/code/x"'
+
+
+def test_homeify_outside_home(t_mod, monkeypatch):
+    monkeypatch.setattr(t_mod, "HOME", "/Users/me")
+    assert t_mod._homeify("/Volumes/work/x") == '"/Volumes/work/x"'
+    # A sibling dir sharing the prefix string is NOT under home.
+    assert t_mod._homeify("/Users/meep/x") == '"/Users/meep/x"'
+
+
+def test_hostval_bare_vs_quoted(t_mod):
+    assert t_mod._hostval("chris@mini.local") == "chris@mini.local"
+    assert t_mod._hostval("host with space") == '"host with space"'
+
+
+def test_setup_block_exact_format(t_mod, monkeypatch):
+    monkeypatch.setattr(t_mod, "HOME", "/Users/me")
+    block = t_mod._setup_block(
+        {"dotfiles": "/Users/me/code/dotfiles", "scratch": "/Volumes/work/scratch"},
+        {"mini": "chris@mini.local"}, "chris@mini.local", "2026-08-11")
+    assert block == (
+        "# ── added by `t setup` (2026-08-11) ──\n"
+        'DEV_REPOS[dotfiles]="$HOME/code/dotfiles"\n'
+        'DEV_REPOS[scratch]="/Volumes/work/scratch"\n'
+        "REMOTE_HOSTS[mini]=chris@mini.local\n"
+        "export TBEAM_HOST=chris@mini.local\n")
+
+
+def test_setup_block_repos_only(t_mod, monkeypatch):
+    monkeypatch.setattr(t_mod, "HOME", "/Users/me")
+    block = t_mod._setup_block({"x": "/Users/me/x"}, {}, None, "2026-08-11")
+    assert block == ("# ── added by `t setup` (2026-08-11) ──\n"
+                     'DEV_REPOS[x]="$HOME/x"\n')
+
+
+# ─── t setup: _parse_ssh_hosts ───────────────────────────────────────────────────
+
+def test_parse_ssh_hosts_multi_name_and_wildcards(t_mod, tmp_path):
+    cfg = tmp_path / "config"
+    cfg.write_text("\n".join([
+        "# a comment",
+        "",
+        "Host mini studio.local",
+        "  HostName mini.example.com",
+        "Host *",                       # stock wildcard — skipped
+        "host lower ?maybe !negated",   # keyword case-insensitive; ?/! skipped
+        'Include "unbalanced',          # shlex chokes → whitespace-split fallback
+    ]))
+    assert t_mod._parse_ssh_hosts(str(cfg)) == ["mini", "studio.local", "lower"]
+
+
+def test_parse_ssh_hosts_missing_file(t_mod, tmp_path):
+    assert t_mod._parse_ssh_hosts(str(tmp_path / "nope")) == []
+
+
+def test_parse_ssh_hosts_follows_include_glob(t_mod, tmp_path, monkeypatch):
+    monkeypatch.setattr(t_mod, "HOME", str(tmp_path))
+    ssh = tmp_path / ".ssh"
+    ssh.mkdir()
+    (ssh / "config").write_text("Include extra.d/*.conf\nHost main\n")
+    (ssh / "extra.d").mkdir()
+    (ssh / "extra.d" / "a.conf").write_text("Host inca\n")
+    (ssh / "extra.d" / "b.conf").write_text("Host incb\n")
+    assert t_mod._parse_ssh_hosts(str(ssh / "config")) == ["inca", "incb", "main"]
+
+
+def test_parse_ssh_hosts_include_cycle_safe(t_mod, tmp_path):
+    a = tmp_path / "a"
+    b = tmp_path / "b"
+    a.write_text(f"Include {b}\nHost hosta\n")
+    b.write_text(f"Include {a}\nHost hostb\n")
+    assert t_mod._parse_ssh_hosts(str(a)) == ["hostb", "hosta"]
+
+
+def test_parse_ssh_hosts_dedupes(t_mod, tmp_path):
+    cfg = tmp_path / "config"
+    cfg.write_text("Host mini\nHost mini other\n")
+    assert t_mod._parse_ssh_hosts(str(cfg)) == ["mini", "other"]
+
+
+# ─── t setup: _comment_stale / _append_local ─────────────────────────────────────
+
+def test_comment_stale_targets_only_named_keys(t_mod):
+    text = ("# header\n"
+            'DEV_REPOS[api]="$HOME/code/my-api"\n'
+            'DEV_REPOS[web]="$HOME/code/my-web"\n'
+            "REMOTE_HOSTS[api]=whatever\n")
+    out = t_mod._comment_stale(text, {"api"})
+    assert out == ("# header\n"
+                   '# (stale — t setup) DEV_REPOS[api]="$HOME/code/my-api"\n'
+                   'DEV_REPOS[web]="$HOME/code/my-web"\n'
+                   "REMOTE_HOSTS[api]=whatever\n")
+
+
+def test_comment_stale_preserves_missing_trailing_newline(t_mod):
+    out = t_mod._comment_stale("DEV_REPOS[a]=/x", {"nomatch"})
+    assert out == "DEV_REPOS[a]=/x"
+
+
+def test_append_local_separator_and_newline_normalization(t_mod, tmp_path):
+    f = tmp_path / "local"
+    f.write_text("existing content")     # no trailing newline
+    t_mod._append_local(str(f), "BLOCK\n")
+    assert f.read_text() == "existing content\n\nBLOCK\n"
+
+
+def test_append_local_creates_missing_file_with_header(t_mod, tmp_path):
+    f = tmp_path / "local"
+    t_mod._append_local(str(f), "BLOCK\n")
+    text = f.read_text()
+    assert text.startswith("# ~/.zshrc.local")
+    assert text.endswith("\n\nBLOCK\n")

@@ -130,7 +130,7 @@ fi
 # template on first run; never clobber an existing one.
 if [[ ! -e "$HOME/.zshrc.local" ]]; then
     cp "$LINK_SRC/.zshrc.local.example" "$HOME/.zshrc.local"
-    echo "Created ~/.zshrc.local from template — edit it with your repos (DEV_REPOS) and TBEAM_HOST."
+    echo "Created ~/.zshrc.local from template — run 't setup' in a new shell to register your repos and remote hosts (or edit it by hand)."
 fi
 
 # Claude Code settings — ~/.claude/settings.json is a REAL COPY seeded from

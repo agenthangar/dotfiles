@@ -917,156 +917,193 @@ def _parse_host_entry(ent, used):
     return alias, target
 
 
-def _setup_tui(items, taken):
-    """The t setup screen: a single curses checklist — every discovered repo and
-    host at once, registered ones locked with a dim ✓ — plus the stale/TBEAM
-    options. space toggles, e edits the alias under the cursor (or the TBEAM
-    target), a adds a host by hand, enter shows the review screen, y there
-    confirms. Returns True on a confirmed review (items mutated in place), False
-    on quit; raises when curses cannot initialize — the caller falls back to
-    _setup_prompt_flow."""
-    import curses
-    import locale
-    try:
-        locale.setlocale(locale.LC_ALL, "")   # ncurses needs the locale for ✓ etc.
-    except locale.Error:
-        pass
+def _setup_wizard(items, taken):
+    """The t setup UI: a clack-style inline wizard (the `npm create` aesthetic —
+    step symbols on a vertical rail, the picker redrawn in place with ANSI
+    cursor-up, each finished step collapsing to a one-line summary). Deliberately
+    NOT full-screen: everything stays in normal scrollback, so what you did is
+    still on screen when it ends. stdlib only — termios/tty raw keys, no curses.
+    Steps: repos → hosts → options → review; the item model is shared with the
+    plain-prompt fallback. space toggles, e renames (or edits the TBEAM target),
+    a adds a host by hand, enter advances, q/esc/ctrl-c aborts with nothing
+    written. Returns True on a confirmed review (items mutated in place), False
+    on abort; raises when raw mode is unavailable → _setup_prompt_flow."""
+    import select
+    import termios
+    import tty
+
+    st = Style()
+    out = sys.stdout
+    rail = f"{st.y}│{st.r}"
+    fd = sys.stdin.fileno()
+    old_attrs = termios.tcgetattr(fd)
+    width = max(40, shutil.get_terminal_size((100, 24)).columns)
+
+    def read_key():
+        ch = os.read(fd, 1).decode(errors="replace")
+        if ch == "\x1b":
+            r, _, _ = select.select([fd], [], [], 0.05)
+            if r:
+                seq = os.read(fd, 2).decode(errors="replace")
+                return {"[A": "up", "OA": "up", "[B": "down", "OB": "down"}.get(seq, "esc")
+            return "esc"
+        return {"\r": "enter", "\n": "enter", " ": "space", "\x03": "abort",
+                "\x04": "abort", "": "abort"}.get(ch, ch)
+
+    def cooked_input(prompt, default=""):
+        # temporarily restore the line discipline so input() gives real editing
+        termios.tcsetattr(fd, termios.TCSADRAIN, old_attrs)
+        out.write("\x1b[?25h")
+        out.flush()
+        try:
+            s = input(prompt).strip()
+        except EOFError:
+            s = ""
+        finally:
+            tty.setcbreak(fd)
+            out.write("\x1b[?25l")
+            out.flush()
+        out.write("\x1b[1A\r\x1b[J")   # reclaim the input line for the repaint
+        return s or default
 
     def used_aliases(skip=None):
         return taken | {it["alias"] for it in items
-                        if it is not skip and it["t"] in ("toggle", "locked")
-                        and it.get("kind") in (None, "repo", "host")}
+                        if it is not skip and it["t"] in ("toggle", "locked")}
 
-    def run(scr):
-        curses.curs_set(0)
-        try:
-            curses.use_default_colors()
-        except curses.error:
-            pass
-        pos, top, msg = 0, 0, ""
+    def row_text(it, aw, cur):
+        # host/tbeam values are ssh targets (never home paths); everything else
+        # is a filesystem path worth ~-abbreviating (locked rows have no kind)
+        val = it["value"] if it.get("kind") in ("host", "tbeam") else _tilde(str(it["value"]))
+        val = _truncate(str(val), max(8, width - aw - 12))
+        if it["t"] == "locked":
+            return f"{rail}   {st.g}✓{st.r} {st.y}{it['alias']:<{aw}}  {val} · registered{st.r}"
+        mark = f"{st.c}◼{st.r}" if it["checked"] else "◻"
+        pre = f"{st.c}▸{st.r}" if cur else " "
+        alias = (f"{st.b}{it['alias']:<{aw}}{st.r}" if cur else f"{it['alias']:<{aw}}")
+        return f"{rail}  {pre}{mark} {alias}  {st.y}{val}{st.r}"
 
-        def put(y, x, s, attr=0):
-            h, w = scr.getmaxyx()
-            if 0 <= y < h and x < w:
-                try:
-                    scr.addstr(y, x, s[: max(0, w - x - 1)], attr)
-                except curses.error:
-                    pass   # writing the bottom-right cell always errors; harmless
+    painted = [0]
 
-        def ask(prompt, default=""):
-            h, _w = scr.getmaxyx()
-            curses.echo()
-            curses.curs_set(1)
-            scr.move(h - 1, 0)
-            scr.clrtoeol()
-            put(h - 1, 0, prompt)
-            scr.refresh()
-            try:
-                s = scr.getstr(h - 1, len(prompt), 200).decode(errors="replace").strip()
-            except Exception:
-                s = ""
-            curses.noecho()
-            curses.curs_set(0)
-            return s or default
+    def repaint(lines):
+        if painted[0]:
+            out.write(f"\x1b[{painted[0]}A\r\x1b[J")
+        out.write("\n".join(lines) + "\n")
+        painted[0] = len(lines)
+        out.flush()
 
-        def review():
-            repos, hosts, tbeam, stale_ok = _setup_result(items)
-            if not (repos or hosts or tbeam or stale_ok):
-                return None
-            lines = []
-            if repos or hosts or tbeam:
-                lines += ["will append to ~/.zshrc.local:", ""]
-                lines += ["  " + ln for ln in _setup_block(
-                    repos, hosts, tbeam, time.strftime("%Y-%m-%d")).splitlines()]
-            if stale_ok:
-                sv = next(it["value"] for it in items if it.get("kind") == "stale")
-                lines += ["", f"and comment out the stale entries: {sv}"]
-            scr.erase()
-            put(0, 0, "review", curses.A_BOLD)
-            for i, ln in enumerate(lines):
-                put(2 + i, 2, ln, curses.A_DIM if ln.lstrip().startswith("#") else 0)
-            h, _w = scr.getmaxyx()
-            put(h - 1, 0, "y append · any other key go back", curses.A_DIM)
-            scr.refresh()
-            return scr.getch() in (ord("y"), ord("Y"))
+    def collapse(sec_label, summary):
+        repaint([f"{st.g}◇{st.r}  {st.b}{sec_label}{st.r} {st.y}·{st.r} {summary}", rail])
+        painted[0] = 0   # the collapsed line is final — next step paints below
 
+    def step(sec, sec_label, source, hints):
+        toggles = lambda: [i for i, x in enumerate(items) if x["sec"] == sec and x["t"] == "toggle"]
+        locked = [x for x in items if x["sec"] == sec and x["t"] == "locked"]
+        pos, msg = 0, ""
         while True:
-            sel = _selectable(items)
-            pos = min(pos, len(sel) - 1)
-            cur = sel[pos]
-            h, w = scr.getmaxyx()
-            body = h - 4
-            top = min(top, cur)
-            if cur >= top + body:
-                top = cur - body + 1
-            aw = max([len(it["alias"]) for it in items
-                      if it["t"] in ("toggle", "locked")
-                      and it.get("kind") in (None, "repo", "host")] or [1])
-            scr.erase()
-            put(0, 0, "t setup — pick what to add to ~/.zshrc.local", curses.A_BOLD)
-            put(1, 0, "nothing is written until you confirm the review", curses.A_DIM)
-            for row, idx in enumerate(range(top, min(len(items), top + body))):
-                it, yy, hot = items[idx], 3 + row, idx == cur
-                if it["t"] == "header":
-                    put(yy, 0, it["label"], curses.A_BOLD)
-                elif it["t"] == "note":
-                    put(yy, 6, it["label"], curses.A_DIM)
-                elif it["t"] == "locked":
-                    put(yy, 2, f" ✓  {it['alias']:<{aw}}  {_tilde(it['value'])}", curses.A_DIM)
-                elif it["t"] == "toggle":
-                    mark = "✓" if it["checked"] else " "
-                    if it["kind"] in ("repo", "host"):
-                        text = f"[{mark}] {it['alias']:<{aw}}  {_tilde(it['value'])}"
-                    else:
-                        text = f"[{mark}] {it['alias']} — {it['value']}"
-                    put(yy, 2, text, curses.A_REVERSE if hot else 0)
-            put(h - 2, 0, msg, curses.A_BOLD)
-            put(h - 1, 0, "↑↓ move · space toggle ✓ · e edit alias · a add host · "
-                          "enter review · q quit", curses.A_DIM)
+            rows = toggles()
+            pos = max(0, min(pos, len(rows) - 1))
+            aw = max([len(items[i]["alias"]) for i in rows] +
+                     [len(x["alias"]) for x in locked] + [1])
+            head = (f"{st.c}◆{st.r}  {st.b}{sec_label}{st.r} {st.y}· {source} · "
+                    f"{msg or hints}{st.r}")
+            lines = [head]
+            lines += [row_text(items[i], aw, n == pos) for n, i in enumerate(rows)]
+            if not rows:
+                lines.append(f"{rail}   {st.y}nothing new{st.r}")
+            lines += [row_text(x, aw, False) for x in locked]
+            repaint(lines)
             msg = ""
-            scr.refresh()
-            ch = scr.getch()
-            it = items[cur]
-            if ch in (ord("q"), 27, -1):
+            k = read_key()
+            it = items[rows[pos]] if rows else None
+            if k in ("q", "esc", "abort"):
                 return False
-            elif ch in (curses.KEY_UP, ord("k")):
-                pos = max(0, pos - 1)
-            elif ch in (curses.KEY_DOWN, ord("j")):
-                pos = min(len(sel) - 1, pos + 1)
-            elif ch == ord(" "):
+            elif k == "enter":
+                added = [items[i]["alias"] for i in toggles() if items[i]["checked"]]
+                collapse(sec_label, ", ".join(added) if added
+                         else f"{st.y}nothing selected{st.r}")
+                return True
+            elif it and k in ("up", "k"):
+                pos -= 1
+            elif it and k in ("down", "j"):
+                pos += 1
+            elif it and k == "space":
                 it["checked"] = not it["checked"]
-                pos = min(pos + 1, len(sel) - 1)   # advance, like the pickers do
-            elif ch == ord("e") and it["kind"] in ("repo", "host"):
-                a = ask(f"alias [{it['alias']}]: ", it["alias"])
-                if a != it["alias"]:
-                    if _SETUP_KEY.match(a) and a not in used_aliases(skip=it):
-                        it["alias"] = a
-                    else:
-                        msg = f"'{a}' is taken or not a valid key"
-            elif ch == ord("e") and it["kind"] == "tbeam":
-                it["value"] = ask(f"TBEAM_HOST target [{it['value']}]: ", it["value"])
-            elif ch == ord("a"):
-                ent = ask("add host — alias=target or user@host: ")
+                pos += 1
+            elif it and k == "e" and it["kind"] in ("repo", "host"):
+                a = cooked_input(f"{rail}  alias [{it['alias']}]: ", it["alias"])
+                if a == it["alias"]:
+                    pass
+                elif _SETUP_KEY.match(a) and a not in used_aliases(skip=it):
+                    it["alias"] = a
+                else:
+                    msg = f"⚠ '{a}' is taken or not a valid key"
+            elif it and k == "e" and it["kind"] == "tbeam":
+                it["value"] = cooked_input(f"{rail}  TBEAM_HOST target [{it['value']}]: ",
+                                           it["value"])
+            elif k == "a" and sec == "hosts":
+                ent = cooked_input(f"{rail}  add host (alias=target or user@host): ")
                 if not ent:
                     continue
                 alias, target = _parse_host_entry(ent, used_aliases())
                 if alias is None:
-                    msg = target
+                    msg = f"⚠ {target}"
                     continue
-                at = _host_insert_at(items)
                 items[:] = [x for x in items if not (x["sec"] == "hosts" and x["t"] == "note")]
-                at = min(at, len(items))
+                at = _host_insert_at(items)
                 items.insert(at, {"t": "toggle", "sec": "hosts", "kind": "host",
                                   "alias": alias, "value": target, "checked": True})
-                pos = _selectable(items).index(at)
-                msg = f"+ {alias} → {target}"
-            elif ch in (10, 13, curses.KEY_ENTER):
-                r = review()
-                if r is None:
-                    msg = "nothing selected — space toggles ✓"
-                elif r:
-                    return True
-    return bool(curses.wrapper(run))
+                pos = toggles().index(at)
+
+    def review():
+        repos, hosts, tbeam, stale_ok = _setup_result(items)
+        if not (repos or hosts or tbeam or stale_ok):
+            repaint([f"{st.g}◇{st.r}  {st.y}nothing selected — nothing to write{st.r}"])
+            painted[0] = 0
+            return True   # a confirmed no-op; cmd_setup prints the summary
+        body = []
+        if repos or hosts or tbeam:
+            body += _setup_block(repos, hosts, tbeam, time.strftime("%Y-%m-%d")).splitlines()
+        if stale_ok:
+            sv = next(x["value"] for x in items if x.get("kind") == "stale")
+            body.append(f"# plus: comment out the stale entries ({sv})")
+        while True:
+            lines = [f"{st.c}◆{st.r}  {st.b}append to ~/.zshrc.local?{st.r} "
+                     f"{st.y}· y append · q abort{st.r}"]
+            lines += [f"{rail}  {st.y}{ln}{st.r}" if ln.startswith('#') else f"{rail}  {ln}"
+                      for ln in body]
+            repaint(lines)
+            k = read_key()
+            if k == "y":
+                lines[0] = f"{st.g}◇{st.r}  {st.b}append to ~/.zshrc.local{st.r} {st.y}· confirmed{st.r}"
+                repaint(lines)
+                painted[0] = 0
+                return True
+            if k in ("q", "esc", "abort", "n"):
+                return False
+
+    out.write(f"{st.y}┌{st.r}  {st.b}t setup{st.r} {st.y}· ~/.zshrc.local — nothing "
+              f"is written until the final confirm{st.r}\n{rail}\n")
+    tty.setcbreak(fd)
+    out.write("\x1b[?25l")
+    try:
+        base = f"{st.y}space select · e rename · "
+        ok = (step("repos", "repos", items[0]["label"].split("· ", 1)[-1],
+                   base + "enter continue · q quit")
+              and step("hosts", "hosts", "~/.ssh/config",
+                       base + "a add · enter continue · q quit")
+              and (not any(x["sec"] == "options" and x["t"] == "toggle" for x in items)
+                   or step("options", "options", "optional extras",
+                           base + "enter continue · q quit"))
+              and review())
+    except KeyboardInterrupt:
+        ok = False
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old_attrs)
+        out.write("\x1b[?25h")
+        out.flush()
+    end = "" if ok else f" {st.y}· aborted — nothing written{st.r}"
+    out.write(f"{st.y}└{st.r}{end}\n")
+    return ok
 
 
 def _setup_prompt_flow(items, taken):
@@ -1210,13 +1247,16 @@ def cmd_setup(cfg, args):
         print("(add an unlisted host by hand: REMOTE_HOSTS[alias]=user@host in ~/.zshrc.local)")
         return 0
     all_keys = taken_keys | host_keys
+    wizard_ran = True
     try:
-        confirmed = _setup_tui(items, all_keys)
+        confirmed = _setup_wizard(items, all_keys)
     except Exception as e:
-        print(f"(full-screen UI unavailable: {e} — falling back to prompts)", file=sys.stderr)
+        wizard_ran = False
+        print(f"(inline UI unavailable: {e} — falling back to prompts)", file=sys.stderr)
         confirmed = _setup_prompt_flow(items, all_keys)
     if not confirmed:
-        print("t setup: aborted — nothing written")
+        if not wizard_ran:   # the wizard already printed its └ aborted line
+            print("t setup: aborted — nothing written")
         return 1
 
     add_repos, add_hosts, tbeam_target, stale_ok = _setup_result(items)
@@ -1227,7 +1267,7 @@ def cmd_setup(cfg, args):
             fh.write(local_text)
         print(f"✓ commented out stale entries: {', '.join(stale)}")
     if not add_repos and not add_hosts and not tbeam_target:
-        if not stale_ok:
+        if not stale_ok and not wizard_ran:   # the wizard showed "nothing selected"
             print("nothing selected — nothing written")
         return 0
 
@@ -1236,9 +1276,13 @@ def cmd_setup(cfg, args):
     # a fresh zsh -lic sources the updated ~/.zshrc.local; .zshrc's own
     # _t_sync_config call then regenerates the (now-stale) config cache
     zsh_capture("_t_sync_config")
-    print("✓ appended to ~/.zshrc.local:")
-    for ln in block.splitlines():
-        print(f"  {st.y}{ln}{st.r}" if ln.startswith("#") else f"  {ln}")
+    n = len(add_repos) + len(add_hosts) + (1 if tbeam_target else 0)
+    if wizard_ran:   # its review left the exact block on screen — just summarize
+        print(f"✓ appended {n} entr{'y' if n == 1 else 'ies'} to ~/.zshrc.local")
+    else:
+        print("✓ appended to ~/.zshrc.local:")
+        for ln in block.splitlines():
+            print(f"  {st.y}{ln}{st.r}" if ln.startswith("#") else f"  {ln}")
     if not os.environ.get("T_SETUP_SHIM"):
         print("run `source ~/.zshrc` (or open a new shell) to make the new shortcuts live")
     return 0
@@ -1460,15 +1504,15 @@ Run `t <verb> -h` for a verb's own flags.""")
     sp.add_argument("rest", nargs=argparse.REMAINDER, help="command to run (omit for an interactive shell)")
 
     sp = sub.add_parser("setup", help="register local repos and ssh hosts in ~/.zshrc.local",
-        description="Interactive onboarding for this machine's per-machine config: one checklist "
-            "screen with every git checkout found under the scan dirs (default ~/code) and every "
-            "~/.ssh/config host, already-registered entries shown locked with a ✓. space toggles, "
-            "e edits an alias, a adds a host by hand, enter reviews the exact block, y appends it "
-            "to ~/.zshrc.local (append-only; re-running is safe — registered entries are never "
-            "re-offered). Also offers to comment out registered repos whose path no longer exists "
-            "(the fresh-install placeholders) and to set TBEAM_HOST. Run it from the shell — the "
-            "t() shim reloads your config afterward so the new cd shortcuts and host shorthands "
-            "go live.")
+        description="Interactive onboarding for this machine's per-machine config: a stepped "
+            "inline wizard over every git checkout found under the scan dirs (default ~/code) "
+            "and every ~/.ssh/config host, with already-registered entries shown locked under a "
+            "✓. space toggles, e renames, a adds a host by hand, enter advances, and the review "
+            "step shows the exact block before y appends it to ~/.zshrc.local (append-only; "
+            "re-running is safe — registered entries are never re-offered). Also offers to "
+            "comment out registered repos whose path no longer exists (the fresh-install "
+            "placeholders) and to set TBEAM_HOST. Run it from the shell — the t() shim reloads "
+            "your config afterward so the new cd shortcuts and host shorthands go live.")
     sp.add_argument("dirs", nargs="*", help="directories to scan for git repos (default: ~/code)")
     sp.add_argument("--dry-run", action="store_true",
                     help="print what would be offered/appended, change nothing")

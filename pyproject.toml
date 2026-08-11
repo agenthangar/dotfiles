@@ -34,8 +34,8 @@ exclude_lines = [
     "def _read_usage\\(",
     "def _columns\\(",
     "class Style",
-    # bin/t interactive setup glue (curses screen + input() prompts)
-    "def _setup_tui\\(",
+    # bin/t interactive setup glue (inline wizard + input() prompts)
+    "def _setup_wizard\\(",
     "def _setup_prompt_flow\\(",
     "def _prompt\\(",
     "def _confirm\\(",

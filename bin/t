@@ -923,11 +923,13 @@ def _setup_wizard(items, taken):
     cursor-up, each finished step collapsing to a one-line summary). Deliberately
     NOT full-screen: everything stays in normal scrollback, so what you did is
     still on screen when it ends. stdlib only — termios/tty raw keys, no curses.
-    Steps: repos → hosts → options → review; the item model is shared with the
-    plain-prompt fallback. space toggles, e renames (or edits the TBEAM target),
-    a adds a host by hand, enter advances, q/esc/ctrl-c aborts with nothing
-    written. Returns True on a confirmed review (items mutated in place), False
-    on abort; raises when raw mode is unavailable → _setup_prompt_flow."""
+    The flow is select → name → write: steps repos → hosts → names → options →
+    review, over the item model shared with the plain-prompt fallback. In a
+    selection step space toggles, a adds a host by hand, enter advances; the
+    names step prompts once per picked entry (enter keeps the suggested alias,
+    typing overrides); q/esc/ctrl-c aborts with nothing written. Returns True on
+    a confirmed review (items mutated in place), False on abort; raises when raw
+    mode is unavailable → _setup_prompt_flow."""
     import select
     import termios
     import tty
@@ -950,7 +952,7 @@ def _setup_wizard(items, taken):
         return {"\r": "enter", "\n": "enter", " ": "space", "\x03": "abort",
                 "\x04": "abort", "": "abort"}.get(ch, ch)
 
-    def cooked_input(prompt, default=""):
+    def cooked_input(prompt, default="", erase=True):
         # temporarily restore the line discipline so input() gives real editing
         termios.tcsetattr(fd, termios.TCSADRAIN, old_attrs)
         out.write("\x1b[?25h")
@@ -963,7 +965,8 @@ def _setup_wizard(items, taken):
             tty.setcbreak(fd)
             out.write("\x1b[?25l")
             out.flush()
-        out.write("\x1b[1A\r\x1b[J")   # reclaim the input line for the repaint
+        if erase:
+            out.write("\x1b[1A\r\x1b[J")   # reclaim the input line for the repaint
         return s or default
 
     def used_aliases(skip=None):
@@ -1029,14 +1032,6 @@ def _setup_wizard(items, taken):
             elif it and k == "space":
                 it["checked"] = not it["checked"]
                 pos += 1
-            elif it and k == "e" and it["kind"] in ("repo", "host"):
-                a = cooked_input(f"{rail}  alias [{it['alias']}]: ", it["alias"])
-                if a == it["alias"]:
-                    pass
-                elif _SETUP_KEY.match(a) and a not in used_aliases(skip=it):
-                    it["alias"] = a
-                else:
-                    msg = f"⚠ '{a}' is taken or not a valid key"
             elif it and k == "e" and it["kind"] == "tbeam":
                 it["value"] = cooked_input(f"{rail}  TBEAM_HOST target [{it['value']}]: ",
                                            it["value"])
@@ -1053,6 +1048,35 @@ def _setup_wizard(items, taken):
                 items.insert(at, {"t": "toggle", "sec": "hosts", "kind": "host",
                                   "alias": alias, "value": target, "checked": True})
                 pos = toggles().index(at)
+
+    def step_names():
+        # naming is its own step AFTER selection (select → name → write): every
+        # picked repo/host gets one prompt line, enter keeps the suggestion
+        targets = [it for it in items if it["t"] == "toggle" and it["checked"]
+                   and it["kind"] in ("repo", "host")]
+        if not targets:
+            return True
+        out.write(f"{st.c}◆{st.r}  {st.b}names{st.r} {st.y}· enter keeps the "
+                  f"suggestion, or type your own{st.r}\n")
+        out.flush()
+        lines = 1
+        vw = min(max(len(_tilde(str(t["value"]))) for t in targets), width - 24)
+        for it in targets:
+            shown = _truncate(_tilde(str(it["value"])), vw)
+            while True:
+                s = cooked_input(f"{rail}  {shown:<{vw}} [{it['alias']}]: ",
+                                 it["alias"], erase=False)
+                lines += 1
+                if s == it["alias"]:
+                    break
+                if _SETUP_KEY.match(s) and s not in used_aliases(skip=it):
+                    it["alias"] = s
+                    break
+                out.write(f"{rail}  {st.y}⚠ '{s}' is taken or not a valid key{st.r}\n")
+                lines += 1
+        out.write(f"\x1b[{lines}A\r\x1b[J")
+        collapse("names", ", ".join(t["alias"] for t in targets))
+        return True
 
     def review():
         repos, hosts, tbeam, stale_ok = _setup_result(items)
@@ -1086,14 +1110,15 @@ def _setup_wizard(items, taken):
     tty.setcbreak(fd)
     out.write("\x1b[?25l")
     try:
-        base = f"{st.y}space select · e rename · "
+        base = f"{st.y}space select · "
         ok = (step("repos", "repos", items[0]["label"].split("· ", 1)[-1],
                    base + "enter continue · q quit")
               and step("hosts", "hosts", "~/.ssh/config",
                        base + "a add · enter continue · q quit")
+              and step_names()
               and (not any(x["sec"] == "options" and x["t"] == "toggle" for x in items)
                    or step("options", "options", "optional extras",
-                           base + "enter continue · q quit"))
+                           base + "e edit target · enter continue · q quit"))
               and review())
     except KeyboardInterrupt:
         ok = False
@@ -1507,8 +1532,10 @@ Run `t <verb> -h` for a verb's own flags.""")
         description="Interactive onboarding for this machine's per-machine config: a stepped "
             "inline wizard over every git checkout found under the scan dirs (default ~/code) "
             "and every ~/.ssh/config host, with already-registered entries shown locked under a "
-            "✓. space toggles, e renames, a adds a host by hand, enter advances, and the review "
-            "step shows the exact block before y appends it to ~/.zshrc.local (append-only; "
+            "✓. The flow is select → name → write: space toggles, a adds a host by hand, enter "
+            "advances; a names step then confirms each picked alias (enter keeps the suggestion, "
+            "typing overrides), and the review step shows the exact block before y appends it to "
+            "~/.zshrc.local (append-only; "
             "re-running is safe — registered entries are never re-offered). Also offers to "
             "comment out registered repos whose path no longer exists (the fresh-install "
             "placeholders) and to set TBEAM_HOST. Run it from the shell — the t() shim reloads "

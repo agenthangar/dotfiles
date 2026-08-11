@@ -588,7 +588,8 @@ def test_setup_items_full_structure(t_mod):
     kinds = [(it["t"], it.get("kind")) for it in items]
     assert kinds == [
         ("header", None), ("toggle", "repo"), ("locked", None),          # repos
-        ("spacer", None), ("header", None), ("toggle", "host"), ("locked", None),
+        ("spacer", None), ("header", None), ("toggle", "host"),
+        ("toggle", "addhost"), ("locked", None),                         # hosts
         ("spacer", None), ("header", None), ("toggle", "stale"), ("toggle", "tbeam"),
     ]
     assert items[0]["label"] == "REPOS · ~/code"
@@ -598,7 +599,9 @@ def test_setup_items_full_structure(t_mod):
 def test_setup_items_empty_sections_get_notes(t_mod):
     items = _items(t_mod, repo_cands=[], host_cands=[], tbeam_default=None, stale=[])
     notes = [it["label"] for it in items if it["t"] == "note"]
-    assert len(notes) == 2
+    assert notes == ["no new checkouts found"]
+    # the hosts section always keeps its selectable add-a-host action row
+    assert [it["kind"] for it in items if it["t"] == "toggle"] == ["addhost"]
     # no OPTIONS section when there is nothing to put in it
     assert all(it.get("label") != "OPTIONS" for it in items if it["t"] == "header")
 
@@ -606,7 +609,7 @@ def test_setup_items_empty_sections_get_notes(t_mod):
 def test_selectable_indices(t_mod):
     items = _items(t_mod)
     idx = t_mod._selectable(items)
-    assert [items[i]["kind"] for i in idx] == ["repo", "host", "stale", "tbeam"]
+    assert [items[i]["kind"] for i in idx] == ["repo", "host", "addhost", "stale", "tbeam"]
 
 
 def test_setup_result_maps_checked_toggles(t_mod):
@@ -624,10 +627,17 @@ def test_setup_result_unchecked_is_empty(t_mod):
     assert t_mod._setup_result(_items(t_mod)) == ({}, {}, None, False)
 
 
-def test_host_insert_at_after_last_host_toggle(t_mod):
+def test_host_insert_at_before_addhost_row(t_mod):
     items = _items(t_mod)
     at = t_mod._host_insert_at(items)
     assert items[at - 1]["kind"] == "host"      # right after the host toggle
+    assert items[at]["kind"] == "addhost"       # directly above the action row
+
+
+def test_host_insert_at_without_addhost_row(t_mod):
+    items = [it for it in _items(t_mod) if it.get("kind") != "addhost"]
+    at = t_mod._host_insert_at(items)
+    assert items[at - 1]["kind"] == "host"
     assert items[at]["t"] == "locked"           # before the registered rows
 
 

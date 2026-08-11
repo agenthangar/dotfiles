@@ -838,9 +838,10 @@ def _setup_items(repo_cands, reg_repos, host_cands, reg_hosts, tbeam_default, st
     for alias, target in host_cands:
         items.append({"t": "toggle", "sec": "hosts", "kind": "host",
                       "alias": alias, "value": target, "checked": False})
-    if not host_cands:
-        items.append({"t": "note", "sec": "hosts",
-                      "label": "no new hosts in ~/.ssh/config — press a to add one"})
+    # manual add is a ROW, not a keybind: the hosts step always has something to
+    # select, and the affordance is visible instead of hidden in a hint bar
+    items.append({"t": "toggle", "sec": "hosts", "kind": "addhost",
+                  "alias": "+ add a host manually", "value": "", "checked": False})
     for k in sorted(reg_hosts):
         items.append({"t": "locked", "sec": "hosts", "alias": k, "value": reg_hosts[k]})
     if stale or tbeam_default:
@@ -879,11 +880,16 @@ def _setup_result(items):
 
 
 def _host_insert_at(items):
-    """Where a manually-added host row belongs: after the last host toggle, else
-    right after the HOSTS header — always before the section's locked rows."""
+    """Where a manually-added host row belongs: right above the '+ add a host'
+    action row (else after the last host toggle / the HOSTS header) — always
+    before the section's locked rows."""
     at = None
     for i, it in enumerate(items):
-        if it["sec"] == "hosts" and (it["t"] == "header" or it["t"] == "toggle"):
+        if it["sec"] != "hosts":
+            continue
+        if it.get("kind") == "addhost":
+            return i
+        if it["t"] in ("header", "toggle"):
             at = i
     return (at + 1) if at is not None else len(items)
 
@@ -991,6 +997,12 @@ def _setup_wizard(items, taken):
                         if it is not skip and it["t"] in ("toggle", "locked")}
 
     def row_text(it, aw, cur):
+        if it.get("kind") == "addhost":
+            pre = f"{st.c}▸{st.r}" if cur else " "
+            text = it["alias"].lstrip("+ ") + "…"
+            body = f"{st.b}{text}{st.r}" if cur else text
+            tail = f"  {st.c}· space to add{st.r}" if cur else ""
+            return f"{rail}  {pre}{st.c}+{st.r} {body}{tail}"
         # host/tbeam values are ssh targets (never home paths); everything else
         # is a filesystem path worth ~-abbreviating (locked rows have no kind)
         val = it["value"] if it.get("kind") in ("host", "tbeam") else _tilde(str(it["value"]))
@@ -1024,7 +1036,8 @@ def _setup_wizard(items, taken):
         while True:
             rows = toggles()
             pos = max(0, min(pos, len(rows) - 1))
-            aw = max([len(items[i]["alias"]) for i in rows] +
+            aw = max([len(items[i]["alias"]) for i in rows
+                      if items[i].get("kind") != "addhost"] +
                      [len(x["alias"]) for x in locked] + [1])
             head = (f"{st.c}◆{st.r}  {st.b}{sec_label}{st.r} {st.y}· {source} · "
                     f"{msg or hints}{st.r}")
@@ -1048,6 +1061,19 @@ def _setup_wizard(items, taken):
                 pos -= 1
             elif it and k in ("down", "j"):
                 pos += 1
+            elif ((k == "a" and sec == "hosts")
+                  or (it and it.get("kind") == "addhost" and k in ("space", "e"))):
+                ent = cooked_input("│  add host (alias=target or user@host): ")
+                if not ent:
+                    continue
+                alias, target = _parse_host_entry(ent, used_aliases())
+                if alias is None:
+                    msg = f"⚠ {target}"
+                    continue
+                at = _host_insert_at(items)
+                items.insert(at, {"t": "toggle", "sec": "hosts", "kind": "host",
+                                  "alias": alias, "value": target, "checked": True})
+                pos = toggles().index(at)
             elif it and k == "space":
                 it["checked"] = not it["checked"]
                 pos += 1
@@ -1063,19 +1089,6 @@ def _setup_wizard(items, taken):
             elif it and k == "e" and it["kind"] == "tbeam":
                 it["value"] = cooked_input("│  TBEAM_HOST target → ", it["value"],
                                            prefill=it["value"])
-            elif k == "a" and sec == "hosts":
-                ent = cooked_input("│  add host (alias=target or user@host): ")
-                if not ent:
-                    continue
-                alias, target = _parse_host_entry(ent, used_aliases())
-                if alias is None:
-                    msg = f"⚠ {target}"
-                    continue
-                items[:] = [x for x in items if not (x["sec"] == "hosts" and x["t"] == "note")]
-                at = _host_insert_at(items)
-                items.insert(at, {"t": "toggle", "sec": "hosts", "kind": "host",
-                                  "alias": alias, "value": target, "checked": True})
-                pos = toggles().index(at)
             else:
                 # a key that does nothing must SAY so — a silent no-op reads as broken
                 msg = f"⚠ no binding for that key — {hints}"
@@ -1175,6 +1188,8 @@ def _setup_prompt_flow(items, taken):
         elif it["t"] == "locked":
             print(f"  {st.y}✓ {it['alias']} — already registered{st.r}")
         elif it["t"] == "toggle":
+            if it["kind"] == "addhost":
+                continue   # the fallback has its own manual-add loop below
             if it["kind"] in ("repo", "host"):
                 q = {"repo": f"add repo {it['alias']} ({_tilde(it['value'])})",
                      "host": f"add host {it['alias']} → {it['value']}"}[it["kind"]]

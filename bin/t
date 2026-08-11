@@ -1082,11 +1082,27 @@ def _setup_prompt_flow(items, taken):
         elif it["t"] == "locked":
             print(f"  {st.y}✓ {it['alias']} — already registered{st.r}")
         elif it["t"] == "toggle":
-            q = {"repo": f"add repo {it['alias']} ({_tilde(it['value'])})",
-                 "host": f"add host {it['alias']} → {it['value']}",
-                 "stale": f"comment out stale entries ({it['value']})",
-                 "tbeam": f"set TBEAM_HOST = {it['value']}"}[it["kind"]]
-            it["checked"] = _confirm(f"  {q}?")
+            if it["kind"] in ("repo", "host"):
+                q = {"repo": f"add repo {it['alias']} ({_tilde(it['value'])})",
+                     "host": f"add host {it['alias']} → {it['value']}"}[it["kind"]]
+                while True:   # any answer that is not y/n = yes, under that alias
+                    r = _prompt(f"  {q}? [y/N/other alias] ")
+                    if r is None or r.lower() in ("", "n", "no"):
+                        break
+                    if r.lower() in ("y", "yes"):
+                        it["checked"] = True
+                        break
+                    used = taken | {x["alias"] for x in items
+                                    if x is not it and x["t"] in ("toggle", "locked")}
+                    if _SETUP_KEY.match(r) and r not in used:
+                        it["alias"] = r
+                        it["checked"] = True
+                        break
+                    print(f"  '{r}' is taken or not a valid key", file=sys.stderr)
+            else:
+                q = {"stale": f"comment out stale entries ({it['value']})",
+                     "tbeam": f"set TBEAM_HOST = {it['value']}"}[it["kind"]]
+                it["checked"] = _confirm(f"  {q}?")
     while True:
         ent = _prompt("add host (alias=target or user@host, blank to finish): ")
         if not ent:

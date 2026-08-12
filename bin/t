@@ -924,19 +924,16 @@ def _parse_host_entry(ent, used):
 
 
 def _setup_wizard(items, taken):
-    """The t setup UI: a clack-style inline wizard (the `npm create` aesthetic —
-    step symbols on a vertical rail, the picker redrawn in place with ANSI
-    cursor-up, each finished step collapsing to a one-line summary). Deliberately
-    NOT full-screen: everything stays in normal scrollback, so what you did is
-    still on screen when it ends. stdlib only — termios/tty raw keys, no curses.
-    The flow is select → name → write: steps repos → hosts → names → options →
-    review, over the item model shared with the plain-prompt fallback. In a
-    selection step space toggles, a adds a host by hand, enter advances; the
-    names step prompts once per picked entry with the suggested alias PRE-FILLED
-    in the input line (edit in place, enter accepts); q/esc/ctrl-c aborts with
-    nothing written. Returns True on
-    a confirmed review (items mutated in place), False on abort; raises when raw
-    mode is unavailable → _setup_prompt_flow."""
+    """The t setup UI: a clack-style inline TWO-SCREEN flow. Screen one is the
+    whole selection — repos, hosts (with the '+ add a host' action row), and
+    options on a single list under one cursor; screen two is a diff-style review
+    of the exact ~/.zshrc.local changes: y applies, n/esc goes back to the
+    selection, q/ctrl-c aborts with nothing written. Rendered inline on a
+    vertical rail (redrawn in place via ANSI cursor-up, windowed when taller
+    than the terminal) so the whole transcript stays in scrollback. stdlib only
+    — termios/tty raw keys, readline prefill for the rename input. Returns True
+    on apply (items mutated in place), False on abort; raises when raw mode is
+    unavailable → _setup_prompt_flow."""
     import select
     import termios
     import tty
@@ -959,7 +956,7 @@ def _setup_wizard(items, taken):
         return {"\r": "enter", "\n": "enter", " ": "space", "\x03": "abort",
                 "\x04": "abort", "": "abort"}.get(ch, ch)
 
-    def cooked_input(prompt, default="", erase=True, prefill=None):
+    def cooked_input(prompt, default="", prefill=None):
         # Temporarily restore the line discipline so input() gives real editing.
         # `prefill` puts the suggestion IN the input line, editable in place —
         # the clearest "you can change this" signal there is (readline startup
@@ -988,13 +985,21 @@ def _setup_wizard(items, taken):
             tty.setcbreak(fd)
             out.write("\x1b[?25l")
             out.flush()
-        if erase:
-            out.write("\x1b[1A\r\x1b[J")   # reclaim the input line for the repaint
+        out.write("\x1b[1A\r\x1b[J")   # reclaim the input line for the repaint
         return s or default
 
     def used_aliases(skip=None):
         return taken | {it["alias"] for it in items
                         if it is not skip and it["t"] in ("toggle", "locked")}
+
+    painted = [0]
+
+    def repaint(lines):
+        if painted[0]:
+            out.write(f"\x1b[{painted[0]}A\r\x1b[J")
+        out.write("\n".join(lines) + "\n")
+        painted[0] = len(lines)
+        out.flush()
 
     def row_text(it, aw, cur):
         if it.get("kind") == "addhost":
@@ -1016,53 +1021,55 @@ def _setup_wizard(items, taken):
         tail = f"  {st.c}· e rename{st.r}" if cur and it.get("kind") in ("repo", "host") else ""
         return f"{rail}  {pre}{mark} {alias}  {st.y}{val}{st.r}{tail}"
 
-    painted = [0]
+    HINTS = "space select · e rename · enter review · q quit"
 
-    def repaint(lines):
-        if painted[0]:
-            out.write(f"\x1b[{painted[0]}A\r\x1b[J")
-        out.write("\n".join(lines) + "\n")
-        painted[0] = len(lines)
-        out.flush()
-
-    def collapse(sec_label, summary):
-        repaint([f"{st.g}◇{st.r}  {st.b}{sec_label}{st.r} {st.y}·{st.r} {summary}", rail])
-        painted[0] = 0   # the collapsed line is final — next step paints below
-
-    def step(sec, sec_label, source, hints):
-        toggles = lambda: [i for i, x in enumerate(items) if x["sec"] == sec and x["t"] == "toggle"]
-        locked = [x for x in items if x["sec"] == sec and x["t"] == "locked"]
-        pos, msg = 0, ""
+    def select_screen(msg=""):
+        # ONE list: every section under a single cursor; enter goes to review
+        pos = 0
         while True:
-            rows = toggles()
-            pos = max(0, min(pos, len(rows) - 1))
-            aw = max([len(items[i]["alias"]) for i in rows
+            sel = _selectable(items)
+            pos = max(0, min(pos, len(sel) - 1))
+            cur = sel[pos]
+            aw = max([len(items[i]["alias"]) for i in sel
                       if items[i].get("kind") != "addhost"] +
-                     [len(x["alias"]) for x in locked] + [1])
-            head = (f"{st.c}◆{st.r}  {st.b}{sec_label}{st.r} {st.y}· {source} · "
-                    f"{msg or hints}{st.r}")
-            lines = [head]
-            lines += [row_text(items[i], aw, n == pos) for n, i in enumerate(rows)]
-            if not rows:
-                lines.append(f"{rail}   {st.y}nothing new{st.r}")
-            lines += [row_text(x, aw, False) for x in locked]
+                     [len(x["alias"]) for x in items if x["t"] == "locked"] + [1])
+            disp = [(f"{st.c}◆{st.r}  {st.b}pick what to add{st.r}  "
+                     f"{st.y}{msg or HINTS}{st.r}", None)]
+            for idx, it in enumerate(items):
+                if it["t"] == "spacer":
+                    disp.append((rail, None))
+                elif it["t"] == "header":
+                    disp.append((f"{rail}  {st.b}{it['label']}{st.r}", None))
+                elif it["t"] == "note":
+                    disp.append((f"{rail}   {st.y}{it['label']}{st.r}", None))
+                else:
+                    disp.append((row_text(it, aw, idx == cur), idx))
+            # window the list when taller than the terminal, cursor kept visible
+            body = max(6, shutil.get_terminal_size((100, 24)).lines - 3)
+            if len(disp) > body:
+                cur_line = next((n for n, d in enumerate(disp) if d[1] == cur), 1)
+                lo = max(1, min(cur_line - body // 2, len(disp) - (body - 1)))
+                lines = [disp[0][0]] + [d[0] for d in disp[lo:lo + body - 1]]
+                if lo > 1:
+                    lines[1] = f"{rail}  {st.y}… {lo - 1} more above{st.r}"
+                if lo + body - 1 < len(disp):
+                    lines[-1] = f"{rail}  {st.y}… {len(disp) - (lo + body - 1)} more below{st.r}"
+            else:
+                lines = [d[0] for d in disp]
             repaint(lines)
             msg = ""
             k = read_key()
-            it = items[rows[pos]] if rows else None
+            it = items[cur] if sel else None
             if k in ("q", "esc", "abort"):
                 return False
             elif k == "enter":
-                added = [items[i]["alias"] for i in toggles() if items[i]["checked"]]
-                collapse(sec_label, ", ".join(added) if added
-                         else f"{st.y}nothing selected{st.r}")
                 return True
             elif it and k in ("up", "k"):
                 pos -= 1
             elif it and k in ("down", "j"):
                 pos += 1
-            elif ((k == "a" and sec == "hosts")
-                  or (it and it.get("kind") == "addhost" and k in ("space", "e"))):
+            elif (k == "a") or (it and it.get("kind") == "addhost"
+                                and k in ("space", "e")):
                 ent = cooked_input("│  add host (alias=target or user@host): ")
                 if not ent:
                     continue
@@ -1073,7 +1080,7 @@ def _setup_wizard(items, taken):
                 at = _host_insert_at(items)
                 items.insert(at, {"t": "toggle", "sec": "hosts", "kind": "host",
                                   "alias": alias, "value": target, "checked": True})
-                pos = toggles().index(at)
+                pos = _selectable(items).index(at)
             elif it and k == "space":
                 it["checked"] = not it["checked"]
                 pos += 1
@@ -1091,79 +1098,53 @@ def _setup_wizard(items, taken):
                                            prefill=it["value"])
             else:
                 # a key that does nothing must SAY so — a silent no-op reads as broken
-                msg = f"⚠ no binding for that key — {hints}"
+                msg = f"⚠ no binding for that key — {HINTS}"
 
-    def step_names():
-        # naming is its own step AFTER selection (select → name → write): every
-        # picked repo/host gets one prompt line, enter keeps the suggestion
-        targets = [it for it in items if it["t"] == "toggle" and it["checked"]
-                   and it["kind"] in ("repo", "host")]
-        if not targets:
-            return True
-        out.write(f"{st.c}◆{st.r}  {st.b}names{st.r} {st.y}· each name is sitting "
-                  f"in the input — edit it, or press enter to accept{st.r}\n")
-        out.flush()
-        lines = 1
-        vw = min(max(len(_tilde(str(t["value"]))) for t in targets), width - 24)
-        for it in targets:
-            shown = _truncate(_tilde(str(it["value"])), vw)
-            while True:
-                s = cooked_input(f"│  {shown:<{vw}} → ", it["alias"], erase=False,
-                                 prefill=it["alias"])
-                lines += 1
-                if s == it["alias"]:
-                    break
-                if _SETUP_KEY.match(s) and s not in used_aliases(skip=it):
-                    it["alias"] = s
-                    break
-                out.write(f"{rail}  {st.y}⚠ '{s}' is taken or not a valid key{st.r}\n")
-                lines += 1
-        out.write(f"\x1b[{lines}A\r\x1b[J")
-        collapse("names", ", ".join(t["alias"] for t in targets))
-        return True
-
-    def review():
+    def review_screen():
+        # diff-style: exactly what lands in ~/.zshrc.local, one keypress decides
         repos, hosts, tbeam, stale_ok = _setup_result(items)
         if not (repos or hosts or tbeam or stale_ok):
-            repaint([f"{st.g}◇{st.r}  {st.y}nothing selected — nothing to write{st.r}"])
-            painted[0] = 0
-            return True   # a confirmed no-op; cmd_setup prints the summary
-        body = []
-        if repos or hosts or tbeam:
-            body += _setup_block(repos, hosts, tbeam, time.strftime("%Y-%m-%d")).splitlines()
+            return "empty"
+        lines = [f"{st.c}◆{st.r}  {st.b}review — changes to ~/.zshrc.local{st.r}  "
+                 f"{st.y}y apply · n back · q quit{st.r}"]
+        for ln in _setup_block(repos, hosts, tbeam, time.strftime("%Y-%m-%d")).splitlines():
+            shown = f"{st.y}{ln}{st.r}" if ln.startswith("#") else ln
+            lines.append(f"{rail}  {st.g}+{st.r} {shown}")
         if stale_ok:
             sv = next(x["value"] for x in items if x.get("kind") == "stale")
-            body.append(f"# plus: comment out the stale entries ({sv})")
+            lines.append(f"{rail}  {st.y}~ comment out stale entries: {sv}{st.r}")
+        repaint(lines)
         while True:
-            lines = [f"{st.c}◆{st.r}  {st.b}append to ~/.zshrc.local?{st.r} "
-                     f"{st.y}· y append · q abort{st.r}"]
-            lines += [f"{rail}  {st.y}{ln}{st.r}" if ln.startswith('#') else f"{rail}  {ln}"
-                      for ln in body]
-            repaint(lines)
             k = read_key()
             if k == "y":
-                lines[0] = f"{st.g}◇{st.r}  {st.b}append to ~/.zshrc.local{st.r} {st.y}· confirmed{st.r}"
+                lines[0] = f"{st.g}◇{st.r}  {st.b}applied to ~/.zshrc.local{st.r}"
                 repaint(lines)
                 painted[0] = 0
                 return True
-            if k in ("q", "esc", "abort", "n"):
+            if k in ("n", "esc"):
                 return False
+            if k in ("q", "abort"):
+                return None
 
     out.write(f"{st.y}┌{st.r}  {st.b}t setup{st.r} {st.y}· ~/.zshrc.local — nothing "
-              f"is written until the final confirm{st.r}\n{rail}\n")
+              f"is written until you confirm{st.r}\n{rail}\n")
     tty.setcbreak(fd)
     out.write("\x1b[?25l")
+    ok, msg = False, ""
     try:
-        base = f"{st.y}space select · e rename · "
-        ok = (step("repos", "repos", items[0]["label"].split("· ", 1)[-1],
-                   base + "enter continue · q quit")
-              and step("hosts", "hosts", "~/.ssh/config",
-                       base + "a add · enter continue · q quit")
-              and step_names()
-              and (not any(x["sec"] == "options" and x["t"] == "toggle" for x in items)
-                   or step("options", "options", "optional extras",
-                           base + "e edit target · enter continue · q quit"))
-              and review())
+        while True:
+            if not select_screen(msg):
+                break
+            r = review_screen()
+            if r == "empty":
+                msg = "nothing selected — space marks ◼ what gets added"
+                continue
+            if r:
+                ok = True
+                break
+            if r is None:
+                break
+            msg = ""   # n: back to the selection, keep editing
     except KeyboardInterrupt:
         ok = False
     finally:
@@ -1577,11 +1558,11 @@ Run `t <verb> -h` for a verb's own flags.""")
     sp = sub.add_parser("setup", help="register local repos and ssh hosts in ~/.zshrc.local",
         description="Interactive onboarding for this machine's per-machine config: a stepped "
             "inline wizard over every git checkout found under the scan dirs (default ~/code) "
-            "and every ~/.ssh/config host, with already-registered entries shown locked under a "
-            "✓. The flow is select → name → write: space toggles, a adds a host by hand, enter "
-            "advances; a names step then confirms each picked alias — the suggestion sits "
-            "pre-filled in the input line, edit it in place or press enter to accept — and the "
-            "review step shows the exact block before y appends it to "
+            "and every ~/.ssh/config host on ONE list, with already-registered entries shown "
+            "locked under a ✓. space toggles, e renames in place (the current name sits "
+            "pre-filled in the input), a (or the '+ add a host' row) adds a host by hand; enter "
+            "then shows the exact changes as a diff — y applies, n goes back to keep editing, "
+            "q aborts. Appends to "
             "~/.zshrc.local (append-only; "
             "re-running is safe — registered entries are never re-offered). Also offers to "
             "comment out registered repos whose path no longer exists (the fresh-install "

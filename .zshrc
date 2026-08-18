@@ -165,6 +165,19 @@ prview() {
 # exit/Ctrl-C. For a backgrounded, persistent block use `sleep-manager` instead.
 nosleep() { [[ "$1" == -h || "$1" == --help ]] && { _help_for nosleep; return 0; }; trap 'sudo pmset -a disablesleep 0' EXIT INT; sudo pmset -a disablesleep 1 && caffeinate -dimsu; }
 
+# _dots_tmux_apply — push ~/.tmux.conf into an already-running tmux server. tmux
+# reads the file only at SERVER START, so a released config change is silently
+# inert for the long-lived server until re-sourced — which read as "the fix
+# didn't work" after a dots. Called from dots' default path; install.sh has its
+# own copy of this step (covers --dev, migration, and manual installs), so no
+# rollout ever needs a manual `tmux source-file`. No server → no-op (and no
+# stray server: one auto-started with no sessions exits immediately).
+_dots_tmux_apply() {
+  [[ -r ~/.tmux.conf ]] && command -v tmux >/dev/null 2>&1 && tmux has-session 2>/dev/null || return 0
+  tmux source-file ~/.tmux.conf 2>/dev/null \
+    || print -r -- "dots — ⚠ tmux source-file ~/.tmux.conf failed (check the config)" >&2
+}
+
 # dots — update your LIVE dotfiles to origin/main and reload zsh
 #
 # Usage: dots [--dev]
@@ -310,6 +323,7 @@ dots() {
     print -r -- "${y}dots — main worktree can't fast-forward origin/main; reloaded only${r0}"
   fi
 
+  _dots_tmux_apply
   source ~/.zshrc
 }
 

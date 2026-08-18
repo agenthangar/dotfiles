@@ -27,6 +27,17 @@ DEV_BRANCH="${DEV_BRANCH:-dev/claude-1}"
 # clone is sitting on `main`, move it to $DEV_BRANCH first so `main` is free for the
 # worktree.
 setup_main_worktree() {
+    # Running FROM the main worktree itself (the natural move after `dots`, since
+    # the dev clone's parked install.sh may be stale): this tree IS the live
+    # surface. There is no dev clone here to migrate — the "sitting on main"
+    # branch below would try to move the LIVE worktree off main and die with
+    # "'$DEV_BRANCH' is already used by worktree" before any link ran. Just ff.
+    if [[ "$(cd "$DOTFILES_DIR" && pwd -P)" == "$(cd "$MAIN_WT" 2>/dev/null && pwd -P || echo __no_main_wt__)" ]]; then
+        git -C "$MAIN_WT" fetch -q origin 2>/dev/null || true
+        git -C "$MAIN_WT" merge --ff-only origin/main -q 2>/dev/null || true
+        return
+    fi
+
     git -C "$DOTFILES_DIR" fetch -q origin 2>/dev/null || true
 
     local cur

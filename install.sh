@@ -108,6 +108,19 @@ link "$LINK_SRC/bin/pr-watch"         "$HOME/bin/pr-watch"
 link "$LINK_SRC/claude/commands/tpush.md" "$HOME/.claude/commands/tpush.md"
 link "$LINK_SRC/claude/commands/tpop.md"  "$HOME/.claude/commands/tpop.md"
 
+# tmux reads ~/.tmux.conf only at SERVER START, so the link above is inert for an
+# already-running server until re-sourced. Apply it here (dots' default path does
+# the same via _dots_tmux_apply) so no rollout needs a manual `tmux source-file`.
+# `tmux has-session` never leaves a stray server behind: one auto-started with no
+# sessions exits immediately.
+if command -v tmux >/dev/null 2>&1 && tmux has-session 2>/dev/null; then
+    if tmux source-file "$HOME/.tmux.conf" 2>/dev/null; then
+        echo "Applied .tmux.conf to the running tmux server"
+    else
+        echo "WARNING: tmux source-file ~/.tmux.conf failed - check the config" >&2
+    fi
+fi
+
 # SSH config via Include, NOT a wholesale symlink. Symlinking ~/.ssh/config would
 # replace any existing host entries (backed up to .bak, but still a surprise). So
 # link our snippet to ~/.ssh/dotfiles.conf and make ~/.ssh/config pull it in with

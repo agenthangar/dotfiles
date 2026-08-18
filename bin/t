@@ -1398,7 +1398,8 @@ def _doctor_findings(facts):
         if facts.get("mouse") != "on":
             if facts.get("conf_mouse_on"):
                 out.append("⚠ tmux mouse is OFF but ~/.tmux.conf says on — the server "
-                           "predates the config; run: tmux source-file ~/.tmux.conf")
+                           "predates the config; run dots (it re-sources it), or: "
+                           "tmux source-file ~/.tmux.conf")
             else:
                 out.append("⚠ tmux mouse is OFF — the wheel scrolls the terminal's stale "
                            "scrollback, not the pane; get the repo ~/.tmux.conf linked "

@@ -686,3 +686,73 @@ def test_append_local_creates_missing_file_with_header(t_mod, tmp_path):
     text = f.read_text()
     assert text.startswith("# ~/.zshrc.local")
     assert text.endswith("\n\nBLOCK\n")
+
+
+# ─── doctor: _parse_install_links / _doctor_findings ───────────────────────────
+
+def test_parse_install_links_extracts_pairs(t_mod):
+    text = (
+        'link "$LINK_SRC/.zshrc"               "$HOME/.zshrc"\n'
+        'link "$LINK_SRC/bin/t"                "$HOME/bin/t"\n'
+        'link "$LINK_SRC/ssh/config" "$HOME/.ssh/dotfiles.conf"\n'
+    )
+    assert t_mod._parse_install_links(text) == [
+        (".zshrc", "$HOME/.zshrc"),
+        ("bin/t", "$HOME/bin/t"),
+        ("ssh/config", "$HOME/.ssh/dotfiles.conf"),
+    ]
+
+
+def test_parse_install_links_skips_comments_and_other_lines(t_mod):
+    text = (
+        '# link "$LINK_SRC/dead" "$HOME/dead"\n'
+        'echo link "$LINK_SRC/nope" "$HOME/nope"\n'
+        'link "$LINK_SRC/.tmux.conf"           "$HOME/.tmux.conf"\n'
+    )
+    assert t_mod._parse_install_links(text) == [(".tmux.conf", "$HOME/.tmux.conf")]
+
+
+def test_doctor_findings_healthy(t_mod):
+    facts = {"links": [("/h/.zshrc", "ok")], "behind": 0, "conf_exists": True,
+             "conf_is_link": True, "conf_mouse_on": True, "tmux_running": True,
+             "mouse": "on", "history_limit": 50000, "panes": []}
+    assert t_mod._doctor_findings(facts) == ["✓ nothing suspicious found"]
+
+
+def test_doctor_findings_bad_links_and_behind(t_mod):
+    facts = {"links": [("/h/.zshrc", "ok"), ("/h/.tmux.conf", "missing")], "behind": 2}
+    out = t_mod._doctor_findings(facts)
+    assert any("1 managed link(s) not in place" in l and ".tmux.conf (missing)" in l for l in out)
+    assert any("behind origin/main — run dots" in l and "2 commit(s)" in l for l in out)
+
+
+def test_doctor_findings_conf_real_file(t_mod):
+    out = t_mod._doctor_findings({"conf_exists": True, "conf_is_link": False})
+    assert any("real file, not the repo-managed symlink" in l for l in out)
+
+
+def test_doctor_findings_mouse_off_config_loaded_vs_not(t_mod):
+    # conf says on but server off → the server predates the config: source-file hint
+    out = t_mod._doctor_findings({"tmux_running": True, "mouse": "off", "conf_mouse_on": True})
+    assert any("tmux source-file" in l for l in out)
+    # conf does not say on → the config itself is missing the setting: install.sh hint
+    out = t_mod._doctor_findings({"tmux_running": True, "mouse": "off", "conf_mouse_on": False})
+    assert any("stale scrollback" in l for l in out)
+
+
+def test_doctor_findings_mouse_capture_panes_and_stale_history(t_mod):
+    panes = [{"session": "dev-ff-1", "cmd": "claude", "mouse": True, "alt": True, "hist": 2000},
+             {"session": "dev-ff-2", "cmd": "zsh", "mouse": False, "alt": False, "hist": 2000}]
+    facts = {"tmux_running": True, "mouse": "on", "history_limit": 50000, "panes": panes}
+    out = t_mod._doctor_findings(facts)
+    assert any("1 pane(s) capture the wheel" in l for l in out)
+    assert any("old history-limit (2000)" in l for l in out)
+
+
+def test_doctor_findings_no_capture_note_when_mouse_off(t_mod):
+    # with mouse off the wheel never reaches the pane app, so the capture note
+    # would be noise — only the mouse-off warning should show
+    panes = [{"session": "s", "cmd": "claude", "mouse": True, "alt": True, "hist": 2000}]
+    out = t_mod._doctor_findings({"tmux_running": True, "mouse": "off",
+                                  "conf_mouse_on": True, "panes": panes})
+    assert not any("capture the wheel" in l for l in out)

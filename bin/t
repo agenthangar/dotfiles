@@ -1357,6 +1357,224 @@ def cmd_pending(cfg, args):
     return 2
 
 
+# ─── doctor — read-only setup diagnostics ─────────────────────────────────────
+# Born from a real debugging session: "scroll wheel doesn't work" turned out to be
+# four stacked facts (stale main worktree, missing ~/.tmux.conf link, tmux server
+# options predating the config, and Claude's fullscreen TUI capturing the wheel).
+# doctor gathers exactly that state in one shot. The gathering is subprocess glue
+# (cmd_doctor, coverage-excluded); the diagnosis rules are pure + pytest-covered.
+
+# install.sh's own `link "$LINK_SRC/<src>" "<dst>"` calls, parsed rather than
+# hardcoded so doctor can never drift from what install.sh actually manages.
+_INSTALL_LINK_RE = re.compile(r'^link\s+"\$LINK_SRC/([^"]+)"\s+"([^"]+)"', re.M)
+
+
+def _parse_install_links(text):
+    return [(m.group(1), m.group(2)) for m in _INSTALL_LINK_RE.finditer(text)]
+
+
+def _doctor_findings(facts):
+    """Pure diagnosis over the gathered facts → list of finding lines.
+
+    facts keys (all optional): links [(dst, status)] where status != "ok" is a
+    problem; behind (int, live surface commits behind origin/main); conf_exists /
+    conf_is_link (~/.tmux.conf); tmux_running; mouse ("on"/"off"); conf_mouse_on
+    (the FILE says mouse on); history_limit (global); panes [{session, cmd,
+    mouse, alt, hist}].
+    """
+    out = []
+    bad = [(d, s) for d, s in facts.get("links", []) if s != "ok"]
+    if bad:
+        out.append("⚠ %d managed link(s) not in place: %s — re-run install.sh (from the "
+                   "main worktree, so it is current)"
+                   % (len(bad), ", ".join("%s (%s)" % (os.path.basename(d), s) for d, s in bad)))
+    if facts.get("behind"):
+        out.append("⚠ live surface is %d commit(s) behind origin/main — run dots"
+                   % facts["behind"])
+    if facts.get("conf_exists") and not facts.get("conf_is_link"):
+        out.append("⚠ ~/.tmux.conf is a real file, not the repo-managed symlink — "
+                   "re-run install.sh to adopt it (the old file is backed up to .bak)")
+    if facts.get("tmux_running"):
+        if facts.get("mouse") != "on":
+            if facts.get("conf_mouse_on"):
+                out.append("⚠ tmux mouse is OFF but ~/.tmux.conf says on — the server "
+                           "predates the config; run: tmux source-file ~/.tmux.conf")
+            else:
+                out.append("⚠ tmux mouse is OFF — the wheel scrolls the terminal's stale "
+                           "scrollback, not the pane; get the repo ~/.tmux.conf linked "
+                           "(install.sh), then tmux source-file ~/.tmux.conf")
+        caps = [p for p in facts.get("panes", []) if p.get("mouse")]
+        if caps and facts.get("mouse") == "on":
+            out.append("· %d pane(s) capture the wheel themselves (Claude's fullscreen "
+                       "TUI): scrolling there moves Claude's view, not tmux history. "
+                       "Full output: ctrl+o transcript ('[' dumps it to native "
+                       "scrollback); classic renderer: /tui default or "
+                       "CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN=1" % len(caps))
+        gl = facts.get("history_limit")
+        stale = [p for p in facts.get("panes", []) if gl and p.get("hist") and p["hist"] < gl]
+        if stale:
+            out.append("· %d existing pane(s) still have the old history-limit (%d); the "
+                       "global %d applies only to panes created after the change"
+                       % (len(stale), stale[0]["hist"], gl))
+    if not out:
+        out.append("✓ nothing suspicious found")
+    return out
+
+
+def cmd_doctor(cfg, args):
+    import platform
+
+    st = Style()
+
+    def run(cmd, timeout=8):
+        """stdout on success (stripped, possibly empty), None on any failure."""
+        try:
+            r = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                               text=True, timeout=timeout)
+        except (OSError, subprocess.TimeoutExpired):
+            return None
+        return r.stdout.strip() if r.returncode == 0 else None
+
+    def ver(out):
+        if out is None or not out.strip():
+            return "missing"
+        m = re.search(r"\d[\w.\-]*", out.splitlines()[0])
+        return m.group(0) if m else out.splitlines()[0]
+
+    def section(title):
+        print("\n%s%s%s" % (st.b, title, st.r))
+
+    print("%st doctor%s — dotfiles / tmux / Claude session diagnostics" % (st.b, st.r))
+
+    # host + terminal environment
+    section("Host")
+    un = platform.uname()
+    os_line = "%s %s (%s)" % (un.system, un.release, un.machine)
+    if un.system == "Darwin":
+        v = run(["sw_vers", "-productVersion"])
+        if v:
+            os_line = "macOS %s (%s)" % (v, un.machine)
+    print("  %s · %s" % (un.node, os_line))
+    bits = ["TERM=%s" % os.environ.get("TERM", "?")]
+    if os.environ.get("TERM_PROGRAM"):
+        bits.append("TERM_PROGRAM=%s %s" % (os.environ["TERM_PROGRAM"],
+                                            os.environ.get("TERM_PROGRAM_VERSION", "")))
+    bits.append("inside tmux: %s" % ("yes" if os.environ.get("TMUX") else "no"))
+    bits.append("ssh: %s" % ("yes" if os.environ.get("SSH_CONNECTION") else "no"))
+    print("  " + " · ".join(bits))
+
+    # tool versions (claude lives on the interactive PATH / ~/.local/bin)
+    section("Versions")
+    vers = ["%s %s" % (n, ver(run(c))) for n, c in [
+        ("zsh", ["zsh", "--version"]), ("tmux", ["tmux", "-V"]),
+        ("git", ["git", "--version"]), ("gh", ["gh", "--version"]),
+        ("fzf", ["fzf", "--version"])]]
+    claude_bin = shutil.which("claude") or os.path.join(HOME, ".local", "bin", "claude")
+    vers.append("claude %s" % (ver(run([claude_bin, "--version"], timeout=15))
+                               if os.path.exists(claude_bin) else "missing"))
+    print("  " + " · ".join(vers))
+
+    # dotfiles: which checkout is live, is it current, are the links in place
+    section("Dotfiles")
+    facts = {}
+    zrc = os.path.join(HOME, ".zshrc")
+    live_src = None
+    if os.path.islink(zrc):
+        live_src = os.path.dirname(os.path.realpath(zrc))
+        br = run(["git", "-C", live_src, "rev-parse", "--abbrev-ref", "HEAD"]) or "?"
+        head = run(["git", "-C", live_src, "log", "-1", "--format=%h %s"]) or "?"
+        print("  live surface   ~/.zshrc → %s" % live_src)
+        print("                 %s @ %s" % (br, head))
+        fetched = run(["git", "-C", live_src, "fetch", "-q", "origin", "main"]) is not None
+        behind = run(["git", "-C", live_src, "rev-list", "--count", "HEAD..origin/main"])
+        if behind is not None and behind.isdigit():
+            facts["behind"] = int(behind)
+            note = "" if fetched else " (as of last fetch — origin unreachable)"
+            print("                 vs origin/main: %s%s"
+                  % ("up to date" if not facts["behind"] else "behind %d" % facts["behind"], note))
+    else:
+        print("  live surface   ~/.zshrc is not a symlink — install.sh has not run here")
+    links = []
+    if live_src:
+        try:
+            with open(os.path.join(live_src, "install.sh")) as f:
+                pairs = _parse_install_links(f.read())
+        except OSError:
+            pairs = []
+        for rel, dst_raw in pairs:
+            dst = dst_raw.replace("$HOME", HOME)
+            want = os.path.realpath(os.path.join(live_src, rel))
+            if not os.path.lexists(dst):
+                links.append((dst, "missing"))
+            elif not os.path.islink(dst):
+                links.append((dst, "not a symlink"))
+            elif os.path.realpath(dst) != want:
+                links.append((dst, "→ %s" % os.path.realpath(dst)))
+            else:
+                links.append((dst, "ok"))
+        n_ok = sum(1 for _, s in links if s == "ok")
+        print("  managed links  %d/%d in place" % (n_ok, len(links)))
+        for d, s in links:
+            if s != "ok":
+                print("                 %s~/%s: %s%s"
+                      % (st.y, os.path.relpath(d, HOME), s, st.r))
+    facts["links"] = links
+    if os.path.exists(CONFIG):
+        age = int(time.time() - os.path.getmtime(CONFIG))
+        print("  config bridge  %s (%dm old)" % (CONFIG.replace(HOME, "~"), age // 60))
+    else:
+        print("  config bridge  missing (%s) — open an interactive zsh once" % CONFIG.replace(HOME, "~"))
+
+    # tmux: server options vs the config file, and who owns the mouse per pane
+    section("Tmux")
+    tmux_running = run(["tmux", "list-sessions", "-F", "#{session_name}"]) is not None
+    facts["tmux_running"] = tmux_running
+    conf = os.path.join(HOME, ".tmux.conf")
+    facts["conf_exists"] = os.path.lexists(conf)
+    facts["conf_is_link"] = os.path.islink(conf)
+    try:
+        with open(conf) as f:
+            facts["conf_mouse_on"] = bool(re.search(r"^\s*set(?:-option)?\s+-g\s+mouse\s+on",
+                                                    f.read(), re.M))
+    except OSError:
+        facts["conf_mouse_on"] = False
+    print("  ~/.tmux.conf   %s" % ("→ %s" % os.path.realpath(conf) if facts["conf_is_link"]
+                                   else "real file (not repo-managed)" if facts["conf_exists"]
+                                   else "absent"))
+    if not tmux_running:
+        print("  server         not running")
+    else:
+        mouse = run(["tmux", "show", "-g", "-v", "mouse"])
+        focus = run(["tmux", "show", "-g", "-v", "focus-events"])
+        hist = run(["tmux", "show", "-g", "-v", "history-limit"])
+        facts["mouse"] = mouse
+        facts["history_limit"] = int(hist) if hist and hist.isdigit() else None
+        print("  server         mouse %s · focus-events %s · history-limit %s"
+              % (mouse, focus, hist))
+        panes = []
+        raw = run(["tmux", "list-panes", "-a", "-F",
+                   "#{session_name}\t#{pane_current_command}\t#{mouse_any_flag}"
+                   "\t#{alternate_on}\t#{history_limit}"]) or ""
+        for ln in raw.splitlines():
+            f = ln.split("\t")
+            if len(f) == 5:
+                panes.append({"session": f[0], "cmd": f[1], "mouse": f[2] == "1",
+                              "alt": f[3] == "1", "hist": int(f[4]) if f[4].isdigit() else 0})
+        facts["panes"] = panes
+        if panes:
+            w = max(len(p["session"]) for p in panes)
+            for p in panes:
+                flags = [x for x in (("mouse-capture" if p["mouse"] else None),
+                                     ("alt-screen" if p["alt"] else None)) if x]
+                print("    %-*s  %-12s %-25s hist %d"
+                      % (w, p["session"], p["cmd"], " ".join(flags) or "-", p["hist"]))
+
+    section("Findings")
+    for line in _doctor_findings(facts):
+        print("  " + line)
+    return 0
+
+
 # ─── argument parsing (gh-style) ───────────────────────────────────────────────
 
 def build_parser():
@@ -1572,6 +1790,15 @@ Run `t <verb> -h` for a verb's own flags.""")
     sp.add_argument("--dry-run", action="store_true",
                     help="print what would be offered/appended, change nothing")
 
+    sub.add_parser("doctor", help="diagnose this machine's dotfiles/tmux/Claude setup",
+        description="Read-only diagnostics for when the tooling misbehaves: which checkout the "
+            "live $HOME symlinks point at and whether it is behind origin/main, whether every "
+            "install.sh-managed link is in place, tmux server options vs ~/.tmux.conf (mouse, "
+            "focus-events, history-limit), which panes capture the mouse themselves (Claude's "
+            "fullscreen TUI — the usual answer to 'the scroll wheel does not scroll the "
+            "output'), and tool versions. Ends with findings + suggested fixes. Run it on "
+            "another machine with `t on <host> t doctor`.")
+
     # machine-readable / internal (hidden-ish; still have -h)
     sub.add_parser("session-rows", help="machine-readable per-host scan (remote contract)",
         description="Internal/machine-readable: emit one tab-separated row per live dev slot on "
@@ -1595,6 +1822,7 @@ IMPLEMENTED = {
     "ls": cmd_ls, "session-rows": cmd_session_rows, "on": cmd_on, "read": cmd_read,
     "plan": cmd_plan, "paste": cmd_paste, "kill": cmd_kill, "setup": cmd_setup,
     "land": cmd_land, "kill-owner": cmd_kill_owner, "cursor": cmd_cursor,
+    "doctor": cmd_doctor,
 }
 
 

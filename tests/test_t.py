@@ -756,3 +756,59 @@ def test_doctor_findings_no_capture_note_when_mouse_off(t_mod):
     out = t_mod._doctor_findings({"tmux_running": True, "mouse": "off",
                                   "conf_mouse_on": True, "panes": panes})
     assert not any("capture the wheel" in l for l in out)
+
+
+# ─── doctor: _effective_tui / the non-tmux wheel-as-arrows rule ────────────────
+
+def test_effective_tui_unset_is_not_fullscreen(t_mod):
+    # `tui` is optional with no schema default: unset means the classic
+    # renderer, so it must never resolve to fullscreen
+    assert t_mod._effective_tui(None, {}) is None
+    assert t_mod._effective_tui("default", {}) == "default"
+    assert t_mod._effective_tui("fullscreen", {}) == "fullscreen"
+
+
+def test_effective_tui_env_overrides(t_mod):
+    # NO_FLICKER is documented as equivalent to fullscreen
+    assert t_mod._effective_tui(None, {"CLAUDE_CODE_NO_FLICKER": "1"}) == "fullscreen"
+    # DISABLE_ALTERNATE_SCREEN forces the main screen and outranks everything
+    assert t_mod._effective_tui(
+        "fullscreen", {"CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN": "1"}) == "default"
+    assert t_mod._effective_tui(
+        None, {"CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN": "1",
+               "CLAUDE_CODE_NO_FLICKER": "1"}) == "default"
+
+
+def test_env_on_treats_falsey_strings_as_off(t_mod):
+    for v in ("", "0", "false", "FALSE", "  "):
+        assert t_mod._env_on({"X": v}, "X") is False
+    for v in ("1", "true", "yes"):
+        assert t_mod._env_on({"X": v}, "X") is True
+    assert t_mod._env_on({}, "X") is False
+
+
+def test_doctor_findings_wheel_as_arrows_outside_tmux(t_mod):
+    out = t_mod._doctor_findings(
+        {"in_tmux": False, "term_program": "Apple_Terminal", "tui": "fullscreen"})
+    assert any("arrow keys on the alternate screen" in l for l in out)
+    assert any("/tui default" in l for l in out)
+
+
+def test_doctor_findings_wheel_rule_is_narrow(t_mod):
+    def fires(**over):
+        facts = {"in_tmux": False, "term_program": "Apple_Terminal", "tui": "fullscreen"}
+        facts.update(over)
+        return any("arrow keys on the alternate screen" in l
+                   for l in t_mod._doctor_findings(facts))
+
+    assert fires()
+    # inside tmux the pane-capture note already covers it
+    assert not fires(in_tmux=True)
+    # classic renderer scrolls native scrollback fine
+    assert not fires(tui="default")
+    # unset renderer must stay quiet (this is the regression that would spam
+    # every user who never opted into fullscreen)
+    assert not fires(tui=None)
+    # terminals that report the wheel properly are not affected
+    assert not fires(term_program="iTerm.app")
+    assert not fires(term_program=None)

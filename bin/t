@@ -1401,6 +1401,36 @@ def _effective_tui(settings_tui, env):
         return "fullscreen"
     return settings_tui
 
+# Terminals that translate the scroll wheel into arrow keys while an app sits on
+# the alternate screen. Claude's fullscreen renderer keeps its own virtualized
+# scrollback and expects real wheel events, so there the wheel moves nothing and
+# Claude posts "Scroll wheel is sending arrow keys" (its detector trips on 8 bare
+# arrows inside a 100ms window). Verified for Apple_Terminal — only add a
+# terminal here once its wheel has actually been observed arriving as arrows.
+_WHEEL_ARROW_TERMS = ("Apple_Terminal",)
+
+
+def _env_on(env, name):
+    """A CLAUDE_CODE_* toggle counts as on unless unset/empty/0/false."""
+    return env.get(name, "").strip().lower() not in ("", "0", "false")
+
+
+def _effective_tui(settings_tui, env):
+    """Which renderer Claude will actually use: "fullscreen", "default" or None.
+
+    `tui` is optional in Claude's settings schema with NO default, and the
+    fullscreen upsell only fires while it is undefined — so unset means the
+    CLASSIC main-screen renderer and must never be read as fullscreen (that
+    would fire the wheel warning at everyone who never opted in). The env knobs
+    override the file; DISABLE_ALTERNATE_SCREEN wins outright because it forces
+    the main screen regardless of the renderer setting.
+    """
+    if _env_on(env, "CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN"):
+        return "default"
+    if _env_on(env, "CLAUDE_CODE_NO_FLICKER"):   # documented as == fullscreen
+        return "fullscreen"
+    return settings_tui
+
 
 def _parse_install_links(text):
     return [(m.group(1), m.group(2)) for m in _INSTALL_LINK_RE.finditer(text)]

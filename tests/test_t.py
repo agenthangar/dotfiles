@@ -703,6 +703,44 @@ def test_parse_install_links_extracts_pairs(t_mod):
     ]
 
 
+def test_parse_install_links_accepts_indented_calls(t_mod):
+    # the calls live inside install.sh's link_all(), so they are indented; anchoring
+    # `link` at column 0 made doctor report 0 managed links
+    text = (
+        'link_all() {\n'
+        '    link "$LINK_SRC/.zshrc"     "$HOME/.zshrc"\n'
+        '\tlink "$LINK_SRC/bin/t"       "$HOME/bin/t"\n'
+        '}\n'
+    )
+    assert t_mod._parse_install_links(text) == [
+        (".zshrc", "$HOME/.zshrc"),
+        ("bin/t", "$HOME/bin/t"),
+    ]
+
+
+def test_parse_install_links_indented_mentions_still_skipped(t_mod):
+    # indentation is allowed, but the line must still START with `link`
+    text = (
+        '    # link "$LINK_SRC/dead" "$HOME/dead"\n'
+        '    echo link "$LINK_SRC/nope" "$HOME/nope"\n'
+        '    link "$LINK_SRC/real" "$HOME/real"\n'
+    )
+    assert t_mod._parse_install_links(text) == [("real", "$HOME/real")]
+
+
+def test_parse_install_links_matches_the_real_install_sh(t_mod):
+    # guards the coupling directly: whatever install.sh looks like, doctor must find
+    # every managed link in it
+    import os
+    root = os.path.dirname(os.path.dirname(os.path.abspath(t_mod.__file__)))
+    with open(os.path.join(root, "install.sh")) as f:
+        pairs = t_mod._parse_install_links(f.read())
+    assert len(pairs) >= 12
+    dsts = [d for _, d in pairs]
+    assert "$HOME/.tmux.conf" in dsts
+    assert "$HOME/.ssh/dotfiles.conf" in dsts   # the one outside the main block
+
+
 def test_parse_install_links_skips_comments_and_other_lines(t_mod):
     text = (
         '# link "$LINK_SRC/dead" "$HOME/dead"\n'
@@ -723,6 +761,8 @@ def test_doctor_findings_bad_links_and_behind(t_mod):
     facts = {"links": [("/h/.zshrc", "ok"), ("/h/.tmux.conf", "missing")], "behind": 2}
     out = t_mod._doctor_findings(facts)
     assert any("1 managed link(s) not in place" in l and ".tmux.conf (missing)" in l for l in out)
+    # the fix is a runnable command, not a path to hand-type
+    assert any("run dots" in l for l in out)
     assert any("behind origin/main — run dots" in l and "2 commit(s)" in l for l in out)
 
 

@@ -1368,6 +1368,36 @@ def cmd_pending(cfg, args):
 # hardcoded so doctor can never drift from what install.sh actually manages.
 _INSTALL_LINK_RE = re.compile(r'^link\s+"\$LINK_SRC/([^"]+)"\s+"([^"]+)"', re.M)
 
+# Terminals that translate the scroll wheel into arrow keys while an app sits on
+# the alternate screen. Claude's fullscreen renderer keeps its own virtualized
+# scrollback and expects real wheel events, so there the wheel moves nothing and
+# Claude posts "Scroll wheel is sending arrow keys" (its detector trips on 8 bare
+# arrows inside a 100ms window). Verified for Apple_Terminal — only add a
+# terminal here once its wheel has actually been observed arriving as arrows.
+_WHEEL_ARROW_TERMS = ("Apple_Terminal",)
+
+
+def _env_on(env, name):
+    """A CLAUDE_CODE_* toggle counts as on unless unset/empty/0/false."""
+    return env.get(name, "").strip().lower() not in ("", "0", "false")
+
+
+def _effective_tui(settings_tui, env):
+    """Which renderer Claude will actually use: "fullscreen", "default" or None.
+
+    `tui` is optional in Claude's settings schema with NO default, and the
+    fullscreen upsell only fires while it is undefined — so unset means the
+    CLASSIC main-screen renderer and must never be read as fullscreen (that
+    would fire the wheel warning at everyone who never opted in). The env knobs
+    override the file; DISABLE_ALTERNATE_SCREEN wins outright because it forces
+    the main screen regardless of the renderer setting.
+    """
+    if _env_on(env, "CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN"):
+        return "default"
+    if _env_on(env, "CLAUDE_CODE_NO_FLICKER"):   # documented as == fullscreen
+        return "fullscreen"
+    return settings_tui
+
 
 def _parse_install_links(text):
     return [(m.group(1), m.group(2)) for m in _INSTALL_LINK_RE.finditer(text)]
@@ -1380,7 +1410,8 @@ def _doctor_findings(facts):
     problem; behind (int, live surface commits behind origin/main); conf_exists /
     conf_is_link (~/.tmux.conf); tmux_running; mouse ("on"/"off"); conf_mouse_on
     (the FILE says mouse on); history_limit (global); panes [{session, cmd,
-    mouse, alt, hist}].
+    mouse, alt, hist}]; in_tmux; term_program ($TERM_PROGRAM); tui (the
+    effective renderer per _effective_tui).
     """
     out = []
     bad = [(d, s) for d, s in facts.get("links", []) if s != "ok"]
@@ -1417,12 +1448,21 @@ def _doctor_findings(facts):
             out.append("· %d existing pane(s) still have the old history-limit (%d); the "
                        "global %d applies only to panes created after the change"
                        % (len(stale), stale[0]["hist"], gl))
+    if (not facts.get("in_tmux") and facts.get("tui") == "fullscreen"
+            and facts.get("term_program") in _WHEEL_ARROW_TERMS):
+        out.append("⚠ %s turns the wheel into arrow keys on the alternate screen, so "
+                   "the fullscreen renderer never sees it scroll (\"Scroll wheel is "
+                   "sending arrow keys\"). Fix: /tui default — the classic renderer "
+                   "draws on the main screen, so the wheel scrolls the terminal\'s own "
+                   "scrollback. To keep fullscreen, read back with the ctrl+o transcript "
+                   "(\'[\' dumps it to native scrollback)" % facts["term_program"])
     if not out:
         out.append("✓ nothing suspicious found")
     return out
 
 
 def cmd_doctor(cfg, args):
+    import json
     import platform
 
     st = Style()
@@ -1463,6 +1503,15 @@ def cmd_doctor(cfg, args):
     bits.append("inside tmux: %s" % ("yes" if os.environ.get("TMUX") else "no"))
     bits.append("ssh: %s" % ("yes" if os.environ.get("SSH_CONNECTION") else "no"))
     print("  " + " · ".join(bits))
+    # which renderer Claude will use here — decides who owns the scroll wheel
+    settings_tui = None
+    try:
+        with open(os.path.join(HOME, ".claude", "settings.json")) as f:
+            settings_tui = json.load(f).get("tui")
+    except (OSError, ValueError, AttributeError):
+        settings_tui = None
+    tui = _effective_tui(settings_tui, os.environ)
+    print("  claude tui: %s" % (tui or "default (unset)"))
 
     # tool versions (claude lives on the interactive PATH / ~/.local/bin)
     section("Versions")
@@ -1477,7 +1526,8 @@ def cmd_doctor(cfg, args):
 
     # dotfiles: which checkout is live, is it current, are the links in place
     section("Dotfiles")
-    facts = {}
+    facts = {"in_tmux": bool(os.environ.get("TMUX")),
+             "term_program": os.environ.get("TERM_PROGRAM"), "tui": tui}
     zrc = os.path.join(HOME, ".zshrc")
     live_src = None
     if os.path.islink(zrc):

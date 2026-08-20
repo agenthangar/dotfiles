@@ -75,7 +75,14 @@ setup_main_worktree() {
     git -C "$MAIN_WT" merge --ff-only origin/main -q 2>/dev/null || true
 }
 
-if [[ -n "${DOTFILES_LINK_DEV:-}" ]]; then
+# DOTFILES_LINKS_ONLY=1 is the fast, OFFLINE relink `dots` runs on every invocation
+# (see _dots_relink in .zshrc): link from THIS tree — whichever copy of install.sh the
+# caller chose to run — and stop right after link_all. Deliberately skips
+# setup_main_worktree, so it never fetches and cannot trip the missing-worktree
+# recreate; $DOTFILES_DIR always exists, since it is where this script lives.
+if [[ -n "${DOTFILES_LINKS_ONLY:-}" ]]; then
+    LINK_SRC="$DOTFILES_DIR"
+elif [[ -n "${DOTFILES_LINK_DEV:-}" ]]; then
     LINK_SRC="$DOTFILES_DIR"
     echo "Linking from the DEV clone ($(git -C "$DOTFILES_DIR" symbolic-ref --short -q HEAD || echo '?')) — in-progress edits are live."
 else
@@ -85,6 +92,15 @@ fi
 
 link() {
     local src="$1" dst="$2"
+    # Already pointing where we want it: say nothing and touch nothing. This is what
+    # lets `dots` relink unconditionally on every run and stay silent unless something
+    # actually changed. Compare the RAW readlink, not a resolved realpath, so a link
+    # whose target is not checked out yet still counts as correct instead of being
+    # rewritten every time. It also closes the window where the old unconditional
+    # rm + ln left ~/.zshrc briefly absent.
+    if [[ -L "$dst" && "$(readlink "$dst")" == "$src" ]]; then
+        return 0
+    fi
     if [[ -L "$dst" ]]; then
         rm "$dst"
     elif [[ -e "$dst" ]]; then
@@ -96,17 +112,40 @@ link() {
     echo "Linked $dst -> $src"
 }
 
-link "$LINK_SRC/.zshrc"               "$HOME/.zshrc"
-link "$LINK_SRC/.tmux.conf"           "$HOME/.tmux.conf"
-link "$LINK_SRC/bin/sleep-manager"    "$HOME/bin/sleep-manager"
-link "$LINK_SRC/bin/csync"            "$HOME/bin/csync"
-link "$LINK_SRC/bin/cursor-beam"      "$HOME/bin/cursor-beam"
-link "$LINK_SRC/bin/pii-scan"         "$HOME/bin/pii-scan"
-link "$LINK_SRC/bin/claude-stamp-tmux" "$HOME/bin/claude-stamp-tmux"
-link "$LINK_SRC/bin/t"                "$HOME/bin/t"
-link "$LINK_SRC/bin/pr-watch"         "$HOME/bin/pr-watch"
-link "$LINK_SRC/claude/commands/tpush.md" "$HOME/.claude/commands/tpush.md"
-link "$LINK_SRC/claude/commands/tpop.md"  "$HOME/.claude/commands/tpop.md"
+# EVERY managed link lives in here, including the ssh one that used to sit further
+# down with the Include rewrite. That matters: `t doctor` discovers the managed set by
+# parsing these `link` lines (bin/t's _INSTALL_LINK_RE), so a link outside link_all
+# would be a link doctor reports as drifted and the links-only relink never fixes —
+# a relink that fires on every single `dots` forever.
+link_all() {
+    link "$LINK_SRC/.zshrc"               "$HOME/.zshrc"
+    link "$LINK_SRC/.tmux.conf"           "$HOME/.tmux.conf"
+    link "$LINK_SRC/bin/sleep-manager"    "$HOME/bin/sleep-manager"
+    link "$LINK_SRC/bin/csync"            "$HOME/bin/csync"
+    link "$LINK_SRC/bin/cursor-beam"      "$HOME/bin/cursor-beam"
+    link "$LINK_SRC/bin/pii-scan"         "$HOME/bin/pii-scan"
+    link "$LINK_SRC/bin/claude-stamp-tmux" "$HOME/bin/claude-stamp-tmux"
+    link "$LINK_SRC/bin/t"                "$HOME/bin/t"
+    link "$LINK_SRC/bin/pr-watch"         "$HOME/bin/pr-watch"
+    link "$LINK_SRC/claude/commands/tpush.md" "$HOME/.claude/commands/tpush.md"
+    link "$LINK_SRC/claude/commands/tpop.md"  "$HOME/.claude/commands/tpop.md"
+    # ~/.ssh must exist and be 0700 before the snippet can land in it. The Include
+    # rewrite that pairs with this link stays below, in the full-install section.
+    mkdir -p "$HOME/.ssh"
+    chmod 700 "$HOME/.ssh"
+    link "$LINK_SRC/ssh/config" "$HOME/.ssh/dotfiles.conf"
+}
+
+link_all
+
+# Everything below is the FULL install. The links-only relink stops here, before the
+# tmux source-file, the ssh Include rewrite, the ~/.zshrc.local and settings.json
+# seeds, the global gitconfig/hooksPath writes, the PII denylist branch (which would
+# DELETE the denylist when PII_SCRUB_RULES is unset — always true from a shell hook),
+# the launchd agent restart, and brew bundle.
+if [[ -n "${DOTFILES_LINKS_ONLY:-}" ]]; then
+    exit 0
+fi
 
 # tmux reads ~/.tmux.conf only at SERVER START, so the link above is inert for an
 # already-running server until re-sourced. Apply it here (dots' default path does
@@ -128,9 +167,6 @@ fi
 # our snippet's `Host *` defaults must lose to any per-host settings already in
 # the user's config — so the include goes after them, not before. Non-destructive
 # and idempotent.
-mkdir -p "$HOME/.ssh"
-chmod 700 "$HOME/.ssh"
-link "$LINK_SRC/ssh/config" "$HOME/.ssh/dotfiles.conf"
 ssh_main="$HOME/.ssh/config"
 include_line="Include dotfiles.conf"
 # An older install symlinked ~/.ssh/config straight at the repo; drop that link so

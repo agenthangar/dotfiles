@@ -172,6 +172,37 @@ nosleep() { [[ "$1" == -h || "$1" == --help ]] && { _help_for nosleep; return 0;
 # own copy of this step (covers --dev, migration, and manual installs), so no
 # rollout ever needs a manual `tmux source-file`. No server → no-op (and no
 # stray server: one auto-started with no sessions exits immediately).
+# _dots_relink — reconcile the install.sh-managed $HOME symlinks with a checkout.
+# $1 = the tree to link FROM; we run that tree's own install.sh, and its
+# DOTFILES_LINKS_ONLY mode links from wherever it lives, so the arg picks the source
+# with no path guessing (dots already holds both paths in locals).
+#
+# Why unconditional rather than "detect drift, then fix": the fixer IS the checker, so
+# they cannot disagree and there is no second copy of the link list to keep in sync.
+# It is offline, sub-10ms, and silent unless a link actually changed, because
+# install.sh's link() no-ops on an already-correct symlink. A diff-based check ("did
+# this dots pull a commit touching install.sh?") would NOT have caught the case this
+# exists for: a machine that already fast-forwarded past the commit adding a link and
+# simply never relinked.
+_dots_relink() {
+  local wt="$1" out
+  [[ -x "$wt/install.sh" ]] || return 0
+  # Capability check, NOT decoration. During the rollout window this .zshrc can be live
+  # (via dots --dev) while $wt/install.sh is still the pre-merge copy that has never
+  # heard of DOTFILES_LINKS_ONLY — it would ignore the var and run the FULL install:
+  # brew bundle, the launchd restart, and the PII branch that DELETES the denylist when
+  # PII_SCRUB_RULES is unset. Verified by hitting exactly that in a sandbox. An
+  # install.sh that cannot do links-only simply does not get relinked here.
+  grep -q 'DOTFILES_LINKS_ONLY' "$wt/install.sh" 2>/dev/null || return 0
+  if ! out=$(DOTFILES_LINKS_ONLY=1 "$wt/install.sh" 2>&1); then
+    print -r -- "dots — ⚠ relink failed:" >&2
+    print -r -- "$out" >&2
+    return 1
+  fi
+  [[ -n "$out" ]] && print -r -- "$out"
+  return 0
+}
+
 _dots_tmux_apply() {
   [[ -r ~/.tmux.conf ]] && command -v tmux >/dev/null 2>&1 && tmux has-session 2>/dev/null || return 0
   tmux source-file ~/.tmux.conf 2>/dev/null \
@@ -180,7 +211,7 @@ _dots_tmux_apply() {
 
 # dots — update your LIVE dotfiles to origin/main and reload zsh
 #
-# Usage: dots [--dev]
+# Usage: dots [--dev | --relink]
 #
 # The live surface (what $HOME symlinks point at) is a dedicated git worktree pinned
 # to `main`, separate from the clone you develop in (see the symlink-model note in
@@ -190,6 +221,16 @@ _dots_tmux_apply() {
 # in-progress work: develop on the dev branch via `t open dotfiles`, run `dots` to
 # pull released updates whenever, in any order. (First run on an old single-tree
 # machine migrates it: moves the clone off main and sets the worktree up.)
+#
+# It also RECONCILES the $HOME symlinks every run, so a released change that adds a
+# managed file lands by itself. Before this, dots only fast-forwarded, and a new `link`
+# call in install.sh silently never applied — that is how a fresh ~/.tmux.conf failed
+# to land and how `t resume` once vanished. Silent when nothing changed.
+#
+# Flags:
+#   --dev, -d     make the checkout you are STANDING IN live (see below)
+#   --relink      reconcile the live symlinks now, without fetching
+#   --force, -f   with --dev: allow the clean parked dev clone as the source
 #
 # --dev (-d): flip the live surface to the dotfiles checkout you are STANDING IN —
 # re-links from it (catching new/renamed files) and reloads, so its in-progress edits
@@ -215,6 +256,24 @@ dots() {
   [[ $commondir == /* ]] || commondir="$live/$commondir"
   local devclone="${commondir:A:h}"
   local mainwt="${DOTFILES_MAIN_WT:-$HOME/.local/share/dotfiles-main}"
+  local relinked   # hoisted: a 2nd assignmentless `local` in another branch prints it
+
+  if [[ "$1" == --relink ]]; then
+    # Explicit, fetch-free reconcile of the live surface — the escape hatch that
+    # replaces hand-typing a path to the main worktree's install.sh. Uses $live, not
+    # $mainwt, so it is correct after `dots --dev` too (relink whatever is live now).
+    local out
+    if out=$(_dots_relink "$live"); then
+      if [[ -n "$out" ]]; then
+        print -r -- "${g}✓${r0} ${y}relinked from ${c}${live/#$HOME/~}${r0}"
+        print -r -- "$out"
+      else
+        print -r -- "${g}✓${r0} ${y}links already up to date (${c}${live/#$HOME/~}${r0}${y})${r0}"
+      fi
+    fi
+    source ~/.zshrc
+    return
+  fi
 
   if [[ "$1" == --dev || "$1" == -d ]]; then
     # Link the live symlinks from the dotfiles checkout $PWD is in — the cwd IS
@@ -289,6 +348,12 @@ dots() {
 
   if ! git -C "$live" fetch -q origin main 2>/dev/null; then
     print -r -- "${y}dots — fetch failed (offline?), reloaded only${r0}"
+    # relinking needs no network, and "already pulled but never relinked" is exactly
+    # the state this fixes — so do it even when the fetch failed.
+    if relinked=$(_dots_relink "$live") && [[ -n "$relinked" ]]; then
+      print -r -- "${g}✓${r0} ${y}relinked newly managed file(s):${r0}"
+      print -r -- "$relinked"
+    fi
     source ~/.zshrc
     return
   fi
@@ -323,6 +388,14 @@ dots() {
     print -r -- "${y}dots — main worktree can't fast-forward origin/main; reloaded only${r0}"
   fi
 
+  # Reconcile the managed links with what we just fast-forwarded to. Must come AFTER
+  # the ff (the new install.sh and its new link set only exist on disk once the merge
+  # above ran) and BEFORE _dots_tmux_apply, so a newly linked ~/.tmux.conf is what
+  # gets sourced into the running server.
+  if relinked=$(_dots_relink "$mainwt") && [[ -n "$relinked" ]]; then
+    print -r -- "${g}✓${r0} ${y}relinked newly managed file(s):${r0}"
+    print -r -- "$relinked"
+  fi
   _dots_tmux_apply
   source ~/.zshrc
 }

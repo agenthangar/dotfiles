@@ -1365,8 +1365,11 @@ def cmd_pending(cfg, args):
 # (cmd_doctor, coverage-excluded); the diagnosis rules are pure + pytest-covered.
 
 # install.sh's own `link "$LINK_SRC/<src>" "<dst>"` calls, parsed rather than
-# hardcoded so doctor can never drift from what install.sh actually manages.
-_INSTALL_LINK_RE = re.compile(r'^link\s+"\$LINK_SRC/([^"]+)"\s+"([^"]+)"', re.M)
+# hardcoded so doctor can never drift from what install.sh actually manages. Leading
+# whitespace is allowed because the calls live inside install.sh's link_all(); a
+# comment or a mention (`# link …`, `echo link …`) still has to not match, which is
+# why this anchors on indentation-then-`link` rather than searching anywhere.
+_INSTALL_LINK_RE = re.compile(r'^[ \t]*link\s+"\$LINK_SRC/([^"]+)"\s+"([^"]+)"', re.M)
 
 # Terminals that translate the scroll wheel into arrow keys while an app sits on
 # the alternate screen. Claude's fullscreen renderer keeps its own virtualized
@@ -1416,8 +1419,8 @@ def _doctor_findings(facts):
     out = []
     bad = [(d, s) for d, s in facts.get("links", []) if s != "ok"]
     if bad:
-        out.append("⚠ %d managed link(s) not in place: %s — re-run install.sh (from the "
-                   "main worktree, so it is current)"
+        out.append("⚠ %d managed link(s) not in place: %s — run dots (it relinks every "
+                   "run; dots --relink to do it without fetching)"
                    % (len(bad), ", ".join("%s (%s)" % (os.path.basename(d), s) for d, s in bad)))
     if facts.get("behind"):
         out.append("⚠ live surface is %d commit(s) behind origin/main — run dots"

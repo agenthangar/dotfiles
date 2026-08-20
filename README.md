@@ -70,6 +70,12 @@ re-sources `~/.zshrc`. Your live dotfiles become exactly what's published on
 means it takes effect immediately. It leaves you on `main`; it's safe, stopping
 and only reloading if the working tree has uncommitted edits.
 
+`dots` also **reconciles the managed symlinks every run**, so a released change that
+adds a managed file (a new `bin/` script, a new dotfile) lands without a manual
+install — the failure it fixes was a fast-forwarded machine whose `~/.tmux.conf` link
+had simply never been made. It is offline and prints nothing unless a link changed.
+**`dots --relink`** does just that step, without fetching.
+
 **`dots --dev`** installs from whatever branch is checked out *now* instead — it
 re-runs `install.sh` (relinking any new or renamed files) and reloads, without
 fetching or switching branches. Use it to apply in-progress dev work — e.g. a new
@@ -176,10 +182,10 @@ path/to/dotfiles/install.sh
 ```
 
 It creates the symlinks (backing up anything in the way to `*.bak`), seeds
-`~/.zshrc.local` and `~/.claude/settings.json` from their templates when absent
-(prompting for the Claude settings — example by default), then runs `brew bundle`
-(skipped if Homebrew is absent). Everything is idempotent; re-run after moving the
-repo to relink.
+`~/.zshrc.local` and `~/.claude/settings.json` from their templates when absent,
+then runs `brew bundle` (skipped if Homebrew is absent). It is non-interactive and
+idempotent — an already-correct symlink is left alone and prints nothing. You rarely
+need to run it by hand after the first time: `dots` reconciles the symlinks itself.
 
 **SSH config** is the one exception to the symlink model: rather than replacing
 `~/.ssh/config`, `install.sh` links the snippet to `~/.ssh/dotfiles.conf` and

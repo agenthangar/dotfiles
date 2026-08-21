@@ -852,3 +852,322 @@ def test_doctor_findings_wheel_rule_is_narrow(t_mod):
     # terminals that report the wheel properly are not affected
     assert not fires(term_program="iTerm.app")
     assert not fires(term_program=None)
+
+
+# ─── t todo — key resolution ───────────────────────────────────────────────────
+
+def _todo_cfg(t_mod, tmp_path, monkeypatch):
+    return _config_with(t_mod, tmp_path, monkeypatch,
+                        {"dotfiles": "/code/dotfiles", "ff": "/code/financial-forecast"},
+                        worktree_root="/wt")
+
+
+def test_todo_key_prefers_the_worktree_path(t_mod, tmp_path, monkeypatch):
+    cfg = _todo_cfg(t_mod, tmp_path, monkeypatch)
+    # The worktree path carries the slot, and it wins over a disagreeing tmux name —
+    # the path is where the code actually is.
+    assert t_mod._todo_key(cfg, "/wt/dotfiles/3") == "dotfiles-3"
+    assert t_mod._todo_key(cfg, "/wt/dotfiles/3", tmux_name="dev-ff-9") == "dotfiles-3"
+
+
+def test_todo_key_worktree_is_keyed_on_the_basename_not_the_alias(t_mod, tmp_path, monkeypatch):
+    cfg = _todo_cfg(t_mod, tmp_path, monkeypatch)
+    # Worktree dirs are $DEV_WORKTREE_ROOT/<repo basename>/<slot> — deliberately the
+    # basename, so the path is identical on every host — but the KEY uses the local
+    # alias, so `ff` (at ~/code/financial-forecast) lands as ff-2, not financial-forecast-2.
+    assert t_mod._todo_key(cfg, "/wt/financial-forecast/2") == "ff-2"
+
+
+def test_todo_key_falls_back_to_the_tmux_session_name(t_mod, tmp_path, monkeypatch):
+    cfg = _todo_cfg(t_mod, tmp_path, monkeypatch)
+    # Shared-tree (worktree opt-out) repo: the path has no slot, the session name does.
+    assert t_mod._todo_key(cfg, "/code/dotfiles", tmux_name="dev-dotfiles-2") == "dotfiles-2"
+    # …and it works from anywhere inside that slot's tmux session, repo dir or not.
+    assert t_mod._todo_key(cfg, "/tmp", tmux_name="dev-dotfiles-2") == "dotfiles-2"
+
+
+def test_todo_key_splits_the_tmux_name_on_the_last_dash(t_mod, tmp_path, monkeypatch):
+    cfg = _todo_cfg(t_mod, tmp_path, monkeypatch)
+    # Multi-dash alias must survive (the _dev_* last-dash rule).
+    assert t_mod._todo_key(cfg, "/tmp", tmux_name="dev-my-long-repo-7") == "my-long-repo-7"
+    # Not a dev slot, or no numeric slot → not a key.
+    assert t_mod._todo_key(cfg, "/tmp", tmux_name="scratchpad") == "scratch"
+    assert t_mod._todo_key(cfg, "/tmp", tmux_name="dev-dotfiles-main") == "scratch"
+    assert t_mod._todo_key(cfg, "/tmp", tmux_name="dev-4") == "scratch"
+
+
+def test_todo_key_repo_dir_without_a_slot(t_mod, tmp_path, monkeypatch):
+    cfg = _todo_cfg(t_mod, tmp_path, monkeypatch)
+    assert t_mod._todo_key(cfg, "/code/dotfiles") == "dotfiles"
+    assert t_mod._todo_key(cfg, "/code/dotfiles/bin") == "dotfiles"
+
+
+def test_todo_key_scratch_and_override(t_mod, tmp_path, monkeypatch):
+    cfg = _todo_cfg(t_mod, tmp_path, monkeypatch)
+    # Nowhere in particular still has somewhere to write, so a quick add never errors.
+    assert t_mod._todo_key(cfg, "/tmp") == "scratch"
+    # -s wins over everything.
+    assert t_mod._todo_key(cfg, "/wt/dotfiles/3", tmux_name="dev-ff-1",
+                           override="ff-9") == "ff-9"
+
+
+# ─── t todo — paths and persistence ────────────────────────────────────────────
+
+def test_todo_dir_honours_xdg_state_home(t_mod, monkeypatch):
+    monkeypatch.setenv("XDG_STATE_HOME", "/xdg/state")
+    assert t_mod._todo_dir() == "/xdg/state/t/todo"
+    assert t_mod._todo_path("dotfiles-1") == "/xdg/state/t/todo/dotfiles-1.json"
+
+
+def test_todo_dir_defaults_under_local_state(t_mod, monkeypatch):
+    monkeypatch.delenv("XDG_STATE_HOME", raising=False)
+    monkeypatch.setattr(t_mod, "HOME", "/home/me")
+    assert t_mod._todo_dir() == "/home/me/.local/state/t/todo"
+
+
+def test_todo_load_missing_file_is_an_empty_list(t_mod, tmp_path):
+    data = t_mod._todo_load(str(tmp_path / "nope.json"))
+    assert data == {"v": 1, "next_id": 1, "items": []}
+
+
+def test_todo_load_corrupt_file_is_an_empty_list(t_mod, tmp_path):
+    # A half-written file must not make the command unusable.
+    p = tmp_path / "x.json"
+    p.write_text('{"items": [{"id": 1, "te')
+    assert t_mod._todo_load(str(p))["items"] == []
+    p.write_text('["not", "a", "dict"]')
+    assert t_mod._todo_load(str(p))["items"] == []
+
+
+def test_todo_load_repairs_next_id(t_mod, tmp_path):
+    # A stale next_id (hand-edited, or a sync that kept the older scalar) must never
+    # hand out an id that is already taken.
+    p = tmp_path / "x.json"
+    p.write_text('{"v": 1, "next_id": 2, "items": ['
+                 '{"id": 1, "text": "a"}, {"id": 7, "text": "b"}]}')
+    assert t_mod._todo_load(str(p))["next_id"] == 8
+
+
+def test_todo_save_then_load_roundtrips(t_mod, tmp_path):
+    path = str(tmp_path / "deep" / "dotfiles-1.json")
+    data = {"v": 1, "next_id": 2,
+            "items": [{"id": 1, "text": "café ☕", "done": False,
+                       "added": 1, "done_at": None, "deleted": False}]}
+    t_mod._todo_save(path, data)          # creates the parent dir
+    assert t_mod._todo_load(path) == data
+    assert not os.path.exists(path + ".tmp")
+
+
+# ─── t todo — the mutation core ────────────────────────────────────────────────
+
+def _fresh(t_mod):
+    return dict(t_mod._TODO_EMPTY, items=[])
+
+
+def _add(t_mod, data, *texts):
+    for text in texts:
+        t_mod._todo_apply(data, "add", text.split(), now=100)
+    return data
+
+
+def test_todo_add_assigns_rising_ids(t_mod):
+    data = _fresh(t_mod)
+    msg, rc = t_mod._todo_apply(data, "add", ["rebase", "onto", "main"], now=100)
+    assert rc == 0 and "#1" in msg
+    t_mod._todo_apply(data, "add", ["second"], now=100)
+    assert [i["id"] for i in data["items"]] == [1, 2]
+    assert data["items"][0]["text"] == "rebase onto main"
+    assert data["next_id"] == 3
+
+
+def test_todo_add_needs_text(t_mod):
+    data = _fresh(t_mod)
+    msg, rc = t_mod._todo_apply(data, "add", ["   "], now=100)
+    assert rc == 2 and data["items"] == []
+
+
+def test_todo_done_and_undone(t_mod):
+    data = _add(t_mod, _fresh(t_mod), "one", "two")
+    msg, rc = t_mod._todo_apply(data, "done", ["1"], now=200)
+    assert rc == 0 and "#1" in msg
+    assert data["items"][0]["done"] and data["items"][0]["done_at"] == 200
+    assert [i["id"] for i in t_mod._todo_open(data)] == [2]
+    t_mod._todo_apply(data, "undone", ["1"], now=300)
+    assert not data["items"][0]["done"] and data["items"][0]["done_at"] is None
+
+
+def test_todo_accepts_several_ids_at_once(t_mod):
+    data = _add(t_mod, _fresh(t_mod), "one", "two", "three")
+    msg, rc = t_mod._todo_apply(data, "done", ["1", "3"], now=200)
+    assert rc == 0
+    assert [i["id"] for i in t_mod._todo_open(data)] == [2]
+
+
+def test_todo_unknown_id_reports_without_raising(t_mod):
+    data = _add(t_mod, _fresh(t_mod), "one")
+    msg, rc = t_mod._todo_apply(data, "done", ["9", "not-a-number"], now=200)
+    assert rc == 1
+    assert "9" in msg and "not-a-number" in msg
+    assert not data["items"][0]["done"]
+    # A partial hit still applies what it could, and still reports the miss.
+    msg, rc = t_mod._todo_apply(data, "done", ["1", "9"], now=200)
+    assert rc == 1 and data["items"][0]["done"]
+
+
+def test_todo_id_actions_need_an_id(t_mod):
+    data = _add(t_mod, _fresh(t_mod), "one")
+    for action in ("done", "undone", "rm"):
+        assert t_mod._todo_apply(data, action, [], now=200)[1] == 2
+
+
+def test_todo_rm_is_a_tombstone_not_a_delete(t_mod):
+    # csync's rsync has no --delete, so a physically dropped item comes back from
+    # iCloud. The item must survive in the file, flagged.
+    data = _add(t_mod, _fresh(t_mod), "one", "two")
+    t_mod._todo_apply(data, "rm", ["1"], now=200)
+    assert len(data["items"]) == 2
+    assert data["items"][0]["deleted"] and data["items"][0]["deleted_at"] == 200
+    assert [i["id"] for i in t_mod._todo_open(data)] == [2]
+    # …and a tombstoned item is gone for good: not listable, not addressable.
+    assert t_mod._todo_find(data, "1") is None
+    assert t_mod._todo_apply(data, "done", ["1"], now=300)[1] == 1
+    assert [i["id"] for i in t_mod._todo_visible(data, show_all=True)] == [2]
+
+
+def test_todo_clear_purges_finished_only(t_mod):
+    data = _add(t_mod, _fresh(t_mod), "one", "two", "three")
+    t_mod._todo_apply(data, "done", ["1"], now=200)
+    t_mod._todo_apply(data, "rm", ["2"], now=200)
+    msg, rc = t_mod._todo_apply(data, "clear", [], now=300)
+    assert rc == 0 and "2" in msg
+    assert [i["id"] for i in data["items"]] == [3]
+    # Ids are never reused after a clear — next_id keeps rising.
+    assert t_mod._todo_apply(data, "add", ["four"], now=300)[0].startswith("✓ added #4")
+
+
+def test_todo_clear_on_a_tidy_list_says_so(t_mod):
+    data = _add(t_mod, _fresh(t_mod), "one")
+    msg, rc = t_mod._todo_apply(data, "clear", [], now=300)
+    assert rc == 0 and msg == "nothing to clear"
+    assert len(data["items"]) == 1
+
+
+def test_todo_edit_retexts(t_mod):
+    data = _add(t_mod, _fresh(t_mod), "one")
+    msg, rc = t_mod._todo_apply(data, "edit", ["1", "much", "better"], now=300)
+    assert rc == 0 and data["items"][0]["text"] == "much better"
+    assert t_mod._todo_apply(data, "edit", ["1"], now=300)[1] == 2       # no new text
+    assert t_mod._todo_apply(data, "edit", ["1", "  "], now=300)[1] == 2  # blank new text
+    assert t_mod._todo_apply(data, "edit", ["9", "x"], now=300)[1] == 1  # no such id
+
+
+def test_todo_unknown_action_offers_the_whole_line_back(t_mod):
+    # The likely slip is forgetting `add`, so the hint must quote everything typed,
+    # not just the first word.
+    data = _fresh(t_mod)
+    msg, rc = t_mod._todo_apply(data, "fix", ["the", "thing"], now=300)
+    assert rc == 2 and "t todo add 'fix the thing'" in msg
+    assert data["items"] == []
+
+
+# ─── t todo — rendering ────────────────────────────────────────────────────────
+
+def _plain(t_mod):
+    """A colourless Style so assertions can match text, not escape codes."""
+    st = t_mod.Style()
+    for attr in ("g", "c", "y", "b", "r"):
+        setattr(st, attr, "")
+    return st
+
+
+def test_todo_render_lists_open_items(t_mod):
+    data = _add(t_mod, _fresh(t_mod), "one", "two")
+    t_mod._todo_apply(data, "done", ["1"], now=200)
+    lines = t_mod._todo_render(data, "dotfiles-1", st=_plain(t_mod))
+    assert lines[0] == "dotfiles-1 — 1 open"
+    assert [l.strip() for l in lines[1:]] == ["2  ◻ two"]
+
+
+def test_todo_render_all_flag_shows_done_and_a_tally(t_mod):
+    data = _add(t_mod, _fresh(t_mod), "one", "two")
+    t_mod._todo_apply(data, "done", ["1"], now=200)
+    lines = t_mod._todo_render(data, "dotfiles-1", show_all=True, st=_plain(t_mod))
+    assert lines[0] == "dotfiles-1 — 1 open · 1 done"
+    assert [l.strip() for l in lines[1:]] == ["1  ✓ one", "2  ◻ two"]
+
+
+def test_todo_render_empty_list_hints_at_add(t_mod):
+    lines = t_mod._todo_render(_fresh(t_mod), "dotfiles-1", st=_plain(t_mod))
+    assert lines[0] == "dotfiles-1 — nothing open"
+    assert "t todo add" in lines[1]
+
+
+def test_todo_render_truncates_to_width(t_mod):
+    data = _add(t_mod, _fresh(t_mod), "x" * 200)
+    lines = t_mod._todo_render(data, "k", width=40, st=_plain(t_mod))
+    assert all(len(l) <= 40 for l in lines)
+    assert lines[1].endswith("…")
+
+
+def test_todo_render_all_groups_by_slot_and_skips_empty(t_mod):
+    a = _add(t_mod, _fresh(t_mod), "first", "second")
+    b = _add(t_mod, _fresh(t_mod), "other")
+    empty = _fresh(t_mod)
+    done_only = _add(t_mod, _fresh(t_mod), "finished")
+    t_mod._todo_apply(done_only, "done", ["1"], now=200)
+    lines = t_mod._todo_render_all(
+        [("dotfiles-1", a), ("ff-2", b), ("gone-3", empty), ("tidy-4", done_only)],
+        st=_plain(t_mod))
+    assert "dotfiles-1" in lines[0] and "first" in lines[0]
+    assert lines[1].strip().startswith("2")       # continuation row: no repeated key
+    assert "dotfiles-1" not in lines[1]
+    assert "ff-2" in lines[2] and "other" in lines[2]
+    # A slot with nothing open never takes a row.
+    assert not any("gone-3" in l or "tidy-4" in l for l in lines)
+
+
+def test_todo_render_all_says_so_when_everything_is_clear(t_mod):
+    lines = t_mod._todo_render_all([("a-1", _fresh(t_mod))], st=_plain(t_mod))
+    assert lines == ["nothing open in any slot"]
+
+
+# ─── t todo — statusline ───────────────────────────────────────────────────────
+
+def _statusline(t_mod, tmp_path, monkeypatch, payload, key=None, texts=()):
+    cfg = _todo_cfg(t_mod, tmp_path, monkeypatch)
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+    if key:
+        data = _add(t_mod, _fresh(t_mod), *texts)
+        t_mod._todo_save(t_mod._todo_path(key), data)
+    return t_mod._todo_statusline(payload, cfg)
+
+
+def test_todo_statusline_renders_slot_model_and_top_item(t_mod, tmp_path, monkeypatch):
+    line = _statusline(t_mod, tmp_path, monkeypatch,
+                       {"workspace": {"current_dir": "/wt/dotfiles/1"},
+                        "model": {"display_name": "Opus"}},
+                       key="dotfiles-1", texts=("rebase onto main", "second"))
+    assert line == "dotfiles-1 · Opus · ◻ 2  rebase onto main"
+
+
+def test_todo_statusline_prefers_workspace_over_cwd(t_mod, tmp_path, monkeypatch):
+    # They differ when Claude is started from a subdir; workspace.current_dir is
+    # the project root and is what the slot is keyed on.
+    line = _statusline(t_mod, tmp_path, monkeypatch,
+                       {"cwd": "/tmp", "workspace": {"current_dir": "/wt/financial-forecast/2"}})
+    assert line.startswith("ff-2")
+
+
+def test_todo_statusline_survives_a_bare_payload(t_mod, tmp_path, monkeypatch):
+    # A statusline that raises leaves the TUI with a permanently broken status bar,
+    # so every field has to be optional.
+    for payload in ({}, {"model": None, "workspace": "nonsense"}, []):
+        line = _statusline(t_mod, tmp_path, monkeypatch, payload)
+        assert line.endswith("◻ 0")
+
+
+def test_todo_statusline_truncates_a_long_item(t_mod, tmp_path, monkeypatch):
+    line = _statusline(t_mod, tmp_path, monkeypatch,
+                       {"workspace": {"current_dir": "/wt/dotfiles/1"}},
+                       key="dotfiles-1", texts=("y" * 200,))
+    assert line.endswith("…") and len(line) < 80

@@ -20,6 +20,7 @@
 
 import argparse
 import glob
+import json
 import os
 import re
 import shlex
@@ -1659,6 +1660,310 @@ def cmd_doctor(cfg, args):
     return 0
 
 
+
+# ─── todo — a per-slot task list ───────────────────────────────────────────────
+#
+# Keyed on the SLOT (<repo>-<slot>), not the Claude session id: a conversation's id
+# changes under you (compaction, /clear, a fresh `t resume`) while the work does not,
+# and the slot is the unit you actually hold in your head when several run at once.
+# Keying on <repo>-<slot> also survives a beam, since the worktree path and branch are
+# basename+slot on every host by design.
+#
+# Removal is a TOMBSTONE, never an unlink. csync's sync_pair is `rsync --update` with
+# NO --delete (bin/csync), so a file removed here comes straight back from iCloud on
+# the next run — but a done/deleted FLAG rides inside the file, and the newest whole
+# file wins. Only `t todo clear` physically drops the flagged items. Same reason the
+# union caveat is real: two machines editing one slot's list between syncs lose a side.
+# That is the one-live-owner-per-slot invariant the rest of `t` already assumes.
+
+_TODO_EMPTY = {"v": 1, "next_id": 1, "items": []}
+
+
+def _todo_dir():
+    """State root, read at call time so tests (and $XDG_STATE_HOME) can redirect it."""
+    base = os.environ.get("XDG_STATE_HOME") or os.path.join(HOME, ".local", "state")
+    return os.path.join(base, "t", "todo")
+
+
+def _todo_path(key):
+    return os.path.join(_todo_dir(), key + ".json")
+
+
+def _todo_key(cfg, cwd, tmux_name=None, override=None):
+    """The list a given cwd belongs to. Ladder, most specific first:
+      1. an explicit -s override;
+      2. a per-session worktree — cfg.repo_of_dir gives (alias, slot) straight off the
+         path, which is the normal case since Claude's Bash tool runs in the worktree;
+      3. the tmux session name (dev-<repo>-<slot>) for a shared-tree / opt-out repo,
+         split on the LAST dash so a multi-dash alias resolves (the _dev_* rule);
+      4. a canonical repo dir with no slot → the repo's own list;
+      5. nothing → "scratch", so a quick add from anywhere never errors out.
+    Deliberately NOT _infer_repo: its newest-log tiebreak between sibling aliases (dot
+    vs dotfiles) can drift between calls, which would silently split one slot's list
+    across two files. repo_of_dir's basename-else-shortest choice is stable."""
+    if override:
+        return override
+    alias, slot = cfg.repo_of_dir(cwd)
+    if alias and slot:
+        return "%s-%s" % (alias, slot)
+    if tmux_name and tmux_name.startswith("dev-"):
+        repo, dash, num = tmux_name[4:].rpartition("-")
+        if dash and repo and num.isdigit():
+            return "%s-%s" % (repo, num)
+    if alias:
+        return alias
+    return "scratch"
+
+
+def _todo_load(path):
+    """Read a list file. Missing, unreadable, or malformed all read as an EMPTY list
+    rather than an error: this is a convenience surface, and refusing to work because
+    half a JSON write survived would be worse than starting the list over."""
+    try:
+        with open(path, encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, ValueError):
+        return dict(_TODO_EMPTY, items=[])
+    if not isinstance(data, dict) or not isinstance(data.get("items"), list):
+        return dict(_TODO_EMPTY, items=[])
+    items = [i for i in data["items"] if isinstance(i, dict) and "id" in i]
+    highest = max([i.get("id", 0) for i in items] or [0])
+    return {"v": data.get("v", 1),
+            "next_id": max(int(data.get("next_id", 1) or 1), highest + 1),
+            "items": items}
+
+
+def _todo_save(path, data):
+    """Write atomically (tmp + os.replace) so a crash mid-write can never leave a
+    truncated list where a good one was."""
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(data, fh, ensure_ascii=False, indent=1)
+        fh.write("\n")
+    os.replace(tmp, path)
+
+
+def _todo_open(data):
+    return [i for i in data["items"] if not i.get("done") and not i.get("deleted")]
+
+
+def _todo_visible(data, show_all=False):
+    live = [i for i in data["items"] if not i.get("deleted")]
+    return live if show_all else [i for i in live if not i.get("done")]
+
+
+def _todo_find(data, tok):
+    """Resolve an id token to a live (non-tombstoned) item, else None."""
+    if not str(tok).isdigit():
+        return None
+    n = int(tok)
+    for i in data["items"]:
+        if i.get("id") == n and not i.get("deleted"):
+            return i
+    return None
+
+
+_TODO_ACTIONS = ("add", "done", "undone", "rm", "edit", "clear", "ls")
+
+
+def _todo_apply(data, action, rest, now=None):
+    """Mutate `data` in place for one action. Returns (message, rc). Never raises on
+    bad input — an unknown id is a message and rc 1, so a fat-fingered `t todo done 9`
+    reports instead of exploding."""
+    now = int(now if now is not None else time.time())
+    rest = list(rest or [])
+
+    if action == "add":
+        text = " ".join(rest).strip()
+        if not text:
+            return ("t todo add: needs some text — t todo add \"rebase onto main\"", 2)
+        item = {"id": data["next_id"], "text": text, "done": False,
+                "added": now, "done_at": None, "deleted": False}
+        data["items"].append(item)
+        data["next_id"] += 1
+        return ("✓ added #%d  %s" % (item["id"], text), 0)
+
+    if action in ("done", "undone", "rm"):
+        if not rest:
+            return ("t todo %s: needs an id (t todo to list them)" % action, 2)
+        hit, missed = [], []
+        for tok in rest:
+            item = _todo_find(data, tok)
+            if not item:
+                missed.append(str(tok))
+                continue
+            if action == "done":
+                item["done"], item["done_at"] = True, now
+            elif action == "undone":
+                item["done"], item["done_at"] = False, None
+            else:
+                item["deleted"], item["deleted_at"] = True, now
+            hit.append(item)
+        verb = {"done": "done", "undone": "reopened", "rm": "removed"}[action]
+        msg = []
+        if hit:
+            msg.append("✓ %s %s" % (verb, ", ".join("#%d" % i["id"] for i in hit)))
+        if missed:
+            msg.append("⚠ no such item: %s" % ", ".join(missed))
+        return ("\n".join(msg), 1 if missed else 0)
+
+    if action == "edit":
+        if len(rest) < 2:
+            return ("t todo edit: needs an id and the new text", 2)
+        item = _todo_find(data, rest[0])
+        if not item:
+            return ("⚠ no such item: %s" % rest[0], 1)
+        text = " ".join(rest[1:]).strip()
+        if not text:
+            return ("t todo edit: needs the new text", 2)
+        item["text"] = text
+        return ("✓ #%d  %s" % (item["id"], text), 0)
+
+    if action == "clear":
+        gone = [i for i in data["items"] if i.get("done") or i.get("deleted")]
+        data["items"] = [i for i in data["items"] if not (i.get("done") or i.get("deleted"))]
+        if not gone:
+            return ("nothing to clear", 0)
+        return ("✓ cleared %d finished item%s" % (len(gone), "" if len(gone) == 1 else "s"), 0)
+
+    return ("t todo: unknown action '%s' — one of: %s\n"
+            "(to add that as an item, say so: t todo add %s)"
+            % (action, ", ".join(_TODO_ACTIONS),
+               shlex.quote(" ".join([action] + rest))), 2)
+
+
+def _todo_render(data, key, show_all=False, width=80, st=None):
+    """The one-list view. Returns display lines (no trailing newlines)."""
+    st = st or Style()
+    items = _todo_visible(data, show_all)
+    n_open = len(_todo_open(data))
+    n_done = len(items) - n_open if show_all else 0
+    tally = "nothing open" if not n_open else "%d open" % n_open
+    if n_done:
+        tally += " · %d done" % n_done
+    head = "%s%s%s %s— %s%s" % (st.b, key, st.r, st.y, tally, st.r)
+    if not items:
+        return [head, '  %s(t todo add "…")%s' % (st.y, st.r)]
+    lines = [head]
+    idw = max(len(str(i["id"])) for i in items)
+    for i in items:
+        mark = "✓" if i.get("done") else "◻"
+        body = _truncate(i["text"], max(10, width - idw - 6))
+        if i.get("done"):
+            lines.append("  %s%*d  %s %s%s" % (st.y, idw, i["id"], mark, body, st.r))
+        else:
+            lines.append("  %s%*d%s  %s %s" % (st.c, idw, i["id"], st.r, mark, body))
+    return lines
+
+
+def _todo_render_all(entries, width=80, st=None):
+    """The -A cross-slot view: every list with something open, grouped by key. This is
+    the actual answer to 'many things in parallel and I forget what I need to do'."""
+    st = st or Style()
+    live = [(k, _todo_open(d)) for k, d in entries]
+    live = [(k, items) for k, items in live if items]
+    if not live:
+        return ["%snothing open in any slot%s" % (st.y, st.r)]
+    kw = max(len(k) for k, _ in live)
+    lines = []
+    for key, items in live:
+        for n, i in enumerate(items):
+            label = key if n == 0 else ""
+            body = _truncate(i["text"], max(10, width - kw - 10))
+            lines.append("  %s%-*s%s  %s%2d%s  ◻ %s"
+                         % (st.b, kw, label, st.r, st.c, i["id"], st.r, body))
+    return lines
+
+
+def _todo_statusline(payload, cfg):
+    """One line for Claude Code's statusLine. The payload arrives as JSON on stdin;
+    workspace.current_dir is preferred over cwd (they differ when Claude is run from a
+    subdir of the project). Everything is optional — a statusline that raises leaves
+    the TUI with a permanently broken status bar, so every field degrades to nothing."""
+    if not isinstance(payload, dict):
+        payload = {}
+    ws = payload.get("workspace") if isinstance(payload.get("workspace"), dict) else {}
+    cwd = ws.get("current_dir") or payload.get("cwd") or os.getcwd()
+    model = payload.get("model") if isinstance(payload.get("model"), dict) else {}
+    name = (model.get("display_name") or "").strip()
+    key = _todo_key(cfg, cwd)
+    items = _todo_open(_todo_load(_todo_path(key)))
+    bits = [key]
+    if name:
+        bits.append(name)
+    if items:
+        bits.append("◻ %d  %s" % (len(items), _truncate(items[0]["text"], 44)))
+    else:
+        bits.append("◻ 0")
+    return " · ".join(bits)
+
+
+def _tmux_session_name():
+    """The tmux session this shell is in, or None. Gathering only — _todo_key takes it
+    as an argument so the ladder stays pure."""
+    if not os.environ.get("TMUX"):
+        return None
+    try:
+        out = subprocess.run(["tmux", "display-message", "-p", "#S"],
+                             capture_output=True, text=True)
+    except OSError:
+        return None
+    return out.stdout.strip() or None
+
+
+def cmd_todo(cfg, args):
+    # --statusline is a rendering-only path invoked by Claude Code many times a second;
+    # it must never raise and never write. The blanket except is deliberate.
+    if args.statusline:
+        payload = {}
+        try:
+            raw = "" if sys.stdin.isatty() else sys.stdin.read()
+            if raw.strip():
+                payload = json.loads(raw)
+        except Exception:
+            payload = {}   # unparseable stdin still gets a line, just without the model
+        try:
+            print(_todo_statusline(payload, cfg))
+        except Exception:
+            print("")
+        return 0
+
+    width = _columns()
+    st = Style()
+
+    if args.all_slots:
+        entries = [(os.path.basename(p)[:-5], _todo_load(p))
+                   for p in sorted(glob.glob(os.path.join(_todo_dir(), "*.json")))]
+        for line in _todo_render_all(entries, width, st):
+            print(line)
+        return 0
+
+    key = _todo_key(cfg, os.getcwd(), _tmux_session_name(), args.slot)
+    path = _todo_path(key)
+    data = _todo_load(path)
+    action = args.action or "ls"
+
+    if args.json:
+        json.dump({"key": key, "path": path, **data}, sys.stdout, ensure_ascii=False, indent=1)
+        sys.stdout.write("\n")
+        return 0
+
+    if action != "ls":
+        msg, rc = _todo_apply(data, action, args.rest)
+        if rc != 2:
+            _todo_save(path, data)
+        if msg:
+            print(msg, file=sys.stderr if rc else sys.stdout)
+        if rc:
+            return rc
+        if action == "add":
+            return 0
+
+    for line in _todo_render(data, key, args.all, width, st):
+        print(line)
+    return 0
+
 # ─── argument parsing (gh-style) ───────────────────────────────────────────────
 
 def build_parser():
@@ -1679,6 +1984,7 @@ examples:
   t push                  send the current session to a background tmux slot
   t pop api 3             pull dev-api-3 back to this terminal
   t resume api 3          revive dev-api-3's last conversation after it was closed
+  t todo add "rebase"     add to this slot's task list (t todo -A: every slot)
   t cd ff 5               cd this shell into ff's slot-5 worktree (bare t cd: picker)
   t beam api --host mini  send a session to 'mini' and resume it there
   t find "auth refactor"  search saved sessions, then resume the pick
@@ -1883,6 +2189,31 @@ Run `t <verb> -h` for a verb's own flags.""")
             "output'), and tool versions. Ends with findings + suggested fixes. Run it on "
             "another machine with `t on <host> t doctor`.")
 
+    sp = sub.add_parser("todo", help="a scratch task list scoped to this dev slot",
+        description="A small, durable task list for the slot you are standing in — the "
+            "things you meant to come back to. It is keyed on the SLOT (<repo>-<slot>, "
+            "read off the worktree path or the tmux session name), not the Claude "
+            "session id, because a conversation's id changes under you (compaction, "
+            "/clear, a fresh `t resume`) while the work does not; outside any repo it "
+            "falls back to a shared `scratch` list rather than erroring. Lists live in "
+            "$XDG_STATE_HOME/t/todo/<key>.json and ride csync to your other machines, "
+            "so a beamed slot keeps its list.\n\n"
+            "Actions: add <text…> | done <id…> | undone <id…> | rm <id…> | "
+            "edit <id> <text…> | clear (purge finished) | ls (the default). Finishing "
+            "or removing an item only FLAGS it — csync never deletes, so a physically "
+            "unlinked item would come straight back; `clear` is what really drops them.",
+        formatter_class=argparse.RawDescriptionHelpFormatter)
+    sp.add_argument("action", nargs="?", help="add|done|undone|rm|edit|clear|ls (default: ls)")
+    sp.add_argument("rest", nargs=argparse.REMAINDER,
+                    help="the item text, or the ids to act on")
+    sp.add_argument("-a", "--all", action="store_true", help="show finished items too")
+    sp.add_argument("-A", "--all-slots", action="store_true",
+                    help="every slot's open items, grouped — the cross-slot overview")
+    sp.add_argument("-s", "--slot", metavar="KEY",
+                    help="target another list by key (e.g. dotfiles-3) instead of the cwd's")
+    sp.add_argument("--json", action="store_true", help="dump this list as JSON")
+    sp.add_argument("--statusline", action="store_true",
+                    help="render one status line from the Claude statusLine JSON on stdin")
     # machine-readable / internal (hidden-ish; still have -h)
     sub.add_parser("session-rows", help="machine-readable per-host scan (remote contract)",
         description="Internal/machine-readable: emit one tab-separated row per live dev slot on "
@@ -1906,7 +2237,7 @@ IMPLEMENTED = {
     "ls": cmd_ls, "session-rows": cmd_session_rows, "on": cmd_on, "read": cmd_read,
     "plan": cmd_plan, "paste": cmd_paste, "kill": cmd_kill, "setup": cmd_setup,
     "land": cmd_land, "kill-owner": cmd_kill_owner, "cursor": cmd_cursor,
-    "doctor": cmd_doctor,
+    "doctor": cmd_doctor, "todo": cmd_todo,
 }
 
 

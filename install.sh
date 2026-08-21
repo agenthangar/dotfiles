@@ -139,6 +139,50 @@ link_all() {
 
 link_all
 
+# Claude Code statusline — the open-task count for the slot, always on screen.
+#
+# This runs in the LINKS-ONLY path, above the exit below, so a plain `dots` applies
+# it: the README's contract is "you rarely need to run install.sh by hand — dots
+# reconciles", and a step only reachable by a manual full install breaks that (it is
+# how a released change lands on one machine and silently not on another). Safe here
+# for the same reasons link_all is: offline, idempotent, additive, and it never
+# deletes — unlike the brew/launchd/PII steps the exit exists to skip.
+#
+# Seeding statusLine into settings.json.example only helps a FRESH machine:
+# install_claude_settings never clobbers an existing settings.json (Claude writes to
+# it at runtime), so every box that already has one would never get the key. Hence
+# this targeted merge — it adds statusLine ONLY when absent, so a hand-set statusline
+# is always kept, and it rewrites via tmp + os.replace so a crash cannot truncate the
+# live settings file. Silent unless it actually changes something, because it runs on
+# every single `dots`.
+install_claude_statusline() {
+    local dst="$HOME/.claude/settings.json"
+    [[ -e "$dst" ]] || return 0          # nothing to merge into; the seed already has it
+    command -v python3 >/dev/null 2>&1 || return 0
+    python3 - "$dst" <<'PY'
+import json, os, sys
+
+dst = sys.argv[1]
+try:
+    with open(dst, encoding="utf-8") as fh:
+        data = json.load(fh)
+except (OSError, ValueError):
+    sys.exit(0)          # not ours to repair, and never block a relink over it
+if not isinstance(data, dict) or data.get("statusLine"):
+    sys.exit(0)          # already set (or hand-set) — silent no-op, this runs every dots
+# $HOME, not an expanded path: Claude runs these through a shell (the SessionStart
+# hook uses the same form), so the setting survives a moved home directory.
+data["statusLine"] = {"type": "command", "command": "$HOME/bin/t todo --statusline"}
+tmp = dst + ".tmp"
+with open(tmp, "w", encoding="utf-8") as fh:
+    json.dump(data, fh, indent=2)
+    fh.write("\n")
+os.replace(tmp, dst)
+print("Set statusLine in %s -> t todo --statusline (open task count for this slot)" % dst)
+PY
+}
+install_claude_statusline
+
 # Everything below is the FULL install. The links-only relink stops here, before the
 # tmux source-file, the ssh Include rewrite, the ~/.zshrc.local and settings.json
 # seeds, the global gitconfig/hooksPath writes, the PII denylist branch (which would
@@ -231,44 +275,6 @@ install_claude_settings() {
     echo "Created $dst from settings.json.example"
 }
 install_claude_settings
-
-# Claude Code statusline — the open-task count for the slot, always on screen. Seeding
-# it into settings.json.example only helps a FRESH machine: install_claude_settings
-# above never clobbers an existing settings.json (Claude writes to it at runtime), so
-# every box that already has one would never get the key. Hence this targeted merge —
-# it adds statusLine ONLY when absent, so a hand-set statusline is always kept, and it
-# rewrites via tmp + os.replace so a crash can't truncate the live settings file.
-install_claude_statusline() {
-    local dst="$HOME/.claude/settings.json"
-    [[ -e "$dst" ]] || return 0          # nothing to merge into; the seed already has it
-    command -v python3 >/dev/null 2>&1 || return 0
-    python3 - "$dst" <<'PY'
-import json, os, sys
-
-dst = sys.argv[1]
-try:
-    with open(dst, encoding="utf-8") as fh:
-        data = json.load(fh)
-except (OSError, ValueError) as e:
-    print("WARNING: could not read %s (%s) - statusLine not set" % (dst, e), file=sys.stderr)
-    sys.exit(0)
-if not isinstance(data, dict):
-    sys.exit(0)
-if data.get("statusLine"):
-    print("Keeping existing statusLine in %s" % dst)
-    sys.exit(0)
-# $HOME, not an expanded path: Claude runs these through a shell (the SessionStart
-# hook above uses the same form), so the setting survives a moved home directory.
-data["statusLine"] = {"type": "command", "command": "$HOME/bin/t todo --statusline"}
-tmp = dst + ".tmp"
-with open(tmp, "w", encoding="utf-8") as fh:
-    json.dump(data, fh, indent=2)
-    fh.write("\n")
-os.replace(tmp, dst)
-print("Set statusLine in %s -> t todo --statusline (open task count for this slot)" % dst)
-PY
-}
-install_claude_statusline
 
 # Global git default — a pull reconciliation strategy so `git pull` never emits
 # the "divergent branches" hint and never silently merges or rebases. ff-only: a

@@ -35,6 +35,7 @@ exclude_lines = [
     "def _columns\\(",
     "class Style",
     # bin/t interactive setup glue (inline wizard + input() prompts)
+    "def _tmux_session_name\\(",
     "def _setup_wizard\\(",
     "def _setup_prompt_flow\\(",
     "def _prompt\\(",

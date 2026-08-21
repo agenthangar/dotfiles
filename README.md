@@ -19,6 +19,7 @@ shim in `.zshrc` for verbs that must run in your shell).
 | `t push` / `t pop` | Move a session between a foreground terminal and a detached tmux slot — one-live-owner guarantee |
 | `t beam <repo> [slot] --host <h>` | Teleport a running session to another machine; pull one back with `t open … --here` |
 | `t find <query>` | Semantic search across saved sessions ("which one was working on X?"), reranked by Claude |
+| `t todo [add\|done\|rm] …` | A task list scoped to the slot you are in — bare to list, `-A` for every slot at once. Also `/todo` inside Claude, and the statusline |
 
 Run `t -h` for the full verb list.
 
@@ -27,7 +28,7 @@ Run `t -h` for the full verb list.
 | Command | What it does |
 | --- | --- |
 | `dots [--dev]` | Sync dotfiles to `origin/main` HEAD and reload zsh; `--dev` installs from the current branch instead ([details](#keeping-machines-in-sync)) |
-| `csync` | Two-way sync of Claude session history across machines via iCloud Drive |
+| `csync` | Two-way sync of Claude session history, plans, and `t todo` lists across machines via iCloud Drive |
 | `sleep-manager` | Block or restore macOS sleep (`status`, `disable`, `enable`) |
 | `pii-scan` | Keep personal data out of this public repo ([details](#pii-guard)) |
 | `help` / `h` | Auto-generated, grouped list of every command ([details](#the-help-command)) |

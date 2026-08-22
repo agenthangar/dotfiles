@@ -209,18 +209,75 @@ _dots_tmux_apply() {
     || print -r -- "dots — ⚠ tmux source-file ~/.tmux.conf failed (check the config)" >&2
 }
 
+# _dots_live_tree — the checkout the $HOME symlinks currently point at, empty if the
+# machine has never been installed. THE single source of truth for "which tree is
+# LIVE", and deliberately repo-agnostic: it protects whatever tree happens to be live
+# rather than "dotfiles" by name. Used by dots, by _dev_repo_prepare (never switch the
+# live tree's branch) and by the worktree sweep (never reap the live tree).
+_dots_live_tree() {
+  local z=$HOME/.zshrc d
+  [[ -L $z ]] || return 1
+  d=${z:A:h}
+  [[ -d $d ]] || return 1
+  git -C "$d" rev-parse --show-toplevel 2>/dev/null
+}
+
+# _dots_resolve — set $live (the tree $HOME points at) and $primary (the ONE canonical
+# checkout = parent of the shared .git). Returns 1 when there is no usable repo at all.
+#
+# The validation is not defensive padding. The old inline version did:
+#     commondir=$(git -C "$live" rev-parse --git-common-dir 2>/dev/null)
+#     [[ $commondir == /* ]] || commondir="$live/$commondir"
+# so when $live was NOT a git checkout (~/.zshrc a real file, or a dangling link
+# mid-migration) commondir came back EMPTY, became "$live/", and $primary silently
+# resolved to the PARENT DIRECTORY of live — then everything downstream operated on
+# garbage. Masked under the two-tree layout; reachable now.
+_dots_resolve() {
+  live=""; primary=""
+  local z=$HOME/.zshrc d cdir
+  if [[ -L $z ]]; then
+    d=${z:A:h}
+    if [[ -d $d ]] && cdir=$(git -C "$d" rev-parse --git-common-dir 2>/dev/null) && [[ -n $cdir ]]; then
+      live=$(git -C "$d" rev-parse --show-toplevel 2>/dev/null)
+      [[ $cdir == /* ]] || cdir="$d/$cdir"
+      primary="${cdir:A:h}"
+    fi
+  fi
+  # Never installed, or the live tree is gone: fall back to the configured repo dir.
+  if [[ -z $primary ]]; then
+    primary="${DEV_REPOS[dotfiles]:-${DEV_REPOS[dot]:-$HOME/code/dotfiles}}"
+  fi
+  [[ -d $primary/.git ]]
+}
+
+# _dots_legacy_present — is a pre-migration two-tree layout still (partly) here?
+# Either the legacy worktree dir survives, or some non-primary worktree still holds
+# refs/heads/main. Needed because once the links have flipped, `live != primary` and
+# `primary is off main` are both FALSE while the old tree is still registered.
+_dots_legacy_present() {
+  local primary="$1" legacy="${DOTFILES_MAIN_WT:-$HOME/.local/share/dotfiles-main}" h
+  [[ -e $legacy && ${legacy:A} != ${primary:A} ]] && return 0
+  # Collect into an array first: a `... | while read` body is a SUBSHELL in zsh, so a
+  # `return 0` inside it is swallowed and the function always reports "clean".
+  local -a holders
+  holders=(${(f)"$(git -C "$primary" worktree list --porcelain 2>/dev/null \
+    | awk '/^worktree /{w=substr($0,10)} /^branch refs\/heads\/main$/{print w}')"})
+  for h in $holders; do
+    [[ -n $h && ${h:A} != ${primary:A} ]] && return 0
+  done
+  return 1
+}
+
 # dots — update your LIVE dotfiles to origin/main and reload zsh
 #
 # Usage: dots [--dev | --relink]
 #
-# The live surface (what $HOME symlinks point at) is a dedicated git worktree pinned
-# to `main`, separate from the clone you develop in (see the symlink-model note in
-# CLAUDE.md). Default `dots` fast-forwards THAT worktree to origin/main and re-sources
-# ~/.zshrc — so your live config becomes exactly what is published on main. It never
-# touches your dev clone, never switches your branch, and so can NOT blast away
-# in-progress work: develop on the dev branch via `t open dotfiles`, run `dots` to
-# pull released updates whenever, in any order. (First run on an old single-tree
-# machine migrates it: moves the clone off main and sets the worktree up.)
+# There is ONE canonical checkout (normally ~/code/dotfiles), parked on `main`, and it
+# IS the live surface — the $HOME symlinks point straight at it. Default `dots`
+# fast-forwards it to origin/main and re-sources ~/.zshrc, so your live config becomes
+# exactly what is published on main. It cannot blast away in-progress work because no
+# work lives there: every session develops in its own worktree via `t open dotfiles`.
+# (A machine still on the old two-tree layout is migrated in place on the first run.)
 #
 # It also RECONCILES the $HOME symlinks every run, so a released change that adds a
 # managed file lands by itself. Before this, dots only fast-forwarded, and a new `link`
@@ -228,47 +285,42 @@ _dots_tmux_apply() {
 # to land and how `t resume` once vanished. Silent when nothing changed.
 #
 # Flags:
-#   --dev, -d     make the checkout you are STANDING IN live (see below)
+#   --dev, -d     make the session worktree you are STANDING IN live (see below)
 #   --relink      reconcile the live symlinks now, without fetching
-#   --force, -f   with --dev: allow the clean parked dev clone as the source
 #
 # --dev (-d): flip the live surface to the dotfiles checkout you are STANDING IN —
 # re-links from it (catching new/renamed files) and reloads, so its in-progress edits
 # go live for testing without merging. The cwd is the choice: a per-session worktree
-# (`t cd dot <slot>`, then `dots --dev`), or a dev clone with real work on it.
-# Anywhere else it errors — no fallback, no guessing. Refused as sources: any non-
-# dotfiles dir, the live main worktree (plain `dots` manages it), and the dev clone
-# parked CLEAN on $DEV_BRANCH (stale content, no in-progress work — the error lists
-# your session worktrees; --force overrides). A later plain `dots` flips live back
-# to the main worktree. Skips brew bundle.
+# (`t cd dot <slot>`, then `dots --dev`). Anywhere else it errors — no fallback, no
+# guessing, because the old implicit fallback silently linked a stale tree while
+# reporting ✓. Refused as sources: any non-dotfiles dir, a checkout with no runnable
+# install.sh, and the canonical checkout itself (it is already live and plain `dots`
+# manages it — the error lists your session worktrees instead). A later plain `dots`
+# flips live back to the canonical checkout. Skips brew bundle.
 dots() {
   [[ "$1" == -h || "$1" == --help ]] && { _help_for dots; return 0; }
 
   local g c y r0=
   if [[ -t 1 ]]; then g=$'\e[32m'; c=$'\e[36m'; y=$'\e[2m'; r0=$'\e[0m'; fi
 
-  # The live surface — resolve the ~/.zshrc symlink to its real dir (:A follows the
-  # link + absolutizes, :h takes the dirname). After migration this IS the main
-  # worktree; on an un-migrated machine it is still the single clone.
-  local live="${${:-$HOME/.zshrc}:A:h}"
-  # The dev clone = parent of the shared .git common dir (works from any worktree).
-  local commondir=$(git -C "$live" rev-parse --git-common-dir 2>/dev/null)
-  [[ $commondir == /* ]] || commondir="$live/$commondir"
-  local devclone="${commondir:A:h}"
-  local mainwt="${DOTFILES_MAIN_WT:-$HOME/.local/share/dotfiles-main}"
+  local live primary
+  if ! _dots_resolve; then
+    print -r -- "dots: no dotfiles checkout found (looked for the tree ~/.zshrc links to, then \$DEV_REPOS[dotfiles])." >&2
+    return 1
+  fi
   local relinked   # hoisted: a 2nd assignmentless `local` in another branch prints it
 
   if [[ "$1" == --relink ]]; then
     # Explicit, fetch-free reconcile of the live surface — the escape hatch that
-    # replaces hand-typing a path to the main worktree's install.sh. Uses $live, not
-    # $mainwt, so it is correct after `dots --dev` too (relink whatever is live now).
-    local out
-    if out=$(_dots_relink "$live"); then
+    # replaces hand-typing a path to install.sh. Uses $live, not $primary, so it is
+    # correct after `dots --dev` too (relink whatever is live right now).
+    local out target="${live:-$primary}"
+    if out=$(_dots_relink "$target"); then
       if [[ -n "$out" ]]; then
-        print -r -- "${g}✓${r0} ${y}relinked from ${c}${live/#$HOME/~}${r0}"
+        print -r -- "${g}✓${r0} ${y}relinked from ${c}${target/#$HOME/~}${r0}"
         print -r -- "$out"
       else
-        print -r -- "${g}✓${r0} ${y}links already up to date (${c}${live/#$HOME/~}${r0}${y})${r0}"
+        print -r -- "${g}✓${r0} ${y}links already up to date (${c}${target/#$HOME/~}${r0}${y})${r0}"
       fi
     fi
     source ~/.zshrc
@@ -276,49 +328,44 @@ dots() {
   fi
 
   if [[ "$1" == --dev || "$1" == -d ]]; then
-    # Link the live symlinks from the dotfiles checkout $PWD is in — the cwd IS
-    # the choice (the dev clone, a per-session worktree, any tree sharing the
-    # dotfiles .git), so `t cd dot 1` + `dots --dev` tests that session's edits
-    # live. No fallback: anywhere else it ERRORS instead of guessing (the old
-    # implicit dev-clone fallback silently linked the stale parked clone from any
-    # directory — that is how `t resume` once vanished with a ✓). The main
-    # worktree is refused too: it is the released surface plain `dots` manages,
-    # never a dev source.
-    local src pwdcommon
+    if [[ "$2" == --force || "$2" == -f ]]; then
+      # --force used to mean "yes, I really am working in the parked dev clone" — a
+      # state that cannot exist now that there is one tree and it is the live one.
+      # Silently accepting it would read as success, so say what changed.
+      print -r -- "dots --dev: --force is gone — there is only one canonical checkout now, and it IS the live surface." >&2
+      print -r -- "  work in a session worktree (\`t open dot\`); \`dots --relink\` re-links the live tree without fetching." >&2
+      return 1
+    fi
+    # Link the live symlinks from the dotfiles checkout $PWD is in — the cwd IS the
+    # choice, so `t cd dot 1` + `dots --dev` tests that session's edits live. No
+    # fallback: anywhere else it ERRORS instead of guessing (the old implicit
+    # dev-clone fallback silently linked a stale tree — that is how `t resume` once
+    # vanished with a ✓).
+    local src pwdcommon primarycommon
     src=$(git -C "$PWD" rev-parse --show-toplevel 2>/dev/null)
     if [[ -z $src ]]; then
-      print -r -- "dots --dev: not inside a git checkout — cd into a dotfiles checkout first (the dev clone, or a session worktree via \`t cd dot <slot>\`)." >&2
+      print -r -- "dots --dev: not inside a git checkout — cd into a dotfiles session worktree first (\`t cd dot <slot>\`)." >&2
       return 1
     fi
     pwdcommon=$(git -C "$src" rev-parse --git-common-dir 2>/dev/null)
     [[ $pwdcommon == /* ]] || pwdcommon="$src/$pwdcommon"
-    if [[ ${pwdcommon:A} != ${commondir:A} ]]; then
-      print -r -- "dots --dev: $src is not a dotfiles checkout — cd into the dev clone or a dotfiles session worktree first." >&2
-      return 1
-    fi
-    if [[ ${src:A} == ${mainwt:A} ]]; then
-      print -r -- "dots --dev: this is the live main worktree — plain \`dots\` manages it; cd into the dev clone or a session worktree." >&2
+    primarycommon="$primary/.git"
+    if [[ ${pwdcommon:A} != ${primarycommon:A} ]]; then
+      print -r -- "dots --dev: $src is not a dotfiles checkout — cd into a dotfiles session worktree first (\`t cd dot <slot>\`)." >&2
       return 1
     fi
     if [[ ! -x $src/install.sh ]]; then
       print -r -- "dots --dev: $src has no runnable install.sh — malformed/ancient checkout, nothing to install." >&2
       return 1
     fi
-    local label="worktree ${src:t2}"
-    [[ ${src:A} == ${devclone:A} ]] && label="DEV clone"
-    local branch=$(git -C "$src" symbolic-ref --short -q HEAD)
-    # A CLEAN dev clone parked on $DEV_BRANCH is not a valid source either: under
-    # worktree-per-session nothing is developed there — its content is whatever
-    # stale state the parking branch froze at (linking it has uninstalled `t
-    # resume` TWICE now), and ~/code/dotfiles is the cd-shortcut landing spot, so
-    # standing here by habit is exactly how the mistake happens. The real work
-    # lives in session worktrees — list them with their branches. A dirty clone
-    # or a non-parking branch is a deliberate dev state and links fine; --force
-    # overrides.
-    if [[ "$2" != --force && "$2" != -f && ${src:A} == ${devclone:A} && "$branch" == "$DEV_BRANCH" ]] \
-       && [[ -z "$(git -C "$src" status --porcelain 2>/dev/null)" ]]; then
-      print -r -- "dots --dev: this is the dev clone parked CLEAN on ${branch} — no in-progress work here, only stale content." >&2
-      local -a _wts; _wts=("${DEV_WORKTREE_ROOT:-$HOME/code/.worktrees}/${devclone:t}"/*(N/))
+    # The one refusal that matters: $primary is parked on main and IS the live
+    # surface, so "make it live" is a no-op at best and, if it has drifted off main,
+    # actively wrong. Under worktree-per-session no in-progress work lives here —
+    # and ~/code/dotfiles is the cd-shortcut landing spot, so standing here by habit
+    # is exactly how the mistake happens. Point at the real work instead.
+    if [[ ${src:A} == ${primary:A} ]]; then
+      print -r -- "dots --dev: $src is the ONE canonical checkout — it is parked on main and already IS the live surface (plain \`dots\` manages it)." >&2
+      local -a _wts; _wts=("${DEV_WORKTREE_ROOT:-$HOME/code/.worktrees}/${primary:t}"/*(N/))
       local _w
       if (( ${#_wts} )); then
         print -r -- "  session worktrees with real work:" >&2
@@ -326,14 +373,14 @@ dots() {
           print -r -- "    cd $_w && dots --dev    [$(git -C "$_w" branch --show-current 2>/dev/null || echo '?')]" >&2
         done
       else
-        print -r -- "  no session worktrees yet — t open ${devclone:t} starts one (then cd its worktree + dots --dev)" >&2
+        print -r -- "  no session worktrees yet — \`t open ${primary:t}\` starts one (then cd its worktree + dots --dev)" >&2
       fi
-      print -r -- "  link the parked clone anyway: dots --dev --force" >&2
       return 1
     fi
+    local branch=$(git -C "$src" symbolic-ref --short -q HEAD)
     local out
     if out=$(DOTFILES_NO_BREW=1 DOTFILES_LINK_DEV=1 "$src/install.sh" 2>&1); then
-      print -r -- "${g}✓${r0} ${y}live = ${label} (${c}${branch:-detached}${r0}${y}) — in-progress edits are live, reloaded${r0}"
+      print -r -- "${g}✓${r0} ${y}live = worktree ${src:t2} (${c}${branch:-detached}${r0}${y}) — in-progress edits are live, reloaded${r0}"
     else
       print -r -- "${y}dots --dev — install.sh failed on ${c}${branch:-detached}${r0}${y}:${r0}"
       print -r -- "$out"
@@ -342,15 +389,15 @@ dots() {
     return
   fi
 
-  # Default: update the main worktree (the live surface) to origin/main.
+  # Default: fast-forward the canonical checkout (the live surface) to origin/main.
   local before=""
-  [[ -d "$mainwt" ]] && before=$(git -C "$mainwt" rev-parse --short HEAD 2>/dev/null)
+  [[ -n $live ]] && before=$(git -C "$live" rev-parse --short HEAD 2>/dev/null)
 
-  if ! git -C "$live" fetch -q origin main 2>/dev/null; then
+  if ! git -C "$primary" fetch -q origin main 2>/dev/null; then
     print -r -- "${y}dots — fetch failed (offline?), reloaded only${r0}"
     # relinking needs no network, and "already pulled but never relinked" is exactly
     # the state this fixes — so do it even when the fetch failed.
-    if relinked=$(_dots_relink "$live") && [[ -n "$relinked" ]]; then
+    if relinked=$(_dots_relink "${live:-$primary}") && [[ -n "$relinked" ]]; then
       print -r -- "${g}✓${r0} ${y}relinked newly managed file(s):${r0}"
       print -r -- "$relinked"
     fi
@@ -358,41 +405,52 @@ dots() {
     return
   fi
 
-  # Migrate (old single tree) or flip back from --dev: whenever the live surface is
-  # not already the main worktree, run install.sh to set it up + repoint the symlinks.
-  # Canonicalize $mainwt with :A so a /tmp vs /private/tmp (or any symlinked parent)
-  # difference does not re-trigger migration on every dots run — $live is already :A.
-  if [[ "$live" != "${mainwt:A}" || ! -d "$mainwt" ]]; then
+  # Run install.sh when the layout needs repairing. Three distinct triggers:
+  #   live != primary   — a legacy two-tree machine, or a flip back from --dev
+  #   primary off main  — SELF-HEAL: something switched the live tree's branch;
+  #                       without this the machine stays silently wrong forever
+  #   legacy present    — a half-finished migration, which the first two miss once
+  #                       the links have already flipped
+  # Always run "$live/install.sh", NEVER "$primary/install.sh": $live is by
+  # construction the tree whose .zshrc defined the dots you are running, so it is the
+  # freshest copy. On a legacy machine $primary is the old parked dev clone, whose
+  # install.sh may predate this change entirely — running it would rebuild the very
+  # worktree we are removing, forever. install.sh is location-independent
+  # (BASH_SOURCE) and resolves $PRIMARY itself, so running it from anywhere is safe.
+  local pbr=$(git -C "$primary" symbolic-ref --short -q HEAD)
+  if [[ ${live:A} != ${primary:A} || $pbr != main ]] || _dots_legacy_present "$primary"; then
     local out
-    if ! out=$(DOTFILES_NO_BREW=1 "$devclone/install.sh" 2>&1); then
-      print -r -- "${y}dots — worktree setup failed:${r0}"
+    if ! out=$(DOTFILES_NO_BREW=1 "${live:-$primary}/install.sh" 2>&1); then
+      print -r -- "${y}dots — layout setup failed:${r0}"
       print -r -- "$out"
       source ~/.zshrc
       return
     fi
-    [[ -z "$before" ]] && before=$(git -C "$mainwt" rev-parse --short HEAD 2>/dev/null)
+    [[ -n "$out" ]] && print -r -- "$out"
+    _dots_resolve   # the links just moved; re-read where live points
   fi
 
-  if ! git -C "$mainwt" diff --quiet HEAD 2>/dev/null; then
-    # The worktree should never be hand-edited (edit in the dev clone) — a dirty tree
-    # blocks the fast-forward, so flag it instead of silently doing nothing.
-    print -r -- "${y}dots — main worktree has local edits (edit in the dev clone, not the live files); reloaded only${r0}"
-  elif git -C "$mainwt" merge --ff-only origin/main >/dev/null 2>&1; then
-    local after=$(git -C "$mainwt" rev-parse --short HEAD)
+  if ! git -C "$primary" diff --quiet HEAD 2>/dev/null; then
+    # A dirty tree blocks the fast-forward, so flag it instead of silently doing
+    # nothing. This tree IS the live surface now, so an edit here changed $HOME.
+    print -r -- "${y}dots — ${c}${primary/#$HOME/~}${r0}${y} has local edits — it is the LIVE surface now, not a dev tree.${r0}"
+    print -r -- "${y}      work in a session worktree (\`t open dot\`), then merge + dots. Reloaded only.${r0}"
+  elif git -C "$primary" merge --ff-only origin/main >/dev/null 2>&1; then
+    local after=$(git -C "$primary" rev-parse --short HEAD)
     if [[ "$before" == "$after" ]]; then
       print -r -- "${g}✓${r0} ${y}live = ${c}main${r0} ${y}at ${after} — already latest, reloaded${r0}"
     else
       print -r -- "${g}✓${r0} ${y}updated live ${c}main${r0} ${y}${before} → ${after}, reloaded${r0}"
     fi
   else
-    print -r -- "${y}dots — main worktree can't fast-forward origin/main; reloaded only${r0}"
+    print -r -- "${y}dots — ${c}${primary/#$HOME/~}${r0}${y} can't fast-forward origin/main; reloaded only${r0}"
   fi
 
   # Reconcile the managed links with what we just fast-forwarded to. Must come AFTER
   # the ff (the new install.sh and its new link set only exist on disk once the merge
   # above ran) and BEFORE _dots_tmux_apply, so a newly linked ~/.tmux.conf is what
   # gets sourced into the running server.
-  if relinked=$(_dots_relink "$mainwt") && [[ -n "$relinked" ]]; then
+  if relinked=$(_dots_relink "$primary") && [[ -n "$relinked" ]]; then
     print -r -- "${g}✓${r0} ${y}relinked newly managed file(s):${r0}"
     print -r -- "$relinked"
   fi
@@ -474,6 +532,23 @@ _dev_worktree_create() {
   fi
   [[ -e "$wt/.git" ]] || return 1
   print -r -- "$wt"
+}
+
+# _dev_shared_tree_ok <repo> — may a session fall back to this repo's SHARED tree when
+# worktree creation failed? No, if that tree is the live surface. The canonical
+# dotfiles checkout is parked on `main` and IS what $HOME points at, so dropping a
+# session into it means editing live config on a protected branch — every save lands
+# in $HOME instantly and every commit targets main. `_dev_repo_prepare` already
+# refuses to switch its branch, but that does not stop the session cd'ing in and
+# editing. Better to fail loudly than to hand an agent the live tree.
+_dev_shared_tree_ok() {
+  local repodir="${DEV_REPOS[$1]}" live
+  [[ -n $repodir ]] || return 0
+  live=$(_dots_live_tree 2>/dev/null) || return 0
+  [[ -n $live && ${repodir:A} == ${live:A} ]] || return 0
+  print -r -- "✗ worktree setup failed for $1 — refusing to fall back to ${repodir}: it is the LIVE surface (\$HOME symlinks point there)." >&2
+  print -r -- "  retry, or clear a stale registration: git -C ${repodir} worktree prune" >&2
+  return 1
 }
 
 # _dev_worktree_beam_push <wt> <host> — ON THE ORIGIN, carry the slot worktree's LIVE edits
@@ -662,20 +737,38 @@ _dev_beam_land_cwd() {
 #     never stash: `git checkout` carries non-conflicting uncommitted edits across
 #     and refuses safely when a tracked edit would be overwritten — so the session
 #     lands on the dev branch in the common case, and a genuine conflict just leaves
-#     the checkout put (noted, not trampled; resolve it in the dev clone).
+#     the checkout put (noted, not trampled; resolve it in a session worktree).
 #   • Fast-forward (`pull --ff-only`) ONLY on a clean tree: a sibling may hold WIP,
 #     and moving the branch under it mid-conversation is the trampling we avoid. When
 #     dirty we are already on <branch>, so the session just starts; the ff waits for
 #     a clean moment. (Matches the global pull.ff=only — never a merge/reset.)
-# Note: `dots` updates main in its OWN worktree (~/.local/share/dotfiles-main),
-# independent of this checkout, so keeping the dev tree on <branch> never starves
-# `dots` of main updates. Runs in the session's own shell (cwd = the repo).
+# Runs in the session's own shell (cwd = the repo).
+#
+# HARD REFUSAL on the live tree. The canonical checkout is parked on `main` and IS
+# the live surface ($HOME symlinks point at it), so switching its branch here would
+# swap your live config out from under you mid-session — the exact bug the whole
+# worktree model exists to prevent, reintroduced through a side door. It is reachable
+# two ways: the DEV_WORKTREE[repo]=0 opt-out, and the _dev_worktree_create failure
+# fallback. Note `_dev_branch_for` returns $DEV_BRANCH for an unpinned repo, so the
+# `checkout -qb` below would CREATE that branch and move the live tree onto it.
+# Refuse unconditionally, not just when the branch differs: the `pull --ff-only` half
+# is `dots`' job too, and one flat rule beats a two-clause one.
 _dev_repo_prepare() {
-  local branch="$1"
+  local branch="$1" here live
+  here=$(git rev-parse --show-toplevel 2>/dev/null) || return 0
+  live=$(_dots_live_tree 2>/dev/null)
+  if [[ -n $live && ${here:A} == ${live:A} ]]; then
+    # Name the repo the way `t` does (alias, not the path tail — a worktree path ends
+    # in its SLOT number, so ${here:t} would suggest `t open 1`).
+    local _r _alias; _r=$(_dev_repo_of_dir "$here" 2>/dev/null); _alias=${_r%%$'\t'*}
+    echo "↷ branch sync skipped — $here is the LIVE surface (\$HOME symlinks point here); \`dots\` owns its branch."
+    echo "  develop in a per-session worktree instead${_alias:+: t open $_alias}"
+    return 0
+  fi
   git fetch -q origin 2>/dev/null
   if [[ "$(git symbolic-ref --short -q HEAD)" != "$branch" ]]; then
     git checkout -q "$branch" 2>/dev/null || git checkout -qb "$branch" 2>/dev/null || {
-      echo "↷ branch sync skipped — can't switch to $branch without overwriting local edits (commit them in the dev clone first)."
+      echo "↷ branch sync skipped — can't switch to $branch without overwriting local edits (commit them first)."
       return 0
     }
   fi
@@ -845,10 +938,21 @@ _dev_worktree_sweep_run() {
   [[ -n $root && -d $root ]] || return
   local -a livepaths
   livepaths=("${(@f)$(tmux list-sessions -F '#{session_path}' 2>/dev/null)}")
+  # Resolved ONCE, outside the loop: after `dots --dev` the $HOME symlinks point into
+  # a session worktree, and reaping it would dangle every managed link — including
+  # ~/.zshrc, which takes `dots` itself down with it. Merge the PR, wait for a sweep,
+  # and the machine loses its shell config with no obvious cause.
+  local livewt; livewt=$(_dots_live_tree 2>/dev/null)
   local wt repo slot repodir br r dirt
   for wt in $root/*/*(N/); do                       # <basename>/<slot> dirs
     [[ -e "$wt/.git" ]] || continue
     (( ${livepaths[(Ie)$wt]} )) && continue         # live session here → keep
+    # Unlike the dirty/merged skips below this one is LOGGED: a worktree that is
+    # merged, clean, and never reaped is otherwise a silent mystery.
+    if [[ -n $livewt && ${wt:A} == ${livewt:A} ]]; then
+      print -r -- "[$(strftime '%F %T' $EPOCHSECONDS 2>/dev/null)] sweep: keeping $wt — it is the LIVE surface (dots --dev); run plain \`dots\` to flip live back"
+      continue
+    fi
     r=$(_dev_repo_of_dir "$wt"); repo=${r%%$'\t'*}; slot=${r#*$'\t'}
     [[ -n $repo && -n $slot ]] || continue
     repodir=${DEV_REPOS[$repo]}
@@ -2241,7 +2345,8 @@ _t_dev() {
               || [[ -e "$(_dev_worktree_path "$repo" "$_wslot")/.git" ]]; do (( _wslot++ )); done
       fi
       local _wt; _wt="$(_dev_worktree_create "$repo" "$_wslot")"
-      [[ -n $_wt ]] && { dir="$_wt"; skip_prepare=1; }
+      if [[ -n $_wt ]]; then dir="$_wt"; skip_prepare=1
+      else _dev_shared_tree_ok "$repo" || return 1; fi
     fi
     echo "Starting claude in $dir (no tmux)"
     cd "$dir" || return 1
@@ -2321,7 +2426,10 @@ _t_dev() {
     if _dev_worktree_enabled "$repo"; then
       local _wt; _wt="$(_dev_worktree_create "$repo" "$slot")"
       if [[ -n $_wt ]]; then dir="$_wt"; skip_prepare=1
-      else echo "↷ worktree setup failed for $repo $slot — using shared tree $dir" >&2; fi
+      else
+        _dev_shared_tree_ok "$repo" || return 1
+        echo "↷ worktree setup failed for $repo $slot — using shared tree $dir" >&2
+      fi
     fi
     echo "Starting $session in $dir (logging to $logfile)"
     _dev_new_session "$session" "$dir" "$branch" "$skip_prepare"

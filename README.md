@@ -27,7 +27,7 @@ Run `t -h` for the full verb list.
 
 | Command | What it does |
 | --- | --- |
-| `dots [--dev]` | Sync dotfiles to `origin/main` HEAD and reload zsh; `--dev` installs from the current branch instead ([details](#keeping-machines-in-sync)) |
+| `dots [--dev]` | Sync the live checkout to `origin/main` HEAD and reload zsh; `--dev` makes the session worktree you are standing in live instead ([details](#keeping-machines-in-sync)) |
 | `csync` | Two-way sync of Claude session history, plans, and `t todo` lists across machines via iCloud Drive |
 | `sleep-manager` | Block or restore macOS sleep (`status`, `disable`, `enable`) |
 | `pii-scan` | Keep personal data out of this public repo ([details](#pii-guard)) |
@@ -37,6 +37,9 @@ Run `t -h` for the full verb list.
 
 The files **in this repo are the source of truth.** `install.sh` symlinks them
 into `$HOME`, so editing either side edits both — there is no copy or sync step.
+Specifically it links from the **canonical checkout** (the one parked on `main`),
+which is why that tree is the live surface and session worktrees are not — until
+you point them there yourself with `dots --dev`.
 
 | Repo file | Symlinked to |
 | --- | --- |
@@ -64,12 +67,22 @@ on first run and never clobbers an existing one):
 
 ## Keeping machines in sync
 
-**`dots`** syncs your dotfiles to **`origin/main` HEAD** and reloads your shell in
-one step: it fetches, checks out `main`, fast-forwards it to `origin/main`, and
-re-sources `~/.zshrc`. Your live dotfiles become exactly what's published on
-`main` — nothing is done locally (no merge, no commit), and the symlink model
-means it takes effect immediately. It leaves you on `main`; it's safe, stopping
-and only reloading if the working tree has uncommitted edits.
+There is **one canonical checkout** of this repo (normally `~/code/dotfiles`),
+parked on `main`, and it **is** the live surface — the `$HOME` symlinks point
+straight at it. All development happens in **per-session worktrees**
+(`~/code/.worktrees/<repo>/<slot>` on `dev/<repo>-<slot>`), created by
+`t open <repo>` and reaped once their PR merges.
+
+**`dots`** syncs that checkout to **`origin/main` HEAD** and reloads your shell in
+one step: it fetches, fast-forwards to `origin/main`, and re-sources `~/.zshrc`.
+Your live dotfiles become exactly what's published on `main` — nothing is done
+locally (no merge, no commit), and the symlink model means it takes effect
+immediately. It's safe, stopping and only reloading if the working tree has
+uncommitted edits.
+
+Because that checkout is live, **don't edit or commit in it** — a save there changes
+your `$HOME` config instantly, and `main` is protected. A pre-commit hook refuses
+commits on `main` in the live tree, and `dots --dev` refuses to take it as a source.
 
 `dots` also **reconciles the managed symlinks every run**, so a released change that
 adds a managed file (a new `bin/` script, a new dotfile) lands without a manual
@@ -77,14 +90,14 @@ install — the failure it fixes was a fast-forwarded machine whose `~/.tmux.con
 had simply never been made. It is offline and prints nothing unless a link changed.
 **`dots --relink`** does just that step, without fetching.
 
-**`dots --dev`** installs from whatever branch is checked out *now* instead — it
-re-runs `install.sh` (relinking any new or renamed files) and reloads, without
-fetching or switching branches. Use it to apply in-progress dev work — e.g. a new
-`bin/` script that needs a fresh symlink — before it lands on `main`. It skips
-`brew bundle` for speed.
+**`dots --dev`** flips the live symlinks to the **session worktree you are standing
+in**, so its in-progress edits go live for testing before they merge — useful for a
+new `bin/` script that needs a fresh symlink. `cd` into the worktree
+(`t cd dot <slot>`) and run it; a later plain `dots` flips back. Anywhere else it
+errors rather than guessing. It skips `brew bundle` for speed.
 
-Develop on the standing dev branch via `t open dotfiles`. Session history syncs
-separately, in the background, via `csync`.
+Start a dotfiles session with `t open dotfiles`. Session history syncs separately,
+in the background, via `csync`.
 
 ## The `help` command
 

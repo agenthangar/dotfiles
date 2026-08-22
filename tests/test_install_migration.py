@@ -180,13 +180,25 @@ def test_migration_is_idempotent(legacy):
 def test_partial_run_leaves_home_healthy_and_resumes(legacy):
     """The ordering guarantee: dying mid-install must never dangle a link.
 
-    Force a failure in install_pr_watch — past link_all, before cleanup — by parking
-    a regular FILE where it wants to mkdir a directory. Injecting via the checkout
-    would not work: `git checkout main` restores anything deleted from the tree.
+    Inject the failure into the copy of install.sh we actually invoke, right after
+    link_all — past the symlink flip, before cleanup_legacy_main_worktrees. Patching
+    the invoked copy (rather than blocking some later real step) keeps this
+    deterministic and platform-independent: the steps between link_all and cleanup
+    are variously Darwin-gated or tool-gated, so a "park a file in the way" trick
+    fires on macOS and sails straight past on a Linux CI runner.
+
+    The legacy tree is only ever detached, never checked out, so the patch survives
+    the migration; the primary keeps its pristine copy for the resume run.
     """
     home, primary, legacy_wt = legacy
-    (home / "Library").mkdir(parents=True, exist_ok=True)
-    (home / "Library" / "LaunchAgents").write_text("not a directory\n")
+    sh = legacy_wt / "install.sh"
+    body = sh.read_text()
+    assert "\nlink_all\n" in body, "install.sh no longer calls link_all at top level"
+    sh.write_text(body.replace(
+        "\nlink_all\n",
+        "\nlink_all\nexit 1  # test injection: die after the flip, before cleanup\n",
+        1,
+    ))
 
     res = run_install(legacy_wt, home)
     assert res.returncode != 0, "failure injection did not fire"
@@ -197,10 +209,10 @@ def test_partial_run_leaves_home_healthy_and_resumes(legacy):
     assert legacy_wt.exists()
     assert git("symbolic-ref", "-q", "HEAD", cwd=legacy_wt, check=False).returncode != 0
 
-    # Clear the blocker, then resume. Rule (2) of the enumeration is what makes this
-    # work: the legacy tree is now DETACHED, so the "holds refs/heads/main" scan can
-    # no longer see it and only the literal-path check finds it.
-    (home / "Library" / "LaunchAgents").unlink()
+    # Resume from the primary, whose install.sh is unpatched. Rule (2) of the
+    # enumeration is what makes this work: the legacy tree is now DETACHED, so the
+    # "holds refs/heads/main" scan can no longer see it — only the literal-path
+    # check finds it.
     run_install(primary, home)
     assert not legacy_wt.exists()
 

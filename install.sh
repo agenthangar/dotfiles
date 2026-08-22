@@ -126,7 +126,7 @@ migrate_to_single_tree() {
     done < <(git -C "$PRIMARY" worktree list --porcelain 2>/dev/null)
 
     if [ -e "$LEGACY_MAIN_WT" ] && ! samepath "$LEGACY_MAIN_WT" "$PRIMARY"; then
-        c="$(cd "$LEGACY_MAIN_WT" 2>/dev/null && pwd -P || true)"
+        c="$(cd "$LEGACY_MAIN_WT" 2>/dev/null && pwd -P)" || c=""
         case "$seen" in
             *"|$c|"*) : ;;
             *) LEGACY_TREES="$LEGACY_TREES$LEGACY_MAIN_WT

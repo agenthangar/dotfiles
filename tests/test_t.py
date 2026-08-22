@@ -1342,3 +1342,48 @@ def test_todo_scoped_picks_out_one_repos_lists(t_mod):
     # a non-numeric tail is a different repo's list, not a slot of this one
     assert [k for k, _ in t_mod._todo_scoped(entries, "ff")] == ["ff", "ff-3"]
     assert t_mod._todo_scoped(entries, "nothing") == []
+
+
+# ─── t todo — no-id action pickers ─────────────────────────────────────────────
+
+def _mixed(t_mod):
+    data = _add(t_mod, _fresh(t_mod), "one", "two", "three", "four")
+    t_mod._todo_apply(data, "done", ["2"], now=200)
+    t_mod._todo_apply(data, "rm", ["4"], now=200)
+    return data
+
+
+def test_todo_pick_candidates_done_offers_only_open(t_mod):
+    # marking a done item done again is a no-op, so it must not be offered
+    assert [i for i, _ in t_mod._todo_pick_candidates(_mixed(t_mod), "done")] == [1, 3]
+
+
+def test_todo_pick_candidates_undone_offers_only_finished(t_mod):
+    assert [i for i, _ in t_mod._todo_pick_candidates(_mixed(t_mod), "undone")] == [2]
+
+
+def test_todo_pick_candidates_rm_and_mv_offer_everything_live(t_mod):
+    # you may well want to remove or re-file something already ticked off
+    for action in ("rm", "mv", "edit"):
+        assert [i for i, _ in t_mod._todo_pick_candidates(_mixed(t_mod), action)] == [1, 2, 3]
+
+
+def test_todo_pick_candidates_never_offers_a_tombstone(t_mod):
+    for action in ("done", "undone", "rm", "mv", "edit"):
+        assert 4 not in [i for i, _ in t_mod._todo_pick_candidates(_mixed(t_mod), action)]
+
+
+def test_todo_pick_candidates_labels_carry_state_and_id(t_mod):
+    labels = dict((i, l) for i, l in t_mod._todo_pick_candidates(_mixed(t_mod), "rm"))
+    assert labels[1] == "1  ◻ one"
+    assert labels[2] == "2  ✓ two"
+
+
+def test_todo_pick_candidates_accepts_aliases(t_mod):
+    # the picker is reached via the canonical name, but be robust to either
+    assert (t_mod._todo_pick_candidates(_mixed(t_mod), "x")
+            == t_mod._todo_pick_candidates(_mixed(t_mod), "done"))
+
+
+def test_todo_pick_candidates_empty_list(t_mod):
+    assert t_mod._todo_pick_candidates(_fresh(t_mod), "done") == []

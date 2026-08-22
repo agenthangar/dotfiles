@@ -1933,6 +1933,23 @@ def _todo_render(data, key, show_all=False, width=80, st=None):
     return lines + foot
 
 
+def _todo_pick_candidates(data, action):
+    """Items a no-id `done`/`undone`/`rm`/`edit`/`mv` should offer → [(id, label)].
+
+    `done` offers only open items (marking a done item done again is a no-op), `undone`
+    only finished ones, and the rest offer everything still live — you may well want to
+    remove or re-file something already ticked off."""
+    action = _todo_canon(action)
+    if action == "undone":
+        items = [i for i in data["items"] if i.get("done") and not i.get("deleted")]
+    elif action == "done":
+        items = _todo_open(data)
+    else:
+        items = _todo_visible(data, show_all=True)
+    return [(i["id"], "%d  %s %s" % (i["id"], "✓" if i.get("done") else "◻", i["text"]))
+            for i in items]
+
+
 _TODO_FOOT = ('add: t todo add "…" · done: t todo x <id> · move: t todo mv <id> <slot> '
               '· all: t todo -A · help: t todo -h')
 
@@ -2055,6 +2072,45 @@ def _todo_pick_target(cfg, alias):
     return None
 
 
+def _todo_pick_ids(data, action, multi=True):
+    """fzf the ids for a no-id action. None = cannot or would not pick (caller keeps its
+    existing 'needs an id' error, so scripts and non-TTY callers are unchanged)."""
+    if not (sys.stdin.isatty() and sys.stdout.isatty()) or not shutil.which("fzf"):
+        return None
+    cands = _todo_pick_candidates(data, action)
+    if not cands:
+        return None
+    labels = [lbl for _, lbl in cands]
+    args = ["fzf", "--prompt", "%s> " % _todo_canon(action), "--height", "40%", "--reverse"]
+    if multi:
+        # space toggles, same binding as t resume's multi-pick
+        args += ["--multi", "--marker", "✓ ", "--bind", "space:toggle+down"]
+    try:
+        r = subprocess.run(args, input="\n".join(labels), stdout=subprocess.PIPE, text=True)
+    except OSError:
+        return None
+    picked = [l for l in r.stdout.split("\n") if l.strip()]
+    by_label = {lbl: i for i, lbl in cands}
+    return [str(by_label[l]) for l in picked if l in by_label] or None
+
+
+def _prompt_prefilled(prompt, initial):
+    """readline input with `initial` pre-filled for editing in place (the `e` trick from
+    the t setup wizard). Falls back to a plain prompt when readline is unavailable."""
+    try:
+        import readline
+    except ImportError:
+        return input(prompt).strip() or initial
+    def hook():
+        readline.insert_text(initial)
+        readline.redisplay()
+    readline.set_pre_input_hook(hook)
+    try:
+        return input(prompt).strip()
+    finally:
+        readline.set_pre_input_hook()
+
+
 def _todo_all_entries():
     """(key, data) for every list on disk, key-sorted."""
     return [(os.path.basename(p)[:-5], _todo_load(p))
@@ -2123,10 +2179,18 @@ def cmd_todo(cfg, args):
         return 0
 
     if _todo_canon(action) == "mv":
-        if len(args.rest) < 2:
+        rest = list(args.rest)
+        if not rest:                                   # which item?
+            rest = _todo_pick_ids(data, "mv", multi=False) or []
+        if len(rest) == 1:                             # …and where to?
+            alias = key.rpartition("-")[0] if key not in cfg.repos else key
+            picked = _todo_pick_target(cfg, alias) if alias in cfg.repos else None
+            if picked and picked != key:
+                rest.append(picked)
+        if len(rest) < 2:
             print("t todo mv: needs an id and a destination — t todo mv 2 ff-3", file=sys.stderr)
             return 2
-        tok, dst_key = args.rest[0], args.rest[1]
+        tok, dst_key = rest[0], rest[1]
         if dst_key == key:
             print("t todo mv: #%s is already in %s" % (tok, key), file=sys.stderr)
             return 2
@@ -2153,7 +2217,22 @@ def cmd_todo(cfg, args):
             return 0
 
     if _todo_canon(action) != "ls":
-        msg, rc = _todo_apply(data, action, args.rest)
+        rest = list(args.rest)
+        canon = _todo_canon(action)
+        # No id given → offer the items rather than erroring. Multi-select for the bulk
+        # verbs; edit takes one and then pre-fills its current text for editing in place.
+        if not rest and canon in ("done", "undone", "rm", "edit"):
+            picked = _todo_pick_ids(data, canon, multi=canon != "edit")
+            if picked:
+                rest = picked
+                if canon == "edit":
+                    item = _todo_find(data, rest[0])
+                    text = _prompt_prefilled("text> ", item["text"] if item else "")
+                    if not text:
+                        print("t todo edit: cancelled", file=sys.stderr)
+                        return 2
+                    rest = [rest[0]] + text.split()
+        msg, rc = _todo_apply(data, action, rest)
         if rc != 2:
             _todo_save(path, data)
         if msg:

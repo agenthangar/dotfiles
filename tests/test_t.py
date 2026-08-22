@@ -1270,3 +1270,52 @@ def test_todo_statusline_empty_list_is_one_line_either_way(t_mod, tmp_path, monk
     for n in (1, 5):
         out = _statusline(t_mod, tmp_path, monkeypatch, {}, items_n=n)
         assert out == "scratch · ◻ 0"
+
+
+# ─── t todo — the slotless-add destination picker ──────────────────────────────
+
+def _todo_row(slot, summary=""):
+    return {"host": "local", "sid": "-", "cwd": "", "slot": slot,
+            "state": "", "context": "", "summary": summary}
+
+
+def test_todo_add_targets_repo_level_is_first(t_mod):
+    # fzf preselects line 1, so the current behaviour stays the default — the picker
+    # adds a choice, it must not take one away.
+    out = t_mod._todo_add_targets("ff", [_todo_row("ff-3", "budget work")], {}, set())
+    assert out[0][0] == "ff"
+    assert "no slot" in out[0][1]
+
+
+def test_todo_add_targets_labels_live_slots_with_their_work(t_mod):
+    out = t_mod._todo_add_targets(
+        "ff", [_todo_row("ff-3", "budget amortization"), _todo_row("ff-15", "pwa banner")], {}, set())
+    assert [k for k, _ in out] == ["ff", "ff-3", "ff-15"]
+    assert "budget amortization" in out[1][1] and "pwa banner" in out[2][1]
+
+
+def test_todo_add_targets_unions_three_sources(t_mod):
+    # live session, worktree on disk, existing list — each alone is enough to offer
+    out = t_mod._todo_add_targets("ff", [_todo_row("ff-1", "live one")],
+                                  {"ff-2": 3, "other-9": 1}, {"4"})
+    assert [k for k, _ in out] == ["ff", "ff-1", "ff-2", "ff-4"]
+    assert "live one" in out[1][1]
+    assert "3 open" in out[2][1]
+    assert "worktree" in out[3][1]
+
+
+def test_todo_add_targets_sorts_numerically(t_mod):
+    out = t_mod._todo_add_targets("ff", [], {}, {"2", "10", "1"})
+    assert [k for k, _ in out] == ["ff", "ff-1", "ff-2", "ff-10"]
+
+
+def test_todo_add_targets_ignores_other_repos_and_junk(t_mod):
+    out = t_mod._todo_add_targets(
+        "ff", [_todo_row("dotfiles-1", "x"), _todo_row("ff-abc", "y")],
+        {"scratch": 2, "ff": 1}, {"notaslot"})
+    assert [k for k, _ in out] == ["ff"]        # nothing else qualified
+
+
+def test_todo_add_targets_repo_only_when_no_slots_exist(t_mod):
+    # a single entry is the caller's signal to skip the picker entirely
+    assert len(t_mod._todo_add_targets("ff", [], {}, set())) == 1

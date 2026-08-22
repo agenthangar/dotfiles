@@ -1133,13 +1133,14 @@ def test_todo_render_all_says_so_when_everything_is_clear(t_mod):
 
 # ─── t todo — statusline ───────────────────────────────────────────────────────
 
-def _statusline(t_mod, tmp_path, monkeypatch, payload, key=None, texts=()):
+def _statusline(t_mod, tmp_path, monkeypatch, payload, key=None, texts=(),
+                items_n=1, width=80):
     cfg = _todo_cfg(t_mod, tmp_path, monkeypatch)
     monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
     if key:
         data = _add(t_mod, _fresh(t_mod), *texts)
         t_mod._todo_save(t_mod._todo_path(key), data)
-    return t_mod._todo_statusline(payload, cfg)
+    return t_mod._todo_statusline(payload, cfg, items_n, width)
 
 
 def test_todo_statusline_renders_slot_model_and_top_item(t_mod, tmp_path, monkeypatch):
@@ -1147,7 +1148,7 @@ def test_todo_statusline_renders_slot_model_and_top_item(t_mod, tmp_path, monkey
                        {"workspace": {"current_dir": "/wt/dotfiles/1"},
                         "model": {"display_name": "Opus"}},
                        key="dotfiles-1", texts=("rebase onto main", "second"))
-    assert line == "dotfiles-1 · Opus · ◻ 2  rebase onto main"
+    assert line.startswith("dotfiles-1 · Opus · ◻ 2 · rebase onto main")
 
 
 def test_todo_statusline_prefers_workspace_over_cwd(t_mod, tmp_path, monkeypatch):
@@ -1167,10 +1168,13 @@ def test_todo_statusline_survives_a_bare_payload(t_mod, tmp_path, monkeypatch):
 
 
 def test_todo_statusline_truncates_a_long_item(t_mod, tmp_path, monkeypatch):
-    line = _statusline(t_mod, tmp_path, monkeypatch,
-                       {"workspace": {"current_dir": "/wt/dotfiles/1"}},
-                       key="dotfiles-1", texts=("y" * 200,))
-    assert line.endswith("…") and len(line) < 80
+    # A single item longer than the bar fills it exactly and ellipses — it must never
+    # wrap, or the one-line contract breaks on the narrowest host.
+    for width in (40, 80, 120):
+        line = _statusline(t_mod, tmp_path, monkeypatch,
+                           {"workspace": {"current_dir": "/wt/dotfiles/1"}},
+                           key="dotfiles-1", texts=("y" * 400,), width=width)
+        assert line.endswith("…") and len(line) <= width and "\n" not in line
 
 
 # ─── t todo — action aliases and cross-list move ───────────────────────────────
@@ -1227,3 +1231,39 @@ def test_todo_move_unknown_id(t_mod):
     dst = _fresh(t_mod)
     msg, rc = t_mod._todo_move(src, dst, "9", "ff-3", now=200)
     assert rc == 1 and dst["items"] == [] and not src["items"][0]["deleted"]
+
+
+def test_todo_statusline_packs_items_into_the_width(t_mod, tmp_path, monkeypatch):
+    texts = ("rebase onto main", "fix the ledger rollover", "ask about the beam gap")
+    wide = _statusline(t_mod, tmp_path, monkeypatch,
+                       {"workspace": {"current_dir": "/wt/dotfiles/1"}},
+                       key="dotfiles-1", texts=texts, width=90)
+    narrow = _statusline(t_mod, tmp_path, monkeypatch,
+                         {"workspace": {"current_dir": "/wt/dotfiles/1"}},
+                         key="dotfiles-1", texts=texts, width=45)
+    assert "\n" not in wide and "\n" not in narrow      # one line, always
+    assert len(narrow) <= 45 and narrow.count("·") < wide.count("·")
+    assert wide.endswith(")") and "+" in wide            # the unshown remainder is counted
+
+
+def test_todo_statusline_multiline_lists_items(t_mod, tmp_path, monkeypatch):
+    out = _statusline(t_mod, tmp_path, monkeypatch,
+                      {"workspace": {"current_dir": "/wt/dotfiles/1"}},
+                      key="dotfiles-1", texts=("one", "two", "three"), items_n=2)
+    lines = out.split("\n")
+    assert lines[0].endswith("◻ 3")
+    assert lines[1].strip() == "1 ◻ one" and lines[2].strip() == "2 ◻ two"
+    assert lines[3].strip() == "+1 more"
+
+
+def test_todo_statusline_multiline_without_a_remainder(t_mod, tmp_path, monkeypatch):
+    out = _statusline(t_mod, tmp_path, monkeypatch,
+                      {"workspace": {"current_dir": "/wt/dotfiles/1"}},
+                      key="dotfiles-1", texts=("one",), items_n=5)
+    assert out.split("\n") == ["dotfiles-1 · ◻ 1", "  1 ◻ one"]
+
+
+def test_todo_statusline_empty_list_is_one_line_either_way(t_mod, tmp_path, monkeypatch):
+    for n in (1, 5):
+        out = _statusline(t_mod, tmp_path, monkeypatch, {}, items_n=n)
+        assert out == "scratch · ◻ 0"

@@ -1869,6 +1869,43 @@ def _todo_move(src_data, dst_data, tok, dst_key, now=None):
     return ("✓ moved #%s → %s #%d  %s" % (tok, dst_key, moved["id"], moved["text"]), 0)
 
 
+def _todo_add_targets(alias, rows, list_keys, wt_slots):
+    """Ordered destinations for a slotless `t todo add` → [(key, label)].
+
+    Standing in a repo dir names no slot, and with 20+ live slots for one repo a guess
+    would be worse than asking. The repo-level list stays FIRST so it is the default
+    pick (fzf preselects line 1) — the picker adds a choice, it does not take one away.
+
+    Slots come from three unioned sources, cheapest last-resort first: a live session
+    (labelled with what it is working on — the only label that is actually recognisable
+    among twenty), a worktree on disk, an existing list. Pure: the caller gathers."""
+    live = {}
+    for r in rows:
+        slot = r.get("slot", "")
+        head, _, num = slot.rpartition("-")
+        if head == alias and num.isdigit():
+            live[num] = (r.get("summary") or "").strip()
+    seen = set(live) | {s for s in wt_slots if s.isdigit()}
+    open_counts = {}
+    for key, n in list_keys.items():
+        head, _, num = key.rpartition("-")
+        if head == alias and num.isdigit():
+            seen.add(num)
+            open_counts[num] = n
+    out = [(alias, "%s   (no slot — the repo-level list)" % alias)]
+    for num in sorted(seen, key=int):
+        bits = []
+        if num in live:
+            bits.append(live[num] or "(live)")
+        elif num in wt_slots:
+            bits.append("worktree")
+        if open_counts.get(num):
+            bits.append("%d open" % open_counts[num])
+        out.append(("%s-%s" % (alias, num),
+                    "%s-%s   %s" % (alias, num, " · ".join(bits) or "-")))
+    return out
+
+
 def _todo_render(data, key, show_all=False, width=80, st=None):
     """The one-list view. Returns display lines (no trailing newlines)."""
     st = st or Style()
@@ -1958,6 +1995,46 @@ def _todo_statusline(payload, cfg, items_n=1, width=80):
     return line
 
 
+def _fzf_pick(lines, prompt):
+    """fzf one line out of `lines`; None if fzf is absent, cancelled, or no TTY."""
+    if not (sys.stdin.isatty() and sys.stdout.isatty()) or not shutil.which("fzf"):
+        return None
+    try:
+        r = subprocess.run(["fzf", "--prompt", prompt, "--height", "40%", "--reverse"],
+                           input="\n".join(lines), stdout=subprocess.PIPE, text=True)
+    except OSError:
+        return None
+    return r.stdout.strip() or None
+
+
+def _todo_pick_target(cfg, alias):
+    """Ask which list a slotless add should go to. Returns a key, or None to stay put.
+
+    Bails BEFORE the session scan when there is no picker to show: _dev_session_rows is
+    a `zsh -lic` login shell, far too expensive to spend on a non-interactive add that
+    could never prompt (a script, or Claude's Bash tool)."""
+    if not (sys.stdin.isatty() and sys.stdout.isatty()) or not shutil.which("fzf"):
+        return None
+    wt_root = os.path.join(cfg.worktree_root, os.path.basename(cfg.repos.get(alias, "")))
+    wt_slots = {os.path.basename(p) for p in glob.glob(os.path.join(wt_root, "*"))
+                if os.path.exists(os.path.join(p, ".git"))}
+    list_keys = {}
+    for p in glob.glob(os.path.join(_todo_dir(), "*.json")):
+        list_keys[os.path.basename(p)[:-5]] = len(_todo_open(_todo_load(p)))
+    rows = _parse_rows(zsh_capture("_dev_session_rows"))
+    targets = _todo_add_targets(alias, rows, list_keys, wt_slots)
+    if len(targets) == 1:
+        return None                      # no slots exist — nothing to choose between
+    labels = [lbl for _, lbl in targets]
+    picked = _fzf_pick(labels, "add to> ")
+    if not picked:
+        return None
+    for key, lbl in targets:
+        if lbl == picked:
+            return key
+    return None
+
+
 def _tmux_session_name():
     """The tmux session this shell is in, or None. Gathering only — _todo_key takes it
     as an argument so the ladder stays pure."""
@@ -2005,6 +2082,12 @@ def cmd_todo(cfg, args):
         return 0
 
     key = _todo_key(cfg, os.getcwd(), _tmux_session_name(), args.slot)
+    # Slotless add from a repo dir: offer the repo's slots rather than silently filing
+    # against the repo. Only for `add` (viewing has -A), only interactively, and never
+    # when -s already named a list or --here opted out.
+    if (_todo_canon(args.action or "ls") == "add" and not args.slot and not args.here
+            and key in cfg.repos):
+        key = _todo_pick_target(cfg, key) or key
     path = _todo_path(key)
     data = _todo_load(path)
     action = args.action or "ls"
@@ -2295,6 +2378,8 @@ Run `t <verb> -h` for a verb's own flags.""")
                     help="every slot's open items, grouped — the cross-slot overview")
     sp.add_argument("-s", "--slot", metavar="KEY",
                     help="target another list by key (e.g. dotfiles-3) instead of the cwd's")
+    sp.add_argument("--here", action="store_true",
+                    help="skip the destination picker; file against the cwd's own list")
     sp.add_argument("--json", action="store_true", help="dump this list as JSON")
     sp.add_argument("--statusline", action="store_true",
                     help="render a status line from the Claude statusLine JSON on stdin")

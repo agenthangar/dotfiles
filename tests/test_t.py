@@ -1425,3 +1425,50 @@ def test_todo_id_actions_offers_reopen_only_when_finished(t_mod):
     assert [a for a, _ in t_mod._todo_id_actions(item)] == ["done", "rm", "mv"]
     item["done"] = True
     assert [a for a, _ in t_mod._todo_id_actions(item)] == ["_reopen", "rm", "mv"]
+
+
+# ─── t todo — actions widen to the same scope as the view ──────────────────────
+
+def _two_lists(t_mod):
+    a = _add(t_mod, _fresh(t_mod), "help")
+    b = _add(t_mod, _fresh(t_mod), "other slot thing")
+    return [("dotfiles-1", a), ("dotfiles-3", b)]
+
+
+def test_todo_scoped_candidates_label_the_slot_when_several(t_mod):
+    # The view widens to the repo, so the actions must too — otherwise you see an item
+    # you cannot touch, which is what `t todo rm` did from a repo dir.
+    got = t_mod._todo_scoped_candidates(_two_lists(t_mod), "rm")
+    assert [(k, i) for k, i, _ in got] == [("dotfiles-1", 1), ("dotfiles-3", 1)]
+    assert got[0][2].startswith("dotfiles-1")
+    assert got[1][2].startswith("dotfiles-3")
+
+
+def test_todo_scoped_candidates_drop_the_slot_column_for_one_list(t_mod):
+    entries = _two_lists(t_mod)[:1]
+    assert t_mod._todo_scoped_candidates(entries, "rm")[0][2] == "1  ◻ help"
+
+
+def test_todo_scoped_candidates_stay_action_aware(t_mod):
+    entries = _two_lists(t_mod)
+    t_mod._todo_apply(entries[0][1], "done", ["1"], now=200)
+    assert [k for k, _, _ in t_mod._todo_scoped_candidates(entries, "done")] == ["dotfiles-3"]
+
+
+def test_todo_locate_finds_an_id_across_lists(t_mod):
+    entries = _two_lists(t_mod)
+    assert [k for k, _ in t_mod._todo_locate(entries, "1")] == ["dotfiles-1", "dotfiles-3"]
+    assert t_mod._todo_locate(entries, "9") == []
+
+
+def test_todo_locate_is_unambiguous_when_only_one_list_has_it(t_mod):
+    entries = _two_lists(t_mod)
+    t_mod._todo_apply(entries[1][1], "add", ["second"], now=100)
+    hits = t_mod._todo_locate(entries, "2")
+    assert len(hits) == 1 and hits[0][0] == "dotfiles-3"
+
+
+def test_todo_locate_skips_tombstones(t_mod):
+    entries = _two_lists(t_mod)
+    t_mod._todo_apply(entries[0][1], "rm", ["1"], now=200)
+    assert [k for k, _ in t_mod._todo_locate(entries, "1")] == ["dotfiles-3"]

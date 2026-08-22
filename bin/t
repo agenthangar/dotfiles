@@ -1919,6 +1919,29 @@ def _todo_id_actions(item):
     return [("done", "tick off"), ("rm", "remove"), ("mv", "move to another slot")]
 
 
+def _todo_scoped_candidates(entries, action):
+    """Items to offer across several lists → [(key, id, label)].
+
+    The view widens to the repo when the cwd names no slot; the ACTIONS have to widen
+    with it, or you see an item you cannot touch — which is exactly what `t todo rm`
+    did from a repo dir: it offered the (empty) repo-level list while the view showed a
+    slot's item. The label carries the slot whenever more than one list is in play."""
+    show_key = len(entries) > 1
+    out = []
+    for key, data in entries:
+        for ident, label in _todo_pick_candidates(data, action):
+            out.append((key, ident, "%s%s" % ("%-12s " % key if show_key else "", label)))
+    return out
+
+
+def _todo_locate(entries, tok):
+    """Every live item with id `tok` across `entries` → [(key, item)]. Ids are per-list,
+    so a widened scope can genuinely match twice; the caller disambiguates rather than
+    guessing."""
+    return [(key, i) for key, data in entries for i in data["items"]
+            if not i.get("deleted") and str(i.get("id")) == str(tok)]
+
+
 def _todo_pick_candidates(data, action):
     """Items a no-id `done`/`undone`/`rm`/`edit`/`mv` should offer → [(id, label)].
 
@@ -2105,15 +2128,15 @@ def _todo_pick_action(item):
     return next((a for a, lbl in opts if lbl == picked), None)
 
 
-def _todo_pick_ids(data, action, multi=True):
-    """fzf the ids for a no-id action. None = cannot or would not pick (caller keeps its
-    existing 'needs an id' error, so scripts and non-TTY callers are unchanged)."""
+def _todo_pick_ids(entries, action, multi=True):
+    """fzf the items for a no-id action across `entries` → [(key, id)]. None = cannot or
+    would not pick (caller keeps its 'needs an id' error, so scripts are unchanged)."""
     if not (sys.stdin.isatty() and sys.stdout.isatty()) or not shutil.which("fzf"):
         return None
-    cands = _todo_pick_candidates(data, action)
+    cands = _todo_scoped_candidates(entries, action)
     if not cands:
         return None
-    labels = [lbl for _, lbl in cands]
+    labels = [lbl for _, _, lbl in cands]
     args = ["fzf", "--prompt", "%s> " % _todo_canon(action), "--height", "40%", "--reverse"]
     if multi:
         # space toggles, same binding as t resume's multi-pick
@@ -2123,8 +2146,8 @@ def _todo_pick_ids(data, action, multi=True):
     except OSError:
         return None
     picked = [l for l in r.stdout.split("\n") if l.strip()]
-    by_label = {lbl: i for i, lbl in cands}
-    return [str(by_label[l]) for l in picked if l in by_label] or None
+    by_label = {lbl: (key, ident) for key, ident, lbl in cands}
+    return [by_label[l] for l in picked if l in by_label] or None
 
 
 def _todo_all_entries():
@@ -2179,6 +2202,15 @@ def cmd_todo(cfg, args):
         return 0
 
     key = _todo_key(cfg, os.getcwd(), _tmux_session_name(), args.slot)
+
+    def scope():
+        """Lists this invocation acts on: just the cwd's, or — when the cwd names no
+        slot — the repo's, exactly the set the view shows."""
+        if key in cfg.repos:
+            found = _todo_scoped(_todo_all_entries(), key)
+            if found:
+                return found
+        return [(key, data)]
     # Slotless add from a repo dir: offer the repo's slots rather than silently filing
     # against the repo. Only for `add` (viewing has -A), only interactively, and never
     # when -s already named a list or --here opted out.
@@ -2197,7 +2229,15 @@ def cmd_todo(cfg, args):
     # A lone id is not an action, but it is obviously about one item — offer what can be
     # done with it rather than rejecting it.
     if action and action.isdigit() and not args.rest:
-        item = _todo_find(data, action)
+        hits = _todo_locate(scope(), action)
+        if len(hits) > 1:
+            print("t todo: #%s is in %s — name one with -s"
+                  % (action, ", ".join(k for k, _ in hits)), file=sys.stderr)
+            return 2
+        key = hits[0][0] if hits else key
+        path = _todo_path(key)
+        data = dict(scope()).get(key, data) if hits else data
+        item = hits[0][1] if hits else None
         picked = _todo_pick_action(item) if item else None
         if picked == "mv":
             dest = _todo_pick_target(cfg, key.rpartition("-")[0] if key not in cfg.repos else key)
@@ -2266,12 +2306,42 @@ def cmd_todo(cfg, args):
             return 0
 
     if _todo_canon(action) != "ls":
-        rest = list(args.rest)
-        canon = _todo_canon(action)
-        # No id given → offer the items rather than erroring. Multi-select for the bulk
-        # verbs; edit takes one and then pre-fills its current text for editing in place.
-        if not rest and canon in ("done", "rm"):
-            rest = _todo_pick_ids(data, canon) or []
+        rest, canon = list(args.rest), _todo_canon(action)
+        if canon in ("done", "rm"):
+            entries = scope()
+            by_list = {}
+            if rest:
+                for tok in rest:                       # explicit ids resolve in scope too
+                    hits = _todo_locate(entries, tok)
+                    if len(hits) > 1:
+                        print("t todo: #%s is in %s — name one with -s"
+                              % (tok, ", ".join(k for k, _ in hits)), file=sys.stderr)
+                        return 2
+                    if not hits:
+                        print("⚠ no such item: %s" % tok, file=sys.stderr)
+                        return 1
+                    by_list.setdefault(hits[0][0], []).append(tok)
+            else:
+                for k, ident in _todo_pick_ids(entries, canon) or []:
+                    by_list.setdefault(k, []).append(str(ident))
+            if not by_list:
+                print("t todo %s: needs an id (t todo to list them)" % canon, file=sys.stderr)
+                return 2
+            worst = 0
+            for k, toks in by_list.items():
+                d = dict(entries)[k] if k != key else data
+                msg, rc = _todo_apply(d, canon, toks)
+                if rc != 2:
+                    _todo_save(_todo_path(k), d)
+                print(msg, file=sys.stderr if rc else sys.stdout)
+                worst = max(worst, rc)
+            if worst:
+                return worst
+            for line in _todo_render_all(scope(), width, st) if len(entries) > 1 \
+                    else _todo_render(data, key, args.all, width, st):
+                print(line)
+            return 0
+
         msg, rc = _todo_apply(data, action, rest)
         if rc != 2:
             _todo_save(path, data)
@@ -2279,7 +2349,7 @@ def cmd_todo(cfg, args):
             print(msg, file=sys.stderr if rc else sys.stdout)
         if rc:
             return rc
-        if _todo_canon(action) == "add":
+        if canon == "add":
             return 0
 
     for line in _todo_render(data, key, args.all, width, st):

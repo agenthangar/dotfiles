@@ -924,6 +924,92 @@ def _parse_host_entry(ent, used):
     return alias, target
 
 
+def _pick_inline(title, rows, multi=False):
+    """A one-list inline picker in the `t setup` style — stdlib only, drawn on a rail
+    and redrawn in place, so it never takes over the screen and the whole transaction
+    stays in normal scrollback.
+
+    Deliberately NOT fzf and not curses, the same call t setup documents: fzf is not on
+    every host, and both take the screen. It also replaced a `zsh -lic` session scan
+    that cost 5s and suspended the shell with SIGTTOU — an interactive shell fights the
+    foreground process for the terminal.
+
+    rows: [(value, label)]. Returns a list of values when multi, one value otherwise,
+    or None when it cannot run (no tty, raw mode unavailable) or the user cancels."""
+    import select
+    import termios
+    import tty
+
+    if not rows or not sys.stdin.isatty() or not sys.stdout.isatty():
+        return None
+    st, out, fd = Style(), sys.stdout, sys.stdin.fileno()
+    try:
+        old_attrs = termios.tcgetattr(fd)
+    except termios.error:
+        return None
+    height = max(5, shutil.get_terminal_size((80, 24)).lines - 6)
+    cur, marked, painted = 0, set(), [0]
+
+    def read_key():
+        ch = os.read(fd, 1).decode(errors="replace")
+        if ch == "\x1b":
+            r, _, _ = select.select([fd], [], [], 0.05)
+            if r:
+                seq = os.read(fd, 2).decode(errors="replace")
+                return {"[A": "up", "OA": "up", "[B": "down", "OB": "down"}.get(seq, "esc")
+            return "esc"
+        return {"\r": "enter", "\n": "enter", " ": "space",
+                "\x03": "abort", "\x04": "abort", "": "abort"}.get(ch, ch)
+
+    def paint():
+        lo = max(0, min(cur - height // 2, len(rows) - height)) if len(rows) > height else 0
+        hi = min(len(rows), lo + height)
+        lines = ["%s┌%s %s" % (st.y, st.r, title)]
+        if lo:
+            lines.append("%s│%s   … %d above" % (st.y, st.r, lo))
+        for n in range(lo, hi):
+            sel = "›" if n == cur else " "
+            box = ("✓ " if n in marked else "  ") if multi else ""
+            body = _truncate(rows[n][1], max(20, shutil.get_terminal_size((80, 24)).columns - 8))
+            paint_on = st.c if n == cur else ""
+            lines.append("%s│%s %s%s%s%s%s" % (st.y, st.r, paint_on, sel, box, body, st.r))
+        if hi < len(rows):
+            lines.append("%s│%s   … %d more" % (st.y, st.r, len(rows) - hi))
+        keys = "↑↓ move · space mark · enter pick · q cancel" if multi \
+            else "↑↓ move · enter pick · q cancel"
+        lines.append("%s└%s %s%s%s" % (st.y, st.r, st.y, keys, st.r))
+        if painted[0]:
+            out.write("\x1b[%dA\r\x1b[J" % painted[0])
+        out.write("\n".join(lines) + "\n")
+        out.flush()
+        painted[0] = len(lines)
+
+    try:
+        tty.setcbreak(fd)
+        out.write("\x1b[?25l")
+        while True:
+            paint()
+            k = read_key()
+            if k in ("up", "k"):
+                cur = (cur - 1) % len(rows)
+            elif k in ("down", "j"):
+                cur = (cur + 1) % len(rows)
+            elif k == "space" and multi:
+                marked.symmetric_difference_update({cur})
+                cur = min(cur + 1, len(rows) - 1)
+            elif k == "enter":
+                picked = sorted(marked) if multi and marked else [cur]
+                return [rows[i][0] for i in picked] if multi else rows[cur][0]
+            elif k in ("abort", "esc", "q"):
+                return None
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old_attrs)
+        out.write("\x1b[?25h")
+        if painted[0]:
+            out.write("\x1b[%dA\r\x1b[J" % painted[0])
+        out.flush()
+
+
 def _setup_wizard(items, taken):
     """The t setup UI: a clack-style inline TWO-SCREEN flow. Screen one is the
     whole selection — repos, hosts (with the '+ add a host' action row), and
@@ -2078,76 +2164,49 @@ def _todo_statusline(payload, cfg, items_n=1, width=80):
     return line
 
 
-def _fzf_pick(lines, prompt):
-    """fzf one line out of `lines`; None if fzf is absent, cancelled, or no TTY."""
-    if not (sys.stdin.isatty() and sys.stdout.isatty()) or not shutil.which("fzf"):
-        return None
+def _todo_live_slots():
+    """Live dev slots by name, straight from tmux. This replaced
+    zsh_capture("_dev_session_rows"): that spawned a login+interactive zsh to fetch each
+    slot's "working on" summary, cost 5 SECONDS, and suspended the caller with SIGTTOU
+    when the interactive shell went for the terminal. 8ms here, and a slot number plus
+    its open count is enough to choose between lists."""
     try:
-        r = subprocess.run(["fzf", "--prompt", prompt, "--height", "40%", "--reverse"],
-                           input="\n".join(lines), stdout=subprocess.PIPE, text=True)
+        r = subprocess.run(["tmux", "list-sessions", "-F", "#{session_name}"],
+                           stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
     except OSError:
-        return None
-    return r.stdout.strip() or None
+        return []
+    return [{"slot": n[4:], "summary": ""} for n in r.stdout.split() if n.startswith("dev-")]
 
 
 def _todo_pick_target(cfg, alias):
-    """Ask which list a slotless add should go to. Returns a key, or None to stay put.
-
-    Bails BEFORE the session scan when there is no picker to show: _dev_session_rows is
-    a `zsh -lic` login shell, far too expensive to spend on a non-interactive add that
-    could never prompt (a script, or Claude's Bash tool)."""
-    if not (sys.stdin.isatty() and sys.stdout.isatty()) or not shutil.which("fzf"):
+    """Ask which list a slotless add should go to. Returns a key, or None to stay put."""
+    if not (sys.stdin.isatty() and sys.stdout.isatty()):
         return None
     wt_root = os.path.join(cfg.worktree_root, os.path.basename(cfg.repos.get(alias, "")))
     wt_slots = {os.path.basename(p) for p in glob.glob(os.path.join(wt_root, "*"))
                 if os.path.exists(os.path.join(p, ".git"))}
-    list_keys = {}
-    for p in glob.glob(os.path.join(_todo_dir(), "*.json")):
-        list_keys[os.path.basename(p)[:-5]] = len(_todo_open(_todo_load(p)))
-    rows = _parse_rows(zsh_capture("_dev_session_rows"))
-    targets = _todo_add_targets(alias, rows, list_keys, wt_slots)
+    list_keys = {os.path.basename(p)[:-5]: len(_todo_open(_todo_load(p)))
+                 for p in glob.glob(os.path.join(_todo_dir(), "*.json"))}
+    targets = _todo_add_targets(alias, _todo_live_slots(), list_keys, wt_slots)
     if len(targets) == 1:
         return None                      # no slots exist — nothing to choose between
-    labels = [lbl for _, lbl in targets]
-    picked = _fzf_pick(labels, "add to> ")
-    if not picked:
-        return None
-    for key, lbl in targets:
-        if lbl == picked:
-            return key
-    return None
+    return _pick_inline("add to which list?", targets)
 
 
 def _todo_pick_action(item):
-    """fzf what to do with one item; None if it cannot pick (caller prints the hint)."""
-    if not (sys.stdin.isatty() and sys.stdout.isatty()) or not shutil.which("fzf"):
-        return None
-    opts = _todo_id_actions(item)
-    picked = _fzf_pick([lbl for _, lbl in opts],
-                       'action for #%d "%s"> ' % (item["id"], _truncate(item["text"], 40)))
-    return next((a for a, lbl in opts if lbl == picked), None)
+    """What to do with one item; None if it cannot pick (caller prints the hint)."""
+    return _pick_inline('#%d  %s' % (item["id"], _truncate(item["text"], 50)),
+                        _todo_id_actions(item))
 
 
 def _todo_pick_ids(entries, action, multi=True):
-    """fzf the items for a no-id action across `entries` → [(key, id)]. None = cannot or
+    """Pick the items for a no-id action across `entries` → [(key, id)]. None = cannot or
     would not pick (caller keeps its 'needs an id' error, so scripts are unchanged)."""
-    if not (sys.stdin.isatty() and sys.stdout.isatty()) or not shutil.which("fzf"):
-        return None
     cands = _todo_scoped_candidates(entries, action)
     if not cands:
         return None
-    labels = [lbl for _, _, lbl in cands]
-    args = ["fzf", "--prompt", "%s> " % _todo_canon(action), "--height", "40%", "--reverse"]
-    if multi:
-        # space toggles, same binding as t resume's multi-pick
-        args += ["--multi", "--marker", "✓ ", "--bind", "space:toggle+down"]
-    try:
-        r = subprocess.run(args, input="\n".join(labels), stdout=subprocess.PIPE, text=True)
-    except OSError:
-        return None
-    picked = [l for l in r.stdout.split("\n") if l.strip()]
-    by_label = {lbl: (key, ident) for key, ident, lbl in cands}
-    return [by_label[l] for l in picked if l in by_label] or None
+    rows = [((key, ident), lbl) for key, ident, lbl in cands]
+    return _pick_inline("%s which?" % _todo_canon(action), rows, multi=multi) or None
 
 
 def _todo_all_entries():
@@ -2215,7 +2274,7 @@ def cmd_todo(cfg, args):
     # against the repo. Only for `add` (viewing has -A), only interactively, and never
     # when -s already named a list or --here opted out.
     if (_todo_canon(args.action or "ls") == "add" and not args.slot
-            and key in cfg.repos):
+            and " ".join(args.rest).strip() and key in cfg.repos):
         key = _todo_pick_target(cfg, key) or key
     path = _todo_path(key)
     data = _todo_load(path)

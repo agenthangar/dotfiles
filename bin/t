@@ -1764,7 +1764,21 @@ def _todo_find(data, tok):
     return None
 
 
-_TODO_ACTIONS = ("add", "done", "undone", "rm", "edit", "clear", "ls")
+_TODO_ACTIONS = ("add", "done", "undone", "rm", "mv", "edit", "clear", "ls")
+
+# Spellings that obviously mean one of the above. Being strict here buys nothing —
+# the failure mode is a dead end on `t todo list`, and the cost of guessing wrong is
+# zero because none of these collide with a canonical name.
+_TODO_ALIASES = {
+    "list": "ls", "l": "ls", "a": "add", "new": "add",
+    "do": "done", "x": "done", "check": "done", "reopen": "undone",
+    "del": "rm", "delete": "rm", "remove": "rm", "drop": "rm",
+    "move": "mv", "ed": "edit", "purge": "clear",
+}
+
+
+def _todo_canon(action):
+    return _TODO_ALIASES.get(action, action)
 
 
 def _todo_apply(data, action, rest, now=None):
@@ -1773,6 +1787,7 @@ def _todo_apply(data, action, rest, now=None):
     reports instead of exploding."""
     now = int(now if now is not None else time.time())
     rest = list(rest or [])
+    action = _todo_canon(action)
 
     if action == "add":
         text = " ".join(rest).strip()
@@ -1831,6 +1846,23 @@ def _todo_apply(data, action, rest, now=None):
             "(to add that as an item, say so: t todo add %s)"
             % (action, ", ".join(_TODO_ACTIONS),
                shlex.quote(" ".join([action] + rest))), 2)
+
+
+def _todo_move(src_data, dst_data, tok, dst_key, now=None):
+    """Move one item between two lists. Returns (message, rc); mutates both dicts.
+
+    The item is re-created in the destination with a fresh id (ids are per-list) and
+    TOMBSTONED in the source rather than spliced out — same reason as `rm`: csync has
+    no --delete, so the source file has to carry the fact of the move."""
+    now = int(now if now is not None else time.time())
+    item = _todo_find(src_data, tok)
+    if not item:
+        return ("⚠ no such item: %s" % tok, 1)
+    moved = dict(item, id=dst_data["next_id"], deleted=False, deleted_at=None)
+    dst_data["items"].append(moved)
+    dst_data["next_id"] += 1
+    item["deleted"], item["deleted_at"] = True, now
+    return ("✓ moved #%s → %s #%d  %s" % (tok, dst_key, moved["id"], moved["text"]), 0)
 
 
 def _todo_render(data, key, show_all=False, width=80, st=None):
@@ -1949,7 +1981,24 @@ def cmd_todo(cfg, args):
         sys.stdout.write("\n")
         return 0
 
-    if action != "ls":
+    if _todo_canon(action) == "mv":
+        if len(args.rest) < 2:
+            print("t todo mv: needs an id and a destination — t todo mv 2 ff-3", file=sys.stderr)
+            return 2
+        tok, dst_key = args.rest[0], args.rest[1]
+        if dst_key == key:
+            print("t todo mv: #%s is already in %s" % (tok, key), file=sys.stderr)
+            return 2
+        dst_path = _todo_path(dst_key)
+        dst_data = _todo_load(dst_path)
+        msg, rc = _todo_move(data, dst_data, tok, dst_key)
+        if rc == 0:
+            _todo_save(dst_path, dst_data)
+            _todo_save(path, data)
+        print(msg, file=sys.stderr if rc else sys.stdout)
+        return rc
+
+    if _todo_canon(action) != "ls":
         msg, rc = _todo_apply(data, action, args.rest)
         if rc != 2:
             _todo_save(path, data)
@@ -1957,7 +2006,7 @@ def cmd_todo(cfg, args):
             print(msg, file=sys.stderr if rc else sys.stdout)
         if rc:
             return rc
-        if action == "add":
+        if _todo_canon(action) == "add":
             return 0
 
     for line in _todo_render(data, key, args.all, width, st):
@@ -2199,11 +2248,13 @@ Run `t <verb> -h` for a verb's own flags.""")
             "$XDG_STATE_HOME/t/todo/<key>.json and ride csync to your other machines, "
             "so a beamed slot keeps its list.\n\n"
             "Actions: add <text…> | done <id…> | undone <id…> | rm <id…> | "
-            "edit <id> <text…> | clear (purge finished) | ls (the default). Finishing "
+            "edit <id> <text…> | mv <id> <key> (move to another slot's list) | "
+            "clear (purge finished) | ls (the default); common synonyms like `list`, "
+            "`delete` and `done`/`x` are accepted. Finishing "
             "or removing an item only FLAGS it — csync never deletes, so a physically "
             "unlinked item would come straight back; `clear` is what really drops them.",
         formatter_class=argparse.RawDescriptionHelpFormatter)
-    sp.add_argument("action", nargs="?", help="add|done|undone|rm|edit|clear|ls (default: ls)")
+    sp.add_argument("action", nargs="?", help="add|done|undone|rm|mv|edit|clear|ls (default: ls)")
     sp.add_argument("rest", nargs=argparse.REMAINDER,
                     help="the item text, or the ids to act on")
     sp.add_argument("-a", "--all", action="store_true", help="show finished items too")

@@ -1908,11 +1908,15 @@ def _todo_render_all(entries, width=80, st=None):
     return lines
 
 
-def _todo_statusline(payload, cfg):
-    """One line for Claude Code's statusLine. The payload arrives as JSON on stdin;
+def _todo_statusline(payload, cfg, items_n=1, width=80):
+    """Claude Code's statusLine. The payload arrives as JSON on stdin;
     workspace.current_dir is preferred over cwd (they differ when Claude is run from a
     subdir of the project). Everything is optional — a statusline that raises leaves
-    the TUI with a permanently broken status bar, so every field degrades to nothing."""
+    the TUI with a permanently broken status bar, so every field degrades to nothing.
+
+    items_n == 1 packs as many open items onto ONE line as `width` allows (the safe
+    default: a single line renders anywhere). items_n > 1 emits a header plus one line
+    per item, which is only useful if the host renders a multi-line statusline."""
     if not isinstance(payload, dict):
         payload = {}
     ws = payload.get("workspace") if isinstance(payload.get("workspace"), dict) else {}
@@ -1921,14 +1925,33 @@ def _todo_statusline(payload, cfg):
     name = (model.get("display_name") or "").strip()
     key = _todo_key(cfg, cwd)
     items = _todo_open(_todo_load(_todo_path(key)))
-    bits = [key]
-    if name:
-        bits.append(name)
-    if items:
-        bits.append("◻ %d  %s" % (len(items), _truncate(items[0]["text"], 44)))
-    else:
-        bits.append("◻ 0")
-    return " · ".join(bits)
+
+    head = [key] + ([name] if name else []) + ["◻ %d" % len(items)]
+    head = " · ".join(head)
+    if not items:
+        return head
+
+    if items_n > 1:
+        lines = [head]
+        for i in items[:items_n]:
+            lines.append("  %d ◻ %s" % (i["id"], _truncate(i["text"], max(10, width - 6))))
+        if len(items) > items_n:
+            lines.append("  +%d more" % (len(items) - items_n))
+        return "\n".join(lines)
+
+    # One line: fill the remaining width with as many items as fit, newest ask first.
+    line, shown = head, 0
+    for i in items:
+        cand = "%s · %s" % (line, i["text"])
+        if len(cand) > width - 10 and shown:
+            break
+        line = cand if len(cand) <= width else "%s · %s" % (line, _truncate(i["text"], max(10, width - len(line) - 3)))
+        shown += 1
+        if len(line) >= width - 10:
+            break
+    if shown < len(items):
+        line += " (+%d)" % (len(items) - shown)
+    return line
 
 
 def _tmux_session_name():
@@ -1956,7 +1979,7 @@ def cmd_todo(cfg, args):
         except Exception:
             payload = {}   # unparseable stdin still gets a line, just without the model
         try:
-            print(_todo_statusline(payload, cfg))
+            print(_todo_statusline(payload, cfg, args.items or 1, _columns()))
         except Exception:
             print("")
         return 0
@@ -2264,7 +2287,11 @@ Run `t <verb> -h` for a verb's own flags.""")
                     help="target another list by key (e.g. dotfiles-3) instead of the cwd's")
     sp.add_argument("--json", action="store_true", help="dump this list as JSON")
     sp.add_argument("--statusline", action="store_true",
-                    help="render one status line from the Claude statusLine JSON on stdin")
+                    help="render a status line from the Claude statusLine JSON on stdin")
+    sp.add_argument("-n", "--items", type=int, metavar="N",
+                    help="with --statusline: list up to N items, one per line (needs a "
+                         "host that renders a multi-line statusline). Default 1 = a "
+                         "single line packed with as many items as fit")
     # machine-readable / internal (hidden-ish; still have -h)
     sub.add_parser("session-rows", help="machine-readable per-host scan (remote contract)",
         description="Internal/machine-readable: emit one tab-separated row per live dev slot on "

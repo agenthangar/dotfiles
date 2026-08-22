@@ -1360,7 +1360,7 @@ def cmd_pending(cfg, args):
 
 # ─── doctor — read-only setup diagnostics ─────────────────────────────────────
 # Born from a real debugging session: "scroll wheel doesn't work" turned out to be
-# four stacked facts (stale main worktree, missing ~/.tmux.conf link, tmux server
+# four stacked facts (stale live checkout, missing ~/.tmux.conf link, tmux server
 # options predating the config, and Claude's fullscreen TUI capturing the wheel).
 # doctor gathers exactly that state in one shot. The gathering is subprocess glue
 # (cmd_doctor, coverage-excluded); the diagnosis rules are pure + pytest-covered.

@@ -22,7 +22,7 @@ the PR is your acceptance.
   will usually be declined, not because they're wrong but because this repo tracks
   one person's preferences. Open an issue first if you're unsure.
 - This is a single-author repo; the history prioritizes my workflow over a stable
-  public API. `main` is branch-protected — changes land via PRs from `dev/claude-1`.
+  public API. `main` is branch-protected — changes land via PRs from a per-session worktree branch (`dev/<repo>-<slot>`).
 
 ## Before you open a PR
 

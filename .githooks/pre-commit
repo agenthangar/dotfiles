@@ -1,8 +1,31 @@
 #!/bin/sh
-# Pre-commit: block staged PII before it enters history.
-# Enabled by install.sh via `git config core.hooksPath .githooks`.
-# Runs the literal denylist scan over staged content only.
-# Missing denylist (none on this machine) → warns and passes;
-# the GitHub Action is the backstop. Bypass once with: git commit --no-verify
+# Pre-commit guards. Enabled by install.sh via `git config core.hooksPath .githooks`.
+# Bypass either check once with: git commit --no-verify
 
+# 1. Never commit on `main` in the LIVE checkout.
+#
+# There is one canonical checkout, it is parked on `main`, and the $HOME symlinks
+# point straight at it — so a file saved there changes your live config instantly and
+# a commit there targets the protected branch. Everything is supposed to be developed
+# in a per-session worktree (`t open dot`). The old two-tree layout made this
+# impossible by construction (the dev clone could not hold `main`); with one tree the
+# automated paths are guarded in .zshrc, but a human or an agent can still `cd` in and
+# commit by habit — ~/code/dotfiles is the cd-shortcut landing spot. This is that
+# backstop. It costs nothing in a session worktree, which is never on `main`.
+here=$(git rev-parse --show-toplevel 2>/dev/null)
+branch=$(git symbolic-ref --short -q HEAD 2>/dev/null)
+if [ "$branch" = "main" ] && [ -L "$HOME/.zshrc" ]; then
+    live=$(cd "$(dirname "$(readlink "$HOME/.zshrc")")" 2>/dev/null && pwd -P)
+    if [ -n "$here" ] && [ "$(cd "$here" && pwd -P)" = "$live" ]; then
+        echo "pre-commit: refusing to commit on 'main' in the LIVE checkout ($here)." >&2
+        echo "  \$HOME symlinks point here, and main is protected — work in a session worktree:" >&2
+        echo "      t open $(basename "$here")     # then commit there and open a PR" >&2
+        echo "  override once with: git commit --no-verify" >&2
+        exit 1
+    fi
+fi
+
+# 2. Block staged PII before it enters history. Runs the literal denylist scan over
+# staged content only. Missing denylist (none on this machine) → warns and passes;
+# the GitHub Action is the backstop.
 exec "$(git rev-parse --show-toplevel)/bin/pii-scan" --staged

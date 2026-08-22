@@ -1733,9 +1733,37 @@ def _todo_load(path):
             "items": items}
 
 
+_TODO_TTL = 7 * 86400
+
+
+def _todo_purge(data, now=None, ttl=_TODO_TTL):
+    """Physically drop finished items older than `ttl`. Returns the count dropped.
+
+    This replaced an explicit `clear` verb: a list you have to tidy is a list you stop
+    using. Tombstones still do their csync job while they live (rsync has no --delete,
+    so an unlinked item would come straight back) — they just expire on their own, and
+    the purged copy wins the union merge by being newer.
+
+    An item with no timestamp is LEFT ALONE: rows written before this existed have no
+    done_at, and must not vanish on a technicality."""
+    now = int(now if now is not None else time.time())
+    keep = []
+    for i in data["items"]:
+        if i.get("done") or i.get("deleted"):
+            stamp = i.get("done_at") or i.get("deleted_at")
+            if stamp and now - int(stamp) > ttl:
+                continue
+        keep.append(i)
+    dropped = len(data["items"]) - len(keep)
+    data["items"] = keep
+    return dropped
+
+
 def _todo_save(path, data):
     """Write atomically (tmp + os.replace) so a crash mid-write can never leave a
-    truncated list where a good one was."""
+    truncated list where a good one was. Expiry rides on the write so that reading a
+    list never rewrites it."""
+    _todo_purge(data)
     os.makedirs(os.path.dirname(path), exist_ok=True)
     tmp = path + ".tmp"
     with open(tmp, "w", encoding="utf-8") as fh:
@@ -1764,20 +1792,20 @@ def _todo_find(data, tok):
     return None
 
 
-_TODO_ACTIONS = ("add", "done", "undone", "rm", "mv", "edit", "clear", "ls")
+_TODO_ACTIONS = ("add", "done", "rm", "mv", "ls")
 
-# Spellings that obviously mean one of the above. Being strict here buys nothing —
-# the failure mode is a dead end on `t todo list`, and the cost of guessing wrong is
-# zero because none of these collide with a canonical name.
-_TODO_ALIASES = {
-    "list": "ls", "l": "ls", "a": "add", "new": "add",
-    # No "check": it reads as "show me the list" at least as naturally as "check it
-    # off", so either mapping surprises half the time — `t todo check` demanded an id,
-    # and mapping it to `ls` would silently swallow the id in `t todo check 2`. An
-    # unknown action is the honest answer; the hint names the real ones.
-    "do": "done", "x": "done", "reopen": "undone",
-    "del": "rm", "delete": "rm", "remove": "rm", "drop": "rm",
-    "move": "mv", "ed": "edit", "purge": "clear",
+# Four spellings, not thirteen. Each is a word you would plausibly reach for first;
+# a longer table only made the "one of:" error longer without making anything findable.
+_TODO_ALIASES = {"list": "ls", "x": "done", "delete": "rm", "move": "mv"}
+
+# Verbs that existed for a few days and no longer do. Answering with the reason beats
+# "unknown action" — muscle memory from this week should get a pointer, not a dead end.
+_TODO_RETIRED = {
+    "clear": "finished items purge themselves now",
+    "purge": "finished items purge themselves now",
+    "edit": "remove it and add it again",
+    "undone": "t todo -a, then pick the item",
+    "reopen": "t todo -a, then pick the item",
 }
 
 
@@ -1803,7 +1831,14 @@ def _todo_apply(data, action, rest, now=None):
         data["next_id"] += 1
         return ("✓ added #%d  %s" % (item["id"], text), 0)
 
-    if action in ("done", "undone", "rm"):
+    if action == "_reopen":          # internal: the bare-id picker's un-tick
+        item = _todo_find(data, rest[0]) if rest else None
+        if not item:
+            return ("⚠ no such item: %s" % (rest[0] if rest else "?"), 1)
+        item["done"], item["done_at"] = False, None
+        return ("✓ reopened #%d  %s" % (item["id"], item["text"]), 0)
+
+    if action in ("done", "rm"):
         if not rest:
             return ("t todo %s: needs an id (t todo to list them)" % action, 2)
         hit, missed = [], []
@@ -1814,12 +1849,10 @@ def _todo_apply(data, action, rest, now=None):
                 continue
             if action == "done":
                 item["done"], item["done_at"] = True, now
-            elif action == "undone":
-                item["done"], item["done_at"] = False, None
             else:
                 item["deleted"], item["deleted_at"] = True, now
             hit.append(item)
-        verb = {"done": "done", "undone": "reopened", "rm": "removed"}[action]
+        verb = {"done": "done", "rm": "removed"}[action]
         msg = []
         if hit:
             msg.append("✓ %s %s" % (verb, ", ".join("#%d" % i["id"] for i in hit)))
@@ -1827,29 +1860,11 @@ def _todo_apply(data, action, rest, now=None):
             msg.append("⚠ no such item: %s" % ", ".join(missed))
         return ("\n".join(msg), 1 if missed else 0)
 
-    if action == "edit":
-        if len(rest) < 2:
-            return ("t todo edit: needs an id and the new text", 2)
-        item = _todo_find(data, rest[0])
-        if not item:
-            return ("⚠ no such item: %s" % rest[0], 1)
-        text = " ".join(rest[1:]).strip()
-        if not text:
-            return ("t todo edit: needs the new text", 2)
-        item["text"] = text
-        return ("✓ #%d  %s" % (item["id"], text), 0)
+    if action in _TODO_RETIRED:
+        return ("t todo: `%s` is gone — %s" % (action, _TODO_RETIRED[action]), 2)
 
-    if action == "clear":
-        gone = [i for i in data["items"] if i.get("done") or i.get("deleted")]
-        data["items"] = [i for i in data["items"] if not (i.get("done") or i.get("deleted"))]
-        if not gone:
-            return ("nothing to clear", 0)
-        return ("✓ cleared %d finished item%s" % (len(gone), "" if len(gone) == 1 else "s"), 0)
-
-    return ("t todo: unknown action '%s' — one of: %s\n"
-            "(to add that as an item, say so: t todo add %s)"
-            % (action, ", ".join(_TODO_ACTIONS),
-               shlex.quote(" ".join([action] + rest))), 2)
+    return ("t todo: unknown action '%s' — one of: %s"
+            % (action, ", ".join(_TODO_ACTIONS)), 2)
 
 
 def _todo_move(src_data, dst_data, tok, dst_key, now=None):
@@ -1867,6 +1882,74 @@ def _todo_move(src_data, dst_data, tok, dst_key, now=None):
     dst_data["next_id"] += 1
     item["deleted"], item["deleted_at"] = True, now
     return ("✓ moved #%s → %s #%d  %s" % (tok, dst_key, moved["id"], moved["text"]), 0)
+
+
+def _todo_render(data, key, show_all=False, width=80, st=None):
+    """The one-list view. Returns display lines (no trailing newlines)."""
+    st = st or Style()
+    items = _todo_visible(data, show_all)
+    n_open = len(_todo_open(data))
+    # Footer of next actions, mirroring `t ls`. Bare `t todo` is the discovery surface —
+    # without it the verbs exist only in -h, which nobody runs before they need them.
+    n_done = len(items) - n_open if show_all else 0
+    tally = "nothing open" if not n_open else "%d open" % n_open
+    if n_done:
+        tally += " · %d done" % n_done
+    head = "%s%s%s %s— %s%s" % (st.b, key, st.r, st.y, tally, st.r)
+    foot = ['', "  %s%s%s" % (st.y, _TODO_FOOT, st.r)]
+    if not items:
+        return [head, '  %s(nothing here yet)%s' % (st.y, st.r)] + foot
+    lines = [head]
+    idw = max(len(str(i["id"])) for i in items)
+    for i in items:
+        mark = "✓" if i.get("done") else "◻"
+        body = _truncate(i["text"], max(10, width - idw - 6))
+        if i.get("done"):
+            lines.append("  %s%*d  %s %s%s" % (st.y, idw, i["id"], mark, body, st.r))
+        else:
+            lines.append("  %s%*d%s  %s %s" % (st.c, idw, i["id"], st.r, mark, body))
+    return lines + foot
+
+
+def _todo_id_actions(item):
+    """Actions offered for one item → [(action, label)]. `reopen` appears only for a
+    finished item, and is how un-ticking survives the `undone` verb being removed."""
+    if item.get("done"):
+        return [("_reopen", "reopen"), ("rm", "remove"), ("mv", "move to another slot")]
+    return [("done", "tick off"), ("rm", "remove"), ("mv", "move to another slot")]
+
+
+def _todo_pick_candidates(data, action):
+    """Items a no-id `done`/`undone`/`rm`/`edit`/`mv` should offer → [(id, label)].
+
+    `done` offers only open items (marking a done item done again is a no-op), `undone`
+    only finished ones, and the rest offer everything still live — you may well want to
+    remove or re-file something already ticked off."""
+    action = _todo_canon(action)
+    if action == "undone":
+        items = [i for i in data["items"] if i.get("done") and not i.get("deleted")]
+    elif action == "done":
+        items = _todo_open(data)
+    else:
+        items = _todo_visible(data, show_all=True)
+    return [(i["id"], "%d  %s %s" % (i["id"], "✓" if i.get("done") else "◻", i["text"]))
+            for i in items]
+
+
+_TODO_FOOT = ('add: t todo add "…" · done: t todo done <id> · one item: t todo <id> '
+              '· every slot: t todo -A')
+
+
+def _todo_scoped(entries, alias):
+    """This repo's lists — its repo-level one plus every <alias>-<slot>. A plain shell in
+    a repo dir names no slot, so showing only the (usually empty) repo-level list hides
+    the work sitting in that repo's slots, which is exactly what was being asked for."""
+    out = []
+    for key, data in entries:
+        head, _, num = key.rpartition("-")
+        if key == alias or (head == alias and num.isdigit()):
+            out.append((key, data))
+    return out
 
 
 def _todo_add_targets(alias, rows, list_keys, wt_slots):
@@ -1903,66 +1986,6 @@ def _todo_add_targets(alias, rows, list_keys, wt_slots):
             bits.append("%d open" % open_counts[num])
         out.append(("%s-%s" % (alias, num),
                     "%s-%s   %s" % (alias, num, " · ".join(bits) or "-")))
-    return out
-
-
-def _todo_render(data, key, show_all=False, width=80, st=None):
-    """The one-list view. Returns display lines (no trailing newlines)."""
-    st = st or Style()
-    items = _todo_visible(data, show_all)
-    n_open = len(_todo_open(data))
-    # Footer of next actions, mirroring `t ls`. Bare `t todo` is the discovery surface —
-    # without it the verbs exist only in -h, which nobody runs before they need them.
-    n_done = len(items) - n_open if show_all else 0
-    tally = "nothing open" if not n_open else "%d open" % n_open
-    if n_done:
-        tally += " · %d done" % n_done
-    head = "%s%s%s %s— %s%s" % (st.b, key, st.r, st.y, tally, st.r)
-    foot = ['', "  %s%s%s" % (st.y, _TODO_FOOT, st.r)]
-    if not items:
-        return [head, '  %s(nothing here yet)%s' % (st.y, st.r)] + foot
-    lines = [head]
-    idw = max(len(str(i["id"])) for i in items)
-    for i in items:
-        mark = "✓" if i.get("done") else "◻"
-        body = _truncate(i["text"], max(10, width - idw - 6))
-        if i.get("done"):
-            lines.append("  %s%*d  %s %s%s" % (st.y, idw, i["id"], mark, body, st.r))
-        else:
-            lines.append("  %s%*d%s  %s %s" % (st.c, idw, i["id"], st.r, mark, body))
-    return lines + foot
-
-
-def _todo_pick_candidates(data, action):
-    """Items a no-id `done`/`undone`/`rm`/`edit`/`mv` should offer → [(id, label)].
-
-    `done` offers only open items (marking a done item done again is a no-op), `undone`
-    only finished ones, and the rest offer everything still live — you may well want to
-    remove or re-file something already ticked off."""
-    action = _todo_canon(action)
-    if action == "undone":
-        items = [i for i in data["items"] if i.get("done") and not i.get("deleted")]
-    elif action == "done":
-        items = _todo_open(data)
-    else:
-        items = _todo_visible(data, show_all=True)
-    return [(i["id"], "%d  %s %s" % (i["id"], "✓" if i.get("done") else "◻", i["text"]))
-            for i in items]
-
-
-_TODO_FOOT = ('add: t todo add "…" · done: t todo x <id> · move: t todo mv <id> <slot> '
-              '· all: t todo -A · help: t todo -h')
-
-
-def _todo_scoped(entries, alias):
-    """This repo's lists — its repo-level one plus every <alias>-<slot>. A plain shell in
-    a repo dir names no slot, so showing only the (usually empty) repo-level list hides
-    the work sitting in that repo's slots, which is exactly what was being asked for."""
-    out = []
-    for key, data in entries:
-        head, _, num = key.rpartition("-")
-        if key == alias or (head == alias and num.isdigit()):
-            out.append((key, data))
     return out
 
 
@@ -2072,6 +2095,16 @@ def _todo_pick_target(cfg, alias):
     return None
 
 
+def _todo_pick_action(item):
+    """fzf what to do with one item; None if it cannot pick (caller prints the hint)."""
+    if not (sys.stdin.isatty() and sys.stdout.isatty()) or not shutil.which("fzf"):
+        return None
+    opts = _todo_id_actions(item)
+    picked = _fzf_pick([lbl for _, lbl in opts],
+                       'action for #%d "%s"> ' % (item["id"], _truncate(item["text"], 40)))
+    return next((a for a, lbl in opts if lbl == picked), None)
+
+
 def _todo_pick_ids(data, action, multi=True):
     """fzf the ids for a no-id action. None = cannot or would not pick (caller keeps its
     existing 'needs an id' error, so scripts and non-TTY callers are unchanged)."""
@@ -2092,23 +2125,6 @@ def _todo_pick_ids(data, action, multi=True):
     picked = [l for l in r.stdout.split("\n") if l.strip()]
     by_label = {lbl: i for i, lbl in cands}
     return [str(by_label[l]) for l in picked if l in by_label] or None
-
-
-def _prompt_prefilled(prompt, initial):
-    """readline input with `initial` pre-filled for editing in place (the `e` trick from
-    the t setup wizard). Falls back to a plain prompt when readline is unavailable."""
-    try:
-        import readline
-    except ImportError:
-        return input(prompt).strip() or initial
-    def hook():
-        readline.insert_text(initial)
-        readline.redisplay()
-    readline.set_pre_input_hook(hook)
-    try:
-        return input(prompt).strip()
-    finally:
-        readline.set_pre_input_hook()
 
 
 def _todo_all_entries():
@@ -2166,7 +2182,7 @@ def cmd_todo(cfg, args):
     # Slotless add from a repo dir: offer the repo's slots rather than silently filing
     # against the repo. Only for `add` (viewing has -A), only interactively, and never
     # when -s already named a list or --here opted out.
-    if (_todo_canon(args.action or "ls") == "add" and not args.slot and not args.here
+    if (_todo_canon(args.action or "ls") == "add" and not args.slot
             and key in cfg.repos):
         key = _todo_pick_target(cfg, key) or key
     path = _todo_path(key)
@@ -2177,6 +2193,39 @@ def cmd_todo(cfg, args):
         json.dump({"key": key, "path": path, **data}, sys.stdout, ensure_ascii=False, indent=1)
         sys.stdout.write("\n")
         return 0
+
+    # A lone id is not an action, but it is obviously about one item — offer what can be
+    # done with it rather than rejecting it.
+    if action and action.isdigit() and not args.rest:
+        item = _todo_find(data, action)
+        picked = _todo_pick_action(item) if item else None
+        if picked == "mv":
+            dest = _todo_pick_target(cfg, key.rpartition("-")[0] if key not in cfg.repos else key)
+            if not dest or dest == key:
+                return 2
+            dst_data = _todo_load(_todo_path(dest))
+            msg, rc = _todo_move(data, dst_data, action, dest)
+            if rc == 0:
+                _todo_save(_todo_path(dest), dst_data)
+                _todo_save(path, data)
+            print(msg, file=sys.stderr if rc else sys.stdout)
+            return rc
+        if picked:
+            msg, rc = _todo_apply(data, picked, [action])
+            if rc != 2:
+                _todo_save(path, data)
+            print(msg, file=sys.stderr if rc else sys.stdout)
+            if rc:
+                return rc
+            for line in _todo_render(data, key, args.all, width, st):
+                print(line)
+            return 0
+        if not item:
+            print("⚠ no such item: %s" % action, file=sys.stderr)
+            return 1
+        print("t todo: %s is an item, not an action. Try:  t todo done %s  ·  t todo rm %s"
+              % (action, action, action), file=sys.stderr)
+        return 2
 
     if _todo_canon(action) == "mv":
         rest = list(args.rest)
@@ -2210,8 +2259,8 @@ def cmd_todo(cfg, args):
                 _todo_open(d) for _, d in _todo_scoped(_todo_all_entries(), key)))):
         scoped = _todo_scoped(_todo_all_entries(), key)
         if len(scoped) > 1 or not _todo_open(data):
-            print("%s%s%s %s— across %d list%s%s" % (st.b, key, st.r, st.y, len(scoped),
-                                                     "" if len(scoped) == 1 else "s", st.r))
+            n = sum(len(_todo_open(d)) for _, d in scoped)
+            print("%s%s%s %s— %d open%s" % (st.b, key, st.r, st.y, n, st.r))
             for line in _todo_render_all(scoped, width, st):
                 print(line)
             return 0
@@ -2221,17 +2270,8 @@ def cmd_todo(cfg, args):
         canon = _todo_canon(action)
         # No id given → offer the items rather than erroring. Multi-select for the bulk
         # verbs; edit takes one and then pre-fills its current text for editing in place.
-        if not rest and canon in ("done", "undone", "rm", "edit"):
-            picked = _todo_pick_ids(data, canon, multi=canon != "edit")
-            if picked:
-                rest = picked
-                if canon == "edit":
-                    item = _todo_find(data, rest[0])
-                    text = _prompt_prefilled("text> ", item["text"] if item else "")
-                    if not text:
-                        print("t todo edit: cancelled", file=sys.stderr)
-                        return 2
-                    rest = [rest[0]] + text.split()
+        if not rest and canon in ("done", "rm"):
+            rest = _todo_pick_ids(data, canon) or []
         msg, rc = _todo_apply(data, action, rest)
         if rc != 2:
             _todo_save(path, data)
@@ -2472,38 +2512,33 @@ Run `t <verb> -h` for a verb's own flags.""")
             "another machine with `t on <host> t doctor`.")
 
     sp = sub.add_parser("todo", help="a scratch task list scoped to this dev slot",
-        description="A small, durable task list for the slot you are standing in — the "
-            "things you meant to come back to. It is keyed on the SLOT (<repo>-<slot>, "
-            "read off the worktree path or the tmux session name), not the Claude "
-            "session id, because a conversation's id changes under you (compaction, "
-            "/clear, a fresh `t resume`) while the work does not; outside any repo it "
-            "falls back to a shared `scratch` list rather than erroring. Lists live in "
-            "$XDG_STATE_HOME/t/todo/<key>.json and ride csync to your other machines, "
-            "so a beamed slot keeps its list.\n\n"
-            "Actions: add <text…> | done <id…> | undone <id…> | rm <id…> | "
-            "edit <id> <text…> | mv <id> <key> (move to another slot's list) | "
-            "clear (purge finished) | ls (the default); common synonyms like `list`, "
-            "`delete` and `done`/`x` are accepted. Finishing "
-            "or removing an item only FLAGS it — csync never deletes, so a physically "
-            "unlinked item would come straight back; `clear` is what really drops them.",
+        description="""t todo — tasks for the slot you are standing in
+
+Usage: t todo [action] [args]
+
+  (no action)        show this slot's tasks
+  add <text…>        add a task
+  done [id…]         tick off      — no id: pick from a list
+  rm   [id…]         remove        — no id: pick from a list
+  mv   [id] [slot]   move to another slot's list
+  <id>               pick an action for one item
+
+Lists live in $XDG_STATE_HOME/t/todo/<slot>.json and ride csync to your other
+machines. Finished tasks leave the view at once and are dropped after a week.""",
         formatter_class=argparse.RawDescriptionHelpFormatter)
-    sp.add_argument("action", nargs="?", help="add|done|undone|rm|mv|edit|clear|ls (default: ls)")
-    sp.add_argument("rest", nargs=argparse.REMAINDER,
-                    help="the item text, or the ids to act on")
+    sp.add_argument("action", nargs="?", help=argparse.SUPPRESS)
+    sp.add_argument("rest", nargs=argparse.REMAINDER, help=argparse.SUPPRESS)
     sp.add_argument("-a", "--all", action="store_true", help="show finished items too")
     sp.add_argument("-A", "--all-slots", action="store_true",
-                    help="every slot's open items, grouped — the cross-slot overview")
+                    help="every slot's open items, grouped")
     sp.add_argument("-s", "--slot", metavar="KEY",
                     help="target another list by key (e.g. dotfiles-3) instead of the cwd's")
-    sp.add_argument("--here", action="store_true",
-                    help="skip the destination picker; file against the cwd's own list")
-    sp.add_argument("--json", action="store_true", help="dump this list as JSON")
-    sp.add_argument("--statusline", action="store_true",
-                    help="render a status line from the Claude statusLine JSON on stdin")
-    sp.add_argument("-n", "--items", type=int, metavar="N",
-                    help="with --statusline: list up to N items, one per line (needs a "
-                         "host that renders a multi-line statusline). Default 1 = a "
-                         "single line packed with as many items as fit")
+    # Working but off the everyday surface: the statusLine config and CLAUDE.md depend
+    # on these, nobody types them.
+    sp.add_argument("--json", action="store_true", help=argparse.SUPPRESS)
+    sp.add_argument("--statusline", action="store_true", help=argparse.SUPPRESS)
+    sp.add_argument("-n", "--items", type=int, metavar="N", help=argparse.SUPPRESS)
+
     # machine-readable / internal (hidden-ish; still have -h)
     sub.add_parser("session-rows", help="machine-readable per-host scan (remote contract)",
         description="Internal/machine-readable: emit one tab-separated row per live dev slot on "

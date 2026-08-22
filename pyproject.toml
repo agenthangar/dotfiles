@@ -35,8 +35,8 @@ exclude_lines = [
     "def _columns\\(",
     "class Style",
     # bin/t interactive setup glue (inline wizard + input() prompts)
+    "def _todo_pick_action\\(",
     "def _todo_pick_ids\\(",
-    "def _prompt_prefilled\\(",
     "def _todo_all_entries\\(",
     "def _fzf_pick\\(",
     "def _todo_pick_target\\(",

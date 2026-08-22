@@ -1,6 +1,6 @@
 ---
 description: Show or edit this dev slot's task list
-argument-hint: "[add <text…> | done <id…> | rm <id…> | edit <id> <text…> | clear]"
+argument-hint: "[add <text…> | done <id…> | rm <id…> | mv <id> <slot>]"
 allowed-tools: Bash(t todo:*)
 ---
 
@@ -23,9 +23,9 @@ Notes:
 - With no arguments it lists this slot's open items. `t todo -A` shows every slot's
   open items at once, which is the right call when the user asks what they have going
   on generally rather than here.
-- `done` and `rm` only flag an item; `clear` is what actually drops the finished ones.
-  If the user says "delete" or "clear out", prefer `rm <id>` unless they clearly mean
-  purging everything already finished.
+- `done` and `rm` only flag an item; finished items leave the view at once and are
+  dropped a week later on their own. There is no `clear`, `edit` or `undone` verb — to
+  reword something, `rm` it and `add` it again.
 - Do NOT use your own TodoWrite tool for this — that list is per-turn and vanishes;
   this one is the durable one the user came here for.
 - If `t todo` reports the key as `scratch`, this session is not inside a registered

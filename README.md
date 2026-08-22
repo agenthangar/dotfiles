@@ -19,7 +19,7 @@ shim in `.zshrc` for verbs that must run in your shell).
 | `t push` / `t pop` | Move a session between a foreground terminal and a detached tmux slot — one-live-owner guarantee |
 | `t beam <repo> [slot] --host <h>` | Teleport a running session to another machine; pull one back with `t open … --here` |
 | `t find <query>` | Semantic search across saved sessions ("which one was working on X?"), reranked by Claude |
-| `t todo [add\|done\|rm] …` | A task list scoped to the slot you are in — bare to list, `-A` for every slot at once. Also `/todo` inside Claude, and the statusline |
+| `t todo [add\|done\|rm] …` | A task list scoped to the slot you are in — bare to list, `t todo <id>` to act on one, `-A` for every slot. Also `/todo` inside Claude, and the statusline |
 
 Run `t -h` for the full verb list.
 

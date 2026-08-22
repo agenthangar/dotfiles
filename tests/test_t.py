@@ -986,14 +986,24 @@ def test_todo_add_needs_text(t_mod):
     assert rc == 2 and data["items"] == []
 
 
-def test_todo_done_and_undone(t_mod):
+def test_todo_done_hides_the_item(t_mod):
     data = _add(t_mod, _fresh(t_mod), "one", "two")
     msg, rc = t_mod._todo_apply(data, "done", ["1"], now=200)
     assert rc == 0 and "#1" in msg
     assert data["items"][0]["done"] and data["items"][0]["done_at"] == 200
     assert [i["id"] for i in t_mod._todo_open(data)] == [2]
-    t_mod._todo_apply(data, "undone", ["1"], now=300)
-    assert not data["items"][0]["done"] and data["items"][0]["done_at"] is None
+
+
+def test_todo_reopen_is_internal_only(t_mod):
+    # `undone` was retired as a typed verb, but the bare-id picker still needs to
+    # un-tick — it goes through the underscore-prefixed action nobody types.
+    data = _add(t_mod, _fresh(t_mod), "one")
+    t_mod._todo_apply(data, "done", ["1"], now=200)
+    msg, rc = t_mod._todo_apply(data, "_reopen", ["1"], now=300)
+    assert rc == 0 and not data["items"][0]["done"]
+    assert data["items"][0]["done_at"] is None
+    assert t_mod._todo_apply(data, "_reopen", ["9"], now=300)[1] == 1
+    assert t_mod._todo_apply(data, "_reopen", [], now=300)[1] == 1
 
 
 def test_todo_accepts_several_ids_at_once(t_mod):
@@ -1034,40 +1044,21 @@ def test_todo_rm_is_a_tombstone_not_a_delete(t_mod):
     assert [i["id"] for i in t_mod._todo_visible(data, show_all=True)] == [2]
 
 
-def test_todo_clear_purges_finished_only(t_mod):
-    data = _add(t_mod, _fresh(t_mod), "one", "two", "three")
-    t_mod._todo_apply(data, "done", ["1"], now=200)
-    t_mod._todo_apply(data, "rm", ["2"], now=200)
-    msg, rc = t_mod._todo_apply(data, "clear", [], now=300)
-    assert rc == 0 and "2" in msg
-    assert [i["id"] for i in data["items"]] == [3]
-    # Ids are never reused after a clear — next_id keeps rising.
-    assert t_mod._todo_apply(data, "add", ["four"], now=300)[0].startswith("✓ added #4")
-
-
-def test_todo_clear_on_a_tidy_list_says_so(t_mod):
-    data = _add(t_mod, _fresh(t_mod), "one")
-    msg, rc = t_mod._todo_apply(data, "clear", [], now=300)
-    assert rc == 0 and msg == "nothing to clear"
-    assert len(data["items"]) == 1
-
-
-def test_todo_edit_retexts(t_mod):
-    data = _add(t_mod, _fresh(t_mod), "one")
-    msg, rc = t_mod._todo_apply(data, "edit", ["1", "much", "better"], now=300)
-    assert rc == 0 and data["items"][0]["text"] == "much better"
-    assert t_mod._todo_apply(data, "edit", ["1"], now=300)[1] == 2       # no new text
-    assert t_mod._todo_apply(data, "edit", ["1", "  "], now=300)[1] == 2  # blank new text
-    assert t_mod._todo_apply(data, "edit", ["9", "x"], now=300)[1] == 1  # no such id
-
-
-def test_todo_unknown_action_offers_the_whole_line_back(t_mod):
-    # The likely slip is forgetting `add`, so the hint must quote everything typed,
-    # not just the first word.
+def test_todo_unknown_action_is_one_line(t_mod):
     data = _fresh(t_mod)
     msg, rc = t_mod._todo_apply(data, "fix", ["the", "thing"], now=300)
-    assert rc == 2 and "t todo add 'fix the thing'" in msg
+    assert rc == 2 and "\n" not in msg          # the add-hint second line is gone
+    assert "add, done, rm, mv, ls" in msg
     assert data["items"] == []
+
+
+def test_todo_retired_verbs_explain_themselves(t_mod):
+    # Muscle memory from the week these existed should get a pointer, not a dead end.
+    for verb, needle in (("clear", "purge themselves"), ("edit", "add it again"),
+                         ("undone", "-a"), ("purge", "purge themselves"),
+                         ("reopen", "-a")):
+        msg, rc = t_mod._todo_apply(_fresh(t_mod), verb, [], now=300)
+        assert rc == 2 and "is gone" in msg and needle in msg
 
 
 # ─── t todo — rendering ────────────────────────────────────────────────────────
@@ -1107,7 +1098,7 @@ def test_todo_render_always_ends_with_the_action_footer(t_mod):
     for data in (_fresh(t_mod), _add(t_mod, _fresh(t_mod), "one")):
         lines = t_mod._todo_render(data, "dotfiles-1", st=_plain(t_mod))
         assert lines[-2] == ""
-        for verb in ("t todo add", "t todo x", "t todo mv", "-A", "-h"):
+        for verb in ("t todo add", "t todo done", "t todo <id>", "-A"):
             assert verb in lines[-1]
     empty = t_mod._todo_render(_fresh(t_mod), "dotfiles-1", st=_plain(t_mod))
     assert empty[0] == "dotfiles-1 — nothing open"
@@ -1196,6 +1187,7 @@ def test_todo_action_aliases_resolve(t_mod):
     assert t_mod._todo_canon("list") == "ls"
     assert t_mod._todo_canon("delete") == "rm"
     assert t_mod._todo_canon("x") == "done"
+    assert len(t_mod._TODO_ALIASES) == 4        # four, not thirteen
     # "check" is deliberately NOT an alias — it reads as "show me" as much as "check
     # off", so it stays an unknown action rather than surprising either way.
     assert t_mod._todo_canon("check") == "check"
@@ -1387,3 +1379,49 @@ def test_todo_pick_candidates_accepts_aliases(t_mod):
 
 def test_todo_pick_candidates_empty_list(t_mod):
     assert t_mod._todo_pick_candidates(_fresh(t_mod), "done") == []
+
+
+# ─── t todo — expiry and the bare-id action set ────────────────────────────────
+
+def test_todo_purge_drops_only_stale_finished_items(t_mod):
+    data = _add(t_mod, _fresh(t_mod), "open", "just done", "long done", "long gone")
+    t_mod._todo_apply(data, "done", ["2"], now=1000)          # recent
+    t_mod._todo_apply(data, "done", ["3"], now=1000)
+    t_mod._todo_apply(data, "rm", ["4"], now=1000)
+    data["items"][2]["done_at"] = 1000 - 8 * 86400            # backdate
+    data["items"][3]["deleted_at"] = 1000 - 8 * 86400
+    dropped = t_mod._todo_purge(data, now=1000)
+    assert dropped == 2
+    assert [i["id"] for i in data["items"]] == [1, 2]         # open + recent survive
+
+
+def test_todo_purge_leaves_timestampless_rows_alone(t_mod):
+    # Rows written before expiry existed have no done_at and must not vanish on a
+    # technicality.
+    data = _add(t_mod, _fresh(t_mod), "one")
+    data["items"][0]["done"] = True
+    data["items"][0]["done_at"] = None
+    assert t_mod._todo_purge(data, now=10 ** 9) == 0
+    assert len(data["items"]) == 1
+
+
+def test_todo_purge_never_touches_open_items(t_mod):
+    data = _add(t_mod, _fresh(t_mod), "a", "b")
+    assert t_mod._todo_purge(data, now=10 ** 9) == 0
+
+
+def test_todo_save_expires_on_write(t_mod, tmp_path):
+    data = _add(t_mod, _fresh(t_mod), "one", "two")
+    t_mod._todo_apply(data, "done", ["1"], now=100)
+    data["items"][0]["done_at"] = 100 - 8 * 86400
+    path = str(tmp_path / "k.json")
+    t_mod._todo_save(path, data)
+    assert [i["id"] for i in t_mod._todo_load(path)["items"]] == [2]
+
+
+def test_todo_id_actions_offers_reopen_only_when_finished(t_mod):
+    data = _add(t_mod, _fresh(t_mod), "one")
+    item = data["items"][0]
+    assert [a for a, _ in t_mod._todo_id_actions(item)] == ["done", "rm", "mv"]
+    item["done"] = True
+    assert [a for a, _ in t_mod._todo_id_actions(item)] == ["_reopen", "rm", "mv"]

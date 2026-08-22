@@ -109,8 +109,15 @@ def run_install(cwd, home, **extra_env):
         **os.environ,
         "HOME": str(home),
         "DOTFILES_NO_BREW": "1",
-        # Keep the test off the real launchd/tmux/brew surfaces.
-        "PR_WATCH_NO_BOOTSTRAP": "1",
+        # tmux talks to the REAL server through the inherited $TMUX socket no matter
+        # what $HOME says, so without this the run sources the sandbox's ~/.tmux.conf
+        # into the developer's live server — and makes the test depend on whether a
+        # tmux server happens to be up.
+        "DOTFILES_NO_TMUX": "1",
+        # launchd needs no flag: install_pr_watch only bootstraps when
+        # $HOME/.config/pr-watch/enabled exists, which a fake HOME never has. (An
+        # earlier PR_WATCH_NO_BOOTSTRAP here read as protection but install.sh has
+        # never looked at it.)
     }
     env.update(extra_env)
     return subprocess.run(

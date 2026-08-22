@@ -319,7 +319,16 @@ fi
 # the same via _dots_tmux_apply) so no rollout needs a manual `tmux source-file`.
 # `tmux has-session` never leaves a stray server behind: one auto-started with no
 # sessions exits immediately.
-if command -v tmux >/dev/null 2>&1 && tmux has-session 2>/dev/null; then
+#
+# DOTFILES_NO_TMUX=1 skips it, and that is not cosmetic: `tmux has-session` reaches the
+# REAL server through the inherited $TMUX/socket regardless of $HOME, so a sandboxed run
+# (the migration tests, which drive install.sh under a fake HOME) would source the
+# SANDBOX's ~/.tmux.conf into the developer's live tmux server. Verified, not theorised —
+# a fake-HOME install printed "Applied .tmux.conf to the running tmux server". It is also
+# the one step here whose behaviour depends on whether a tmux server happens to exist,
+# so it makes an otherwise hermetic test environment-dependent.
+if [[ -z "${DOTFILES_NO_TMUX:-}" ]] \
+   && command -v tmux >/dev/null 2>&1 && tmux has-session 2>/dev/null; then
     if tmux source-file "$HOME/.tmux.conf" 2>/dev/null; then
         echo "Applied .tmux.conf to the running tmux server"
     else

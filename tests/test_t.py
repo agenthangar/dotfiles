@@ -1184,6 +1184,9 @@ def test_todo_action_aliases_resolve(t_mod):
     assert t_mod._todo_canon("list") == "ls"
     assert t_mod._todo_canon("delete") == "rm"
     assert t_mod._todo_canon("x") == "done"
+    # "check" is deliberately NOT an alias — it reads as "show me" as much as "check
+    # off", so it stays an unknown action rather than surprising either way.
+    assert t_mod._todo_canon("check") == "check"
     assert t_mod._todo_canon("move") == "mv"
     # canonical names pass through, unknown words stay unknown (so the hint still fires)
     assert t_mod._todo_canon("add") == "add"

@@ -1771,7 +1771,11 @@ _TODO_ACTIONS = ("add", "done", "undone", "rm", "mv", "edit", "clear", "ls")
 # zero because none of these collide with a canonical name.
 _TODO_ALIASES = {
     "list": "ls", "l": "ls", "a": "add", "new": "add",
-    "do": "done", "x": "done", "check": "done", "reopen": "undone",
+    # No "check": it reads as "show me the list" at least as naturally as "check it
+    # off", so either mapping surprises half the time — `t todo check` demanded an id,
+    # and mapping it to `ls` would silently swallow the id in `t todo check 2`. An
+    # unknown action is the honest answer; the hint names the real ones.
+    "do": "done", "x": "done", "reopen": "undone",
     "del": "rm", "delete": "rm", "remove": "rm", "drop": "rm",
     "move": "mv", "ed": "edit", "purge": "clear",
 }

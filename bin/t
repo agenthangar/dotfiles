@@ -1911,13 +1911,16 @@ def _todo_render(data, key, show_all=False, width=80, st=None):
     st = st or Style()
     items = _todo_visible(data, show_all)
     n_open = len(_todo_open(data))
+    # Footer of next actions, mirroring `t ls`. Bare `t todo` is the discovery surface —
+    # without it the verbs exist only in -h, which nobody runs before they need them.
     n_done = len(items) - n_open if show_all else 0
     tally = "nothing open" if not n_open else "%d open" % n_open
     if n_done:
         tally += " · %d done" % n_done
     head = "%s%s%s %s— %s%s" % (st.b, key, st.r, st.y, tally, st.r)
+    foot = ['', "  %s%s%s" % (st.y, _TODO_FOOT, st.r)]
     if not items:
-        return [head, '  %s(t todo add "…")%s' % (st.y, st.r)]
+        return [head, '  %s(nothing here yet)%s' % (st.y, st.r)] + foot
     lines = [head]
     idw = max(len(str(i["id"])) for i in items)
     for i in items:
@@ -1927,7 +1930,23 @@ def _todo_render(data, key, show_all=False, width=80, st=None):
             lines.append("  %s%*d  %s %s%s" % (st.y, idw, i["id"], mark, body, st.r))
         else:
             lines.append("  %s%*d%s  %s %s" % (st.c, idw, i["id"], st.r, mark, body))
-    return lines
+    return lines + foot
+
+
+_TODO_FOOT = ('add: t todo add "…" · done: t todo x <id> · move: t todo mv <id> <slot> '
+              '· all: t todo -A · help: t todo -h')
+
+
+def _todo_scoped(entries, alias):
+    """This repo's lists — its repo-level one plus every <alias>-<slot>. A plain shell in
+    a repo dir names no slot, so showing only the (usually empty) repo-level list hides
+    the work sitting in that repo's slots, which is exactly what was being asked for."""
+    out = []
+    for key, data in entries:
+        head, _, num = key.rpartition("-")
+        if key == alias or (head == alias and num.isdigit()):
+            out.append((key, data))
+    return out
 
 
 def _todo_render_all(entries, width=80, st=None):
@@ -1937,7 +1956,8 @@ def _todo_render_all(entries, width=80, st=None):
     live = [(k, _todo_open(d)) for k, d in entries]
     live = [(k, items) for k, items in live if items]
     if not live:
-        return ["%snothing open in any slot%s" % (st.y, st.r)]
+        return ["%snothing open in any slot%s" % (st.y, st.r),
+                "", "  %s%s%s" % (st.y, _TODO_FOOT, st.r)]
     kw = max(len(k) for k, _ in live)
     lines = []
     for key, items in live:
@@ -1946,7 +1966,7 @@ def _todo_render_all(entries, width=80, st=None):
             body = _truncate(i["text"], max(10, width - kw - 10))
             lines.append("  %s%-*s%s  %s%2d%s  ◻ %s"
                          % (st.b, kw, label, st.r, st.c, i["id"], st.r, body))
-    return lines
+    return lines + ["", "  %s%s%s" % (st.y, _TODO_FOOT, st.r)]
 
 
 def _todo_statusline(payload, cfg, items_n=1, width=80):
@@ -2035,6 +2055,12 @@ def _todo_pick_target(cfg, alias):
     return None
 
 
+def _todo_all_entries():
+    """(key, data) for every list on disk, key-sorted."""
+    return [(os.path.basename(p)[:-5], _todo_load(p))
+            for p in sorted(glob.glob(os.path.join(_todo_dir(), "*.json")))]
+
+
 def _tmux_session_name():
     """The tmux session this shell is in, or None. Gathering only — _todo_key takes it
     as an argument so the ladder stays pure."""
@@ -2075,8 +2101,7 @@ def cmd_todo(cfg, args):
     st = Style()
 
     if args.all_slots:
-        entries = [(os.path.basename(p)[:-5], _todo_load(p))
-                   for p in sorted(glob.glob(os.path.join(_todo_dir(), "*.json")))]
+        entries = _todo_all_entries()
         for line in _todo_render_all(entries, width, st):
             print(line)
         return 0
@@ -2113,6 +2138,19 @@ def cmd_todo(cfg, args):
             _todo_save(path, data)
         print(msg, file=sys.stderr if rc else sys.stdout)
         return rc
+
+    # A repo dir names no slot. Showing only the (usually empty) repo-level list hides
+    # the work sitting in that repo's slots, so a slotless view widens to the repo.
+    if (_todo_canon(action) == "ls" and key in cfg.repos
+            and (_todo_open(data) or any(
+                _todo_open(d) for _, d in _todo_scoped(_todo_all_entries(), key)))):
+        scoped = _todo_scoped(_todo_all_entries(), key)
+        if len(scoped) > 1 or not _todo_open(data):
+            print("%s%s%s %s— across %d list%s%s" % (st.b, key, st.r, st.y, len(scoped),
+                                                     "" if len(scoped) == 1 else "s", st.r))
+            for line in _todo_render_all(scoped, width, st):
+                print(line)
+            return 0
 
     if _todo_canon(action) != "ls":
         msg, rc = _todo_apply(data, action, args.rest)

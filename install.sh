@@ -141,9 +141,17 @@ migrate_to_single_tree() {
     # install.sh BEFORE the change is merged would migrate, then link from $PRIMARY @
     # main (which lacks the new code) — silently rolling the machine back, and the
     # next `dots` would rebuild the very worktree we just removed.
-    if [ -n "$LEGACY_TREES" ] \
-       && ! git -C "$PRIMARY" show origin/main:install.sh 2>/dev/null \
-            | grep -q 'migrate_to_single_tree'; then
+    # Read the probe into a variable and match with `case`, NOT `git show | grep -q`:
+    # grep -q exits at the first match, git show then dies of SIGPIPE, and `set -o
+    # pipefail` reports the PIPELINE as failed — so this guard intermittently concluded
+    # "origin/main does not carry the change" and refused a perfectly good migration.
+    # Measured at 14/400 runs; it was the flake in test_install_migration.
+    probe=$(git -C "$PRIMARY" show origin/main:install.sh 2>/dev/null || true)
+    case "$probe" in
+        *migrate_to_single_tree*) probe_ok=1 ;;
+        *)                        probe_ok=0 ;;
+    esac
+    if [ -n "$LEGACY_TREES" ] && [ "$probe_ok" = 0 ]; then
         echo "Legacy two-tree layout LEFT IN PLACE: origin/main does not carry the"
         echo "single-tree change yet. Merge it, then re-run. (Nothing was touched.)"
         return 1

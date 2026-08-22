@@ -1171,3 +1171,59 @@ def test_todo_statusline_truncates_a_long_item(t_mod, tmp_path, monkeypatch):
                        {"workspace": {"current_dir": "/wt/dotfiles/1"}},
                        key="dotfiles-1", texts=("y" * 200,))
     assert line.endswith("…") and len(line) < 80
+
+
+# ─── t todo — action aliases and cross-list move ───────────────────────────────
+
+def test_todo_action_aliases_resolve(t_mod):
+    # `t todo list` was a dead end; none of these collide with a canonical name.
+    assert t_mod._todo_canon("list") == "ls"
+    assert t_mod._todo_canon("delete") == "rm"
+    assert t_mod._todo_canon("x") == "done"
+    assert t_mod._todo_canon("move") == "mv"
+    # canonical names pass through, unknown words stay unknown (so the hint still fires)
+    assert t_mod._todo_canon("add") == "add"
+    assert t_mod._todo_canon("frobnicate") == "frobnicate"
+
+
+def test_todo_apply_accepts_an_alias(t_mod):
+    data = _add(t_mod, _fresh(t_mod), "one")
+    msg, rc = t_mod._todo_apply(data, "delete", ["1"], now=200)
+    assert rc == 0 and data["items"][0]["deleted"]
+
+
+def test_todo_move_across_lists(t_mod):
+    src = _add(t_mod, _fresh(t_mod), "one", "two")
+    dst = _add(t_mod, _fresh(t_mod), "already here")
+    msg, rc = t_mod._todo_move(src, dst, "1", "ff-3", now=200)
+    assert rc == 0 and "ff-3" in msg
+    # gone from the source, present in the destination, text intact
+    assert [i["id"] for i in t_mod._todo_open(src)] == [2]
+    assert [i["text"] for i in t_mod._todo_open(dst)] == ["already here", "one"]
+
+
+def test_todo_move_reids_in_the_destination(t_mod):
+    # ids are per-list, so the moved item takes the destination's next id, not its own
+    src = _add(t_mod, _fresh(t_mod), "a", "b", "c")
+    dst = _fresh(t_mod)
+    t_mod._todo_move(src, dst, "3", "ff-3", now=200)
+    assert [i["id"] for i in dst["items"]] == [1]
+    assert dst["next_id"] == 2
+
+
+def test_todo_move_tombstones_the_source_item(t_mod):
+    # same reason as rm: csync has no --delete, so the source file must carry the move
+    src = _add(t_mod, _fresh(t_mod), "one")
+    dst = _fresh(t_mod)
+    t_mod._todo_move(src, dst, "1", "ff-3", now=200)
+    assert len(src["items"]) == 1
+    assert src["items"][0]["deleted"] and src["items"][0]["deleted_at"] == 200
+    # …and the moved copy is NOT itself a tombstone
+    assert not dst["items"][0]["deleted"] and dst["items"][0]["deleted_at"] is None
+
+
+def test_todo_move_unknown_id(t_mod):
+    src = _add(t_mod, _fresh(t_mod), "one")
+    dst = _fresh(t_mod)
+    msg, rc = t_mod._todo_move(src, dst, "9", "ff-3", now=200)
+    assert rc == 1 and dst["items"] == [] and not src["items"][0]["deleted"]

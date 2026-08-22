@@ -1988,6 +1988,12 @@ def cmd_todo(cfg, args):
             print("")
         return 0
 
+    # `t todo add -h` must print help, not file an item called "-h". REMAINDER swallows
+    # flags after the action, so the t() shim's -h check and argparse both miss it.
+    # Only the FIRST token counts, so `t todo add fix the -h flag` still adds normally.
+    if args.rest and args.rest[0] in ("-h", "--help"):
+        build_parser().parse_args(["todo", "--help"])   # prints, then SystemExit(0)
+
     width = _columns()
     st = Style()
 

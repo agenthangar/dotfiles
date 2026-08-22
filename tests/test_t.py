@@ -1072,6 +1072,12 @@ def test_todo_unknown_action_offers_the_whole_line_back(t_mod):
 
 # ─── t todo — rendering ────────────────────────────────────────────────────────
 
+def _body(lines):
+    """Drop the trailing blank + action footer every todo view now appends, so these
+    assertions stay about the items themselves."""
+    return lines[:-2] if len(lines) >= 2 and lines[-2] == "" else lines
+
+
 def _plain(t_mod):
     """A colourless Style so assertions can match text, not escape codes."""
     st = t_mod.Style()
@@ -1083,7 +1089,7 @@ def _plain(t_mod):
 def test_todo_render_lists_open_items(t_mod):
     data = _add(t_mod, _fresh(t_mod), "one", "two")
     t_mod._todo_apply(data, "done", ["1"], now=200)
-    lines = t_mod._todo_render(data, "dotfiles-1", st=_plain(t_mod))
+    lines = _body(t_mod._todo_render(data, "dotfiles-1", st=_plain(t_mod)))
     assert lines[0] == "dotfiles-1 — 1 open"
     assert [l.strip() for l in lines[1:]] == ["2  ◻ two"]
 
@@ -1091,20 +1097,25 @@ def test_todo_render_lists_open_items(t_mod):
 def test_todo_render_all_flag_shows_done_and_a_tally(t_mod):
     data = _add(t_mod, _fresh(t_mod), "one", "two")
     t_mod._todo_apply(data, "done", ["1"], now=200)
-    lines = t_mod._todo_render(data, "dotfiles-1", show_all=True, st=_plain(t_mod))
+    lines = _body(t_mod._todo_render(data, "dotfiles-1", show_all=True, st=_plain(t_mod)))
     assert lines[0] == "dotfiles-1 — 1 open · 1 done"
     assert [l.strip() for l in lines[1:]] == ["1  ✓ one", "2  ◻ two"]
 
 
-def test_todo_render_empty_list_hints_at_add(t_mod):
-    lines = t_mod._todo_render(_fresh(t_mod), "dotfiles-1", st=_plain(t_mod))
-    assert lines[0] == "dotfiles-1 — nothing open"
-    assert "t todo add" in lines[1]
+def test_todo_render_always_ends_with_the_action_footer(t_mod):
+    # Bare `t todo` is the discovery surface: the verbs must be visible without -h.
+    for data in (_fresh(t_mod), _add(t_mod, _fresh(t_mod), "one")):
+        lines = t_mod._todo_render(data, "dotfiles-1", st=_plain(t_mod))
+        assert lines[-2] == ""
+        for verb in ("t todo add", "t todo x", "t todo mv", "-A", "-h"):
+            assert verb in lines[-1]
+    empty = t_mod._todo_render(_fresh(t_mod), "dotfiles-1", st=_plain(t_mod))
+    assert empty[0] == "dotfiles-1 — nothing open"
 
 
 def test_todo_render_truncates_to_width(t_mod):
     data = _add(t_mod, _fresh(t_mod), "x" * 200)
-    lines = t_mod._todo_render(data, "k", width=40, st=_plain(t_mod))
+    lines = _body(t_mod._todo_render(data, "k", width=40, st=_plain(t_mod)))
     assert all(len(l) <= 40 for l in lines)
     assert lines[1].endswith("…")
 
@@ -1118,6 +1129,7 @@ def test_todo_render_all_groups_by_slot_and_skips_empty(t_mod):
     lines = t_mod._todo_render_all(
         [("dotfiles-1", a), ("ff-2", b), ("gone-3", empty), ("tidy-4", done_only)],
         st=_plain(t_mod))
+    lines = _body(lines)
     assert "dotfiles-1" in lines[0] and "first" in lines[0]
     assert lines[1].strip().startswith("2")       # continuation row: no repeated key
     assert "dotfiles-1" not in lines[1]
@@ -1128,7 +1140,7 @@ def test_todo_render_all_groups_by_slot_and_skips_empty(t_mod):
 
 def test_todo_render_all_says_so_when_everything_is_clear(t_mod):
     lines = t_mod._todo_render_all([("a-1", _fresh(t_mod))], st=_plain(t_mod))
-    assert lines == ["nothing open in any slot"]
+    assert _body(lines) == ["nothing open in any slot"]
 
 
 # ─── t todo — statusline ───────────────────────────────────────────────────────
@@ -1319,3 +1331,14 @@ def test_todo_add_targets_ignores_other_repos_and_junk(t_mod):
 def test_todo_add_targets_repo_only_when_no_slots_exist(t_mod):
     # a single entry is the caller's signal to skip the picker entirely
     assert len(t_mod._todo_add_targets("ff", [], {}, set())) == 1
+
+
+def test_todo_scoped_picks_out_one_repos_lists(t_mod):
+    entries = [("dotfiles", 1), ("dotfiles-1", 2), ("dotfiles-12", 3),
+               ("ff", 4), ("ff-3", 5), ("scratch", 6), ("dotfiles-main", 7)]
+    entries = [(k, v) for k, v in entries]
+    assert [k for k, _ in t_mod._todo_scoped(entries, "dotfiles")] == [
+        "dotfiles", "dotfiles-1", "dotfiles-12"]
+    # a non-numeric tail is a different repo's list, not a slot of this one
+    assert [k for k, _ in t_mod._todo_scoped(entries, "ff")] == ["ff", "ff-3"]
+    assert t_mod._todo_scoped(entries, "nothing") == []

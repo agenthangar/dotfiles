@@ -6,89 +6,211 @@ set -euo pipefail
 
 DOTFILES_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-# --- Worktree-separation model (read the "symlink model" note in CLAUDE.md) ---
-# The LIVE surface (what $HOME symlinks point at) is a dedicated git worktree pinned
-# to `main`, NOT the clone you develop in. install.sh sets that worktree up and points
-# the symlinks at it; `dots` keeps it fast-forwarded. The clone at $DOTFILES_DIR stays
-# on the dev branch for in-progress work — and because `main` is checked out in the
-# worktree, git physically REFUSES to check it out in the dev clone, so a stray
-# `git checkout main` / old-style `dots` can never swap the live files out from under
-# in-progress work. Override the worktree location with $DOTFILES_MAIN_WT.
+# --- One canonical checkout (read the "symlink model" note in CLAUDE.md) ---
+# There is exactly ONE checkout of this repo: $PRIMARY (normally ~/code/dotfiles),
+# parked on `main`. It IS the live surface — the $HOME symlinks point straight at it
+# and `dots` fast-forwards it. All development happens in per-session worktrees
+# ($DEV_WORKTREE_ROOT/<repo>/<slot> on dev/<repo>-<slot>), never here.
 #
-# Two link modes:
-#   default              LINK_SRC = the main worktree   (live = released `main`)
-#   DOTFILES_LINK_DEV=1  LINK_SRC = $DOTFILES_DIR        (live = your current dev branch;
-#                        the fast inner-loop, set by `dots --dev`)
-MAIN_WT="${DOTFILES_MAIN_WT:-$HOME/.local/share/dotfiles-main}"
-DEV_BRANCH="${DEV_BRANCH:-dev/claude-1}"
+# This replaced an older TWO-tree layout (a dev clone plus a separate `main` worktree
+# at ~/.local/share/dotfiles-main). That split existed because `dots` used to
+# `git checkout main` inside the one tree that also held in-progress work, so a single
+# `dots` reverted everyone's live config. Worktree-per-session removed the work from
+# that tree, so the second tree bought nothing. The structural guarantee survives:
+# git refuses to check out a branch already held by another worktree, so with $PRIMARY
+# holding `main`, no session worktree can ever land on it.
+#
+# migrate_to_single_tree() below converts a legacy two-tree machine in place.
+#
+# Three link modes:
+#   default              LINK_SRC = $PRIMARY      (live = the canonical checkout on main)
+#   DOTFILES_LINK_DEV=1  LINK_SRC = $DOTFILES_DIR (live = the session worktree you are
+#                        standing in; the fast inner-loop, set by `dots --dev`)
+#   DOTFILES_LINKS_ONLY=1  link from $DOTFILES_DIR and stop (the offline relink `dots`
+#                        runs every invocation; never migrates, never fetches)
 
-# setup_main_worktree — idempotently make $MAIN_WT a worktree checked out on `main`,
-# migrating an old single-tree layout in place (aggressive, per design): if the dev
-# clone is sitting on `main`, move it to $DEV_BRANCH first so `main` is free for the
-# worktree.
-setup_main_worktree() {
-    # Running FROM the main worktree itself (the natural move after `dots`, since
-    # the dev clone's parked install.sh may be stale): this tree IS the live
-    # surface. There is no dev clone here to migrate — the "sitting on main"
-    # branch below would try to move the LIVE worktree off main and die with
-    # "'$DEV_BRANCH' is already used by worktree" before any link ran. Just ff.
-    if [[ "$(cd "$DOTFILES_DIR" && pwd -P)" == "$(cd "$MAIN_WT" 2>/dev/null && pwd -P || echo __no_main_wt__)" ]]; then
-        git -C "$MAIN_WT" fetch -q origin 2>/dev/null || true
-        git -C "$MAIN_WT" merge --ff-only origin/main -q 2>/dev/null || true
-        return
+# Legacy-only: where a pre-migration `main` worktree may still be sitting. Read in
+# exactly two places (here and _dots_legacy_present in .zshrc) so a host that
+# overrode the path still gets cleaned up. It is NOT a link source any more.
+LEGACY_MAIN_WT="${DOTFILES_MAIN_WT:-$HOME/.local/share/dotfiles-main}"
+LEGACY_TREES=""   # newline-separated, filled by migrate_to_single_tree
+
+# samepath — compare two dirs by their PHYSICAL path. `git worktree list --porcelain`
+# canonicalizes (/tmp -> /private/tmp), so a literal string compare gives false
+# negatives and would wrongly treat $PRIMARY as a legacy tree.
+samepath() {
+    [ "$(cd "$1" 2>/dev/null && pwd -P)" = "$(cd "$2" 2>/dev/null && pwd -P)" ]
+}
+
+# resolve_primary — the ONE canonical checkout: the parent of the shared .git.
+# Resolved from the COMMON dir (not $DOTFILES_DIR) so that running a session
+# worktree's ./install.sh still links the canonical tree instead of itself.
+# `--git-common-dir` is relative to the dir git RAN IN (".git" from the repo root,
+# "../.git" from bin/, absolute from a linked worktree), so prefix with the -C dir.
+resolve_primary() {
+    local cdir
+    cdir="$(git -C "$DOTFILES_DIR" rev-parse --git-common-dir 2>/dev/null)" || return 1
+    [ -n "$cdir" ] || return 1
+    case "$cdir" in /*) ;; *) cdir="$DOTFILES_DIR/$cdir" ;; esac
+    ( cd "$cdir/.." && pwd )
+}
+
+PRIMARY="$(resolve_primary || true)"
+if [[ -z "$PRIMARY" || ! -d "$PRIMARY/.git" ]]; then
+    # A directory .git is exactly what distinguishes the primary checkout from a
+    # linked worktree (whose .git is a FILE). Without this we could silently link
+    # $HOME at something that is not a checkout at all.
+    echo "install.sh: cannot resolve the primary checkout from $DOTFILES_DIR" >&2
+    echo "  (need a normal clone with a .git directory; --separate-git-dir/bare is unsupported)" >&2
+    exit 1
+fi
+
+# salvage_tree <wt> — never block, never lose data. Dump any local edits in an
+# outgoing legacy tree to a patch BESIDE it (a sibling, so the later rm -rf cannot
+# take the patch with it) and carry on. `git diff HEAD` covers staged AND unstaged
+# changes; untracked files are copied separately since no diff carries them.
+salvage_tree() {
+    local w="$1" stamp patch f dir n
+    if git -C "$w" diff --quiet HEAD 2>/dev/null \
+       && [ -z "$(git -C "$w" ls-files --others --exclude-standard 2>/dev/null)" ]; then
+        return 0
+    fi
+    stamp="$(date +%Y%m%d-%H%M%S)"
+    patch="${w%/}.salvage-$stamp.patch"
+    [ -w "$(dirname "$w")" ] || patch="$HOME/dotfiles-salvage-$stamp.patch"
+    git -C "$w" diff HEAD > "$patch" 2>/dev/null || true
+    n="$(wc -l < "$patch" | tr -d ' ')"
+    echo "Salvaged $n line(s) of local edits from $w"
+    echo "  -> $patch"
+    echo "  re-apply later with: git -C \"$PRIMARY\" apply -3 \"$patch\""
+    git -C "$w" ls-files --others --exclude-standard 2>/dev/null | while IFS= read -r f; do
+        [ -n "$f" ] || continue
+        dir="$patch.untracked/$(dirname "$f")"
+        mkdir -p "$dir"
+        cp -p "$w/$f" "$dir/" 2>/dev/null || true
+        echo "  kept untracked $f -> $patch.untracked/$f"
+    done
+}
+
+# migrate_to_single_tree — convert a legacy two-tree machine in place, WITHOUT ever
+# leaving $HOME pointing at a directory that does not exist.
+#
+# The ordering is the whole trick. We do NOT need to remove the worktrees holding
+# `main` before $PRIMARY can check it out — we only need to release the ref.
+# `checkout --detach` frees refs/heads/main while leaving every file in that tree
+# byte-identical on disk, so the $HOME symlinks keep resolving the entire time. The
+# actual rm happens LAST, after link_all has already repointed everything at
+# $PRIMARY. Die at any earlier step and the machine still works on the old links;
+# re-running resumes idempotently.
+migrate_to_single_tree() {
+    local line w="" c seen="|"
+
+    git -C "$PRIMARY" worktree prune 2>/dev/null || true
+
+    # The set to act on is the UNION of (1) every worktree != $PRIMARY holding
+    # refs/heads/main and (2) the legacy path if it still exists. (2) is not
+    # optional: after a partial run the legacy tree is already DETACHED, so rule (1)
+    # alone would miss it and orphan it forever.
+    while IFS= read -r line; do
+        case "$line" in
+            "worktree "*) w="${line#worktree }" ;;
+            "branch refs/heads/main")
+                samepath "$w" "$PRIMARY" && continue
+                c="$(cd "$w" 2>/dev/null && pwd -P)" || continue
+                [ -n "$c" ] || continue
+                case "$seen" in *"|$c|"*) continue ;; esac
+                seen="$seen$c|"
+                LEGACY_TREES="$LEGACY_TREES$w
+" ;;
+        esac
+    done < <(git -C "$PRIMARY" worktree list --porcelain 2>/dev/null)
+
+    if [ -e "$LEGACY_MAIN_WT" ] && ! samepath "$LEGACY_MAIN_WT" "$PRIMARY"; then
+        c="$(cd "$LEGACY_MAIN_WT" 2>/dev/null && pwd -P || true)"
+        case "$seen" in
+            *"|$c|"*) : ;;
+            *) LEGACY_TREES="$LEGACY_TREES$LEGACY_MAIN_WT
+" ;;
+        esac
     fi
 
-    git -C "$DOTFILES_DIR" fetch -q origin 2>/dev/null || true
+    git -C "$PRIMARY" fetch -q origin 2>/dev/null || true
 
-    local cur
-    cur="$(git -C "$DOTFILES_DIR" symbolic-ref --short -q HEAD || true)"
-    if [[ "$cur" == "main" ]]; then
-        if git -C "$DOTFILES_DIR" show-ref --verify -q "refs/heads/$DEV_BRANCH"; then
-            git -C "$DOTFILES_DIR" checkout -q "$DEV_BRANCH"
-        elif git -C "$DOTFILES_DIR" show-ref --verify -q "refs/remotes/origin/$DEV_BRANCH"; then
-            git -C "$DOTFILES_DIR" checkout -q -b "$DEV_BRANCH" "origin/$DEV_BRANCH"
-        else
-            git -C "$DOTFILES_DIR" checkout -q -b "$DEV_BRANCH"
-        fi
-        echo "Moved dev clone off main -> $DEV_BRANCH (main now lives in the worktree)"
+    # Capability probe. Only when there IS something to migrate, so a fresh clone and
+    # an offline install never trip it. Without this, running a feature branch's
+    # install.sh BEFORE the change is merged would migrate, then link from $PRIMARY @
+    # main (which lacks the new code) — silently rolling the machine back, and the
+    # next `dots` would rebuild the very worktree we just removed.
+    if [ -n "$LEGACY_TREES" ] \
+       && ! git -C "$PRIMARY" show origin/main:install.sh 2>/dev/null \
+            | grep -q 'migrate_to_single_tree'; then
+        echo "Legacy two-tree layout LEFT IN PLACE: origin/main does not carry the"
+        echo "single-tree change yet. Merge it, then re-run. (Nothing was touched.)"
+        return 1
     fi
 
-    # Make sure a local `main` exists for the worktree to check out.
-    git -C "$DOTFILES_DIR" show-ref --verify -q refs/heads/main \
-        || git -C "$DOTFILES_DIR" branch -q --track main origin/main 2>/dev/null || true
+    while IFS= read -r w; do
+        [ -n "$w" ] || continue
+        [ -d "$w" ] || continue
+        salvage_tree "$w"
+        # Detach at the SAME commit: index and working tree are preserved verbatim,
+        # only the branch ref is released.
+        git -C "$w" checkout -q --detach 2>/dev/null \
+            || echo "warning: could not detach $w — main may still be held there"
+    done <<EOF
+$LEGACY_TREES
+EOF
 
-    # Ensure $MAIN_WT is a worktree. Probe its own .git (a linked worktree has a .git
-    # FILE pointing back into the repo) rather than matching `git worktree list` output,
-    # which reports canonicalized paths (/tmp -> /private/tmp) that would not compare
-    # equal and would wrongly trigger a recreate.
-    if [[ -e "$MAIN_WT/.git" ]] && git -C "$MAIN_WT" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
-        :
-    else
-        # Aggressive: clear anything squatting at the path, drop stale admin, recreate.
-        [[ -e "$MAIN_WT" ]] && rm -rf "$MAIN_WT"
-        git -C "$DOTFILES_DIR" worktree prune 2>/dev/null || true
-        mkdir -p "$(dirname "$MAIN_WT")"
-        git -C "$DOTFILES_DIR" worktree add -q "$MAIN_WT" main 2>/dev/null \
-            || git -C "$DOTFILES_DIR" worktree add -q --force "$MAIN_WT" main
-        echo "Created main worktree -> $MAIN_WT"
+    git -C "$PRIMARY" show-ref --verify -q refs/heads/main \
+        || git -C "$PRIMARY" branch -q --track main origin/main 2>/dev/null || true
+
+    # set -e is load-bearing here: if this fails because $PRIMARY has conflicting
+    # uncommitted edits, we die BEFORE link_all and before any deletion. Untouched.
+    if [ "$(git -C "$PRIMARY" symbolic-ref --short -q HEAD || true)" != "main" ]; then
+        echo "Moving $PRIMARY onto main (was $(git -C "$PRIMARY" symbolic-ref --short -q HEAD || echo detached))"
+        git -C "$PRIMARY" checkout -q main
     fi
-    git -C "$MAIN_WT" merge --ff-only origin/main -q 2>/dev/null || true
+    git -C "$PRIMARY" merge --ff-only origin/main -q 2>/dev/null \
+        || echo "note: $PRIMARY cannot fast-forward origin/main — linking local main as-is"
+    return 0
+}
+
+# cleanup_legacy_main_worktrees — the actual removal, deliberately the LAST action of
+# a full install: by now $HOME already points at $PRIMARY, so deleting these cannot
+# strand anything. On a legacy machine `dots` runs "$live/install.sh" where $live IS
+# one of these trees; bash keeps reading from its open fd, but cd to $PRIMARY first so
+# nothing runs with a deleted cwd.
+cleanup_legacy_main_worktrees() {
+    local w
+    [ -n "$LEGACY_TREES" ] || return 0
+    cd "$PRIMARY" || return 0
+    while IFS= read -r w; do
+        case "$w" in ""|/|"$HOME") continue ;; esac
+        samepath "$w" "$PRIMARY" && continue
+        git -C "$PRIMARY" worktree remove --force "$w" 2>/dev/null \
+            || { [ -e "$w" ] && rm -rf "$w"; }
+        echo "Removed legacy main worktree -> $w"
+    done <<EOF
+$LEGACY_TREES
+EOF
+    git -C "$PRIMARY" worktree prune 2>/dev/null || true
 }
 
 # DOTFILES_LINKS_ONLY=1 is the fast, OFFLINE relink `dots` runs on every invocation
 # (see _dots_relink in .zshrc): link from THIS tree — whichever copy of install.sh the
-# caller chose to run — and stop right after link_all. Deliberately skips
-# setup_main_worktree, so it never fetches and cannot trip the missing-worktree
-# recreate; $DOTFILES_DIR always exists, since it is where this script lives.
+# caller chose to run — and stop right after link_all. Deliberately skips the
+# migration, so it never fetches and never removes anything.
 if [[ -n "${DOTFILES_LINKS_ONLY:-}" ]]; then
     LINK_SRC="$DOTFILES_DIR"
 elif [[ -n "${DOTFILES_LINK_DEV:-}" ]]; then
     LINK_SRC="$DOTFILES_DIR"
-    echo "Linking from the DEV clone ($(git -C "$DOTFILES_DIR" symbolic-ref --short -q HEAD || echo '?')) — in-progress edits are live."
+    echo "Linking from the session worktree ($(git -C "$DOTFILES_DIR" symbolic-ref --short -q HEAD || echo '?')) — in-progress edits are live."
 else
-    setup_main_worktree
-    LINK_SRC="$MAIN_WT"
+    # A refusal from the capability probe is a deliberate no-op, not a failure.
+    migrate_to_single_tree || exit 0
+    LINK_SRC="$PRIMARY"
 fi
+
 
 link() {
     local src="$1" dst="$2"
@@ -294,7 +416,7 @@ fi
 # Point this repo's git at the tracked hooks so the PII pre-commit guard runs.
 # Repo-local config (not a $HOME symlink); safe to re-run. The hook fails open
 # when the private denylist is absent, so machines without it still commit.
-git -C "$DOTFILES_DIR" config core.hooksPath .githooks
+git -C "$PRIMARY" config core.hooksPath .githooks
 echo "Set core.hooksPath -> .githooks (PII pre-commit guard)"
 
 # Materialize the private PII denylist when supplied (Cloud Agents / CI parity).
@@ -367,5 +489,9 @@ else
     echo "Homebrew not found — skipping Brewfile. Install it from https://brew.sh,"
     echo "then re-run this script (or 'brew bundle') to get gh/jq/tmux/fzf/glow."
 fi
+
+# LAST real action: by now $HOME points at $PRIMARY, so removing the legacy trees
+# cannot strand a symlink. No-op unless migrate_to_single_tree found something.
+cleanup_legacy_main_worktrees
 
 echo "Done."

@@ -64,7 +64,7 @@ After changing `.zshrc` or a `bin/` script, validate by sourcing or running it. 
 
 ### Git workflow
 
-Work on `dev/claude-1` (or a `cursor/*` feature branch for cloud agents). `main` is protected via PR. Pre-commit runs `pii-scan --staged` (fails open without denylist; fail-closed when `PII_SCRUB_RULES` is configured).
+Work in a per-session worktree on `dev/<repo>-<slot>` (`t open <repo>`), or a `cursor/*` feature branch for cloud agents. `main` is protected via PR — and it is checked out in the ONE canonical clone, which is the live surface, so never commit there. Pre-commit runs `pii-scan --staged` (fails open without denylist; fail-closed when `PII_SCRUB_RULES` is configured).
 
 ### Services
 

@@ -9,13 +9,18 @@
 DEV_REPOS[api]="$HOME/code/my-api"
 DEV_REPOS[web]="$HOME/code/my-web"
 
-# Branch `dev` checks out (and creates) for a fresh Claude session.
-# Defaults to dev/claude-1 in ~/.zshrc; uncomment to use your own.
+# Fallback branch for repos that OPT OUT of worktree-per-session
+# (DEV_WORKTREE[repo]=0). Worktree repos ignore this — each session gets its own
+# dev/<repo>-<slot> branch. Defaults to dev/claude-1 in ~/.zshrc.
 # DEV_BRANCH=dev/agent
 
-# Per-repo branch overrides, keyed by the DEV_REPOS alias. A repo with no entry
-# uses $DEV_BRANCH. Use this for a repo whose workflow commits straight to main:
+# Per-repo branch overrides for those same opt-out repos, keyed by the DEV_REPOS
+# alias. Use this for a repo whose workflow commits straight to main:
 # DEV_BRANCHES[myrepo]=main
+#
+# Do NOT pin the dotfiles repo here. Its canonical clone is parked on `main` and
+# IS the live surface ($HOME symlinks point at it); pinning it to a dev branch
+# would send an opt-out session to switch the live tree's branch.
 
 # Default host for `tbeam` (teleport a Claude session to another machine).
 # Omit this to require an explicit host argument every time.

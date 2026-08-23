@@ -1760,3 +1760,20 @@ def test_todo_locate_skips_tombstones(t_mod):
     entries = _two_lists(t_mod)
     t_mod._todo_apply(entries[0][1], "rm", ["1"], now=200)
     assert [k for k, _ in t_mod._todo_locate(entries, "1")] == ["dotfiles-3"]
+
+
+def test_port_is_live_sees_an_ipv6_only_listener(t_mod):
+    # Vite without --host binds ONLY [::1] on modern macOS/Node; a 127.0.0.1 probe
+    # called ff-12's live :5212 dead and the bar fell through to the shared :5173.
+    import socket
+    if not socket.has_ipv6:
+        return
+    srv = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
+    try:
+        srv.bind(("::1", 0))
+        srv.listen(1)
+        port = srv.getsockname()[1]
+        assert t_mod._port_is_live(port) is True
+    finally:
+        srv.close()
+    assert t_mod._port_is_live(port) is False

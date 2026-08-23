@@ -507,6 +507,38 @@ _dev_worktree_path()   { print -r -- "${DEV_WORKTREE_ROOT}/${DEV_REPOS[$1]:t}/$2
 # _dev_worktree_branch <repo> <slot> — the slot's dedicated branch.
 _dev_worktree_branch() { print -r -- "dev/${DEV_REPOS[$1]:t}-$2" }
 
+# _dev_repo_slots <repo> — every slot NUMBER this repo has any trace of, ascending:
+# a live tmux session (under ANY sibling alias keying the repo's dir — dev-dot-3 and
+# dev-dotfiles-3 are one slot), a worktree dir on disk, or a saved-transcript project
+# dir (a slot whose worktree was swept is still resumable). Replaces `t resume`'s old
+# hardcoded 1..20 scan: slot numbers grow without bound (a busy repo routinely runs
+# past 20 — ff was on 24), and a fixed ceiling hid those slots BOTH ways — live ones
+# never appeared as "● active", and exiting one made its conversation vanish rather
+# than becoming resumable, which read as "t resume loses my sessions". Prints nothing
+# and returns 1 for an unknown repo or one with no slots at all.
+_dev_repo_slots() {
+  setopt local_options null_glob bare_glob_qual
+  local repo="$1" dir="${DEV_REPOS[$1]:-}"
+  [[ -n $dir ]] || return 1
+  local base=${dir:t} enc n p k
+  local -A seen
+  for k in ${(k)DEV_REPOS}; do
+    [[ ${DEV_REPOS[$k]} == $dir ]] || continue
+    for n in ${(f)"$(tmux list-sessions -F '#{session_name}' 2>/dev/null | grep "^dev-${k}-")"}; do
+      n=${n##*-}; [[ $n == <-> ]] && seen[$n]=1
+    done
+  done
+  for p in ${DEV_WORKTREE_ROOT}/${base}/*(N/); do
+    n=${p:t}; [[ $n == <-> ]] && seen[$n]=1
+  done
+  enc=${${:-${DEV_WORKTREE_ROOT}/${base}}//[^A-Za-z0-9]/-}
+  for p in "$HOME/.claude/projects/${enc}-"*(N/); do
+    n=${${p:t}#${enc}-}; [[ $n == <-> ]] && seen[$n]=1
+  done
+  (( $#seen )) || return 1
+  print -rl -- ${(no)${(k)seen}}
+}
+
 # _dev_worktree_create <repo> <slot> — idempotently materialize the slot's worktree and
 # print its path. Reattach is free: an already-present worktree is reused as-is (no
 # re-fetch, no re-branch). A fresh slot branches off the just-fetched origin/main; a slot
@@ -3266,7 +3298,6 @@ _t_resume() {
   for _hcf in "$HOME"/.cache/t/hostnames/*(N); do
     host_alias[$(<$_hcf)]=${_hcf:t}
   done
-  if [[ -n $slot ]]; then slots=($slot); else slots=({1..20}); fi
   for repo in $repos; do
     _rdir=${DEV_REPOS[$repo]}; _rbase=${_rdir:t}
     remote_live_host=(); remote_live_alias=(); remote_live_sum=()
@@ -3280,6 +3311,18 @@ _t_resume() {
           r = $4; sub(/-[^-]+$/, "", r)
           print $1 "\t" n "\t" r "\t" $7
         }')
+    fi
+    # Which slots to look at. NOT a fixed 1..20 range (which silently capped the
+    # scan — a busy repo runs well past 20, and every slot above the ceiling was
+    # invisible BOTH live and dead, reading as "t resume drops my sessions"):
+    # _dev_repo_slots discovers them from tmux + worktrees on disk + saved
+    # project dirs, and the remote-live slots found just above are unioned in
+    # (a slot live only on another host may have no local trace at all).
+    if [[ -n $slot ]]; then
+      slots=($slot)
+    else
+      slots=(${(f)"$(_dev_repo_slots "$repo")"} ${(k)remote_live_host})
+      slots=(${(nou)slots:#})
     fi
     for n in $slots; do
       wt=$(_dev_worktree_path "$repo" "$n")
@@ -3309,22 +3352,30 @@ _t_resume() {
       fi
       # Name-only collision: a dev-<alias>-${n} tmux session (any alias keying
       # this repo's dir — see _t_dev / _t_pop) exists but is rooted elsewhere
-      # (not this slot's worktree — an old alias, opt-out shared tree, or a
-      # stray). _dev_resume_session's `tmux new-session -s dev-${repo}-${n}`
-      # would fail on the duplicate name, and attaching the stale session would
-      # land the user in the wrong worktree with the wrong conversation. Refuse
-      # loudly on explicit ask; skip in scan mode.
+      # (not this slot's worktree — an old alias, an opt-out shared tree, or a
+      # session opened straight in the canonical repo dir, which `t ls` shows
+      # and this scan matched by PATH so it missed). It is still a LIVE session
+      # occupying the slot's tmux name, so it gets the same treatment as one
+      # rooted in the worktree: a labeled row that ATTACHES on pick (_t_dev
+      # canonicalizes sibling aliases, so it lands on this exact session).
+      # It was previously skipped in scan mode and refused on explicit ask —
+      # which made a live slot invisible in the very list that is supposed to
+      # show what is running. Resuming a DEAD conversation into that slot is
+      # still impossible (`tmux new-session -s dev-${repo}-${n}` would collide
+      # on the name), hence the live row rather than the slot's transcripts.
       _stale=
       for _ok in ${(k)DEV_REPOS}; do
         [[ ${DEV_REPOS[$_ok]} != $_rdir ]] && continue
         tmux has-session -t "dev-${_ok}-${n}" 2>/dev/null && { _stale="dev-${_ok}-${n}"; break; }
       done
       if [[ -n $_stale ]]; then
+        stale_path=$(tmux display-message -p -t "$_stale" '#{session_path}' 2>/dev/null)
         if [[ -n $slot ]]; then
-          stale_path=$(tmux display-message -p -t "$_stale" '#{session_path}' 2>/dev/null)
-          echo "Slot $n's tmux name ($_stale) is taken by a session rooted elsewhere${stale_path:+ ($stale_path)} — kill it (tmux kill-session -t $_stale) before resuming." >&2
-          return 1
+          echo "Slot $n is live ($_stale${stale_path:+ in $stale_path}) — attaching (resume only revives dead slots)."
+          _t_dev "$repo" "$n"
+          return
         fi
+        cands+=(9999999999$'\t'"$repo"$'\t'"$n"$'\t'-$'\t'"${stale_path:-$wt}"$'\t'"● active"$'\t'"${local_sum[${_stale#dev-}]:-(live session)}"$'\t'here$'\t'-$'\t'-)
         continue
       fi
       tx=( "$HOME/.claude/projects/${wt//[^A-Za-z0-9]/-}"/*.jsonl(Nom) )

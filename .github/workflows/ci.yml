@@ -121,6 +121,18 @@ jobs:
       - name: Install test deps
         run: pip install -r requirements-dev.txt
 
+      # The .tmux.conf clipboard tests load the real config into a throwaway
+      # `tmux -L` server, and skip themselves when tmux is missing. Ubuntu
+      # runners ship tmux today, but relying on that silently would let those
+      # tests quietly stop running -- the same silent no-op the config they
+      # cover exists to prevent. Install it explicitly if it is not there.
+      - name: Ensure tmux is available
+        run: |
+          command -v tmux >/dev/null || {
+            sudo apt-get update -qq && sudo apt-get install -y -qq tmux
+          }
+          tmux -V
+
       - name: Run tests with coverage gate
         run: pytest --cov --cov-report=term-missing --cov-fail-under=97
 

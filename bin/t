@@ -2119,14 +2119,37 @@ def _todo_shared(cfg, key):
     return (parent, data) if _todo_visible(data, show_all=True) else None
 
 
-def _todo_scoped(entries, alias):
+def _todo_live_nums(repos, alias, live_slots):
+    """Slot NUMBERS of this repo's live tmux sessions, from `_todo_live_slots` rows.
+
+    Matched through the repo DIR, not the alias string: a session named `dev-dot-4`
+    keys the same tree as the `dotfiles-4` list (`_todo_key` files by the canonical
+    alias, whichever name the session was opened under), so a string compare would
+    report a live slot dead. Pure: the caller gathers."""
+    path = repos.get(alias)
+    out = set()
+    for r in live_slots:
+        head, _, num = r.get("slot", "").rpartition("-")
+        if num.isdigit() and path and repos.get(head) == path:
+            out.add(num)
+    return out
+
+
+def _todo_scoped(entries, alias, live_nums=None):
     """This repo's lists — its repo-level one plus every <alias>-<slot>. A plain shell in
     a repo dir names no slot, so showing only the (usually empty) repo-level list hides
-    the work sitting in that repo's slots, which is exactly what was being asked for."""
+    the work sitting in that repo's slots, which is exactly what was being asked for.
+
+    `live_nums` (a set of slot numbers) keeps only ACTIVE slots — the repo-level list is
+    always kept, open or not. A list outlives its session on purpose (keyed on the slot,
+    not the conversation id), so without this gate every slot that ever held a task kept
+    showing up from the repo dir long after its session was gone. None = no gate."""
     out = []
     for key, data in entries:
         head, _, num = key.rpartition("-")
-        if key == alias or (head == alias and num.isdigit()):
+        if key == alias:
+            out.append((key, data))
+        elif head == alias and num.isdigit() and (live_nums is None or num in live_nums):
             out.append((key, data))
     return out
 
@@ -2478,12 +2501,17 @@ def cmd_todo(cfg, args):
 
     key = _todo_key(cfg, os.getcwd(), _tmux_session_name(), args.slot)
 
+    def live_gate():
+        """Slot numbers the repo view is limited to: its live sessions, unless -a asked
+        for everything. None disables the gate."""
+        return None if args.all else _todo_live_nums(cfg.repos, key, _todo_live_slots())
+
     def scope():
         """Lists this invocation acts on, exactly the set the view shows: a slotless cwd
         widens DOWN to the repo's slots, a slot widens UP to its repo-level list. The
         actions have to track the view either way, or you see an item you cannot touch."""
         if key in cfg.repos:
-            found = _todo_scoped(_todo_all_entries(), key)
+            found = _todo_scoped(_todo_all_entries(), key, live_gate())
             if found:
                 return found
         shared = _todo_shared(cfg, key)
@@ -2582,11 +2610,14 @@ def cmd_todo(cfg, args):
         return rc
 
     # A repo dir names no slot. Showing only the (usually empty) repo-level list hides
-    # the work sitting in that repo's slots, so a slotless view widens to the repo.
+    # the work sitting in that repo's slots, so a slotless view widens to the repo —
+    # to its LIVE slots only (-a widens to inactive ones too; the repo-level list is
+    # shown regardless).
     if (_todo_canon(action) == "ls" and key in cfg.repos
             and (_todo_open(data) or any(
-                _todo_open(d) for _, d in _todo_scoped(_todo_all_entries(), key)))):
-        scoped = _todo_scoped(_todo_all_entries(), key)
+                _todo_open(d) for _, d in _todo_scoped(_todo_all_entries(), key,
+                                                       live_gate())))):
+        scoped = _todo_scoped(_todo_all_entries(), key, live_gate())
         if len(scoped) > 1 or not _todo_open(data):
             n = sum(len(_todo_open(d)) for _, d in scoped)
             print("%s%s%s %s— %d open%s" % (st.b, key, st.r, st.y, n, st.r))
@@ -2896,7 +2927,8 @@ machines. Finished tasks leave the view at once and are dropped after a week."""
         formatter_class=argparse.RawDescriptionHelpFormatter)
     sp.add_argument("action", nargs="?", help=argparse.SUPPRESS)
     sp.add_argument("rest", nargs=argparse.REMAINDER, help=argparse.SUPPRESS)
-    sp.add_argument("-a", "--all", action="store_true", help="show finished items too")
+    sp.add_argument("-a", "--all", action="store_true",
+                    help="show finished items too, and inactive slots from a repo dir")
     sp.add_argument("-A", "--all-slots", action="store_true",
                     help="every slot's open items, grouped")
     sp.add_argument("-s", "--slot", metavar="KEY",

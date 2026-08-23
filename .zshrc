@@ -3306,6 +3306,82 @@ EOS
   esac
 }
 
+# _pr_state_stale <cached-state> <age-seconds> — is this cached PR state worth
+# refetching? Prints nothing; returns 0 = refetch, 1 = the cache is good enough.
+# <cached-state> is the raw cache value: a real state, '' when nothing has ever
+# been cached, or '?' when the last lookup FAILED (offline, no auth, deleted PR).
+# <age-seconds> is how long ago it was written, huge when there is no file.
+# Factored out of the render loop because it is a POLICY, not a mechanism: the
+# whole cost/staleness trade-off of the PR tag lives here and nowhere else.
+_pr_state_stale() {
+  local st=$1; local -i age=$2
+  # MERGED/CLOSED are terminal — a merged PR never un-merges, so cache forever.
+  [[ $st == MERGED || $st == CLOSED ]] && return 1
+  # TODO(policy): '' (never asked) and 'OPEN' both want the 300s recheck below,
+  # but '?' is different — it means we ASKED and could not tell. Offline, that
+  # retries every 300s forever, forking a gh child per scan that is guaranteed to
+  # fail. Decide whether a failed lookup should back off (and how far).
+  (( age > 300 ))
+}
+
+# _pr_state_refresh <owner/repo#num> … — warm the pr/ state cache for these refs.
+# ALWAYS called detached (`( _pr_state_refresh … & )`): the pickers read the cache
+# and never block on the network, so a state lands on the NEXT invocation.
+#
+# Batched per REPO, not per PR, which is the entire point. Measured: `gh pr view`
+# is ~0.41s for ONE pr, `gh pr list --state all --limit 100` is ~0.70s for a
+# HUNDRED — so one call per repo already beats two individual lookups, and it
+# warms every PR in the repo, including rows this scan never rendered. A ref older
+# than the list window falls back to a single `gh pr view`, bounded so a scan that
+# references many ancient PRs cannot fork-bomb gh.
+_pr_state_refresh() {
+  (( $# )) || return 0
+  command -v gh >/dev/null 2>&1 || return 1
+  local prdir="${XDG_CACHE_HOME:-$HOME/.cache}/claude-sessions/pr"
+  mkdir -p "$prdir" 2>/dev/null || return 1
+  # Every declaration is hoisted out of the loops below: an assignmentless
+  # `local x` re-run on an already-local x does not redeclare, it PRINTS
+  # `x=value` (the _ok=claw junk-output bug documented on _t_resume).
+  local ref slug num st line f
+  local -A want got
+  local -i fallbacks
+  for ref in "$@"; do
+    slug=${ref%\#*}; num=${ref##*\#}
+    [[ -n $slug && -n $num ]] || continue
+    want[$slug]="${want[$slug]:-} $num"
+  done
+  for slug in ${(k)want}; do
+    got=(); fallbacks=0
+    for line in ${(f)"$(gh pr list --repo $slug --state all --limit 100 \
+                          --json number,state --jq '.[]|"\(.number) \(.state)"' 2>/dev/null)"}; do
+      [[ -n $line ]] || continue
+      got[${line%% *}]=${line##* }
+    done
+    # Persist every state that ONE call returned, not just the refs asked about:
+    # the entries are 6 bytes and terminal ones are cached forever, so warming the
+    # whole repo now is what makes the NEXT new PR resolve on first sight instead
+    # of reading "?" for a round trip. Already-terminal entries are skipped —
+    # rewriting them would only churn an mtime nothing reads.
+    for num in ${(k)got} ${=want[$slug]}; do
+      f="$prdir/${slug//\//#}#$num"
+      if [[ -f $f ]]; then
+        st=$(<$f)
+        [[ $st == MERGED || $st == CLOSED ]] && continue
+      fi
+      st=${got[$num]:-}
+      # Older than the list window — one direct lookup, bounded so a scan that
+      # references many ancient PRs cannot fork-bomb gh.
+      if [[ -z $st ]] && (( fallbacks < 8 )); then
+        (( fallbacks++ ))
+        st=$(gh pr view "https://github.com/$slug/pull/$num" --json state --jq .state 2>/dev/null)
+      fi
+      # '?' records a lookup that FAILED, so _pr_state_stale can tell "never
+      # asked" from "asked and could not tell".
+      print -rn -- "${st:-?}" > "$f.$$.tmp" 2>/dev/null && mv -f "$f.$$.tmp" "$f" 2>/dev/null
+    done
+  done
+}
+
 # _t_resume — the `t resume` verb: revive a DEAD dev slot's last conversation.
 # `t open` on a dead slot deliberately starts a FRESH claude (the worktree and its
 # uncommitted work are reused, but not the chat); this is the counterpart that brings
@@ -3342,8 +3418,10 @@ EOS
 # Dead rows carry the two shared picker signals (see _claude_session_rows and
 # claude-stamp-tmux jobs 3-4): recency/date = max(transcript mtime, last-opened
 # stamp) with ↻ marking opened-but-unwritten conversations, and a " · #N <state>"
-# tag for the last PR URL in the transcript (state cache-only, never a blocking
-# gh call).
+# tag for the last PR URL in the transcript — merged/closed/open, or "?" while the
+# state is not cached yet. State stays cache-only (never a blocking gh call), so a
+# just-created PR reads "?" until the detached refresh lands it; it is rendered
+# explicitly because a bare "#N" was indistinguishable from a session with no PR.
 # User-facing help lives in bin/t (`t resume -h`); the t() shim routes -h there.
 _t_resume() {
   setopt local_options null_glob bare_glob_qual
@@ -3496,22 +3574,24 @@ _t_resume() {
   # of the loops — an assignmentless `local x` re-run on an already-local x
   # does not redeclare, it PRINTS `x=value` (the `_ok=claw` junk-output bug).
   local -a cands slots tx
-  local -a pending _mpaths _mrows _mf
+  local -a pending _mpaths _mrows _mf prstale
   local -A remote_live_host remote_live_alias remote_live_sum
   local -A meta_title meta_pr
   local _p _mr _mrest
   local n wt sid busy rhost _rdir _rbase _rhost _rn _ralias _rsum _ok _stale stale_path
   local txf title when ep org orgf hf skipped=0
-  local reopened opf opep pru prp prkey prnum prst prcf prmt
+  local reopened opf opep pru prp prkey prnum prst prcf prmt prraw prlab
   local _rwtr=${DEV_WORKTREE_ROOT:-}
   # The two picker signals shared with _claude_session_rows/tfind (see the
   # claude-stamp-tmux notes): opened/ = the last-opened stamps (recency =
   # max(transcript, stamp), ↻ on stamp-newer rows); pr/ = the PR-state cache
-  # (cache-only reads — NEVER a blocking gh call — refreshed by detached
-  # children, once per PR per run, so state shows on the next invocation).
+  # (cache-only reads — NEVER a blocking gh call — refreshed by ONE detached
+  # child per run, batched per repo, so state shows on the next invocation;
+  # the freshness policy lives in _pr_state_stale).
   local opdir="${XDG_CACHE_HOME:-$HOME/.cache}/claude-sessions/opened"
   local prdir="${XDG_CACHE_HOME:-$HOME/.cache}/claude-sessions/pr"
   local -A _prspawned
+  local prgh=; command -v gh >/dev/null 2>&1 && prgh=1
   # Recency window (--days, default 30; 'all' disables) + this machine's short
   # hostname, to blank the origin column for locally-run conversations.
   local cutoff=0 selfhost=$(hostname -s 2>/dev/null)
@@ -3658,25 +3738,34 @@ _t_resume() {
     # PR-in-session tag: the LAST github.com …/pull/N URL in the transcript
     # (a `gh pr create` lands its URL in the tool output) names the
     # session's PR; append " · #N <state>" to the title. State is read from
-    # the pr/ cache only; MERGED/CLOSED are terminal, anything else stale
-    # (>5 min) spawns ONE detached gh refresh for the next run.
+    # the pr/ cache ONLY — never a blocking gh call — with the freshness policy in
+    # _pr_state_stale and the (detached, per-repo batched) refetch fired once for
+    # the whole scan below, so a new state shows on the next invocation.
     pru=${meta_pr[$txf]:-}
     if [[ -n $pru ]]; then
       prp=${pru#github.com/}; prp=${prp/\/pull\//\/}
       prkey=${prp//\//#}; prnum=${pru##*/}
-      prcf="$prdir/$prkey"; prst=
+      prcf="$prdir/$prkey"; prraw=; prst=
       if [[ -f $prcf ]]; then
-        prst=$(<$prcf)
-        [[ $prst == MERGED || $prst == CLOSED || $prst == OPEN ]] || prst=
+        prraw=$(<$prcf)
+        [[ $prraw == MERGED || $prraw == CLOSED || $prraw == OPEN ]] && prst=$prraw
       fi
-      title+=" · #$prnum${prst:+ ${(L)prst}}"
-      if [[ $prst != MERGED && $prst != CLOSED && -z ${_prspawned[$prkey]:-} ]]; then
+      # An unknown state renders "?", never a bare "#N". A blank tag is
+      # indistinguishable from "this session opened no PR", and the row you most
+      # want an answer about — the newest one — is ALWAYS the uncached one (its PR
+      # was created after the last scan), so the tag that mattered most was
+      # precisely the one that silently said nothing.
+      prlab=${prst:+${(L)prst}}
+      # "?" only where gh could actually answer: on a host without it (the Linux
+      # node) every row would read "?" forever, which is noise, not information —
+      # there the tag degrades to the old bare "#N".
+      [[ -z $prlab && -n $prgh ]] && prlab='?'
+      title+=" · #$prnum${prlab:+ $prlab}"
+      if [[ -z ${_prspawned[$prkey]:-} ]]; then
         prmt=$(zstat +mtime "$prcf" 2>/dev/null || echo 0)
-        if (( EPOCHSECONDS - prmt > 300 )); then
+        if _pr_state_stale "$prraw" $(( prmt ? EPOCHSECONDS - prmt : 999999999 )); then
           _prspawned[$prkey]=1
-          mkdir -p "$prdir" 2>/dev/null
-          ( { prst=$(gh pr view "https://$pru" --json state --jq .state 2>/dev/null) || prst="?"
-              print -rn -- "$prst" > "$prcf.$$.tmp" && mv -f "$prcf.$$.tmp" "$prcf"; } & ) 2>/dev/null
+          prstale+=("${prp%/*}#$prnum")
         fi
       fi
     fi
@@ -3693,6 +3782,12 @@ _t_resume() {
     fi
     cands+=("$ep"$'\t'"$repo"$'\t'"$n"$'\t'"${${txf:t}%.jsonl}"$'\t'"$wt"$'\t'"$when"$'\t'"$title"$'\t'-$'\t'-$'\t'"${org[1,10]}")
   done
+  # ONE detached refresh for the whole scan, instead of a `gh pr view` child per
+  # stale row: _pr_state_refresh batches the refs by repo, so a scan that turned up
+  # six unknown PRs in one repo costs a single gh call rather than six. Still
+  # strictly fire-and-forget — the render above already used the cache and is done.
+  (( $#prstale )) && ( _pr_state_refresh "${(@)prstale}" & ) 2>/dev/null
+
   (( skipped )) && echo "(${skipped} older conversation(s) outside the last ${days}d hidden — t resume --days all shows them)" >&2
 
   # ONE global newest-first order by session time (the leading epoch field),

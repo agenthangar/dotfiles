@@ -2124,9 +2124,18 @@ def _todo_statusline(payload, cfg, items_n=1, width=80):
     subdir of the project). Everything is optional — a statusline that raises leaves
     the TUI with a permanently broken status bar, so every field degrades to nothing.
 
+    Layout is two zones split by │: a dim head (slot · model) and the tasks, each
+    carrying its own ◻ so the checkbox — not a separator — is what delimits an item.
+    The open COUNT is deliberately gone: the ◻s and the trailing +N already say how
+    many, and a bare number sitting next to a checkbox read as an item.
+
     items_n == 1 packs as many open items onto ONE line as `width` allows (the safe
     default: a single line renders anywhere). items_n > 1 emits a header plus one line
-    per item, which is only useful if the host renders a multi-line statusline."""
+    per item, which is only useful if the host renders a multi-line statusline.
+
+    Colour is emitted UNCONDITIONALLY (honouring NO_COLOR) — Style() gates on
+    isatty and stdout here is always the pipe Claude Code reads, so the shared helper
+    would render every bar plain."""
     if not isinstance(payload, dict):
         payload = {}
     ws = payload.get("workspace") if isinstance(payload.get("workspace"), dict) else {}
@@ -2136,31 +2145,47 @@ def _todo_statusline(payload, cfg, items_n=1, width=80):
     key = _todo_key(cfg, cwd)
     items = _todo_open(_todo_load(_todo_path(key)))
 
-    head = [key] + ([name] if name else []) + ["◻ %d" % len(items)]
-    head = " · ".join(head)
+    dim, cyan, rst = ("", "", "") if os.environ.get("NO_COLOR") else \
+        ("\033[2m", "\033[36m", "\033[0m")
+    box = cyan + "◻" + rst
+    head = " · ".join([key] + ([name] if name else []))
     if not items:
-        return head
+        return dim + head + " │ nothing open" + rst
 
     if items_n > 1:
-        lines = [head]
-        for i in items[:items_n]:
-            lines.append("  %d ◻ %s" % (i["id"], _truncate(i["text"], max(10, width - 6))))
+        shown = items[:items_n]
+        iw = max(len(str(i["id"])) for i in shown)
+        out = [dim + head + " │ %d open" % len(items) + rst]
+        for i in shown:
+            out.append("  %s %s%*d%s %s"
+                       % (box, dim, iw, i["id"], rst,
+                          _truncate(i["text"], max(10, width - 6 - iw))))
         if len(items) > items_n:
-            lines.append("  +%d more" % (len(items) - items_n))
-        return "\n".join(lines)
+            out.append("  %s+%d more%s" % (dim, len(items) - items_n, rst))
+        return "\n".join(out)
 
-    # One line: fill the remaining width with as many items as fit, newest ask first.
-    line, shown = head, 0
+    # One line, newest ask first. Fit against a limit that already reserves the
+    # "+N more" tail, so the assembled bar can never exceed `width`.
+    tail_room = len("  +%d more" % len(items)) if len(items) > 1 else 0
+    limit = width - tail_room
+    plain, line, shown = head + " │ ", dim + head + " │ " + rst, 0
     for i in items:
-        cand = "%s · %s" % (line, i["text"])
-        if len(cand) > width - 10 and shown:
-            break
-        line = cand if len(cand) <= width else "%s · %s" % (line, _truncate(i["text"], max(10, width - len(line) - 3)))
+        sep = "  " if shown else ""
+        text = i["text"]
+        if len(plain) + len(sep) + 2 + len(text) > limit:
+            if shown:
+                break                      # a mid-list ellipsis reads noisier than a +N
+            avail = limit - len(plain) - 2
+            if avail < 10:
+                break
+            text = _truncate(text, avail)
+        plain += sep + "◻ " + text
+        line += sep + box + " " + text
         shown += 1
-        if len(line) >= width - 10:
-            break
+    if not shown:                          # a width too narrow for even one item
+        return dim + head + " │ %d open" % len(items) + rst
     if shown < len(items):
-        line += " (+%d)" % (len(items) - shown)
+        line += "%s  +%d more%s" % (dim, len(items) - shown, rst)
     return line
 
 

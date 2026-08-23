@@ -1143,6 +1143,7 @@ def _statusline(t_mod, tmp_path, monkeypatch, payload, key=None, texts=(),
     if key:
         data = _add(t_mod, _fresh(t_mod), *texts)
         t_mod._todo_save(t_mod._todo_path(key), data)
+    monkeypatch.setenv("NO_COLOR", "1")   # assert on the layout, not the escapes
     return t_mod._todo_statusline(payload, cfg, items_n, width)
 
 
@@ -1151,7 +1152,7 @@ def test_todo_statusline_renders_slot_model_and_top_item(t_mod, tmp_path, monkey
                        {"workspace": {"current_dir": "/wt/dotfiles/1"},
                         "model": {"display_name": "Opus"}},
                        key="dotfiles-1", texts=("rebase onto main", "second"))
-    assert line.startswith("dotfiles-1 · Opus · ◻ 2 · rebase onto main")
+    assert line == "dotfiles-1 · Opus │ ◻ rebase onto main  ◻ second"
 
 
 def test_todo_statusline_prefers_workspace_over_cwd(t_mod, tmp_path, monkeypatch):
@@ -1167,7 +1168,7 @@ def test_todo_statusline_survives_a_bare_payload(t_mod, tmp_path, monkeypatch):
     # so every field has to be optional.
     for payload in ({}, {"model": None, "workspace": "nonsense"}, []):
         line = _statusline(t_mod, tmp_path, monkeypatch, payload)
-        assert line.endswith("◻ 0")
+        assert line.endswith("│ nothing open")
 
 
 def test_todo_statusline_truncates_a_long_item(t_mod, tmp_path, monkeypatch):
@@ -1178,6 +1179,26 @@ def test_todo_statusline_truncates_a_long_item(t_mod, tmp_path, monkeypatch):
                            {"workspace": {"current_dir": "/wt/dotfiles/1"}},
                            key="dotfiles-1", texts=("y" * 400,), width=width)
         assert line.endswith("…") and len(line) <= width and "\n" not in line
+
+
+def test_todo_statusline_colours_unconditionally(t_mod, tmp_path, monkeypatch):
+    # Style() gates on isatty and this stdout is always the pipe Claude Code reads,
+    # so the shared helper would render every bar plain. NO_COLOR still opts out.
+    monkeypatch.delenv("NO_COLOR", raising=False)
+    cfg = _todo_cfg(t_mod, tmp_path, monkeypatch)
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+    t_mod._todo_save(t_mod._todo_path("dotfiles-1"), _add(t_mod, _fresh(t_mod), "one"))
+    line = t_mod._todo_statusline({"workspace": {"current_dir": "/wt/dotfiles/1"}}, cfg)
+    assert line.startswith("\033[2m") and "\033[36m◻\033[0m one" in line
+
+
+def test_todo_statusline_falls_back_when_no_item_fits(t_mod, tmp_path, monkeypatch):
+    # Too narrow for even a truncated item: report the count rather than leave a
+    # dangling │ with nothing after it.
+    line = _statusline(t_mod, tmp_path, monkeypatch,
+                       {"workspace": {"current_dir": "/wt/dotfiles/1"}},
+                       key="dotfiles-1", texts=("one", "two"), width=26)
+    assert line == "dotfiles-1 │ 2 open"
 
 
 # ─── t todo — action aliases and cross-list move ───────────────────────────────
@@ -1249,8 +1270,8 @@ def test_todo_statusline_packs_items_into_the_width(t_mod, tmp_path, monkeypatch
                          {"workspace": {"current_dir": "/wt/dotfiles/1"}},
                          key="dotfiles-1", texts=texts, width=45)
     assert "\n" not in wide and "\n" not in narrow      # one line, always
-    assert len(narrow) <= 45 and narrow.count("·") < wide.count("·")
-    assert wide.endswith(")") and "+" in wide            # the unshown remainder is counted
+    assert len(narrow) <= 45 and narrow.count("◻") < wide.count("◻")
+    assert wide.endswith("more") and "+" in wide         # the unshown remainder is counted
 
 
 def test_todo_statusline_multiline_lists_items(t_mod, tmp_path, monkeypatch):
@@ -1258,8 +1279,8 @@ def test_todo_statusline_multiline_lists_items(t_mod, tmp_path, monkeypatch):
                       {"workspace": {"current_dir": "/wt/dotfiles/1"}},
                       key="dotfiles-1", texts=("one", "two", "three"), items_n=2)
     lines = out.split("\n")
-    assert lines[0].endswith("◻ 3")
-    assert lines[1].strip() == "1 ◻ one" and lines[2].strip() == "2 ◻ two"
+    assert lines[0].endswith("│ 3 open")
+    assert lines[1].strip() == "◻ 1 one" and lines[2].strip() == "◻ 2 two"
     assert lines[3].strip() == "+1 more"
 
 
@@ -1267,13 +1288,13 @@ def test_todo_statusline_multiline_without_a_remainder(t_mod, tmp_path, monkeypa
     out = _statusline(t_mod, tmp_path, monkeypatch,
                       {"workspace": {"current_dir": "/wt/dotfiles/1"}},
                       key="dotfiles-1", texts=("one",), items_n=5)
-    assert out.split("\n") == ["dotfiles-1 · ◻ 1", "  1 ◻ one"]
+    assert out.split("\n") == ["dotfiles-1 │ 1 open", "  ◻ 1 one"]
 
 
 def test_todo_statusline_empty_list_is_one_line_either_way(t_mod, tmp_path, monkeypatch):
     for n in (1, 5):
         out = _statusline(t_mod, tmp_path, monkeypatch, {}, items_n=n)
-        assert out == "scratch · ◻ 0"
+        assert out == "scratch │ nothing open"
 
 
 # ─── t todo — the slotless-add destination picker ──────────────────────────────

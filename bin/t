@@ -25,6 +25,7 @@ import os
 import re
 import shlex
 import shutil
+import socket
 import subprocess
 import sys
 import time
@@ -1899,6 +1900,24 @@ def _todo_canon(action):
     return _TODO_ALIASES.get(action, action)
 
 
+def _todo_slot_arg(rest):
+    """Split a leading bare slot number off an `add` -> ("11", ["fix","it"]) for
+    `t todo add 11 fix the ledger`; (None, rest) when there is none.
+
+    A bare number is genuinely ambiguous here -- `t todo 11` already means item #11 --
+    so the slot reading is taken only when TEXT FOLLOWS. `t todo add 11` alone stays a
+    literal item, which is what a lone number nearly always is. The escape hatch for
+    text that really does start with a digit is quoting: `t todo add "3 more tests"`
+    arrives as ONE token, so rest[0] is not a digit and nothing is stripped.
+
+    Pure -- resolving the number against a repo is the caller's job, and without one
+    (an add from ~) there is nothing to resolve it against, so it stays text."""
+    rest = list(rest or [])
+    if len(rest) >= 2 and rest[0].isdigit():
+        return (rest[0], rest[1:])
+    return (None, rest)
+
+
 def _todo_apply(data, action, rest, now=None):
     """Mutate `data` in place for one action. Returns (message, rc). Never raises on
     bad input — an unknown id is a message and rc 1, so a fat-fingered `t todo done 9`
@@ -1970,8 +1989,13 @@ def _todo_move(src_data, dst_data, tok, dst_key, now=None):
     return ("✓ moved #%s → %s #%d  %s" % (tok, dst_key, moved["id"], moved["text"]), 0)
 
 
-def _todo_render(data, key, show_all=False, width=80, st=None):
-    """The one-list view. Returns display lines (no trailing newlines)."""
+def _todo_render(data, key, show_all=False, width=80, st=None, shared=None):
+    """The one-list view. Returns display lines (no trailing newlines).
+
+    `shared` is an optional (key, data) for the repo-level list this slot hangs off:
+    its items render as a dim second section marked ◇ rather than ◻, so which list an
+    item lives in is readable at a glance — which matters, because ids are per-list and
+    the two sections can both hold a #3."""
     st = st or Style()
     items = _todo_visible(data, show_all)
     n_open = len(_todo_open(data))
@@ -1983,18 +2007,40 @@ def _todo_render(data, key, show_all=False, width=80, st=None):
         tally += " · %d done" % n_done
     head = "%s%s%s %s— %s%s" % (st.b, key, st.r, st.y, tally, st.r)
     foot = ['', "  %s%s%s" % (st.y, _TODO_FOOT, st.r)]
-    if not items:
-        return [head, '  %s(nothing here yet)%s' % (st.y, st.r)] + foot
-    lines = [head]
-    idw = max(len(str(i["id"])) for i in items)
-    for i in items:
-        mark = "✓" if i.get("done") else "◻"
+
+    lines = [head] if items else [head, '  %s(nothing here yet)%s' % (st.y, st.r)]
+    if items:
+        idw = max(len(str(i["id"])) for i in items)
+        for i in items:
+            mark = "✓" if i.get("done") else "◻"
+            body = _truncate(i["text"], max(10, width - idw - 6))
+            if i.get("done"):
+                lines.append("  %s%*d  %s %s%s" % (st.y, idw, i["id"], mark, body, st.r))
+            else:
+                lines.append("  %s%*d%s  %s %s" % (st.c, idw, i["id"], st.r, mark, body))
+    return lines + _todo_shared_lines(shared, show_all, width, st) + foot
+
+
+def _todo_shared_lines(shared, show_all, width, st):
+    """The repo-level section appended to a slot's view. Empty when there is nothing
+    to show, so a slot with no shared notes renders exactly as it always did."""
+    if not shared:
+        return []
+    skey, sdata = shared
+    sitems = _todo_visible(sdata, show_all)
+    if not sitems:
+        return []
+    n = len(_todo_open(sdata))
+    out = ['', "  %s%s — %s%s" % (st.y, skey,
+                                  "nothing open" if not n else "%d open" % n, st.r)]
+    idw = max(len(str(i["id"])) for i in sitems)
+    for i in sitems:
         body = _truncate(i["text"], max(10, width - idw - 6))
-        if i.get("done"):
-            lines.append("  %s%*d  %s %s%s" % (st.y, idw, i["id"], mark, body, st.r))
-        else:
-            lines.append("  %s%*d%s  %s %s" % (st.c, idw, i["id"], st.r, mark, body))
-    return lines + foot
+        mark = "✓" if i.get("done") else "◇"
+        out.append("  %s%*d%s  %s %s%s%s"
+                   % (st.c, idw, i["id"], st.r, mark, st.y if i.get("done") else "",
+                      body, st.r if i.get("done") else ""))
+    return out
 
 
 def _todo_id_actions(item):
@@ -2049,6 +2095,30 @@ _TODO_FOOT = ('add: t todo add "…" · done: t todo done <id> · one item: t to
               '· every slot: t todo -A')
 
 
+def _todo_parent(key, repos):
+    """The repo-level list a slot key belongs to → alias, or None for a repo-level key.
+
+    The counterpart to `_todo_scoped`, which widens a slotless view DOWN to the repo's
+    slots. Without this the widening was one-way: a note jotted at repo level — the
+    cross-slot stuff, which is exactly what wants to be visible everywhere — was
+    invisible from inside every slot, on the bar and in the view alike. The tail must
+    be numeric AND the head a real alias, so `financial-forecast` is a repo, not slot
+    `forecast` of repo `financial`."""
+    head, _, num = key.rpartition("-")
+    return head if num.isdigit() and head in repos else None
+
+
+def _todo_shared(cfg, key):
+    """A slot's repo-level list as a (key, data) pair, or None when there is nothing
+    there. Gated on live items so a slot with no shared notes pays only one stat and
+    renders exactly as it always did."""
+    parent = _todo_parent(key, cfg.repos)
+    if not parent:
+        return None
+    data = _todo_load(_todo_path(parent))
+    return (parent, data) if _todo_visible(data, show_all=True) else None
+
+
 def _todo_scoped(entries, alias):
     """This repo's lists — its repo-level one plus every <alias>-<slot>. A plain shell in
     a repo dir names no slot, so showing only the (usually empty) repo-level list hides
@@ -2098,6 +2168,40 @@ def _todo_add_targets(alias, rows, list_keys, wt_slots):
     return out
 
 
+def _todo_canon_aliases(cfg):
+    """One alias per repo DIR. Sibling keys (dot + dotfiles) name one tree, and
+    repo_of_dir only ever resolves to one of them, so offering both would list the same
+    slots twice under two names. Same choice repo_of_dir makes: the key equal to the
+    basename wins, else the shortest key."""
+    by_dir = {}
+    for key, path in (cfg.repos or {}).items():
+        by_dir.setdefault(os.path.realpath(path), []).append(key)
+    out = []
+    for path, keys in by_dir.items():
+        base = os.path.basename(path)
+        out.append(base if base in keys else min(keys, key=len))
+    return sorted(out)
+
+
+def _todo_add_targets_all(aliases, rows, list_keys, wt_slots):
+    """Destinations for an add from NOWHERE -- no repo in the cwd -> [(key, label)].
+
+    "scratch" stays FIRST so Enter keeps the old fallback behaviour: the picker adds a
+    choice, it never takes one away. Then every repo that has somewhere to file -- a
+    live slot, a worktree, or an existing list. A repo with none of those is left out on
+    purpose: from nowhere the useful destinations are the ones that already exist, and
+    `-s <key>` still reaches any list by name. Pure: the caller gathers.
+
+    wt_slots is keyed by alias here (one repo per key), unlike the single-repo twin."""
+    out = [("scratch", "scratch   (no repo -- the catch-all list)")]
+    for alias in aliases:
+        targets = _todo_add_targets(alias, rows, list_keys, wt_slots.get(alias) or set())
+        if len(targets) == 1 and alias not in list_keys:
+            continue                     # no slots, no list -- nothing to file against
+        out.extend(targets)
+    return out
+
+
 def _todo_render_all(entries, width=80, st=None):
     """The -A cross-slot view: every list with something open, grouped by key. This is
     the actual answer to 'many things in parallel and I forget what I need to do'."""
@@ -2118,14 +2222,61 @@ def _todo_render_all(entries, width=80, st=None):
     return lines + ["", "  %s%s%s" % (st.y, _TODO_FOOT, st.r)]
 
 
-def _todo_statusline(payload, cfg, items_n=1, width=80):
+# The dev server a slot's work is testable at. Mirrors financial-forecast's
+# scripts/dev-worktree.sh, which is the thing that actually binds the port:
+# .worktrees/<repo>/<N> → 5200+N, primary checkout → Vite's canonical 5173.
+# Re-derived here rather than shelled out to because the statusline renders many
+# times a second and that script costs a bash plus several lsof calls.
+_DEV_PORT_BASE = 5200
+_DEV_PORT_PRIMARY = 5173
+
+
+def _port_is_live(port, host="127.0.0.1", timeout=0.05):
+    """True when something is LISTENING on the port. A loopback connect settles in
+    well under a millisecond either way — a closed port refuses immediately rather
+    than waiting out the timeout — which is what makes this affordable per render."""
+    try:
+        with socket.create_connection((host, port), timeout):
+            return True
+    except OSError:
+        return False
+
+
+def _dev_url(key, cwd):
+    """The URL to test this slot's work at, or None if nothing is serving it.
+
+    Candidates in order: the slot's own deterministic port, then the canonical dev
+    port — the latter only for a checkout that could plausibly have a dev server
+    (a package.json), so a repo without one never claims the shared :5173 out from
+    under whoever is on it.
+
+    Only a port with a LIVE listener is returned. A URL that refuses the connection
+    is worse than no URL, and appearing exactly when the server comes up makes the
+    bar double as the "it's ready" signal."""
+    ports = []
+    _, dash, slot = key.rpartition("-")
+    if dash and slot.isdigit():
+        ports.append(_DEV_PORT_BASE + int(slot))
+    if cwd and os.path.exists(os.path.join(cwd, "package.json")):
+        ports.append(_DEV_PORT_PRIMARY)
+    for port in ports:
+        if _port_is_live(port):
+            return "http://localhost:%d" % port
+    return None
+
+
+def _todo_statusline(payload, cfg, items_n=1, width=80, tmux_name=None):
     """Claude Code's statusLine. The payload arrives as JSON on stdin;
     workspace.current_dir is preferred over cwd (they differ when Claude is run from a
     subdir of the project). Everything is optional — a statusline that raises leaves
     the TUI with a permanently broken status bar, so every field degrades to nothing.
 
-    Layout is two zones split by │: a dim head (slot · model) and the tasks, each
-    carrying its own ◻ so the checkbox — not a separator — is what delimits an item.
+    Layout is two zones split by │: a dim head (slot · model, plus ● and the URL the
+    slot is testable at when a dev server is live) and the tasks, each carrying its own
+    checkbox — so the box, not a separator, is what delimits an item.
+    A slot's bar also carries its REPO-level list, marked ◇ instead of ◻ and sorted
+    after the slot's own: the cross-slot notes live there, and keying the bar strictly
+    on the slot hid them from every place you actually work.
     The open COUNT is deliberately gone: the ◻s and the trailing +N already say how
     many, and a bare number sitting next to a checkbox read as an item.
 
@@ -2135,31 +2286,54 @@ def _todo_statusline(payload, cfg, items_n=1, width=80):
 
     Colour is emitted UNCONDITIONALLY (honouring NO_COLOR) — Style() gates on
     isatty and stdout here is always the pipe Claude Code reads, so the shared helper
-    would render every bar plain."""
+    would render every bar plain.
+
+    tmux_name is gathered by the caller and passed in (the ladder stays pure). Without
+    it the bar renders a DIFFERENT list from the one `t todo add` files into whenever
+    the cwd carries no slot of its own — a session run from a repo's primary checkout
+    inside a dev-<repo>-<n> window is exactly that case, and the items silently never
+    appear."""
     if not isinstance(payload, dict):
         payload = {}
     ws = payload.get("workspace") if isinstance(payload.get("workspace"), dict) else {}
     cwd = ws.get("current_dir") or payload.get("cwd") or os.getcwd()
     model = payload.get("model") if isinstance(payload.get("model"), dict) else {}
     name = (model.get("display_name") or "").strip()
-    key = _todo_key(cfg, cwd)
-    items = _todo_open(_todo_load(_todo_path(key)))
+    key = _todo_key(cfg, cwd, tmux_name)
+    items = [("◻", i["id"], i["text"]) for i in _todo_open(_todo_load(_todo_path(key)))]
+    parent = _todo_parent(key, cfg.repos)
+    if parent:                             # the slot's own work first, shared notes after
+        items += [("◇", i["id"], i["text"])
+                  for i in _todo_open(_todo_load(_todo_path(parent)))]
 
-    dim, cyan, rst = ("", "", "") if os.environ.get("NO_COLOR") else \
-        ("\033[2m", "\033[36m", "\033[0m")
-    box = cyan + "◻" + rst
+    dim, cyan, green, rst = ("", "", "", "") if os.environ.get("NO_COLOR") else \
+        ("\033[2m", "\033[36m", "\033[32m", "\033[0m")
     head = " · ".join([key] + ([name] if name else []))
+    # A live dev URL rides in the head zone, but deliberately NOT dim — it is the one
+    # part of the bar you act on. Carried as (coloured, printable) so the one-line
+    # packer below keeps measuring real widths rather than escape sequences.
+    url = _dev_url(key, cwd)
+    # " ● " + url + " │ " is 6 columns of chrome, and an item needs ~12 to say anything.
+    # On a bar too narrow for both, the tasks win — they are the reason for the bar.
+    if url and len(head) + len(url) + 18 > width:
+        url = None
+    if url:
+        head_c = "%s%s%s %s●%s %s%s%s%s │ %s" % (dim, head, rst, green, rst,
+                                                 cyan, url, rst, dim, rst)
+        head_p = "%s ● %s │ " % (head, url)
+    else:
+        head_c, head_p = dim + head + " │ " + rst, head + " │ "
     if not items:
-        return dim + head + " │ nothing open" + rst
+        return head_c + dim + "nothing open" + rst
 
     if items_n > 1:
         shown = items[:items_n]
-        iw = max(len(str(i["id"])) for i in shown)
-        out = [dim + head + " │ %d open" % len(items) + rst]
-        for i in shown:
+        iw = max(len(str(i)) for _, i, _ in shown)
+        out = [head_c + dim + "%d open" % len(items) + rst]
+        for g, ident, text in shown:
             out.append("  %s %s%*d%s %s"
-                       % (box, dim, iw, i["id"], rst,
-                          _truncate(i["text"], max(10, width - 6 - iw))))
+                       % (cyan + g + rst, dim, iw, ident, rst,
+                          _truncate(text, max(10, width - 6 - iw))))
         if len(items) > items_n:
             out.append("  %s+%d more%s" % (dim, len(items) - items_n, rst))
         return "\n".join(out)
@@ -2168,10 +2342,9 @@ def _todo_statusline(payload, cfg, items_n=1, width=80):
     # "+N more" tail, so the assembled bar can never exceed `width`.
     tail_room = len("  +%d more" % len(items)) if len(items) > 1 else 0
     limit = width - tail_room
-    plain, line, shown = head + " │ ", dim + head + " │ " + rst, 0
-    for i in items:
+    plain, line, shown = head_p, head_c, 0
+    for g, _, text in items:
         sep = "  " if shown else ""
-        text = i["text"]
         if len(plain) + len(sep) + 2 + len(text) > limit:
             if shown:
                 break                      # a mid-list ellipsis reads noisier than a +N
@@ -2179,11 +2352,11 @@ def _todo_statusline(payload, cfg, items_n=1, width=80):
             if avail < 10:
                 break
             text = _truncate(text, avail)
-        plain += sep + "◻ " + text
-        line += sep + box + " " + text
+        plain += sep + g + " " + text
+        line += sep + cyan + g + rst + " " + text
         shown += 1
     if not shown:                          # a width too narrow for even one item
-        return dim + head + " │ %d open" % len(items) + rst
+        return head_c + dim + "%d open" % len(items) + rst
     if shown < len(items):
         line += "%s  +%d more%s" % (dim, len(items) - shown, rst)
     return line
@@ -2203,18 +2376,35 @@ def _todo_live_slots():
     return [{"slot": n[4:], "summary": ""} for n in r.stdout.split() if n.startswith("dev-")]
 
 
+def _todo_worktree_slots(cfg, alias):
+    """The slot dirs on disk for one repo: $DEV_WORKTREE_ROOT/<basename>/<slot>."""
+    root = os.path.join(cfg.worktree_root, os.path.basename(cfg.repos.get(alias, "")))
+    return {os.path.basename(p) for p in glob.glob(os.path.join(root, "*"))
+            if os.path.exists(os.path.join(p, ".git"))}
+
+
 def _todo_pick_target(cfg, alias):
-    """Ask which list a slotless add should go to. Returns a key, or None to stay put."""
+    """Ask which list a slotless add should go to. Returns a key, or None to stay put.
+
+    `alias` None means the cwd names no repo at all (an add from ~), so the choice
+    widens across every repo instead of not being offered: the old gate only fired from
+    a repo dir, which left the from-nowhere add silently filing to `scratch` with a ✓
+    line that never said so — the one write path that did not name its list."""
     if not (sys.stdin.isatty() and sys.stdout.isatty()):
         return None
-    wt_root = os.path.join(cfg.worktree_root, os.path.basename(cfg.repos.get(alias, "")))
-    wt_slots = {os.path.basename(p) for p in glob.glob(os.path.join(wt_root, "*"))
-                if os.path.exists(os.path.join(p, ".git"))}
     list_keys = {os.path.basename(p)[:-5]: len(_todo_open(_todo_load(p)))
                  for p in glob.glob(os.path.join(_todo_dir(), "*.json"))}
-    targets = _todo_add_targets(alias, _todo_live_slots(), list_keys, wt_slots)
+    rows = _todo_live_slots()
+    if alias:
+        targets = _todo_add_targets(alias, rows, list_keys,
+                                    _todo_worktree_slots(cfg, alias))
+    else:
+        aliases = _todo_canon_aliases(cfg)
+        targets = _todo_add_targets_all(
+            aliases, rows, list_keys,
+            {a: _todo_worktree_slots(cfg, a) for a in aliases})
     if len(targets) == 1:
-        return None                      # no slots exist — nothing to choose between
+        return None                      # nowhere to file but here — nothing to choose
     return _pick_inline("add to which list?", targets)
 
 
@@ -2265,7 +2455,8 @@ def cmd_todo(cfg, args):
         except Exception:
             payload = {}   # unparseable stdin still gets a line, just without the model
         try:
-            print(_todo_statusline(payload, cfg, args.items or 1, _columns()))
+            print(_todo_statusline(payload, cfg, args.items or 1, _columns(),
+                                   _tmux_session_name()))
         except Exception:
             print("")
         return 0
@@ -2288,19 +2479,32 @@ def cmd_todo(cfg, args):
     key = _todo_key(cfg, os.getcwd(), _tmux_session_name(), args.slot)
 
     def scope():
-        """Lists this invocation acts on: just the cwd's, or — when the cwd names no
-        slot — the repo's, exactly the set the view shows."""
+        """Lists this invocation acts on, exactly the set the view shows: a slotless cwd
+        widens DOWN to the repo's slots, a slot widens UP to its repo-level list. The
+        actions have to track the view either way, or you see an item you cannot touch."""
         if key in cfg.repos:
             found = _todo_scoped(_todo_all_entries(), key)
             if found:
                 return found
-        return [(key, data)]
-    # Slotless add from a repo dir: offer the repo's slots rather than silently filing
-    # against the repo. Only for `add` (viewing has -A), only interactively, and never
-    # when -s already named a list or --here opted out.
-    if (_todo_canon(args.action or "ls") == "add" and not args.slot
-            and " ".join(args.rest).strip() and key in cfg.repos):
-        key = _todo_pick_target(cfg, key) or key
+        shared = _todo_shared(cfg, key)
+        return [(key, data), shared] if shared else [(key, data)]
+    # An `add` resolves its destination three ways, most explicit first: -s names a list
+    # outright; a leading bare slot number files ACROSS slots without leaving the dir
+    # (`t todo add 11 fix the ledger`); otherwise the list is ASKED for rather than
+    # guessed. The picker used to be gated on `key in cfg.repos`, so an add from ~ fell
+    # through to the `scratch` catch-all with no prompt — and since the ✓ line named no
+    # list either, `t todo add 11` looked like it had gone to a slot 11 that was never
+    # involved. Both halves are fixed here and at the ✓ print below.
+    if _todo_canon(args.action or "ls") == "add" and not args.slot:
+        alias = key if key in cfg.repos else key.rpartition("-")[0]
+        alias = alias if alias in cfg.repos else None
+        slot, stripped = _todo_slot_arg(args.rest)
+        if slot and alias:
+            key, args.rest = "%s-%s" % (alias, slot), stripped
+        elif " ".join(args.rest).strip():
+            # No repo to resolve a number against (or no number): ask. The leading token
+            # stays part of the text — a slot needs a repo, and the picker shows both.
+            key = _todo_pick_target(cfg, alias) or key
     path = _todo_path(key)
     data = _todo_load(path)
     action = args.action or "ls"
@@ -2341,7 +2545,8 @@ def cmd_todo(cfg, args):
             print(msg, file=sys.stderr if rc else sys.stdout)
             if rc:
                 return rc
-            for line in _todo_render(data, key, args.all, width, st):
+            for line in _todo_render(data, key, args.all, width, st,
+                                     _todo_shared(cfg, key)):
                 print(line)
             return 0
         if not item:
@@ -2421,14 +2626,23 @@ def cmd_todo(cfg, args):
                 worst = max(worst, rc)
             if worst:
                 return worst
-            for line in _todo_render_all(scope(), width, st) if len(entries) > 1 \
-                    else _todo_render(data, key, args.all, width, st):
+            # _todo_render_all only fits a view widened DOWN to sibling slots; a slot
+            # widened UP re-renders as itself, with the repo section under it.
+            for line in _todo_render_all(scope(), width, st) \
+                    if key in cfg.repos and len(entries) > 1 \
+                    else _todo_render(data, key, args.all, width, st,
+                                      _todo_shared(cfg, key)):
                 print(line)
             return 0
 
         msg, rc = _todo_apply(data, action, rest)
         if rc != 2:
             _todo_save(path, data)
+        if msg and canon == "add" and not rc:
+            # Always name the list. The destination comes from the cwd, a bare slot arg
+            # or a picker — none of which the ✓ line showed, so an add that landed
+            # somewhere unintended stayed invisible until you went looking for it.
+            msg = "%s   %s→ %s%s" % (msg, st.y, key, st.r)
         if msg:
             print(msg, file=sys.stderr if rc else sys.stdout)
         if rc:
@@ -2436,7 +2650,7 @@ def cmd_todo(cfg, args):
         if canon == "add":
             return 0
 
-    for line in _todo_render(data, key, args.all, width, st):
+    for line in _todo_render(data, key, args.all, width, st, _todo_shared(cfg, key)):
         print(line)
     return 0
 

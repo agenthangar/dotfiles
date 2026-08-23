@@ -1604,6 +1604,26 @@ def test_todo_scoped_picks_out_one_repos_lists(t_mod):
     assert t_mod._todo_scoped(entries, "nothing") == []
 
 
+def test_todo_scoped_live_gate_keeps_repo_level_and_only_live_slots(t_mod):
+    # A list outlives its session by design; the repo view hides the dead ones.
+    entries = [("dotfiles", 1), ("dotfiles-1", 2), ("dotfiles-12", 3), ("ff-3", 5)]
+    assert [k for k, _ in t_mod._todo_scoped(entries, "dotfiles", {"12"})] == [
+        "dotfiles", "dotfiles-12"]
+    # the repo-level list is kept even when NO slot is live
+    assert [k for k, _ in t_mod._todo_scoped(entries, "dotfiles", set())] == ["dotfiles"]
+    # None = no gate (the -a path)
+    assert len(t_mod._todo_scoped(entries, "dotfiles", None)) == 3
+
+
+def test_todo_live_nums_resolves_sibling_aliases_through_the_repo_dir(t_mod):
+    repos = {"dotfiles": "/c/dotfiles", "dot": "/c/dotfiles", "ff": "/c/ff"}
+    rows = [{"slot": "dot-4"}, {"slot": "dotfiles-7"}, {"slot": "ff-3"},
+            {"slot": "dotfiles-main"}, {"slot": "nope-1"}]
+    assert t_mod._todo_live_nums(repos, "dotfiles", rows) == {"4", "7"}
+    assert t_mod._todo_live_nums(repos, "ff", rows) == {"3"}
+    assert t_mod._todo_live_nums(repos, "unknown", rows) == set()
+
+
 # ─── t todo — no-id action pickers ─────────────────────────────────────────────
 
 def _mixed(t_mod):

@@ -2254,10 +2254,15 @@ _DEV_PORT_BASE = 5200
 _DEV_PORT_PRIMARY = 5173
 
 
-def _port_is_live(port, host="127.0.0.1", timeout=0.05):
+def _port_is_live(port, host="localhost", timeout=0.05):
     """True when something is LISTENING on the port. A loopback connect settles in
     well under a millisecond either way — a closed port refuses immediately rather
-    than waiting out the timeout — which is what makes this affordable per render."""
+    than waiting out the timeout — which is what makes this affordable per render.
+
+    Probed by NAME, not 127.0.0.1: create_connection tries every address localhost
+    resolves to, and Vite without --host binds ONLY [::1] on modern macOS/Node, so an
+    IPv4-only probe reported a perfectly live slot port dead and the bar fell through
+    to whoever held the shared :5173."""
     try:
         with socket.create_connection((host, port), timeout):
             return True

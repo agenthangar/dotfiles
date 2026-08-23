@@ -553,6 +553,17 @@ _dev_worktree_create() {
   if [[ -e "$wt/.git" ]]; then          # already materialized → reuse (idempotent)
     print -r -- "$wt"; return 0
   fi
+  # A dir with NO .git here is debris, never a worktree: the sweep removed the tree but
+  # a process still rooted in it (the slot's vite dev server, rewriting .vite/deps)
+  # recreated the path. `git worktree add` refuses a non-empty target, which used to
+  # fail this function and drop the session into the SHARED tree. Move it aside —
+  # nothing tracked can live in it, but nothing is deleted either.
+  if [[ -d $wt ]]; then
+    local debris="${wt}.debris-${EPOCHSECONDS}"
+    if mv "$wt" "$debris" 2>/dev/null; then
+      print -r -- "⚠ $wt existed without a worktree (leftover files, e.g. a dev server still running there) — moved to $debris" >&2
+    fi
+  fi
   git -C "$repodir" worktree prune 2>/dev/null    # clear any stale registration first
   git -C "$repodir" fetch -q origin 2>/dev/null   # refresh origin/main before branching
   if git -C "$repodir" show-ref --verify --quiet "refs/heads/$br"; then
@@ -566,21 +577,16 @@ _dev_worktree_create() {
   print -r -- "$wt"
 }
 
-# _dev_shared_tree_ok <repo> — may a session fall back to this repo's SHARED tree when
-# worktree creation failed? No, if that tree is the live surface. The canonical
-# dotfiles checkout is parked on `main` and IS what $HOME points at, so dropping a
-# session into it means editing live config on a protected branch — every save lands
-# in $HOME instantly and every commit targets main. `_dev_repo_prepare` already
-# refuses to switch its branch, but that does not stop the session cd'ing in and
-# editing. Better to fail loudly than to hand an agent the live tree.
-_dev_shared_tree_ok() {
-  local repodir="${DEV_REPOS[$1]}" live
-  [[ -n $repodir ]] || return 0
-  live=$(_dots_live_tree 2>/dev/null) || return 0
-  [[ -n $live && ${repodir:A} == ${live:A} ]] || return 0
-  print -r -- "✗ worktree setup failed for $1 — refusing to fall back to ${repodir}: it is the LIVE surface (\$HOME symlinks point there)." >&2
-  print -r -- "  retry, or clear a stale registration: git -C ${repodir} worktree prune" >&2
-  return 1
+# _dev_worktree_refuse <repo> <slot> — a worktree-enabled repo whose worktree could not
+# be created does NOT get a session in the shared tree. That fallback used to be a
+# one-line ↷ note scrolling past as the session started, and twice it parked an agent
+# in ~/code/financial-forecast on the old shared dev branch, committing there for hours
+# before anyone noticed (ff-12, ff-15). Failing loudly is cheaper than that.
+_dev_worktree_refuse() {
+  local repo="$1" slot="$2" repodir="${DEV_REPOS[$1]}"
+  print -r -- "✗ could not create the worktree for $repo $slot — refusing to start in the shared tree $repodir" >&2
+  print -r -- "  try: git -C $repodir worktree prune; git -C $repodir worktree add $(_dev_worktree_path "$repo" "$slot") -b $(_dev_worktree_branch "$repo" "$slot") origin/main" >&2
+  print -r -- "  (DEV_WORKTREE[$repo]=0 in ~/.zshrc.local opts this repo out of worktrees entirely)" >&2
 }
 
 # _dev_worktree_beam_push <wt> <host> — ON THE ORIGIN, carry the slot worktree's LIVE edits
@@ -2612,7 +2618,7 @@ _t_dev() {
       fi
       local _wt; _wt="$(_dev_worktree_create "$repo" "$_wslot")"
       if [[ -n $_wt ]]; then dir="$_wt"; skip_prepare=1
-      else _dev_shared_tree_ok "$repo" || return 1; fi
+      else _dev_worktree_refuse "$repo" "$_wslot"; return 1; fi
     fi
     echo "Starting claude in $dir (no tmux)"
     cd "$dir" || return 1
@@ -2692,10 +2698,7 @@ _t_dev() {
     if _dev_worktree_enabled "$repo"; then
       local _wt; _wt="$(_dev_worktree_create "$repo" "$slot")"
       if [[ -n $_wt ]]; then dir="$_wt"; skip_prepare=1
-      else
-        _dev_shared_tree_ok "$repo" || return 1
-        echo "↷ worktree setup failed for $repo $slot — using shared tree $dir" >&2
-      fi
+      else _dev_worktree_refuse "$repo" "$slot"; return 1; fi
     fi
     echo "Starting $session in $dir (logging to $logfile)"
     _dev_new_session "$session" "$dir" "$branch" "$skip_prepare"

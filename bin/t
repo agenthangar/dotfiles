@@ -2281,16 +2281,17 @@ def _dev_url(key, cwd):
     Only a port with a LIVE listener is returned. A URL that refuses the connection
     is worse than no URL, and appearing exactly when the server comes up makes the
     bar double as the "it's ready" signal."""
-    ports = []
     _, dash, slot = key.rpartition("-")
     if dash and slot.isdigit():
-        ports.append(_DEV_PORT_BASE + int(slot))
-    if cwd and os.path.exists(os.path.join(cwd, "package.json")):
-        ports.append(_DEV_PORT_PRIMARY)
-    for port in ports:
-        if _port_is_live(port):
-            return "http://localhost:%d" % port
-    return None
+        # A slot has exactly one port. It never falls back to :5173 — that is some
+        # OTHER checkout's server, and a bar that names it while this slot's server
+        # is down sends you to the wrong app with total confidence.
+        port = _DEV_PORT_BASE + int(slot)
+    elif cwd and os.path.exists(os.path.join(cwd, "package.json")):
+        port = _DEV_PORT_PRIMARY
+    else:
+        return None
+    return "http://localhost:%d" % port if _port_is_live(port) else None
 
 
 def _todo_statusline(payload, cfg, items_n=1, width=80, tmux_name=None):

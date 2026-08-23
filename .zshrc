@@ -1927,9 +1927,9 @@ _dev_session_rows() {
   # instead of two display-message forks per session, over the shared
   # _dev_ps_snapshot); pass 2 prints, after ONE _transcript_meta_batch has read
   # every title at once rather than forking python3 per slot.
-  local -a rows rowtx tpaths tx mrows f
-  local -A title_of
-  local s short sid psid dir state context summary i mr mrest
+  local -a rows rowtx tpaths tx mrows f _PR_STALE
+  local -A title_of pr_of _PR_SPAWNED
+  local s short sid psid dir state context summary i mr mrest REPLY
   _dev_ps_snapshot
   while IFS=$'\t' read -r s dir state; do
     [[ $s == dev-* && -n $dir ]] || continue
@@ -1966,6 +1966,7 @@ _dev_session_rows() {
     [[ -n $mr ]] || continue
     mrest=${mr#*$'\t'}                      # peeled, not split: an empty title must
     title_of[${mr%%$'\t'*}]=${mrest%%$'\t'*}  # not collapse the column away
+    pr_of[${mr%%$'\t'*}]=${mrest#*$'\t'}     # the batch already read the PR url
   done
 
   for (( i = 1; i <= $#rows; i++ )); do
@@ -1982,12 +1983,24 @@ _dev_session_rows() {
           summary=$(_dev_session_summary "dev-$short" "$dir" "$psid")
         fi
         [[ -n $summary ]] || summary='(untitled session)'
+        # " · #N <state>" for the session's PR — the same tag `t resume` renders,
+        # from the same cache, so a slot whose PR has landed says so where you
+        # actually look at slots. It rides on the summary instead of a column of
+        # its own because _transcript_meta_batch caps titles at 50 chars, leaving
+        # title+tag comfortably inside WORKING ON at any sane width — and because a
+        # dedicated column would sit empty for every slot that has not opened a PR
+        # yet, which is most of them. Only a row with a known transcript can carry
+        # one; the _dev_session_summary fallback below never resolved a URL.
+        if [[ ${rowtx[$i]} != - ]]; then _pr_state_tag "${pr_of[${rowtx[$i]}]:-}"; summary+=$REPLY; fi
         ;;
     esac
     printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$sid" "$dir" "$short" "$state" "$context" "$summary"
   done
   # plus any FOREGROUND (non-tmux) claudes on this machine, same row format.
   _dev_fg_rows
+  # Dead last, and stdio-detached inside: stdout here IS the row stream (and is an
+  # ssh pipe under `t ls -r`), so the refresh must not write a byte or hold it open.
+  _pr_state_flush
 }
 
 # _dev_rows_all — fan _dev_session_rows out over THIS machine + every $REMOTE_HOSTS
@@ -3382,6 +3395,69 @@ _pr_state_refresh() {
   done
 }
 
+# _pr_state_tag <pr-url> — the shared " · #N <state>" renderer behind the PR tag in
+# both `t resume` and `t ls`. Sets $REPLY to the tag for a transcript's last PR URL
+# (empty for an empty url), reading the pr/ cache ONLY — never a blocking gh call.
+#
+# It returns through REPLY rather than stdout for two reasons, and the first is a
+# correctness one: a `$(_pr_state_tag …)` caller would run this in a SUBSHELL, so
+# the $_PR_STALE appends below would mutate a copy and be thrown away — the batched
+# refresh would then never fire and every unknown row would stay "?" forever.
+# Second, it saves a fork per row, which is the cost `t ls` was just optimized to
+# avoid paying per session.
+#
+# Refs whose cached state is missing or stale are appended to the caller's
+# $_PR_STALE array rather than fetched here, so ONE batched _pr_state_refresh
+# covers a whole scan; the caller calls _pr_state_flush when the scan is done.
+# Callers must declare `local -a _PR_STALE` + `local -A _PR_SPAWNED` (dynamic
+# scoping puts the caller's copies in reach) so two scans never share state.
+#
+# Unknown renders "?" rather than a bare "#N": a blank state is indistinguishable
+# from "this session opened no PR", and the row you most want an answer about — the
+# newest one — is ALWAYS the uncached one, since its PR was created after the last
+# scan. Where gh cannot answer at all (the Linux node) it degrades to a bare "#N",
+# because "?" on every row is noise, not information.
+_pr_state_tag() {
+  local pru=$1
+  REPLY=
+  [[ -n $pru ]] || return 0
+  local prdir="${XDG_CACHE_HOME:-$HOME/.cache}/claude-sessions/pr"
+  local prp=${pru#github.com/}; prp=${prp/\/pull\//\/}
+  local prkey=${prp//\//#} prnum=${pru##*/}
+  local prcf="$prdir/$prkey" prraw= prst= prlab= prmt
+  if [[ -f $prcf ]]; then
+    prraw=$(<$prcf)
+    [[ $prraw == MERGED || $prraw == CLOSED || $prraw == OPEN ]] && prst=$prraw
+  fi
+  prlab=${prst:+${(L)prst}}
+  [[ -z $prlab ]] && command -v gh >/dev/null 2>&1 && prlab='?'
+  if [[ -z ${_PR_SPAWNED[$prkey]:-} ]]; then
+    prmt=$(zstat +mtime "$prcf" 2>/dev/null || echo 0)
+    if _pr_state_stale "$prraw" $(( prmt ? EPOCHSECONDS - prmt : 999999999 )); then
+      _PR_SPAWNED[$prkey]=1
+      _PR_STALE+=("${prp%/*}#$prnum")
+    fi
+  fi
+  REPLY=" · #$prnum${prlab:+ $prlab}"
+}
+
+# _pr_state_flush — spawn ONE detached, per-repo-batched refresh for everything
+# $_PR_STALE collected, then clear it. Two details are load-bearing, not tidy:
+#   `&!` (background AND disown) rather than a plain `&`, because the shortest-lived
+#   caller is the throwaway `zsh -lic` that bin/t runs _dev_session_rows in: it
+#   calls this LAST and exits immediately, and an interactive zsh HUPs its running
+#   jobs on exit, which would kill the refresh mid-`gh` and leave the state to be
+#   refetched on every single run.
+#   Stdio fully redirected, because that same stdout IS the machine-readable row
+#   stream, and an ssh pipe under `t ls -r`: a stray byte from a child would slide
+#   the table columns, and an inherited pipe would hold the connection open until
+#   gh finished.
+_pr_state_flush() {
+  (( ${#_PR_STALE} )) || return 0
+  _pr_state_refresh "${(@)_PR_STALE}" >/dev/null 2>&1 </dev/null &!
+  _PR_STALE=()
+}
+
 # _t_resume — the `t resume` verb: revive a DEAD dev slot's last conversation.
 # `t open` on a dead slot deliberately starts a FRESH claude (the worktree and its
 # uncommitted work are reused, but not the chat); this is the counterpart that brings
@@ -3574,24 +3650,21 @@ _t_resume() {
   # of the loops — an assignmentless `local x` re-run on an already-local x
   # does not redeclare, it PRINTS `x=value` (the `_ok=claw` junk-output bug).
   local -a cands slots tx
-  local -a pending _mpaths _mrows _mf prstale
+  local -a pending _mpaths _mrows _mf _PR_STALE
   local -A remote_live_host remote_live_alias remote_live_sum
   local -A meta_title meta_pr
   local _p _mr _mrest
   local n wt sid busy rhost _rdir _rbase _rhost _rn _ralias _rsum _ok _stale stale_path
   local txf title when ep org orgf hf skipped=0
-  local reopened opf opep pru prp prkey prnum prst prcf prmt prraw prlab
+  local reopened opf opep REPLY
   local _rwtr=${DEV_WORKTREE_ROOT:-}
   # The two picker signals shared with _claude_session_rows/tfind (see the
   # claude-stamp-tmux notes): opened/ = the last-opened stamps (recency =
-  # max(transcript, stamp), ↻ on stamp-newer rows); pr/ = the PR-state cache
-  # (cache-only reads — NEVER a blocking gh call — refreshed by ONE detached
-  # child per run, batched per repo, so state shows on the next invocation;
-  # the freshness policy lives in _pr_state_stale).
+  # max(transcript, stamp), ↻ on stamp-newer rows); the PR tag is _pr_state_tag,
+  # which owns the pr/ cache (cache-only reads — NEVER a blocking gh call) and
+  # collects stale refs into _PR_STALE for the one batched _pr_state_flush below.
   local opdir="${XDG_CACHE_HOME:-$HOME/.cache}/claude-sessions/opened"
-  local prdir="${XDG_CACHE_HOME:-$HOME/.cache}/claude-sessions/pr"
-  local -A _prspawned
-  local prgh=; command -v gh >/dev/null 2>&1 && prgh=1
+  local -A _PR_SPAWNED
   # Recency window (--days, default 30; 'all' disables) + this machine's short
   # hostname, to blank the origin column for locally-run conversations.
   local cutoff=0 selfhost=$(hostname -s 2>/dev/null)
@@ -3741,34 +3814,7 @@ _t_resume() {
     # the pr/ cache ONLY — never a blocking gh call — with the freshness policy in
     # _pr_state_stale and the (detached, per-repo batched) refetch fired once for
     # the whole scan below, so a new state shows on the next invocation.
-    pru=${meta_pr[$txf]:-}
-    if [[ -n $pru ]]; then
-      prp=${pru#github.com/}; prp=${prp/\/pull\//\/}
-      prkey=${prp//\//#}; prnum=${pru##*/}
-      prcf="$prdir/$prkey"; prraw=; prst=
-      if [[ -f $prcf ]]; then
-        prraw=$(<$prcf)
-        [[ $prraw == MERGED || $prraw == CLOSED || $prraw == OPEN ]] && prst=$prraw
-      fi
-      # An unknown state renders "?", never a bare "#N". A blank tag is
-      # indistinguishable from "this session opened no PR", and the row you most
-      # want an answer about — the newest one — is ALWAYS the uncached one (its PR
-      # was created after the last scan), so the tag that mattered most was
-      # precisely the one that silently said nothing.
-      prlab=${prst:+${(L)prst}}
-      # "?" only where gh could actually answer: on a host without it (the Linux
-      # node) every row would read "?" forever, which is noise, not information —
-      # there the tag degrades to the old bare "#N".
-      [[ -z $prlab && -n $prgh ]] && prlab='?'
-      title+=" · #$prnum${prlab:+ $prlab}"
-      if [[ -z ${_prspawned[$prkey]:-} ]]; then
-        prmt=$(zstat +mtime "$prcf" 2>/dev/null || echo 0)
-        if _pr_state_stale "$prraw" $(( prmt ? EPOCHSECONDS - prmt : 999999999 )); then
-          _prspawned[$prkey]=1
-          prstale+=("${prp%/*}#$prnum")
-        fi
-      fi
-    fi
+    _pr_state_tag "${meta_pr[$txf]:-}"; title+=$REPLY
     # Origin: which machine the conversation LAST RAN on — the <sid>.origin
     # stamp claude-stamp-tmux writes next to the transcript (syncs with it).
     # Blank for this machine / unstamped (pre-feature) transcripts; a raw
@@ -3786,7 +3832,7 @@ _t_resume() {
   # stale row: _pr_state_refresh batches the refs by repo, so a scan that turned up
   # six unknown PRs in one repo costs a single gh call rather than six. Still
   # strictly fire-and-forget — the render above already used the cache and is done.
-  (( $#prstale )) && ( _pr_state_refresh "${(@)prstale}" & ) 2>/dev/null
+  _pr_state_flush
 
   (( skipped )) && echo "(${skipped} older conversation(s) outside the last ${days}d hidden — t resume --days all shows them)" >&2
 

@@ -2270,6 +2270,11 @@ def _port_is_live(port, host="localhost", timeout=0.05):
         return False
 
 
+def _has_dev_server(cwd):
+    """Could this checkout be running a dev server at all? A package.json is the tell."""
+    return bool(cwd) and os.path.exists(os.path.join(cwd, "package.json"))
+
+
 def _dev_url(key, cwd):
     """The URL to test this slot's work at, or None if nothing is serving it.
 
@@ -2281,16 +2286,19 @@ def _dev_url(key, cwd):
     Only a port with a LIVE listener is returned. A URL that refuses the connection
     is worse than no URL, and appearing exactly when the server comes up makes the
     bar double as the "it's ready" signal."""
+    # Only a checkout that could run a dev server (a package.json) gets a URL at all.
+    # Ports are 5200+N across EVERY repo, so dotfiles slot 3 would otherwise claim
+    # ff slot 3's vite on :5203 — a CLI repo pointing at someone else's web app.
+    if not _has_dev_server(cwd):
+        return None
     _, dash, slot = key.rpartition("-")
     if dash and slot.isdigit():
         # A slot has exactly one port. It never falls back to :5173 — that is some
         # OTHER checkout's server, and a bar that names it while this slot's server
         # is down sends you to the wrong app with total confidence.
         port = _DEV_PORT_BASE + int(slot)
-    elif cwd and os.path.exists(os.path.join(cwd, "package.json")):
-        port = _DEV_PORT_PRIMARY
     else:
-        return None
+        port = _DEV_PORT_PRIMARY
     return "http://localhost:%d" % port if _port_is_live(port) else None
 
 

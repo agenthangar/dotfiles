@@ -1224,6 +1224,7 @@ def _statusline(t_mod, tmp_path, monkeypatch, payload, key=None, texts=(),
         data = _add(t_mod, _fresh(t_mod), *texts)
         t_mod._todo_save(t_mod._todo_path(key), data)
     monkeypatch.setattr(t_mod, "_port_is_live", lambda p, *a, **k: p in live_ports)
+    monkeypatch.setattr(t_mod, "_has_dev_server", lambda cwd: True)  # the fake cwd has no files
     monkeypatch.setenv("NO_COLOR", "1")   # assert on the layout, not the escapes
     return t_mod._todo_statusline(payload, cfg, items_n, width, tmux_name)
 
@@ -1400,6 +1401,7 @@ def _dev_url(t_mod, monkeypatch, key, cwd, live=()):
 def test_dev_url_uses_the_slot_port(t_mod, monkeypatch, tmp_path):
     # The slot number IS the port offset — dev-worktree.sh binds 5200+N — so slot 12
     # is testable at :5212 and nowhere else.
+    (tmp_path / "package.json").write_text("{}")
     assert _dev_url(t_mod, monkeypatch, "ff-12", str(tmp_path), live=(5212,)) \
         == "http://localhost:5212"
 
@@ -1436,6 +1438,12 @@ def test_dev_url_will_not_claim_the_shared_port_without_a_package_json(
     # :5173 is whoever got there first. A checkout with no dev server of its own must
     # not point the user at someone else's app.
     assert _dev_url(t_mod, monkeypatch, "dotfiles", str(tmp_path), live=(5173,)) is None
+
+
+def test_dev_url_slot_port_needs_a_dev_server_too(t_mod, monkeypatch, tmp_path):
+    # Ports are 5200+N across EVERY repo: dotfiles slot 3 must not claim ff slot 3's
+    # vite on :5203 — a CLI repo has nothing to serve.
+    assert _dev_url(t_mod, monkeypatch, "dotfiles-3", str(tmp_path), live=(5203,)) is None
 
 
 def test_dev_url_ignores_a_non_numeric_trailing_segment(t_mod, monkeypatch, tmp_path):

@@ -1970,8 +1970,13 @@ def _todo_move(src_data, dst_data, tok, dst_key, now=None):
     return ("✓ moved #%s → %s #%d  %s" % (tok, dst_key, moved["id"], moved["text"]), 0)
 
 
-def _todo_render(data, key, show_all=False, width=80, st=None):
-    """The one-list view. Returns display lines (no trailing newlines)."""
+def _todo_render(data, key, show_all=False, width=80, st=None, shared=None):
+    """The one-list view. Returns display lines (no trailing newlines).
+
+    `shared` is an optional (key, data) for the repo-level list this slot hangs off:
+    its items render as a dim second section marked ◇ rather than ◻, so which list an
+    item lives in is readable at a glance — which matters, because ids are per-list and
+    the two sections can both hold a #3."""
     st = st or Style()
     items = _todo_visible(data, show_all)
     n_open = len(_todo_open(data))
@@ -1983,18 +1988,40 @@ def _todo_render(data, key, show_all=False, width=80, st=None):
         tally += " · %d done" % n_done
     head = "%s%s%s %s— %s%s" % (st.b, key, st.r, st.y, tally, st.r)
     foot = ['', "  %s%s%s" % (st.y, _TODO_FOOT, st.r)]
-    if not items:
-        return [head, '  %s(nothing here yet)%s' % (st.y, st.r)] + foot
-    lines = [head]
-    idw = max(len(str(i["id"])) for i in items)
-    for i in items:
-        mark = "✓" if i.get("done") else "◻"
+
+    lines = [head] if items else [head, '  %s(nothing here yet)%s' % (st.y, st.r)]
+    if items:
+        idw = max(len(str(i["id"])) for i in items)
+        for i in items:
+            mark = "✓" if i.get("done") else "◻"
+            body = _truncate(i["text"], max(10, width - idw - 6))
+            if i.get("done"):
+                lines.append("  %s%*d  %s %s%s" % (st.y, idw, i["id"], mark, body, st.r))
+            else:
+                lines.append("  %s%*d%s  %s %s" % (st.c, idw, i["id"], st.r, mark, body))
+    return lines + _todo_shared_lines(shared, show_all, width, st) + foot
+
+
+def _todo_shared_lines(shared, show_all, width, st):
+    """The repo-level section appended to a slot's view. Empty when there is nothing
+    to show, so a slot with no shared notes renders exactly as it always did."""
+    if not shared:
+        return []
+    skey, sdata = shared
+    sitems = _todo_visible(sdata, show_all)
+    if not sitems:
+        return []
+    n = len(_todo_open(sdata))
+    out = ['', "  %s%s — %s%s" % (st.y, skey,
+                                  "nothing open" if not n else "%d open" % n, st.r)]
+    idw = max(len(str(i["id"])) for i in sitems)
+    for i in sitems:
         body = _truncate(i["text"], max(10, width - idw - 6))
-        if i.get("done"):
-            lines.append("  %s%*d  %s %s%s" % (st.y, idw, i["id"], mark, body, st.r))
-        else:
-            lines.append("  %s%*d%s  %s %s" % (st.c, idw, i["id"], st.r, mark, body))
-    return lines + foot
+        mark = "✓" if i.get("done") else "◇"
+        out.append("  %s%*d%s  %s %s%s%s"
+                   % (st.c, idw, i["id"], st.r, mark, st.y if i.get("done") else "",
+                      body, st.r if i.get("done") else ""))
+    return out
 
 
 def _todo_id_actions(item):
@@ -2047,6 +2074,30 @@ def _todo_pick_candidates(data, action):
 
 _TODO_FOOT = ('add: t todo add "…" · done: t todo done <id> · one item: t todo <id> '
               '· every slot: t todo -A')
+
+
+def _todo_parent(key, repos):
+    """The repo-level list a slot key belongs to → alias, or None for a repo-level key.
+
+    The counterpart to `_todo_scoped`, which widens a slotless view DOWN to the repo's
+    slots. Without this the widening was one-way: a note jotted at repo level — the
+    cross-slot stuff, which is exactly what wants to be visible everywhere — was
+    invisible from inside every slot, on the bar and in the view alike. The tail must
+    be numeric AND the head a real alias, so `financial-forecast` is a repo, not slot
+    `forecast` of repo `financial`."""
+    head, _, num = key.rpartition("-")
+    return head if num.isdigit() and head in repos else None
+
+
+def _todo_shared(cfg, key):
+    """A slot's repo-level list as a (key, data) pair, or None when there is nothing
+    there. Gated on live items so a slot with no shared notes pays only one stat and
+    renders exactly as it always did."""
+    parent = _todo_parent(key, cfg.repos)
+    if not parent:
+        return None
+    data = _todo_load(_todo_path(parent))
+    return (parent, data) if _todo_visible(data, show_all=True) else None
 
 
 def _todo_scoped(entries, alias):
@@ -2125,7 +2176,10 @@ def _todo_statusline(payload, cfg, items_n=1, width=80):
     the TUI with a permanently broken status bar, so every field degrades to nothing.
 
     Layout is two zones split by │: a dim head (slot · model) and the tasks, each
-    carrying its own ◻ so the checkbox — not a separator — is what delimits an item.
+    carrying its own checkbox — so the box, not a separator, is what delimits an item.
+    A slot's bar also carries its REPO-level list, marked ◇ instead of ◻ and sorted
+    after the slot's own: the cross-slot notes live there, and keying the bar strictly
+    on the slot hid them from every place you actually work.
     The open COUNT is deliberately gone: the ◻s and the trailing +N already say how
     many, and a bare number sitting next to a checkbox read as an item.
 
@@ -2143,23 +2197,26 @@ def _todo_statusline(payload, cfg, items_n=1, width=80):
     model = payload.get("model") if isinstance(payload.get("model"), dict) else {}
     name = (model.get("display_name") or "").strip()
     key = _todo_key(cfg, cwd)
-    items = _todo_open(_todo_load(_todo_path(key)))
+    items = [("◻", i["id"], i["text"]) for i in _todo_open(_todo_load(_todo_path(key)))]
+    parent = _todo_parent(key, cfg.repos)
+    if parent:                             # the slot's own work first, shared notes after
+        items += [("◇", i["id"], i["text"])
+                  for i in _todo_open(_todo_load(_todo_path(parent)))]
 
     dim, cyan, rst = ("", "", "") if os.environ.get("NO_COLOR") else \
         ("\033[2m", "\033[36m", "\033[0m")
-    box = cyan + "◻" + rst
     head = " · ".join([key] + ([name] if name else []))
     if not items:
         return dim + head + " │ nothing open" + rst
 
     if items_n > 1:
         shown = items[:items_n]
-        iw = max(len(str(i["id"])) for i in shown)
+        iw = max(len(str(i)) for _, i, _ in shown)
         out = [dim + head + " │ %d open" % len(items) + rst]
-        for i in shown:
+        for g, ident, text in shown:
             out.append("  %s %s%*d%s %s"
-                       % (box, dim, iw, i["id"], rst,
-                          _truncate(i["text"], max(10, width - 6 - iw))))
+                       % (cyan + g + rst, dim, iw, ident, rst,
+                          _truncate(text, max(10, width - 6 - iw))))
         if len(items) > items_n:
             out.append("  %s+%d more%s" % (dim, len(items) - items_n, rst))
         return "\n".join(out)
@@ -2169,9 +2226,8 @@ def _todo_statusline(payload, cfg, items_n=1, width=80):
     tail_room = len("  +%d more" % len(items)) if len(items) > 1 else 0
     limit = width - tail_room
     plain, line, shown = head + " │ ", dim + head + " │ " + rst, 0
-    for i in items:
+    for g, _, text in items:
         sep = "  " if shown else ""
-        text = i["text"]
         if len(plain) + len(sep) + 2 + len(text) > limit:
             if shown:
                 break                      # a mid-list ellipsis reads noisier than a +N
@@ -2179,8 +2235,8 @@ def _todo_statusline(payload, cfg, items_n=1, width=80):
             if avail < 10:
                 break
             text = _truncate(text, avail)
-        plain += sep + "◻ " + text
-        line += sep + box + " " + text
+        plain += sep + g + " " + text
+        line += sep + cyan + g + rst + " " + text
         shown += 1
     if not shown:                          # a width too narrow for even one item
         return dim + head + " │ %d open" % len(items) + rst
@@ -2288,13 +2344,15 @@ def cmd_todo(cfg, args):
     key = _todo_key(cfg, os.getcwd(), _tmux_session_name(), args.slot)
 
     def scope():
-        """Lists this invocation acts on: just the cwd's, or — when the cwd names no
-        slot — the repo's, exactly the set the view shows."""
+        """Lists this invocation acts on, exactly the set the view shows: a slotless cwd
+        widens DOWN to the repo's slots, a slot widens UP to its repo-level list. The
+        actions have to track the view either way, or you see an item you cannot touch."""
         if key in cfg.repos:
             found = _todo_scoped(_todo_all_entries(), key)
             if found:
                 return found
-        return [(key, data)]
+        shared = _todo_shared(cfg, key)
+        return [(key, data), shared] if shared else [(key, data)]
     # Slotless add from a repo dir: offer the repo's slots rather than silently filing
     # against the repo. Only for `add` (viewing has -A), only interactively, and never
     # when -s already named a list or --here opted out.
@@ -2341,7 +2399,8 @@ def cmd_todo(cfg, args):
             print(msg, file=sys.stderr if rc else sys.stdout)
             if rc:
                 return rc
-            for line in _todo_render(data, key, args.all, width, st):
+            for line in _todo_render(data, key, args.all, width, st,
+                                     _todo_shared(cfg, key)):
                 print(line)
             return 0
         if not item:
@@ -2421,8 +2480,12 @@ def cmd_todo(cfg, args):
                 worst = max(worst, rc)
             if worst:
                 return worst
-            for line in _todo_render_all(scope(), width, st) if len(entries) > 1 \
-                    else _todo_render(data, key, args.all, width, st):
+            # _todo_render_all only fits a view widened DOWN to sibling slots; a slot
+            # widened UP re-renders as itself, with the repo section under it.
+            for line in _todo_render_all(scope(), width, st) \
+                    if key in cfg.repos and len(entries) > 1 \
+                    else _todo_render(data, key, args.all, width, st,
+                                      _todo_shared(cfg, key)):
                 print(line)
             return 0
 
@@ -2436,7 +2499,7 @@ def cmd_todo(cfg, args):
         if canon == "add":
             return 0
 
-    for line in _todo_render(data, key, args.all, width, st):
+    for line in _todo_render(data, key, args.all, width, st, _todo_shared(cfg, key)):
         print(line)
     return 0
 

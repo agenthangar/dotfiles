@@ -1134,6 +1134,77 @@ def test_todo_render_all_says_so_when_everything_is_clear(t_mod):
     assert _body(lines) == ["nothing open in any slot"]
 
 
+# ─── t todo — a slot sees its repo-level list ──────────────────────────────────
+
+def test_todo_parent_resolves_a_slot_to_its_repo(t_mod, tmp_path, monkeypatch):
+    repos = _todo_cfg(t_mod, tmp_path, monkeypatch).repos
+    assert t_mod._todo_parent("dotfiles-3", repos) == "dotfiles"
+    assert t_mod._todo_parent("dotfiles", repos) is None      # already repo-level
+    assert t_mod._todo_parent("scratch", repos) is None
+    # The head must be a REAL alias and the tail numeric, or `financial-forecast`
+    # would read as slot "forecast" of a repo "financial".
+    assert t_mod._todo_parent("financial-forecast", repos) is None
+    assert t_mod._todo_parent("dotfiles-main", repos) is None
+
+
+def test_todo_shared_is_none_when_the_repo_list_is_empty(t_mod, tmp_path, monkeypatch):
+    # The common case: a slot with no shared notes pays one stat and renders as before.
+    cfg = _todo_cfg(t_mod, tmp_path, monkeypatch)
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+    assert t_mod._todo_shared(cfg, "dotfiles-3") is None
+    assert t_mod._todo_shared(cfg, "dotfiles") is None        # already repo-level
+    t_mod._todo_save(t_mod._todo_path("dotfiles"), _add(t_mod, _fresh(t_mod), "hello"))
+    assert t_mod._todo_shared(cfg, "dotfiles-3")[0] == "dotfiles"
+
+
+def test_todo_render_marks_shared_items_with_a_diamond(t_mod, tmp_path, monkeypatch):
+    # ◇ not ◻, because ids are per-list and both sections can hold a #3 — which list
+    # an item lives in has to be readable at a glance.
+    own = _add(t_mod, _fresh(t_mod), "fix the thing")
+    shared = _add(t_mod, _fresh(t_mod), "hello")
+    out = "\n".join(t_mod._todo_render(own, "dotfiles-3", shared=("dotfiles", shared)))
+    assert "◻ fix the thing" in out and "◇ hello" in out
+    assert out.index("◻ fix the thing") < out.index("◇ hello")   # own work first
+    assert "dotfiles — 1 open" in out
+
+
+def test_todo_render_hides_a_shared_section_with_nothing_to_show(t_mod):
+    # No repo list, or one holding only ticked-off items, renders exactly as before.
+    own = _add(t_mod, _fresh(t_mod), "fix the thing")
+    plain = t_mod._todo_render(own, "dotfiles-3")
+    assert t_mod._todo_render(own, "dotfiles-3", shared=None) == plain
+    done = _add(t_mod, _fresh(t_mod), "hello")
+    t_mod._todo_apply(done, "done", ["1"], now=100)
+    assert t_mod._todo_render(own, "dotfiles-3", shared=("dotfiles", done)) == plain
+    # -a widens to it, since the item is still live and can be removed or re-filed.
+    assert "✓ hello" in "\n".join(
+        t_mod._todo_render(own, "dotfiles-3", show_all=True, shared=("dotfiles", done)))
+
+
+def test_todo_statusline_carries_the_repo_level_list(t_mod, tmp_path, monkeypatch):
+    # The bar was keyed strictly on the slot, so a note jotted at repo level — the
+    # cross-slot work — was invisible from every place you actually work.
+    cfg = _todo_cfg(t_mod, tmp_path, monkeypatch)
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+    monkeypatch.setenv("NO_COLOR", "1")
+    t_mod._todo_save(t_mod._todo_path("dotfiles-3"), _add(t_mod, _fresh(t_mod), "own"))
+    t_mod._todo_save(t_mod._todo_path("dotfiles"), _add(t_mod, _fresh(t_mod), "hello"))
+    pay = {"workspace": {"current_dir": "/wt/dotfiles/3"}}
+    assert t_mod._todo_statusline(pay, cfg) == "dotfiles-3 │ ◻ own  ◇ hello"
+    # A repo-level cwd is already the shared list; it must not double up.
+    assert t_mod._todo_statusline({"workspace": {"current_dir": "/code/dotfiles"}},
+                                  cfg) == "dotfiles │ ◻ hello"
+
+
+def test_todo_statusline_shared_only_slot_is_not_empty(t_mod, tmp_path, monkeypatch):
+    cfg = _todo_cfg(t_mod, tmp_path, monkeypatch)
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+    monkeypatch.setenv("NO_COLOR", "1")
+    t_mod._todo_save(t_mod._todo_path("dotfiles"), _add(t_mod, _fresh(t_mod), "hello"))
+    assert t_mod._todo_statusline({"workspace": {"current_dir": "/wt/dotfiles/3"}},
+                                  cfg) == "dotfiles-3 │ ◇ hello"
+
+
 # ─── t todo — statusline ───────────────────────────────────────────────────────
 
 def _statusline(t_mod, tmp_path, monkeypatch, payload, key=None, texts=(),

@@ -1187,6 +1187,7 @@ def test_todo_statusline_carries_the_repo_level_list(t_mod, tmp_path, monkeypatc
     cfg = _todo_cfg(t_mod, tmp_path, monkeypatch)
     monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
     monkeypatch.setenv("NO_COLOR", "1")
+    _no_dev_server(t_mod, monkeypatch)
     t_mod._todo_save(t_mod._todo_path("dotfiles-3"), _add(t_mod, _fresh(t_mod), "own"))
     t_mod._todo_save(t_mod._todo_path("dotfiles"), _add(t_mod, _fresh(t_mod), "hello"))
     pay = {"workspace": {"current_dir": "/wt/dotfiles/3"}}
@@ -1200,6 +1201,7 @@ def test_todo_statusline_shared_only_slot_is_not_empty(t_mod, tmp_path, monkeypa
     cfg = _todo_cfg(t_mod, tmp_path, monkeypatch)
     monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
     monkeypatch.setenv("NO_COLOR", "1")
+    _no_dev_server(t_mod, monkeypatch)
     t_mod._todo_save(t_mod._todo_path("dotfiles"), _add(t_mod, _fresh(t_mod), "hello"))
     assert t_mod._todo_statusline({"workspace": {"current_dir": "/wt/dotfiles/3"}},
                                   cfg) == "dotfiles-3 │ ◇ hello"
@@ -1207,15 +1209,23 @@ def test_todo_statusline_shared_only_slot_is_not_empty(t_mod, tmp_path, monkeypa
 
 # ─── t todo — statusline ───────────────────────────────────────────────────────
 
+def _no_dev_server(t_mod, monkeypatch):
+    """Stub the port probe. Without it the bar depends on whatever happens to be
+    listening on the machine running the suite — slot 3 is :5203 to a real dev server
+    as readily as to nothing at all."""
+    monkeypatch.setattr(t_mod, "_port_is_live", lambda *a, **k: False)
+
+
 def _statusline(t_mod, tmp_path, monkeypatch, payload, key=None, texts=(),
-                items_n=1, width=80):
+                items_n=1, width=80, live_ports=(), tmux_name=None):
     cfg = _todo_cfg(t_mod, tmp_path, monkeypatch)
     monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
     if key:
         data = _add(t_mod, _fresh(t_mod), *texts)
         t_mod._todo_save(t_mod._todo_path(key), data)
+    monkeypatch.setattr(t_mod, "_port_is_live", lambda p, *a, **k: p in live_ports)
     monkeypatch.setenv("NO_COLOR", "1")   # assert on the layout, not the escapes
-    return t_mod._todo_statusline(payload, cfg, items_n, width)
+    return t_mod._todo_statusline(payload, cfg, items_n, width, tmux_name)
 
 
 def test_todo_statusline_renders_slot_model_and_top_item(t_mod, tmp_path, monkeypatch):
@@ -1258,6 +1268,7 @@ def test_todo_statusline_colours_unconditionally(t_mod, tmp_path, monkeypatch):
     monkeypatch.delenv("NO_COLOR", raising=False)
     cfg = _todo_cfg(t_mod, tmp_path, monkeypatch)
     monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+    _no_dev_server(t_mod, monkeypatch)
     t_mod._todo_save(t_mod._todo_path("dotfiles-1"), _add(t_mod, _fresh(t_mod), "one"))
     line = t_mod._todo_statusline({"workspace": {"current_dir": "/wt/dotfiles/1"}}, cfg)
     assert line.startswith("\033[2m") and "\033[36m◻\033[0m one" in line
@@ -1362,10 +1373,109 @@ def test_todo_statusline_multiline_without_a_remainder(t_mod, tmp_path, monkeypa
     assert out.split("\n") == ["dotfiles-1 │ 1 open", "  ◻ 1 one"]
 
 
+def test_todo_statusline_uses_the_tmux_slot_when_the_cwd_has_none(
+        t_mod, tmp_path, monkeypatch):
+    # A session run from a repo's PRIMARY checkout inside a dev-<repo>-<n> window: the
+    # path carries no slot, so without the tmux name the bar renders the repo-level
+    # list while `t todo add` files into the slot's — the items just never show up.
+    line = _statusline(t_mod, tmp_path, monkeypatch, {"cwd": "/code/dotfiles"},
+                       key="dotfiles-12", texts=("check the chart",),
+                       tmux_name="dev-dotfiles-12")
+    assert line.startswith("dotfiles-12 │ ◻ check the chart")
+
+
 def test_todo_statusline_empty_list_is_one_line_either_way(t_mod, tmp_path, monkeypatch):
     for n in (1, 5):
         out = _statusline(t_mod, tmp_path, monkeypatch, {}, items_n=n)
         assert out == "scratch │ nothing open"
+
+
+# ─── t todo — the dev URL zone ─────────────────────────────────────────────────
+
+def _dev_url(t_mod, monkeypatch, key, cwd, live=()):
+    monkeypatch.setattr(t_mod, "_port_is_live", lambda p, *a, **k: p in live)
+    return t_mod._dev_url(key, cwd)
+
+
+def test_dev_url_uses_the_slot_port(t_mod, monkeypatch, tmp_path):
+    # The slot number IS the port offset — dev-worktree.sh binds 5200+N — so slot 12
+    # is testable at :5212 and nowhere else.
+    assert _dev_url(t_mod, monkeypatch, "ff-12", str(tmp_path), live=(5212,)) \
+        == "http://localhost:5212"
+
+
+def test_dev_url_is_none_when_nothing_is_listening(t_mod, monkeypatch, tmp_path):
+    # A URL that refuses the connection is worse than no URL.
+    assert _dev_url(t_mod, monkeypatch, "ff-12", str(tmp_path)) is None
+
+
+def test_dev_url_falls_back_to_the_canonical_port_for_a_primary_checkout(
+        t_mod, monkeypatch, tmp_path):
+    # No slot in the key (or a slot whose own server is down) → the plain dev port,
+    # which is where a primary checkout serves from.
+    (tmp_path / "package.json").write_text("{}")
+    assert _dev_url(t_mod, monkeypatch, "ff", str(tmp_path), live=(5173,)) \
+        == "http://localhost:5173"
+    assert _dev_url(t_mod, monkeypatch, "ff-12", str(tmp_path), live=(5173,)) \
+        == "http://localhost:5173"
+
+
+def test_dev_url_prefers_the_slot_port_over_the_shared_one(t_mod, monkeypatch, tmp_path):
+    (tmp_path / "package.json").write_text("{}")
+    assert _dev_url(t_mod, monkeypatch, "ff-12", str(tmp_path), live=(5173, 5212)) \
+        == "http://localhost:5212"
+
+
+def test_dev_url_will_not_claim_the_shared_port_without_a_package_json(
+        t_mod, monkeypatch, tmp_path):
+    # :5173 is whoever got there first. A checkout with no dev server of its own must
+    # not point the user at someone else's app.
+    assert _dev_url(t_mod, monkeypatch, "dotfiles", str(tmp_path), live=(5173,)) is None
+
+
+def test_dev_url_ignores_a_non_numeric_trailing_segment(t_mod, monkeypatch, tmp_path):
+    assert _dev_url(t_mod, monkeypatch, "scratch", str(tmp_path), live=(5200,)) is None
+
+
+def test_todo_statusline_shows_the_live_url(t_mod, tmp_path, monkeypatch):
+    line = _statusline(t_mod, tmp_path, monkeypatch,
+                       {"workspace": {"current_dir": "/wt/dotfiles/1"},
+                        "model": {"display_name": "Opus"}},
+                       key="dotfiles-1", texts=("check the chart",), live_ports=(5201,))
+    assert line == "dotfiles-1 · Opus ● http://localhost:5201 │ ◻ check the chart"
+
+
+def test_todo_statusline_shows_the_url_with_an_empty_list(t_mod, tmp_path, monkeypatch):
+    # The URL is where you go, the list is what to do there — the first must not
+    # depend on the second.
+    line = _statusline(t_mod, tmp_path, monkeypatch,
+                       {"workspace": {"current_dir": "/wt/dotfiles/1"}},
+                       live_ports=(5201,))
+    assert line == "dotfiles-1 ● http://localhost:5201 │ nothing open"
+
+
+def test_todo_statusline_counts_the_url_against_the_width(t_mod, tmp_path, monkeypatch):
+    # The head grew by ~24 columns and the one-line contract is what holds the bar
+    # together, so the URL has to be measured, not just appended.
+    for width in (26, 40, 80, 120):
+        line = _statusline(t_mod, tmp_path, monkeypatch,
+                           {"workspace": {"current_dir": "/wt/dotfiles/1"}},
+                           key="dotfiles-1", texts=("y" * 400,), width=width,
+                           live_ports=(5201,))
+        assert len(line) <= width and "\n" not in line
+
+
+def test_todo_statusline_drops_the_url_on_a_narrow_bar(t_mod, tmp_path, monkeypatch):
+    # Head + URL alone is 34 columns; at 40 there is nothing left to say, so the
+    # tasks keep the bar and the URL steps aside.
+    def bar(width):
+        return _statusline(t_mod, tmp_path, monkeypatch,
+                           {"workspace": {"current_dir": "/wt/dotfiles/1"}},
+                           key="dotfiles-1", texts=("check the chart",), width=width,
+                           live_ports=(5201,))
+
+    assert "localhost:5201" in bar(80)
+    assert bar(40) == "dotfiles-1 │ ◻ check the chart"
 
 
 # ─── t todo — the slotless-add destination picker ──────────────────────────────

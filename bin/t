@@ -25,6 +25,7 @@ import os
 import re
 import shlex
 import shutil
+import socket
 import subprocess
 import sys
 import time
@@ -2221,14 +2222,58 @@ def _todo_render_all(entries, width=80, st=None):
     return lines + ["", "  %s%s%s" % (st.y, _TODO_FOOT, st.r)]
 
 
-def _todo_statusline(payload, cfg, items_n=1, width=80):
+# The dev server a slot's work is testable at. Mirrors financial-forecast's
+# scripts/dev-worktree.sh, which is the thing that actually binds the port:
+# .worktrees/<repo>/<N> → 5200+N, primary checkout → Vite's canonical 5173.
+# Re-derived here rather than shelled out to because the statusline renders many
+# times a second and that script costs a bash plus several lsof calls.
+_DEV_PORT_BASE = 5200
+_DEV_PORT_PRIMARY = 5173
+
+
+def _port_is_live(port, host="127.0.0.1", timeout=0.05):
+    """True when something is LISTENING on the port. A loopback connect settles in
+    well under a millisecond either way — a closed port refuses immediately rather
+    than waiting out the timeout — which is what makes this affordable per render."""
+    try:
+        with socket.create_connection((host, port), timeout):
+            return True
+    except OSError:
+        return False
+
+
+def _dev_url(key, cwd):
+    """The URL to test this slot's work at, or None if nothing is serving it.
+
+    Candidates in order: the slot's own deterministic port, then the canonical dev
+    port — the latter only for a checkout that could plausibly have a dev server
+    (a package.json), so a repo without one never claims the shared :5173 out from
+    under whoever is on it.
+
+    Only a port with a LIVE listener is returned. A URL that refuses the connection
+    is worse than no URL, and appearing exactly when the server comes up makes the
+    bar double as the "it's ready" signal."""
+    ports = []
+    _, dash, slot = key.rpartition("-")
+    if dash and slot.isdigit():
+        ports.append(_DEV_PORT_BASE + int(slot))
+    if cwd and os.path.exists(os.path.join(cwd, "package.json")):
+        ports.append(_DEV_PORT_PRIMARY)
+    for port in ports:
+        if _port_is_live(port):
+            return "http://localhost:%d" % port
+    return None
+
+
+def _todo_statusline(payload, cfg, items_n=1, width=80, tmux_name=None):
     """Claude Code's statusLine. The payload arrives as JSON on stdin;
     workspace.current_dir is preferred over cwd (they differ when Claude is run from a
     subdir of the project). Everything is optional — a statusline that raises leaves
     the TUI with a permanently broken status bar, so every field degrades to nothing.
 
-    Layout is two zones split by │: a dim head (slot · model) and the tasks, each
-    carrying its own checkbox — so the box, not a separator, is what delimits an item.
+    Layout is two zones split by │: a dim head (slot · model, plus ● and the URL the
+    slot is testable at when a dev server is live) and the tasks, each carrying its own
+    checkbox — so the box, not a separator, is what delimits an item.
     A slot's bar also carries its REPO-level list, marked ◇ instead of ◻ and sorted
     after the slot's own: the cross-slot notes live there, and keying the bar strictly
     on the slot hid them from every place you actually work.
@@ -2241,30 +2286,50 @@ def _todo_statusline(payload, cfg, items_n=1, width=80):
 
     Colour is emitted UNCONDITIONALLY (honouring NO_COLOR) — Style() gates on
     isatty and stdout here is always the pipe Claude Code reads, so the shared helper
-    would render every bar plain."""
+    would render every bar plain.
+
+    tmux_name is gathered by the caller and passed in (the ladder stays pure). Without
+    it the bar renders a DIFFERENT list from the one `t todo add` files into whenever
+    the cwd carries no slot of its own — a session run from a repo's primary checkout
+    inside a dev-<repo>-<n> window is exactly that case, and the items silently never
+    appear."""
     if not isinstance(payload, dict):
         payload = {}
     ws = payload.get("workspace") if isinstance(payload.get("workspace"), dict) else {}
     cwd = ws.get("current_dir") or payload.get("cwd") or os.getcwd()
     model = payload.get("model") if isinstance(payload.get("model"), dict) else {}
     name = (model.get("display_name") or "").strip()
-    key = _todo_key(cfg, cwd)
+    key = _todo_key(cfg, cwd, tmux_name)
     items = [("◻", i["id"], i["text"]) for i in _todo_open(_todo_load(_todo_path(key)))]
     parent = _todo_parent(key, cfg.repos)
     if parent:                             # the slot's own work first, shared notes after
         items += [("◇", i["id"], i["text"])
                   for i in _todo_open(_todo_load(_todo_path(parent)))]
 
-    dim, cyan, rst = ("", "", "") if os.environ.get("NO_COLOR") else \
-        ("\033[2m", "\033[36m", "\033[0m")
+    dim, cyan, green, rst = ("", "", "", "") if os.environ.get("NO_COLOR") else \
+        ("\033[2m", "\033[36m", "\033[32m", "\033[0m")
     head = " · ".join([key] + ([name] if name else []))
+    # A live dev URL rides in the head zone, but deliberately NOT dim — it is the one
+    # part of the bar you act on. Carried as (coloured, printable) so the one-line
+    # packer below keeps measuring real widths rather than escape sequences.
+    url = _dev_url(key, cwd)
+    # " ● " + url + " │ " is 6 columns of chrome, and an item needs ~12 to say anything.
+    # On a bar too narrow for both, the tasks win — they are the reason for the bar.
+    if url and len(head) + len(url) + 18 > width:
+        url = None
+    if url:
+        head_c = "%s%s%s %s●%s %s%s%s%s │ %s" % (dim, head, rst, green, rst,
+                                                 cyan, url, rst, dim, rst)
+        head_p = "%s ● %s │ " % (head, url)
+    else:
+        head_c, head_p = dim + head + " │ " + rst, head + " │ "
     if not items:
-        return dim + head + " │ nothing open" + rst
+        return head_c + dim + "nothing open" + rst
 
     if items_n > 1:
         shown = items[:items_n]
         iw = max(len(str(i)) for _, i, _ in shown)
-        out = [dim + head + " │ %d open" % len(items) + rst]
+        out = [head_c + dim + "%d open" % len(items) + rst]
         for g, ident, text in shown:
             out.append("  %s %s%*d%s %s"
                        % (cyan + g + rst, dim, iw, ident, rst,
@@ -2277,7 +2342,7 @@ def _todo_statusline(payload, cfg, items_n=1, width=80):
     # "+N more" tail, so the assembled bar can never exceed `width`.
     tail_room = len("  +%d more" % len(items)) if len(items) > 1 else 0
     limit = width - tail_room
-    plain, line, shown = head + " │ ", dim + head + " │ " + rst, 0
+    plain, line, shown = head_p, head_c, 0
     for g, _, text in items:
         sep = "  " if shown else ""
         if len(plain) + len(sep) + 2 + len(text) > limit:
@@ -2291,7 +2356,7 @@ def _todo_statusline(payload, cfg, items_n=1, width=80):
         line += sep + cyan + g + rst + " " + text
         shown += 1
     if not shown:                          # a width too narrow for even one item
-        return dim + head + " │ %d open" % len(items) + rst
+        return head_c + dim + "%d open" % len(items) + rst
     if shown < len(items):
         line += "%s  +%d more%s" % (dim, len(items) - shown, rst)
     return line
@@ -2390,7 +2455,8 @@ def cmd_todo(cfg, args):
         except Exception:
             payload = {}   # unparseable stdin still gets a line, just without the model
         try:
-            print(_todo_statusline(payload, cfg, args.items or 1, _columns()))
+            print(_todo_statusline(payload, cfg, args.items or 1, _columns(),
+                                   _tmux_session_name()))
         except Exception:
             print("")
         return 0

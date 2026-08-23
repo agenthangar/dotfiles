@@ -1411,13 +1411,18 @@ def test_dev_url_is_none_when_nothing_is_listening(t_mod, monkeypatch, tmp_path)
 
 def test_dev_url_falls_back_to_the_canonical_port_for_a_primary_checkout(
         t_mod, monkeypatch, tmp_path):
-    # No slot in the key (or a slot whose own server is down) → the plain dev port,
-    # which is where a primary checkout serves from.
+    # No slot in the key → the plain dev port, which is where a primary checkout
+    # serves from.
     (tmp_path / "package.json").write_text("{}")
     assert _dev_url(t_mod, monkeypatch, "ff", str(tmp_path), live=(5173,)) \
         == "http://localhost:5173"
-    assert _dev_url(t_mod, monkeypatch, "ff-12", str(tmp_path), live=(5173,)) \
-        == "http://localhost:5173"
+
+
+def test_dev_url_never_hands_a_slot_the_shared_port(t_mod, monkeypatch, tmp_path):
+    # ff-12's server was down and the bar confidently said :5173 — some OTHER
+    # checkout's app. A slot has one port; down means no URL.
+    (tmp_path / "package.json").write_text("{}")
+    assert _dev_url(t_mod, monkeypatch, "ff-12", str(tmp_path), live=(5173,)) is None
 
 
 def test_dev_url_prefers_the_slot_port_over_the_shared_one(t_mod, monkeypatch, tmp_path):

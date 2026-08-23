@@ -507,6 +507,38 @@ _dev_worktree_path()   { print -r -- "${DEV_WORKTREE_ROOT}/${DEV_REPOS[$1]:t}/$2
 # _dev_worktree_branch <repo> <slot> — the slot's dedicated branch.
 _dev_worktree_branch() { print -r -- "dev/${DEV_REPOS[$1]:t}-$2" }
 
+# _dev_repo_slots <repo> — every slot NUMBER this repo has any trace of, ascending:
+# a live tmux session (under ANY sibling alias keying the repo's dir — dev-dot-3 and
+# dev-dotfiles-3 are one slot), a worktree dir on disk, or a saved-transcript project
+# dir (a slot whose worktree was swept is still resumable). Replaces `t resume`'s old
+# hardcoded 1..20 scan: slot numbers grow without bound (a busy repo routinely runs
+# past 20 — ff was on 24), and a fixed ceiling hid those slots BOTH ways — live ones
+# never appeared as "● active", and exiting one made its conversation vanish rather
+# than becoming resumable, which read as "t resume loses my sessions". Prints nothing
+# and returns 1 for an unknown repo or one with no slots at all.
+_dev_repo_slots() {
+  setopt local_options null_glob bare_glob_qual
+  local repo="$1" dir="${DEV_REPOS[$1]:-}"
+  [[ -n $dir ]] || return 1
+  local base=${dir:t} enc n p k
+  local -A seen
+  for k in ${(k)DEV_REPOS}; do
+    [[ ${DEV_REPOS[$k]} == $dir ]] || continue
+    for n in ${(f)"$(tmux list-sessions -F '#{session_name}' 2>/dev/null | grep "^dev-${k}-")"}; do
+      n=${n##*-}; [[ $n == <-> ]] && seen[$n]=1
+    done
+  done
+  for p in ${DEV_WORKTREE_ROOT}/${base}/*(N/); do
+    n=${p:t}; [[ $n == <-> ]] && seen[$n]=1
+  done
+  enc=${${:-${DEV_WORKTREE_ROOT}/${base}}//[^A-Za-z0-9]/-}
+  for p in "$HOME/.claude/projects/${enc}-"*(N/); do
+    n=${${p:t}#${enc}-}; [[ $n == <-> ]] && seen[$n]=1
+  done
+  (( $#seen )) || return 1
+  print -rl -- ${(no)${(k)seen}}
+}
+
 # _dev_worktree_create <repo> <slot> — idempotently materialize the slot's worktree and
 # print its path. Reattach is free: an already-present worktree is reused as-is (no
 # re-fetch, no re-branch). A fresh slot branches off the just-fetched origin/main; a slot
@@ -1124,6 +1156,43 @@ _t_paste() {
   tmux attach-session -t "$session"
 }
 
+# ─── one-shot process/pane snapshot (the scan fast path) ─────────────────────────
+# Every "is this slot running claude, and which pid is it?" question used to fork:
+# a `tmux list-panes` per session, then `ps -o comm=` + `pgrep -P` per pid walking
+# down the subtree — and _dev_session_rows asks it three times per session
+# (_dev_session_sid, _dev_session_has_claude, _dev_session_summary→sid again) with
+# _dev_fg_rows asking a fourth time for every session. On 17 slots that was ~800ms
+# of pure fork overhead in `t ls` and `t resume`.
+# _dev_ps_snapshot takes the whole process table and the whole pane→pid map in TWO
+# forks, into globals the walkers read instead. It is TTL'd (3s) rather than
+# explicitly scoped: `t ls` runs in a throwaway `zsh -lic` where the globals die with
+# the process anyway, while an interactive shell calling _t_resume must not answer
+# from a snapshot taken minutes ago. Every consumer keeps its original fork-based
+# path and falls back to it when the snapshot is empty (no ps, no tmux server), so
+# behaviour is identical — this is a cache, not a new source of truth.
+typeset -gA _DEV_PS_COMM _DEV_PS_PPID _DEV_PS_KIDS _DEV_PANE_PIDS _DEV_SESS_PID
+typeset -g _DEV_PS_AT=0
+_dev_ps_snapshot() {
+  (( ${#_DEV_PS_COMM} )) && (( EPOCHREALTIME - _DEV_PS_AT < 3 )) && return 0
+  _DEV_PS_COMM=(); _DEV_PS_PPID=(); _DEV_PS_KIDS=(); _DEV_PANE_PIDS=(); _DEV_SESS_PID=()
+  local pid ppid comm sname
+  # comm can contain spaces (an .app bundle path), so it takes the rest of the line
+  # and :t trims it to the basename — same normalization the old per-pid ps did.
+  while read -r pid ppid comm; do
+    [[ $pid == <-> ]] || continue
+    _DEV_PS_COMM[$pid]=${comm:t}
+    _DEV_PS_PPID[$pid]=$ppid
+    _DEV_PS_KIDS[$ppid]="${_DEV_PS_KIDS[$ppid]:-} $pid"
+  done < <(ps -Axo pid=,ppid=,comm= 2>/dev/null)
+  while IFS=$'\t' read -r sname pid; do
+    [[ -n $sname ]] || continue
+    _DEV_PANE_PIDS[$sname]="${_DEV_PANE_PIDS[$sname]:-} $pid"
+  done < <(tmux list-panes -a -F "#{session_name}"$'\t'"#{pane_pid}" 2>/dev/null)
+  (( ${#_DEV_PS_COMM} )) && _DEV_PS_AT=$EPOCHREALTIME
+}
+# _dev_snap_ok — true when the snapshot can answer session→pid questions.
+_dev_snap_ok() { (( ${#_DEV_PS_COMM} && ${#_DEV_PANE_PIDS} )) }
+
 # _dev_session_has_claude <session> — true if a live `claude` process exists
 # ANYWHERE in the session: the pane leader itself, a direct child, or deeper.
 # We deliberately do NOT use pane_current_command: Claude sets its process title
@@ -1143,7 +1212,28 @@ _t_paste() {
 # deeper is more likely an MCP server or dev tool, so we match only the
 # unambiguous `claude` name there.
 _dev_session_has_claude() {
-  local s="$1" pane_pid kid comm
+  local s="$1" pane_pid kid comm pid
+  local -a stack
+  # Snapshot fast path (see _dev_ps_snapshot): same walk, zero forks. The `node`
+  # special-case for a DIRECT child is preserved verbatim — a claude launched via a
+  # node shim shows up that way, and dropping it would flip live slots to "(no
+  # active session)".
+  _dev_ps_snapshot
+  if _dev_snap_ok; then
+    for pane_pid in ${=_DEV_PANE_PIDS[$s]:-}; do
+      [[ ${_DEV_PS_COMM[$pane_pid]:-} == claude ]] && return 0
+      for kid in ${=_DEV_PS_KIDS[$pane_pid]:-}; do
+        case ${_DEV_PS_COMM[$kid]:-} in (claude|node) return 0 ;; esac
+        stack=($kid)
+        while (( $#stack )); do
+          pid=$stack[1]; shift stack
+          [[ ${_DEV_PS_COMM[$pid]:-} == claude ]] && return 0
+          stack+=(${=_DEV_PS_KIDS[$pid]:-})
+        done
+      done
+    done
+    return 1
+  fi
   for pane_pid in ${(f)"$(tmux list-panes -t "$s" -F '#{pane_pid}' 2>/dev/null)"}; do
     comm=$(ps -o comm= -p "$pane_pid" 2>/dev/null)
     [[ "${comm:t}" == claude ]] && return 0
@@ -1186,7 +1276,27 @@ _dev_session_at_welcome() {
 # session (first match, same subtree scan as _dev_session_has_claude), or nothing.
 # Used to map OLD sessions (no CLAUDE_RESUME_ID) to their transcript by start time.
 _dev_session_claude_pid() {
-  local s="$1" pane_pid kid comm found
+  local s="$1" pane_pid kid comm found pid
+  local -a stack
+  # Snapshot fast path, MEMOIZED per session (`-` = looked, found nothing): three
+  # different callers ask this for the same session during one scan.
+  _dev_ps_snapshot
+  if _dev_snap_ok; then
+    if [[ -n ${_DEV_SESS_PID[$s]:-} ]]; then
+      [[ ${_DEV_SESS_PID[$s]} == - ]] && return 1
+      print -r -- "${_DEV_SESS_PID[$s]}"; return 0
+    fi
+    stack=(${=_DEV_PANE_PIDS[$s]:-})
+    while (( $#stack )); do
+      pid=$stack[1]; shift stack
+      if [[ ${_DEV_PS_COMM[$pid]:-} == claude ]]; then
+        _DEV_SESS_PID[$s]=$pid; print -r -- "$pid"; return 0
+      fi
+      stack+=(${=_DEV_PS_KIDS[$pid]:-})
+    done
+    _DEV_SESS_PID[$s]='-'
+    return 1
+  fi
   for pane_pid in ${(f)"$(tmux list-panes -t "$s" -F '#{pane_pid}' 2>/dev/null)"}; do
     comm=$(ps -o comm= -p "$pane_pid" 2>/dev/null)
     [[ "${comm:t}" == claude ]] && { print -r -- "$pane_pid"; return 0; }
@@ -1208,39 +1318,126 @@ _dev_pid_tree_claude_pid() {
   return 1
 }
 
-# _transcript_title <transcript.jsonl> — print the one-line title of a Claude
-# transcript: customTitle (set by /rename) wins, else the generated aiTitle, else the
-# first real user prompt; trimmed to 50 chars. Factored out so dev-slot summaries and
-# foreground-session summaries share one parser.
-_transcript_title() {
-  python3 - "$1" <<'PY'
-import json, sys
-title = ctitle = msg = None
-try:
-    for line in open(sys.argv[1], errors='ignore'):
+# _transcript_meta_batch — the transcript reader behind every title/PR-tag column.
+# args: transcript paths. stdout: `path\ttitle\tpr-url` per line, same order, one line
+# per input (missing/unreadable → empty fields). Paths ride in ARGV, not on stdin —
+# the heredoc IS python3's stdin here, so a `sys.stdin.read()` would come back empty.
+# Two things make it
+# fast, and both were needed: `t resume ff` read 135MB across 43 transcripts twice
+# (once for the title, once for a `grep -ao` PR-URL pass) and `t ls` forked python3
+# once per live session — together ~2.2s and ~0.5s of pure re-reading.
+#   BATCHED: one python3 for the whole scan instead of one per file, so the ~25ms
+#   interpreter start is paid once. This is why callers collect their paths first.
+#   INCREMENTALLY CACHED: per-transcript state (last title seen, first user prompt,
+#   last PR URL, and the byte offset scanned so far) lives in
+#   ~/.cache/claude-sessions/meta/<hash>, so a DEAD transcript is never re-read and a
+#   LIVE one re-reads only the bytes appended since last time. Transcripts are
+#   append-only .jsonl, which is what makes a resumable offset correct; the cache is
+#   keyed on st_ino and invalidated whenever the inode changes (csync's rsync writes
+#   a NEW file, so a synced-in transcript rescans in full) or the file is shorter
+#   than the recorded offset (truncation/rewrite). The offset always stops at the
+#   last complete newline, so a half-written final line is re-read next time rather
+#   than parsed in halves.
+# Cache misses are cheap to be wrong about (a title is cosmetic) but the invalidation
+# above means a stale one needs an in-place same-inode rewrite that shrinks nothing —
+# which append-only .jsonl never does.
+_transcript_meta_batch() {
+  (( $# )) || return 0
+  python3 - "$@" <<'PY'
+import hashlib, json, os, re, sys
+
+CACHE = os.path.join(os.environ.get('XDG_CACHE_HOME') or os.path.expanduser('~/.cache'),
+                     'claude-sessions', 'meta')
+PR = re.compile(r'github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/pull/[0-9]+')
+SOFT = (ValueError, AttributeError, TypeError, KeyError)
+
+
+def load(key):
+    try:
+        with open(os.path.join(CACHE, key)) as fh:
+            st = json.load(fh)
+        return st if isinstance(st, dict) else None
+    except (OSError, ValueError):
+        return None
+
+
+def save(key, st):
+    try:
+        os.makedirs(CACHE, exist_ok=True)
+        tmp = os.path.join(CACHE, '%s.%d.tmp' % (key, os.getpid()))
+        with open(tmp, 'w') as fh:
+            json.dump(st, fh)
+        os.replace(tmp, os.path.join(CACHE, key))
+    except OSError:
+        pass
+
+
+def scan(st, text):
+    for line in text.splitlines():
         if '"custom-title"' in line:                    # /rename — wins
             try:
                 t = json.loads(line).get('customTitle')
-                if t: ctitle = t                        # keep the most recent
-            except ValueError: pass
+                if t: st['ct'] = t                      # keep the most recent
+            except SOFT: pass
         if '"ai-title"' in line:
             try:
                 t = json.loads(line).get('aiTitle')
-                if t: title = t                         # keep the most recent
-            except ValueError: pass
-        if msg is None and '"type":"user"' in line:     # first real prompt
+                if t: st['at'] = t                      # keep the most recent
+            except SOFT: pass
+        if st['msg'] is None and '"type":"user"' in line:   # first real prompt
             try:
                 c = json.loads(line).get('message', {}).get('content')
                 txt = c if isinstance(c, str) else (
                     ' '.join(x.get('text', '') for x in c if isinstance(x, dict))
                     if isinstance(c, list) else '')
                 txt = txt.strip()
-                if txt and not txt.startswith('<'): msg = txt
-            except ValueError: pass
-except OSError:
-    pass
-print(' '.join((ctitle or title or msg or '').split())[:50])
+                if txt and not txt.startswith('<'): st['msg'] = txt
+            except SOFT: pass
+        hits = PR.findall(line)                         # LAST PR URL in the session
+        if hits: st['pr'] = hits[-1]
+
+
+for path in sys.argv[1:]:
+    if not path:
+        continue
+    try:
+        info = os.stat(path)
+    except OSError:
+        sys.stdout.write('%s\t\t\n' % path)
+        continue
+    key = hashlib.sha1(path.encode('utf-8', 'surrogateescape')).hexdigest()[:20]
+    st = load(key)
+    if not st or st.get('ino') != info.st_ino or st.get('off', 0) > info.st_size:
+        st = {'ino': info.st_ino, 'off': 0, 'ct': None, 'at': None, 'msg': None, 'pr': None}
+    if st['off'] < info.st_size:
+        data = b''
+        try:
+            with open(path, 'rb') as fh:
+                fh.seek(st['off'])
+                data = fh.read()
+        except OSError:
+            pass
+        cut = data.rfind(b'\n')                         # whole lines only
+        if cut >= 0:
+            scan(st, data[:cut + 1].decode('utf-8', 'replace'))
+            st['off'] += cut + 1
+            save(key, st)
+    title = ' '.join((st['ct'] or st['at'] or st['msg'] or '').split())[:50]
+    sys.stdout.write('%s\t%s\t%s\n' % (path, title, st['pr'] or ''))
 PY
+}
+
+# _transcript_title <transcript.jsonl> — print the one-line title of a Claude
+# transcript: customTitle (set by /rename) wins, else the generated aiTitle, else the
+# first real user prompt; trimmed to 50 chars. Factored out so dev-slot summaries and
+# foreground-session summaries share one parser — now a single-path call into
+# _transcript_meta_batch above, so one-off callers still get the incremental cache.
+# A caller with SEVERAL transcripts should call the batch directly instead: this one
+# pays a python3 start per file, which is the whole cost once the cache is warm.
+_transcript_title() {
+  local row; row=$(_transcript_meta_batch "$1")
+  row=${row#*$'\t'}          # drop the echoed path
+  print -r -- "${row%$'\t'*}"  # drop the PR url
 }
 
 # _dev_summary_for_pid <dir> <claude-pid> — title of the transcript a LIVE claude
@@ -1317,8 +1514,11 @@ _dev_session_sid() {
 # defers to _dev_summary_for_pid (birthtime match on the LIVE claude). None → "".
 _dev_session_summary() {
   setopt local_options null_glob bare_glob_qual
-  local session="$1" dir="$2" sid
-  sid=$(_dev_session_sid "$session" "$dir")
+  # <sid> is optional: callers that already resolved it (_dev_session_rows) pass it
+  # in, because resolving it walks the process table and used to be done TWICE per
+  # session — once for the row's id column and again in here.
+  local session="$1" dir="$2" sid="${3:-}"
+  [[ -n $sid ]] || sid=$(_dev_session_sid "$session" "$dir")
   if [[ -n $sid ]]; then
     # A valid id (registry or validated stamp) always has its transcript under this
     # slot's own project dir, since the dir IS the conversation's cwd.
@@ -1351,13 +1551,26 @@ _dev_fg_rows() {
   done
   # the claude THIS shell is running under (walk up $$), so we don't list ourselves.
   local me up=$$
-  while [[ -n $up && $up != 1 ]]; do
-    [[ "$(ps -o comm= -p $up 2>/dev/null)" == claude ]] && { me=$up; break; }
-    up=$(ps -o ppid= -p $up 2>/dev/null | tr -d ' ')
-  done
+  local -a claudes
+  if _dev_snap_ok; then                     # snapshot: no ps fork per ancestor level
+    while [[ -n $up && $up != 1 ]]; do
+      [[ ${_DEV_PS_COMM[$up]:-} == claude ]] && { me=$up; break; }
+      up=${_DEV_PS_PPID[$up]:-}
+    done
+    for p in ${(k)_DEV_PS_COMM}; do
+      [[ ${_DEV_PS_COMM[$p]} == claude ]] && claudes+=($p)
+    done
+    claudes=(${(no)claudes})                # assoc keys are unordered; pid order is stable
+  else
+    while [[ -n $up && $up != 1 ]]; do
+      [[ "$(ps -o comm= -p $up 2>/dev/null)" == claude ]] && { me=$up; break; }
+      up=$(ps -o ppid= -p $up 2>/dev/null | tr -d ' ')
+    done
+    claudes=(${(f)"$(ps -Axo pid,comm 2>/dev/null | awk '{n=$2; sub(/.*\//,"",n)} n=="claude"{print $1}')"})
+  fi
   local -A live
   local pid cwd repo k label sid title summary context
-  for pid in ${(f)"$(ps -Axo pid,comm 2>/dev/null | awk '{n=$2; sub(/.*\//,"",n)} n=="claude"{print $1}')"}; do
+  for pid in ${(@)claudes}; do
     live[$pid]=1
     [[ -n ${inslot[$pid]} || $pid == $me ]] && continue
     sid= cwd=
@@ -1708,31 +1921,71 @@ _dev_list() {
 # what genuinely differ machine-to-machine (transcripts already converge via csync),
 # so the cross-host view lists these, not transcripts.
 _dev_session_rows() {
-  local names
-  names=$(tmux list-sessions -F '#{session_name}' 2>/dev/null | grep '^dev-' | sort)
-  local s short sid dir state context summary
-  while IFS= read -r s; do
-    [[ -n $s ]] || continue
+  setopt local_options null_glob bare_glob_qual
+  # Two passes, because the expensive part is per-transcript and batches. Pass 1
+  # asks tmux and the process table (ONE list-sessions carrying name+path+attached,
+  # instead of two display-message forks per session, over the shared
+  # _dev_ps_snapshot); pass 2 prints, after ONE _transcript_meta_batch has read
+  # every title at once rather than forking python3 per slot.
+  local -a rows rowtx tpaths tx mrows f
+  local -A title_of
+  local s short sid psid dir state context summary i mr mrest
+  _dev_ps_snapshot
+  while IFS=$'\t' read -r s dir state; do
+    [[ $s == dev-* && -n $dir ]] || continue
     short="${s#dev-}"
-    dir=$(tmux display-message -p -t "$s" '#{session_path}' 2>/dev/null)
     # Authoritative id (registry-first, stamp validated against the slot's repo) —
     # not the raw CLAUDE_RESUME_ID stamp, which a reused slot can carry stale from a
     # prior (even cross-repo) occupant; this is the targeting id callers act on.
     sid=$(_dev_session_sid "$s" "$dir")
     # `-` sentinel for an unstamped slot (idle / no conversation): keeps every
     # field non-empty so a tab is never a *leading/consecutive* IFS-whitespace
-    # delimiter that `read` would collapse, sliding the columns.
+    # delimiter that `read` would collapse, sliding the columns. It also keeps the
+    # rows[] records below splittable with (ps:\t:).
     [[ -n $sid ]] || sid='-'
-    state=$(tmux display-message -p -t "$s" '#{?session_attached,attached,detached}' 2>/dev/null)
+    tx=()
     if ! _dev_session_has_claude "$s"; then
-      context=none; summary='(no active session)'
+      context=none
     elif _dev_session_at_welcome "$s"; then
-      context=idle; summary='(idle — no conversation)'
+      context=idle
     else
-      context=active; summary=$(_dev_session_summary "$s" "$dir"); [[ -n $summary ]] || summary='(untitled session)'
+      context=active
+      # A valid id always has its transcript under this slot's own project dir,
+      # since the dir IS the conversation's cwd. Collect it for the batch; a slot
+      # with no id (or no transcript) falls back to _dev_session_summary in pass 2,
+      # which owns the birthtime-matching heuristic for that case.
+      [[ $sid != - ]] && tx=( "$HOME/.claude/projects/${dir//[^A-Za-z0-9]/-}/$sid".jsonl(N) )
     fi
+    rows+=("$sid"$'\t'"$dir"$'\t'"$short"$'\t'"$state"$'\t'"$context")
+    if [[ -n ${tx[1]:-} ]]; then rowtx+=("${tx[1]}"); tpaths+=("${tx[1]}")
+    else rowtx+=('-'); fi
+  done < <(tmux list-sessions -F "#{session_name}"$'\t'"#{session_path}"$'\t'"#{?session_attached,attached,detached}" 2>/dev/null | sort)
+
+  (( $#tpaths )) && mrows=("${(@f)$(_transcript_meta_batch "${(@)tpaths}")}")
+  for mr in "${(@)mrows}"; do
+    [[ -n $mr ]] || continue
+    mrest=${mr#*$'\t'}                      # peeled, not split: an empty title must
+    title_of[${mr%%$'\t'*}]=${mrest%%$'\t'*}  # not collapse the column away
+  done
+
+  for (( i = 1; i <= $#rows; i++ )); do
+    f=("${(@ps:\t:)rows[$i]}")
+    sid=$f[1]; dir=$f[2]; short=$f[3]; state=$f[4]; context=$f[5]
+    case $context in
+      none) summary='(no active session)' ;;
+      idle) summary='(idle — no conversation)' ;;
+      *)
+        if [[ ${rowtx[$i]} != - ]]; then
+          summary=${title_of[${rowtx[$i]}]:-}
+        else
+          psid=$sid; [[ $psid == - ]] && psid=
+          summary=$(_dev_session_summary "dev-$short" "$dir" "$psid")
+        fi
+        [[ -n $summary ]] || summary='(untitled session)'
+        ;;
+    esac
     printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$sid" "$dir" "$short" "$state" "$context" "$summary"
-  done <<< "$names"
+  done
   # plus any FOREGROUND (non-tmux) claudes on this machine, same row format.
   _dev_fg_rows
 }
@@ -3243,7 +3496,10 @@ _t_resume() {
   # of the loops — an assignmentless `local x` re-run on an already-local x
   # does not redeclare, it PRINTS `x=value` (the `_ok=claw` junk-output bug).
   local -a cands slots tx
+  local -a pending _mpaths _mrows _mf
   local -A remote_live_host remote_live_alias remote_live_sum
+  local -A meta_title meta_pr
+  local _p _mr _mrest
   local n wt sid busy rhost _rdir _rbase _rhost _rn _ralias _rsum _ok _stale stale_path
   local txf title when ep org orgf hf skipped=0
   local reopened opf opep pru prp prkey prnum prst prcf prmt
@@ -3266,7 +3522,6 @@ _t_resume() {
   for _hcf in "$HOME"/.cache/t/hostnames/*(N); do
     host_alias[$(<$_hcf)]=${_hcf:t}
   done
-  if [[ -n $slot ]]; then slots=($slot); else slots=({1..20}); fi
   for repo in $repos; do
     _rdir=${DEV_REPOS[$repo]}; _rbase=${_rdir:t}
     remote_live_host=(); remote_live_alias=(); remote_live_sum=()
@@ -3280,6 +3535,18 @@ _t_resume() {
           r = $4; sub(/-[^-]+$/, "", r)
           print $1 "\t" n "\t" r "\t" $7
         }')
+    fi
+    # Which slots to look at. NOT a fixed 1..20 range (which silently capped the
+    # scan — a busy repo runs well past 20, and every slot above the ceiling was
+    # invisible BOTH live and dead, reading as "t resume drops my sessions"):
+    # _dev_repo_slots discovers them from tmux + worktrees on disk + saved
+    # project dirs, and the remote-live slots found just above are unioned in
+    # (a slot live only on another host may have no local trace at all).
+    if [[ -n $slot ]]; then
+      slots=($slot)
+    else
+      slots=(${(f)"$(_dev_repo_slots "$repo")"} ${(k)remote_live_host})
+      slots=(${(nou)slots:#})
     fi
     for n in $slots; do
       wt=$(_dev_worktree_path "$repo" "$n")
@@ -3309,22 +3576,30 @@ _t_resume() {
       fi
       # Name-only collision: a dev-<alias>-${n} tmux session (any alias keying
       # this repo's dir — see _t_dev / _t_pop) exists but is rooted elsewhere
-      # (not this slot's worktree — an old alias, opt-out shared tree, or a
-      # stray). _dev_resume_session's `tmux new-session -s dev-${repo}-${n}`
-      # would fail on the duplicate name, and attaching the stale session would
-      # land the user in the wrong worktree with the wrong conversation. Refuse
-      # loudly on explicit ask; skip in scan mode.
+      # (not this slot's worktree — an old alias, an opt-out shared tree, or a
+      # session opened straight in the canonical repo dir, which `t ls` shows
+      # and this scan matched by PATH so it missed). It is still a LIVE session
+      # occupying the slot's tmux name, so it gets the same treatment as one
+      # rooted in the worktree: a labeled row that ATTACHES on pick (_t_dev
+      # canonicalizes sibling aliases, so it lands on this exact session).
+      # It was previously skipped in scan mode and refused on explicit ask —
+      # which made a live slot invisible in the very list that is supposed to
+      # show what is running. Resuming a DEAD conversation into that slot is
+      # still impossible (`tmux new-session -s dev-${repo}-${n}` would collide
+      # on the name), hence the live row rather than the slot's transcripts.
       _stale=
       for _ok in ${(k)DEV_REPOS}; do
         [[ ${DEV_REPOS[$_ok]} != $_rdir ]] && continue
         tmux has-session -t "dev-${_ok}-${n}" 2>/dev/null && { _stale="dev-${_ok}-${n}"; break; }
       done
       if [[ -n $_stale ]]; then
+        stale_path=$(tmux display-message -p -t "$_stale" '#{session_path}' 2>/dev/null)
         if [[ -n $slot ]]; then
-          stale_path=$(tmux display-message -p -t "$_stale" '#{session_path}' 2>/dev/null)
-          echo "Slot $n's tmux name ($_stale) is taken by a session rooted elsewhere${stale_path:+ ($stale_path)} — kill it (tmux kill-session -t $_stale) before resuming." >&2
-          return 1
+          echo "Slot $n is live ($_stale${stale_path:+ in $stale_path}) — attaching (resume only revives dead slots)."
+          _t_dev "$repo" "$n"
+          return
         fi
+        cands+=(9999999999$'\t'"$repo"$'\t'"$n"$'\t'-$'\t'"${stale_path:-$wt}"$'\t'"● active"$'\t'"${local_sum[${_stale#dev-}]:-(live session)}"$'\t'here$'\t'-$'\t'-)
         continue
       fi
       tx=( "$HOME/.claude/projects/${wt//[^A-Za-z0-9]/-}"/*.jsonl(Nom) )
@@ -3342,51 +3617,81 @@ _t_resume() {
         if (( cutoff && ep < cutoff )); then
           (( skipped++ )); continue        # outside the --days window
         fi
-        title=$(_transcript_title "$txf")
-        [[ -n $title ]] || continue        # conversationless stub — nothing to resume
-        # ep already reflects the reopened stamp (ep=opep above), so one
-        # strftime covers both branches; ↻ marks the stamp-dated rows.
-        when=; (( ep )) && when=$(strftime '%b %d %H:%M' "$ep" 2>/dev/null)
-        [[ -n $reopened && -n $when ]] && when+=" ↻"
-        # PR-in-session tag: the LAST github.com …/pull/N URL in the transcript
-        # (a `gh pr create` lands its URL in the tool output) names the
-        # session's PR; append " · #N <state>" to the title. State is read from
-        # the pr/ cache only; MERGED/CLOSED are terminal, anything else stale
-        # (>5 min) spawns ONE detached gh refresh for the next run.
-        pru=$(grep -ao 'github\.com/[A-Za-z0-9_.-]*/[A-Za-z0-9_.-]*/pull/[0-9]*' "$txf" 2>/dev/null | tail -1)
-        if [[ -n $pru ]]; then
-          prp=${pru#github.com/}; prp=${prp/\/pull\//\/}
-          prkey=${prp//\//#}; prnum=${pru##*/}
-          prcf="$prdir/$prkey"; prst=
-          if [[ -f $prcf ]]; then
-            prst=$(<$prcf)
-            [[ $prst == MERGED || $prst == CLOSED || $prst == OPEN ]] || prst=
-          fi
-          title+=" · #$prnum${prst:+ ${(L)prst}}"
-          if [[ $prst != MERGED && $prst != CLOSED && -z ${_prspawned[$prkey]:-} ]]; then
-            prmt=$(zstat +mtime "$prcf" 2>/dev/null || echo 0)
-            if (( EPOCHSECONDS - prmt > 300 )); then
-              _prspawned[$prkey]=1
-              mkdir -p "$prdir" 2>/dev/null
-              ( { prst=$(gh pr view "https://$pru" --json state --jq .state 2>/dev/null) || prst="?"
-                  print -rn -- "$prst" > "$prcf.$$.tmp" && mv -f "$prcf.$$.tmp" "$prcf"; } & ) 2>/dev/null
-            fi
-          fi
-        fi
-        # Origin: which machine the conversation LAST RAN on — the <sid>.origin
-        # stamp claude-stamp-tmux writes next to the transcript (syncs with it).
-        # Blank for this machine / unstamped (pre-feature) transcripts; a raw
-        # hostname is translated to its $REMOTE_HOSTS key when the cache knows it.
-        org=; orgf="${txf%.jsonl}.origin"
-        if [[ -f $orgf ]]; then
-          org=$(<$orgf)
-          if [[ $org == $selfhost ]]; then org=
-          elif [[ -n ${host_alias[$org]:-} ]]; then org=${host_alias[$org]}
-          fi
-        fi
-        cands+=("$ep"$'\t'"$repo"$'\t'"$n"$'\t'"${${txf:t}%.jsonl}"$'\t'"$wt"$'\t'"$when"$'\t'"$title"$'\t'-$'\t'-$'\t'"${org[1,10]}")
+        # Nothing is READ from the transcript here: the title and the PR URL both
+        # need the file's contents, and doing that inline meant a python3 fork
+        # plus a whole-file `grep -ao` per candidate — 135MB read twice for ff's
+        # 43 in-window conversations. Collect the survivors instead and read them
+        # all in ONE batched, incrementally-cached pass below. Every field is
+        # non-empty (reopened is 1/0, never blank) so the `ps:\t:` split back
+        # cannot collapse a column.
+        pending+=("$ep"$'\t'"$repo"$'\t'"$n"$'\t'"$wt"$'\t'"$txf"$'\t'"${reopened:-0}")
       done
     done
+  done
+
+  # ONE batched metadata read for every surviving candidate (title + last PR URL),
+  # warm-cached per transcript and incremental for the ones still being appended to.
+  if (( $#pending )); then
+    for _p in "${(@)pending}"; do _mpaths+=("${${(@ps:\t:)_p}[5]}"); done
+    _mrows=("${(@f)$(_transcript_meta_batch "${(@)_mpaths}")}")
+    for _mr in "${(@)_mrows}"; do
+      [[ -n $_mr ]] || continue
+      # Peeled with parameter expansion, NOT a split: title and pr are both
+      # allowed to be empty and tab is an IFS-whitespace char, so `read`/`(ps)`
+      # would collapse the blank column and slide the fields (the same trap the
+      # `-` sentinels in _dev_session_rows exist for).
+      _mrest=${_mr#*$'\t'}
+      meta_title[${_mr%%$'\t'*}]=${_mrest%%$'\t'*}
+      meta_pr[${_mr%%$'\t'*}]=${_mrest#*$'\t'}
+    done
+  fi
+  for _p in "${(@)pending}"; do
+    _mf=("${(@ps:\t:)_p}")
+    ep=$_mf[1]; repo=$_mf[2]; n=$_mf[3]; wt=$_mf[4]; txf=$_mf[5]
+    [[ $_mf[6] == 1 ]] && reopened=1 || reopened=
+    title=${meta_title[$txf]:-}
+    [[ -n $title ]] || continue        # conversationless stub — nothing to resume
+    # ep already reflects the reopened stamp (ep=opep above), so one
+    # strftime covers both branches; ↻ marks the stamp-dated rows.
+    when=; (( ep )) && when=$(strftime '%b %d %H:%M' "$ep" 2>/dev/null)
+    [[ -n $reopened && -n $when ]] && when+=" ↻"
+    # PR-in-session tag: the LAST github.com …/pull/N URL in the transcript
+    # (a `gh pr create` lands its URL in the tool output) names the
+    # session's PR; append " · #N <state>" to the title. State is read from
+    # the pr/ cache only; MERGED/CLOSED are terminal, anything else stale
+    # (>5 min) spawns ONE detached gh refresh for the next run.
+    pru=${meta_pr[$txf]:-}
+    if [[ -n $pru ]]; then
+      prp=${pru#github.com/}; prp=${prp/\/pull\//\/}
+      prkey=${prp//\//#}; prnum=${pru##*/}
+      prcf="$prdir/$prkey"; prst=
+      if [[ -f $prcf ]]; then
+        prst=$(<$prcf)
+        [[ $prst == MERGED || $prst == CLOSED || $prst == OPEN ]] || prst=
+      fi
+      title+=" · #$prnum${prst:+ ${(L)prst}}"
+      if [[ $prst != MERGED && $prst != CLOSED && -z ${_prspawned[$prkey]:-} ]]; then
+        prmt=$(zstat +mtime "$prcf" 2>/dev/null || echo 0)
+        if (( EPOCHSECONDS - prmt > 300 )); then
+          _prspawned[$prkey]=1
+          mkdir -p "$prdir" 2>/dev/null
+          ( { prst=$(gh pr view "https://$pru" --json state --jq .state 2>/dev/null) || prst="?"
+              print -rn -- "$prst" > "$prcf.$$.tmp" && mv -f "$prcf.$$.tmp" "$prcf"; } & ) 2>/dev/null
+        fi
+      fi
+    fi
+    # Origin: which machine the conversation LAST RAN on — the <sid>.origin
+    # stamp claude-stamp-tmux writes next to the transcript (syncs with it).
+    # Blank for this machine / unstamped (pre-feature) transcripts; a raw
+    # hostname is translated to its $REMOTE_HOSTS key when the cache knows it.
+    org=; orgf="${txf%.jsonl}.origin"
+    if [[ -f $orgf ]]; then
+      org=$(<$orgf)
+      if [[ $org == $selfhost ]]; then org=
+      elif [[ -n ${host_alias[$org]:-} ]]; then org=${host_alias[$org]}
+      fi
+    fi
+    cands+=("$ep"$'\t'"$repo"$'\t'"$n"$'\t'"${${txf:t}%.jsonl}"$'\t'"$wt"$'\t'"$when"$'\t'"$title"$'\t'-$'\t'-$'\t'"${org[1,10]}")
   done
   (( skipped )) && echo "(${skipped} older conversation(s) outside the last ${days}d hidden — t resume --days all shows them)" >&2
 

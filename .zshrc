@@ -932,6 +932,52 @@ _clawsync_periodic() {
 }
 add-zsh-hook precmd _clawsync_periodic
 
+# _dev_procs_rooted_in <dir> — pids of every process whose cwd is <dir> or below it,
+# minus shells and this process. The dev server a slot starts (`npm run dev` → vite)
+# is what this exists for: it is detached from the slot's tmux session, so it outlives
+# both `t kill` and the sweep, keeps serving the OLD code on the slot's port (the next
+# tenant of that slot number sees its URL in the statusline and trusts it), and
+# rewrites .vite/deps into the reaped path — the debris dir that blocked the next
+# `git worktree add`. Sixteen of them were found running, the oldest two weeks old.
+# Shells are excluded because a user's terminal sitting inside a dead slot is not a
+# leak; killing it would be. One lsof over the whole table (~0.25s) on macOS, /proc
+# on Linux — never a per-pid fork.
+_dev_procs_rooted_in() {
+  local dir="${1:A}" pid cwd comm line
+  [[ -n $dir && $dir != / ]] || return 1
+  local -a hits
+  if [[ -d /proc ]]; then
+    for pid in /proc/<->(N:t); do
+      cwd=$(readlink "/proc/$pid/cwd" 2>/dev/null) || continue
+      [[ $cwd == $dir || $cwd == $dir/* ]] && hits+=("$pid")
+    done
+  else
+    for line in "${(@f)$(lsof -a -d cwd -Fpn 2>/dev/null)}"; do   # p<pid> / fcwd / n<path>
+      case $line in
+        p*) pid=${line#p} ;;
+        n*) cwd=${line#n}; [[ $cwd == $dir || $cwd == $dir/* ]] && hits+=("$pid") ;;
+      esac
+    done
+  fi
+  for pid in $hits; do
+    [[ $pid == $$ || $pid == $PPID ]] && continue
+    comm=$(ps -o comm= -p "$pid" 2>/dev/null); comm=${comm:t}
+    case $comm in zsh|bash|sh|fish|dash|tmux|login|-*) continue ;; esac
+    print -r -- "$pid"
+  done
+}
+
+# _dev_stop_rooted <dir> [why] — SIGTERM every non-shell process rooted in <dir>
+# and print one summary line (nothing when there was nothing to stop).
+_dev_stop_rooted() {
+  local dir="$1" why="${2:-}" n=0 pid
+  for pid in $(_dev_procs_rooted_in "$dir"); do
+    kill -TERM "$pid" 2>/dev/null && (( n++ ))
+  done
+  (( n )) && print -r -- "stopped $n process(es) still rooted in $dir${why:+ ($why)}"
+  return 0
+}
+
 # Worktree sweep — reap per-session worktrees whose work has landed. A slot's worktree
 # + branch (dev/<basename>-<slot>) are removed only when ALL THREE hold: the tmux session
 # is dead (matched by session_path, never by name — dodges alias drift), the branch is
@@ -1004,9 +1050,20 @@ _dev_worktree_sweep_run() {
     dirt=$(git -C "$wt" status --porcelain 2>/dev/null) || dirt='?'
     [[ -z $dirt ]] || continue
     print -r -- "[$(strftime '%F %T' $EPOCHSECONDS 2>/dev/null)] sweep: $wt (branch $br merged)"
+    # The slot's dev server first: left running it serves stale code on the slot's
+    # port and rewrites .vite/deps into the path we are about to remove.
+    _dev_stop_rooted "$wt" "reaped"
     git -C "$repodir" worktree remove --force "$wt" 2>/dev/null \
       && git -C "$repodir" branch -D "$br" 2>/dev/null
     git -C "$repodir" worktree prune 2>/dev/null
+  done
+  # Debris: a reaped path that _dev_worktree_create moved aside because a process
+  # still rooted there had recreated it. Nothing tracked can live in it (the remove
+  # above already cleared the tree), so once its processes are stopped it is cache.
+  for wt in $root/*/*.debris-<->(N/); do
+    print -r -- "[$(strftime '%F %T' $EPOCHSECONDS 2>/dev/null)] sweep: debris $wt"
+    _dev_stop_rooted "$wt" "debris"
+    rm -rf "$wt" 2>/dev/null
   done
 }
 _dev_worktree_sweep() {
@@ -2143,7 +2200,14 @@ _dev_kill_one() {
       || { print; echo "Skipped $session."; return 1; }
     print
   fi
-  tmux kill-session -t "$session" 2>/dev/null && echo "Killed $session"
+  local path; path=$(tmux display-message -p -t "$session" '#{session_path}' 2>/dev/null)
+  tmux kill-session -t "$session" 2>/dev/null && echo "Killed $session" || return 1
+  # A slot's dev server is detached from its tmux session and would outlive it,
+  # serving the old code on the slot's port. Only a per-session worktree is swept
+  # this way — a shared tree's processes belong to everyone.
+  [[ -n $DEV_WORKTREE_ROOT && -n $path && $path == $DEV_WORKTREE_ROOT/* ]] \
+    && _dev_stop_rooted "$path"
+  return 0
 }
 
 # _dev_tmux_session_of_pid <pid> — print the tmux session <pid> runs inside (walk its

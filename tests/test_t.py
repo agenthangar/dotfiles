@@ -1527,6 +1527,72 @@ def test_todo_add_targets_repo_only_when_no_slots_exist(t_mod):
     assert len(t_mod._todo_add_targets("ff", [], {}, set())) == 1
 
 
+def test_todo_slot_arg_takes_a_leading_number_when_text_follows(t_mod):
+    # `t todo add 11 fix the ledger` files across slots without leaving the dir.
+    assert t_mod._todo_slot_arg(["11", "fix", "the", "ledger"]) == ("11", ["fix", "the", "ledger"])
+
+
+def test_todo_slot_arg_leaves_a_lone_number_as_text(t_mod):
+    # `t todo add 11` — a lone number is an item, not a destination for nothing. This is
+    # the case that filed "11" to scratch and read as if it had gone to slot 11.
+    assert t_mod._todo_slot_arg(["11"]) == (None, ["11"])
+    assert t_mod._todo_slot_arg([]) == (None, [])
+    assert t_mod._todo_slot_arg(None) == (None, [])
+
+
+def test_todo_slot_arg_quoting_is_the_escape_hatch(t_mod):
+    # `t todo add "3 more tests"` arrives as ONE token, so nothing is stripped — the way
+    # to keep text that really does start with a digit.
+    assert t_mod._todo_slot_arg(["3 more tests"]) == (None, ["3 more tests"])
+    # …and an unquoted one is read as a slot, which is the accepted collision.
+    assert t_mod._todo_slot_arg(["3", "more", "tests"]) == ("3", ["more", "tests"])
+
+
+def test_todo_slot_arg_ignores_a_non_numeric_head(t_mod):
+    assert t_mod._todo_slot_arg(["fix", "11"]) == (None, ["fix", "11"])
+    assert t_mod._todo_slot_arg(["v2", "bump"]) == (None, ["v2", "bump"])
+
+
+def test_todo_canon_aliases_one_per_repo_dir(t_mod, tmp_path, monkeypatch):
+    # dot + dotfiles name one tree; offering both would list the same slots twice.
+    cfg = _config_with(t_mod, tmp_path, monkeypatch,
+                       {"dot": "/code/dotfiles", "dotfiles": "/code/dotfiles",
+                        "ff": "/code/financial-forecast"})
+    assert t_mod._todo_canon_aliases(cfg) == ["dotfiles", "ff"]
+
+
+def test_todo_canon_aliases_falls_back_to_the_shortest_key(t_mod, tmp_path, monkeypatch):
+    # No key equals the basename → shortest wins, exactly as repo_of_dir chooses.
+    cfg = _config_with(t_mod, tmp_path, monkeypatch,
+                       {"ff": "/code/financial-forecast", "fcast": "/code/financial-forecast"})
+    assert t_mod._todo_canon_aliases(cfg) == ["ff"]
+
+
+def test_todo_add_targets_all_puts_scratch_first(t_mod):
+    # Enter keeps the old from-nowhere behaviour: the picker adds a choice, never takes one.
+    out = t_mod._todo_add_targets_all(["ff"], [_todo_row("ff-3", "budget work")], {}, {})
+    assert out[0][0] == "scratch"
+    assert [k for k, _ in out] == ["scratch", "ff", "ff-3"]
+
+
+def test_todo_add_targets_all_skips_repos_with_nowhere_to_file(t_mod):
+    # ff has a live slot, dotfiles has an existing list, quiet has neither.
+    out = t_mod._todo_add_targets_all(
+        ["dotfiles", "ff", "quiet"], [_todo_row("ff-3", "x")], {"dotfiles": 2}, {})
+    assert [k for k, _ in out] == ["scratch", "dotfiles", "ff", "ff-3"]
+
+
+def test_todo_add_targets_all_reads_worktrees_per_alias(t_mod):
+    out = t_mod._todo_add_targets_all(["ff"], [], {}, {"ff": {"4"}})
+    assert [k for k, _ in out] == ["scratch", "ff", "ff-4"]
+    assert "worktree" in out[2][1]
+
+
+def test_todo_add_targets_all_alone_is_just_scratch(t_mod):
+    # A single entry is the caller's signal to skip the picker entirely.
+    assert len(t_mod._todo_add_targets_all([], [], {}, {})) == 1
+
+
 def test_todo_scoped_picks_out_one_repos_lists(t_mod):
     entries = [("dotfiles", 1), ("dotfiles-1", 2), ("dotfiles-12", 3),
                ("ff", 4), ("ff-3", 5), ("scratch", 6), ("dotfiles-main", 7)]

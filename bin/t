@@ -1900,6 +1900,24 @@ def _todo_canon(action):
     return _TODO_ALIASES.get(action, action)
 
 
+def _todo_slot_arg(rest):
+    """Split a leading bare slot number off an `add` -> ("11", ["fix","it"]) for
+    `t todo add 11 fix the ledger`; (None, rest) when there is none.
+
+    A bare number is genuinely ambiguous here -- `t todo 11` already means item #11 --
+    so the slot reading is taken only when TEXT FOLLOWS. `t todo add 11` alone stays a
+    literal item, which is what a lone number nearly always is. The escape hatch for
+    text that really does start with a digit is quoting: `t todo add "3 more tests"`
+    arrives as ONE token, so rest[0] is not a digit and nothing is stripped.
+
+    Pure -- resolving the number against a repo is the caller's job, and without one
+    (an add from ~) there is nothing to resolve it against, so it stays text."""
+    rest = list(rest or [])
+    if len(rest) >= 2 and rest[0].isdigit():
+        return (rest[0], rest[1:])
+    return (None, rest)
+
+
 def _todo_apply(data, action, rest, now=None):
     """Mutate `data` in place for one action. Returns (message, rc). Never raises on
     bad input — an unknown id is a message and rc 1, so a fat-fingered `t todo done 9`
@@ -2150,6 +2168,40 @@ def _todo_add_targets(alias, rows, list_keys, wt_slots):
     return out
 
 
+def _todo_canon_aliases(cfg):
+    """One alias per repo DIR. Sibling keys (dot + dotfiles) name one tree, and
+    repo_of_dir only ever resolves to one of them, so offering both would list the same
+    slots twice under two names. Same choice repo_of_dir makes: the key equal to the
+    basename wins, else the shortest key."""
+    by_dir = {}
+    for key, path in (cfg.repos or {}).items():
+        by_dir.setdefault(os.path.realpath(path), []).append(key)
+    out = []
+    for path, keys in by_dir.items():
+        base = os.path.basename(path)
+        out.append(base if base in keys else min(keys, key=len))
+    return sorted(out)
+
+
+def _todo_add_targets_all(aliases, rows, list_keys, wt_slots):
+    """Destinations for an add from NOWHERE -- no repo in the cwd -> [(key, label)].
+
+    "scratch" stays FIRST so Enter keeps the old fallback behaviour: the picker adds a
+    choice, it never takes one away. Then every repo that has somewhere to file -- a
+    live slot, a worktree, or an existing list. A repo with none of those is left out on
+    purpose: from nowhere the useful destinations are the ones that already exist, and
+    `-s <key>` still reaches any list by name. Pure: the caller gathers.
+
+    wt_slots is keyed by alias here (one repo per key), unlike the single-repo twin."""
+    out = [("scratch", "scratch   (no repo -- the catch-all list)")]
+    for alias in aliases:
+        targets = _todo_add_targets(alias, rows, list_keys, wt_slots.get(alias) or set())
+        if len(targets) == 1 and alias not in list_keys:
+            continue                     # no slots, no list -- nothing to file against
+        out.extend(targets)
+    return out
+
+
 def _todo_render_all(entries, width=80, st=None):
     """The -A cross-slot view: every list with something open, grouped by key. This is
     the actual answer to 'many things in parallel and I forget what I need to do'."""
@@ -2324,18 +2376,35 @@ def _todo_live_slots():
     return [{"slot": n[4:], "summary": ""} for n in r.stdout.split() if n.startswith("dev-")]
 
 
+def _todo_worktree_slots(cfg, alias):
+    """The slot dirs on disk for one repo: $DEV_WORKTREE_ROOT/<basename>/<slot>."""
+    root = os.path.join(cfg.worktree_root, os.path.basename(cfg.repos.get(alias, "")))
+    return {os.path.basename(p) for p in glob.glob(os.path.join(root, "*"))
+            if os.path.exists(os.path.join(p, ".git"))}
+
+
 def _todo_pick_target(cfg, alias):
-    """Ask which list a slotless add should go to. Returns a key, or None to stay put."""
+    """Ask which list a slotless add should go to. Returns a key, or None to stay put.
+
+    `alias` None means the cwd names no repo at all (an add from ~), so the choice
+    widens across every repo instead of not being offered: the old gate only fired from
+    a repo dir, which left the from-nowhere add silently filing to `scratch` with a ✓
+    line that never said so — the one write path that did not name its list."""
     if not (sys.stdin.isatty() and sys.stdout.isatty()):
         return None
-    wt_root = os.path.join(cfg.worktree_root, os.path.basename(cfg.repos.get(alias, "")))
-    wt_slots = {os.path.basename(p) for p in glob.glob(os.path.join(wt_root, "*"))
-                if os.path.exists(os.path.join(p, ".git"))}
     list_keys = {os.path.basename(p)[:-5]: len(_todo_open(_todo_load(p)))
                  for p in glob.glob(os.path.join(_todo_dir(), "*.json"))}
-    targets = _todo_add_targets(alias, _todo_live_slots(), list_keys, wt_slots)
+    rows = _todo_live_slots()
+    if alias:
+        targets = _todo_add_targets(alias, rows, list_keys,
+                                    _todo_worktree_slots(cfg, alias))
+    else:
+        aliases = _todo_canon_aliases(cfg)
+        targets = _todo_add_targets_all(
+            aliases, rows, list_keys,
+            {a: _todo_worktree_slots(cfg, a) for a in aliases})
     if len(targets) == 1:
-        return None                      # no slots exist — nothing to choose between
+        return None                      # nowhere to file but here — nothing to choose
     return _pick_inline("add to which list?", targets)
 
 
@@ -2419,12 +2488,23 @@ def cmd_todo(cfg, args):
                 return found
         shared = _todo_shared(cfg, key)
         return [(key, data), shared] if shared else [(key, data)]
-    # Slotless add from a repo dir: offer the repo's slots rather than silently filing
-    # against the repo. Only for `add` (viewing has -A), only interactively, and never
-    # when -s already named a list or --here opted out.
-    if (_todo_canon(args.action or "ls") == "add" and not args.slot
-            and " ".join(args.rest).strip() and key in cfg.repos):
-        key = _todo_pick_target(cfg, key) or key
+    # An `add` resolves its destination three ways, most explicit first: -s names a list
+    # outright; a leading bare slot number files ACROSS slots without leaving the dir
+    # (`t todo add 11 fix the ledger`); otherwise the list is ASKED for rather than
+    # guessed. The picker used to be gated on `key in cfg.repos`, so an add from ~ fell
+    # through to the `scratch` catch-all with no prompt — and since the ✓ line named no
+    # list either, `t todo add 11` looked like it had gone to a slot 11 that was never
+    # involved. Both halves are fixed here and at the ✓ print below.
+    if _todo_canon(args.action or "ls") == "add" and not args.slot:
+        alias = key if key in cfg.repos else key.rpartition("-")[0]
+        alias = alias if alias in cfg.repos else None
+        slot, stripped = _todo_slot_arg(args.rest)
+        if slot and alias:
+            key, args.rest = "%s-%s" % (alias, slot), stripped
+        elif " ".join(args.rest).strip():
+            # No repo to resolve a number against (or no number): ask. The leading token
+            # stays part of the text — a slot needs a repo, and the picker shows both.
+            key = _todo_pick_target(cfg, alias) or key
     path = _todo_path(key)
     data = _todo_load(path)
     action = args.action or "ls"
@@ -2558,6 +2638,11 @@ def cmd_todo(cfg, args):
         msg, rc = _todo_apply(data, action, rest)
         if rc != 2:
             _todo_save(path, data)
+        if msg and canon == "add" and not rc:
+            # Always name the list. The destination comes from the cwd, a bare slot arg
+            # or a picker — none of which the ✓ line showed, so an add that landed
+            # somewhere unintended stayed invisible until you went looking for it.
+            msg = "%s   %s→ %s%s" % (msg, st.y, key, st.r)
         if msg:
             print(msg, file=sys.stderr if rc else sys.stdout)
         if rc:

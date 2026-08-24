@@ -1065,6 +1065,71 @@ def test_todo_retired_verbs_explain_themselves(t_mod):
         assert rc == 2 and "is gone" in msg and needle in msg
 
 
+# ─── t todo — flags after the action ──────────────────────────────────────────
+
+def _todo_args(t_mod, *argv):
+    """Parse `t todo <argv>` exactly as main() does, then hoist — argparse's REMAINDER
+    parks every token after the action in `rest`, flags included."""
+    return t_mod._todo_hoist_flags(t_mod.build_parser().parse_args(["todo", *argv]))
+
+
+def test_todo_hoists_flags_typed_after_the_action(t_mod):
+    # `t todo ls -A` used to parse as action=ls, rest=['-A'], all_slots=False — the flag
+    # sat unread and the view answered as a plain `t todo`: "-A can't see all slots".
+    a = _todo_args(t_mod, "ls", "-A")
+    assert a.all_slots and a.rest == []
+    a = _todo_args(t_mod, "ls", "-a")
+    assert a.all and not a.all_slots and a.rest == []
+    a = _todo_args(t_mod, "done", "3", "-s", "dotfiles-4")
+    assert a.slot == "dotfiles-4" and a.rest == ["3"]
+    a = _todo_args(t_mod, "rm", "--items", "2")
+    assert a.items == 2 and a.rest == []
+
+
+def test_todo_hoist_leaves_flag_free_args_alone(t_mod):
+    a = _todo_args(t_mod, "done", "3", "4")
+    assert a.rest == ["3", "4"] and not a.all and not a.all_slots and a.slot is None
+    a = _todo_args(t_mod, "-A")                      # the gh-style order still works
+    assert a.all_slots and a.action is None and a.rest == []
+
+
+def test_todo_add_hoists_only_a_leading_run_of_flags(t_mod):
+    # Flags before the text are flags…
+    a = _todo_args(t_mod, "add", "-s", "dot-3", "fix", "it")
+    assert a.slot == "dot-3" and a.rest == ["fix", "it"]
+    # …but the text is prose: a `-s` inside it is a word, not a list called `in`.
+    a = _todo_args(t_mod, "add", "handle", "-s", "in", "t", "setup")
+    assert a.slot is None and a.rest == ["handle", "-s", "in", "t", "setup"]
+    # A `-h` mid-text stays text (the mini parser has no help action).
+    a = _todo_args(t_mod, "add", "fix", "the", "-h", "flag")
+    assert a.rest == ["fix", "the", "-h", "flag"]
+
+
+def test_todo_add_keeps_unknown_leading_tokens_as_text(t_mod):
+    # A negative number is not a todo flag; it stays the first word.
+    a = _todo_args(t_mod, "add", "-3", "degrees")
+    assert a.rest == ["-3", "degrees"] and not a.all
+    # A quoted dash-shaped first word arrives as ONE space-bearing token; the hoist holds
+    # it back from argparse (whose short-option prefix match would read it as -A plus
+    # junk), so quoting is the documented escape hatch.
+    a = _todo_args(t_mod, "add", "-A literal")
+    assert a.rest == ["-A literal"] and not a.all_slots
+    a = _todo_args(t_mod, "add", "-A literal", "-s", "x")   # …and only a LEADING run hoists
+    assert a.rest == ["-A literal", "-s", "x"] and a.slot is None
+    a = _todo_args(t_mod, "done", "-A literal", "-a")        # ids: a real flag still hoists
+    assert a.all and not a.all_slots and a.rest == ["-A literal"]
+    # `--all-of-them` must not abbreviate to --all.
+    a = _todo_args(t_mod, "add", "--all-of-them", "now")
+    assert a.rest == ["--all-of-them", "now"] and not a.all
+
+
+def test_todo_hoist_honours_a_mid_text_double_dash(t_mod):
+    a = _todo_args(t_mod, "add", "-s", "x", "--", "-A", "literal")
+    assert a.slot == "x" and not a.all_slots and a.rest == ["-A", "literal"]
+    a = _todo_args(t_mod, "done", "3", "--", "-A")
+    assert not a.all_slots and a.rest == ["3", "-A"]
+
+
 # ─── t todo — rendering ────────────────────────────────────────────────────────
 
 def _body(lines):
@@ -1265,6 +1330,20 @@ def test_todo_statusline_truncates_a_long_item(t_mod, tmp_path, monkeypatch):
                            {"workspace": {"current_dir": "/wt/dotfiles/1"}},
                            key="dotfiles-1", texts=("y" * 400,), width=width)
         assert line.endswith("…") and len(line) <= width and "\n" not in line
+
+
+def test_todo_statusline_caps_each_item(t_mod, tmp_path, monkeypatch):
+    # The width fit only ellipses an item that OVERFLOWS the bar, so on a wide
+    # terminal one 140-char task fit outright and hid every item behind it. Each
+    # item is capped independently of the width; the next one still shows.
+    long = "Accounts ledger (http://localhost:5217/#accounts) Aug 21: " + "x" * 90
+    line = _statusline(t_mod, tmp_path, monkeypatch,
+                       {"workspace": {"current_dir": "/wt/dotfiles/1"}},
+                       key="dotfiles-1", texts=(long, "second"), width=240)
+    first = line.split("◻ ")[1].rstrip()
+    assert first.endswith("…") and len(first) == t_mod._TODO_BAR_ITEM_MAX
+    assert first.startswith("Accounts ledger (http://localhost:5217/#accounts)")
+    assert line.endswith("◻ second") and len(line) <= 240
 
 
 def test_todo_statusline_colours_unconditionally(t_mod, tmp_path, monkeypatch):
@@ -1795,6 +1874,59 @@ def test_port_is_live_sees_an_ipv6_only_listener(t_mod):
         srv.close()
     assert t_mod._port_is_live(port) is False
 
+
+def test_todo_repo_arg_takes_the_repo_positionally(t_mod):
+    repos = {"ff": "/code/financial-forecast", "dotfiles": "/code/dotfiles"}
+    # `t todo ff add keep forecast` — the case that failed with "unknown action 'ff'".
+    assert t_mod._todo_repo_arg("ff", ["add", "keep", "forecast"], repos) \
+        == ("ff", "add", ["keep", "forecast"])
+    # A bare repo views it; a repo + number is the slot, then the action.
+    assert t_mod._todo_repo_arg("ff", [], repos) == ("ff", None, [])
+    assert t_mod._todo_repo_arg("ff", ["3"], repos) == ("ff-3", None, [])
+    assert t_mod._todo_repo_arg("ff", ["3", "add", "x"], repos) == ("ff-3", "add", ["x"])
+    # An explicit <alias>-<n> key works too, like -s.
+    assert t_mod._todo_repo_arg("ff-3", ["done", "2"], repos) == ("ff-3", "done", ["2"])
+
+
+def test_todo_repo_arg_leaves_non_repos_alone(t_mod):
+    repos = {"ff": "/code/financial-forecast", "add": "/code/add"}
+    # Not a repo → untouched, including a slot-shaped key of an unknown repo.
+    assert t_mod._todo_repo_arg("done", ["2"], repos) == (None, "done", ["2"])
+    assert t_mod._todo_repo_arg("api-3", ["ls"], repos) == (None, "api-3", ["ls"])
+    assert t_mod._todo_repo_arg(None, [], repos) == (None, None, [])
+    assert t_mod._todo_repo_arg("7", [], repos) == (None, "7", [])
+    # An action name always wins over a repo that happens to share it.
+    assert t_mod._todo_repo_arg("add", ["x"], repos) == (None, "add", ["x"])
+    assert t_mod._todo_repo_arg("list", [], repos) == (None, "list", [])
+def test_todo_ls_target_number_is_a_slot_of_the_cwd_repo(t_mod):
+    # `t todo ls 17` from the repo dir — the bug: the number was dropped and the whole
+    # repo rendered, so there was no way to see one slot.
+    assert t_mod._todo_ls_target("ff", {"ff": "/x/ff"}, ["17"]) == ("ff-17", None)
+
+
+def test_todo_ls_target_resolves_from_inside_a_sibling_slot(t_mod):
+    # From slot 15's worktree the key is ff-15; a number still means "slot N of ff".
+    assert t_mod._todo_ls_target("ff-15", {"ff": "/x/ff"}, ["17"]) == ("ff-17", None)
+
+
+def test_todo_ls_target_no_args_keeps_the_key(t_mod):
+    assert t_mod._todo_ls_target("ff-15", {"ff": "/x/ff"}, []) == ("ff-15", None)
+    assert t_mod._todo_ls_target("ff", {"ff": "/x/ff"}, None) == ("ff", None)
+
+
+def test_todo_ls_target_non_number_is_a_key_verbatim(t_mod):
+    # The positional twin of -s.
+    assert t_mod._todo_ls_target("ff", {"ff": "/x/ff"}, ["dotfiles-3"]) == ("dotfiles-3", None)
+
+
+def test_todo_ls_target_number_needs_a_repo(t_mod):
+    key, err = t_mod._todo_ls_target("scratch", {"ff": "/x/ff"}, ["17"])
+    assert key is None and "<repo>-17" in err
+
+
+def test_todo_ls_target_takes_one_token(t_mod):
+    key, err = t_mod._todo_ls_target("ff", {"ff": "/x/ff"}, ["17", "18"])
+    assert key is None and "one slot" in err
 
 # ─── mcp: transcript extraction ────────────────────────────────────────────────
 

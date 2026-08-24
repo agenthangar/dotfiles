@@ -313,6 +313,92 @@ PY
 }
 install_claude_statusline
 
+# The `sessions` MCP server (bin/t mcp) — "which session is working on what?" from
+# inside any Claude session. Same contract as the statusline seed above, and here in
+# the links-only path for the same reason: a step only a manual install reaches lands
+# on one machine and silently not on another. Add-only — an entry that exists (or was
+# hand-edited) is never touched; `claude mcp remove sessions -s user` plus
+# DOTFILES_NO_MCP=1 in ~/.zshrc.local opts a machine out for good.
+#
+# Presence is read straight out of ~/.claude.json: `claude mcp get` SPAWNS the server
+# to health-check it, which is not a probe you want on every dots. Registration goes
+# through `claude mcp add` (Claude's own writer — that file holds OAuth state and
+# per-project history, never hand-merge it). The path is EXPANDED, unlike the
+# statusline's literal $HOME: a stdio MCP spawn does not go through a shell.
+install_claude_mcp() {
+    [[ -z "${DOTFILES_NO_MCP:-}" ]] || return 0
+    command -v claude  >/dev/null 2>&1 || return 0   # fresh box: t doctor / t mcp --install later
+    command -v python3 >/dev/null 2>&1 || return 0
+    python3 - "$HOME/.claude.json" <<'PY' && return 0
+import json, sys
+try:
+    with open(sys.argv[1], encoding="utf-8") as fh:
+        data = json.load(fh)
+except OSError:
+    sys.exit(1)          # no file yet: register
+except ValueError:
+    sys.exit(0)          # not ours to repair, and never loop-add into a broken file
+servers = data.get("mcpServers") if isinstance(data, dict) else None
+sys.exit(0 if isinstance(servers, dict) and "sessions" in servers else 1)
+PY
+    if command claude mcp add sessions -s user -- "$HOME/bin/t" mcp >/dev/null 2>&1; then
+        echo "Registered MCP server 'sessions' (user scope) -> $HOME/bin/t mcp"
+    else
+        echo "WARNING: could not register the sessions MCP server; run by hand:" >&2
+        echo "  claude mcp add sessions -s user -- $HOME/bin/t mcp" >&2
+    fi
+}
+install_claude_mcp
+
+# Registering the server is only half of it: Claude Code prompts for EVERY MCP tool
+# call unless a permission rule covers it, and a prompt per lookup makes the server
+# useless mid-turn. This one is ours and read-only (four lookups over local
+# transcripts, tmux, and the todo store, spawned by `t mcp` from this checkout), so
+# it is allowed by default. Blanket `mcp__sessions` rather than four per-tool rules,
+# so a tool added to `t mcp` later is covered the day it ships.
+#
+# Same contract as the statusline merge above, for the same reason: seeding
+# settings.json.example only reaches a FRESH machine, because install_claude_settings
+# never clobbers an existing settings.json. Add-only and silent unless it changes
+# something — a hand-narrowed set of per-tool `mcp__sessions__*` rules is a deliberate
+# choice and is left alone, never widened back out from under you.
+install_claude_mcp_allow() {
+    [[ -z "${DOTFILES_NO_MCP:-}" ]] || return 0
+    local dst="$HOME/.claude/settings.json"
+    [[ -e "$dst" ]] || return 0          # nothing to merge into; the seed already has it
+    command -v python3 >/dev/null 2>&1 || return 0
+    python3 - "$dst" <<'PY'
+import json, os, sys
+
+RULE = "mcp__sessions"
+dst = sys.argv[1]
+try:
+    with open(dst, encoding="utf-8") as fh:
+        data = json.load(fh)
+except (OSError, ValueError):
+    sys.exit(0)          # not ours to repair, and never block a relink over it
+if not isinstance(data, dict):
+    sys.exit(0)
+perms = data.setdefault("permissions", {})
+if not isinstance(perms, dict):
+    sys.exit(0)
+allow = perms.setdefault("allow", [])
+if not isinstance(allow, list):
+    sys.exit(0)
+rules = [r for r in allow if isinstance(r, str)]
+if RULE in rules or any(r.startswith(RULE + "__") for r in rules):
+    sys.exit(0)          # already allowed, or hand-narrowed per tool — leave it be
+allow.append(RULE)
+tmp = dst + ".tmp"
+with open(tmp, "w", encoding="utf-8") as fh:
+    json.dump(data, fh, indent=2)
+    fh.write("\n")
+os.replace(tmp, dst)
+print("Allowed %s in %s (the sessions MCP tools no longer prompt)" % (RULE, dst))
+PY
+}
+install_claude_mcp_allow
+
 # Everything below is the FULL install. The links-only relink stops here, before the
 # tmux source-file, the ssh Include rewrite, the ~/.zshrc.local and settings.json
 # seeds, the global gitconfig/hooksPath writes, the PII denylist branch (which would

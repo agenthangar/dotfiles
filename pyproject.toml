@@ -47,6 +47,12 @@ exclude_lines = [
     "def _setup_prompt_flow\\(",
     "def _prompt\\(",
     "def _confirm\\(",
+    # bin/t mcp server glue (tmux/registry gathering, git, the stdio loop, claude mcp add)
+    "def _live_rows\\(",
+    "def _git_brief\\(",
+    "def _mcp_context\\(",
+    "def _mcp_serve\\(",
+    "def _mcp_install\\(",
     # bin/pr-watch subprocess / launchd / notification glue
     "def log\\(",
     "def run\\(",

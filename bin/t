@@ -19,7 +19,9 @@
 # for the data and renders in Python. Reimplementing ps-tree walking buys nothing.
 
 import argparse
+import calendar
 import glob
+import hashlib
 import json
 import os
 import re
@@ -139,14 +141,17 @@ class Config:
 
 # ─── shell-out helpers ─────────────────────────────────────────────────────────
 
-def zsh_capture(snippet):
+def zsh_capture(snippet, stdin=None):
     """Run a zsh login+interactive snippet, return stdout (stderr passes through).
 
     `-lic` is the same context the remote fan-out uses: ~/bin and Homebrew tmux/fzf
     are only on the login/interactive PATH, and the _dev_* helpers are defined there.
+    `stdin` is for the MCP server, whose own stdin is the JSON-RPC wire: it passes
+    DEVNULL so the spawned interactive shell can never read a request off it.
     """
     try:
-        r = subprocess.run(["zsh", "-lic", ZSH_PRELUDE + snippet], stdout=subprocess.PIPE, text=True)
+        r = subprocess.run(["zsh", "-lic", ZSH_PRELUDE + snippet], stdout=subprocess.PIPE,
+                           stdin=stdin, text=True)
         return r.stdout
     except FileNotFoundError:
         return ""
@@ -1577,6 +1582,9 @@ def _doctor_findings(facts):
                    "draws on the main screen, so the wheel scrolls the terminal\'s own "
                    "scrollback. To keep fullscreen, read back with the ctrl+o transcript "
                    "(\'[\' dumps it to native scrollback)" % facts["term_program"])
+    if facts.get("mcp_sessions") is False:
+        out.append("⚠ MCP server 'sessions' is not registered in ~/.claude.json — run "
+                   "t mcp --install (dots does it when claude is on PATH)")
     if not out:
         out.append("✓ nothing suspicious found")
     return out
@@ -1698,6 +1706,12 @@ def cmd_doctor(cfg, args):
         print("  config bridge  missing (%s) — open an interactive zsh once" % CONFIG.replace(HOME, "~"))
 
     # tmux: server options vs the config file, and who owns the mouse per pane
+    if shutil.which("claude"):
+        facts["mcp_sessions"] = _mcp_registered(os.path.join(HOME, ".claude.json"))
+        print("  mcp sessions   %s" % {True: "registered (user scope) → t mcp",
+                                      False: "NOT registered — t mcp --install",
+                                      None: "~/.claude.json unreadable"}[facts["mcp_sessions"]])
+
     section("Tmux")
     tmux_running = run(["tmux", "list-sessions", "-F", "#{session_name}"]) is not None
     facts["tmux_running"] = tmux_running
@@ -2874,6 +2888,1088 @@ def cmd_todo(cfg, args):
         print(line)
     return 0
 
+# ─── mcp — which session is working on what ───────────────────────────────────
+#
+# `t mcp` is a stdio MCP server Claude Code spawns (registered at user scope as
+# `sessions`, so the tools surface as mcp__sessions__* in EVERY repo's sessions). It
+# answers the question nothing else could: "which session is — or was — working on
+# X?". `t ls` carries only a slot's FIRST prompt as its title, `t find` reranks the
+# first six prompts and is a shell-bound fzf picker, and a thing said forty turns into
+# a conversation was invisible to all of them.
+#
+# Three stores, no zsh on the hot path: (1) every saved transcript, through an
+# incremental INDEX cache (~/.cache/claude-sessions/index/<key>: the same inode +
+# byte-offset scheme as .zshrc's _transcript_meta_batch, so a dead transcript is never
+# re-read and a live one re-reads only what was appended); (2) liveness from the pid
+# registry (~/.cache/claude-sessions/<pid> = sid\tcwd, written by claude-stamp-tmux)
+# plus ONE `tmux list-sessions` fork — the zsh _dev_session_rows scan costs 1-5 s and
+# its only extra signal (idle vs active by capture-pane) is not decision-relevant
+# here; only all_hosts=true pays for zsh_capture("_dev_rows_all"), because remote
+# liveness has no other source; (3) the `t todo` store via _todo_all_entries.
+#
+# The CALLER judges. find_sessions returns keyword-scored candidates WITH the prompt
+# excerpts that matched, and the instructions tell the model to read them — the caller
+# is already an LLM, so a nested `claude -p` rerank (what `t find` does) would add
+# 5-15 s and a claude-inside-an-MCP-inside-claude for no better answer.
+#
+# STDOUT IS THE WIRE. Nothing in the serve path may print; every child subprocess
+# runs with stdin=DEVNULL (a spawned interactive zsh must never read the JSON-RPC
+# stdin) and stderr=DEVNULL. Framing mirrors hive's mcp_servers/protocol.py — a
+# hand-rolled newline-delimited JSON-RPC 2.0 loop, because the official `mcp` SDK
+# drags in httpx/pydantic/anyio/starlette and this repo has no dependencies.
+#
+# One server process per Claude session, so several refresh the index concurrently:
+# cache writes are <key>.<pid>.tmp + os.replace, never a shared tmp name.
+
+_PR_RE = re.compile(r"github\.com/([\w.-]+)/([\w.-]+)/pull/(\d+)")
+_INDEX_V = 1
+_INDEX_HEAD, _INDEX_TAIL = 8, 72   # prompts kept per transcript: first 8 + last 72
+_INDEX_TEXT = 400                  # chars kept per prompt
+_INDEX_ASST = 300                  # chars kept of the last assistant message
+_INDEX_REFRESH_S = 15              # per-process re-stat gate between tool calls
+
+
+def _cache_root():
+    """~/.cache/claude-sessions — the registry, opened/, pr/, meta/ and now index/.
+    Read at call time so $XDG_CACHE_HOME (and tests) can redirect it."""
+    base = os.environ.get("XDG_CACHE_HOME") or os.path.join(HOME, ".cache")
+    return os.path.join(base, "claude-sessions")
+
+
+def _index_dir():
+    return os.path.join(_cache_root(), "index")
+
+
+def _projects_dir():
+    return os.path.join(HOME, ".claude", "projects")
+
+
+def _plan_re():
+    # $HOME-anchored like _t_plan's grep, so a plan path quoted in some other host's
+    # transcript (synced in) does not masquerade as a local file.
+    return re.compile(re.escape(HOME) + r"/\.claude/plans/[^\"\s]*\.md")
+
+
+def _iso_epoch(s):
+    """'2026-08-23T06:37:38.765Z' → epoch seconds, or None. Transcript timestamps are
+    UTC; timegm, not mktime, or every date shifts by the host's UTC offset."""
+    try:
+        return calendar.timegm(time.strptime(str(s)[:19], "%Y-%m-%dT%H:%M:%S"))
+    except (TypeError, ValueError):
+        return None
+
+
+def _tx_user_text(rec):
+    """The text the user actually typed in a transcript record, else None.
+
+    The same filter every .zshrc scanner applies — `type == "user"`, content either a
+    string (a typed prompt) or a list of blocks whose `text` is joined (tool_result
+    blocks have no `text`, so they vanish), and nothing starting with `<` (the
+    injected <command-name>/<local-command-stdout>/<system-reminder> pseudo-prompts)
+    — plus two flags those scanners never checked: isMeta (an injected placeholder)
+    and isSidechain (a subagent turn)."""
+    if rec.get("type") != "user" or rec.get("isMeta") or rec.get("isSidechain"):
+        return None
+    msg = rec.get("message")
+    c = msg.get("content") if isinstance(msg, dict) else None
+    if isinstance(c, str):
+        txt = c
+    elif isinstance(c, list):
+        txt = " ".join(x.get("text", "") for x in c if isinstance(x, dict))
+    else:
+        return None
+    txt = " ".join(txt.split())
+    if not txt or txt.startswith("<"):
+        return None
+    return txt
+
+
+def _index_trim(prompts, head=_INDEX_HEAD, tail=_INDEX_TAIL):
+    """Keep the first `head` and last `tail` prompts, in place. The first prompts say
+    what a session is ABOUT (the signal every existing scanner uses); the last say
+    where it LEFT OFF and what is still open — the two things actually asked. The
+    middle is the least useful, and the cap bounds the cache at ~20 MB worst case."""
+    if len(prompts) > head + tail:
+        prompts[:] = prompts[:head] + prompts[-tail:]
+    return prompts
+
+
+def _index_empty(ino):
+    return {"v": _INDEX_V, "ino": ino, "off": 0, "sid": None, "cwd": None,
+            "branch": None, "ct": None, "at": None, "pr": None, "plan": None,
+            "first_ts": None, "last_ts": None, "n_prompts": 0, "prompts": [],
+            "last_asst": None}
+
+
+def _tx_scan_line(st, raw):
+    """Fold one transcript line into the index record `st`. Substring-gated before
+    json.loads so the cold scan of an 800 MB corpus runs at I/O speed: only user
+    lines, assistant lines that carry a text block, title records, and (until the id
+    is known) any line naming a sessionId get decoded. PR and plan mentions are regex
+    hits on the raw line — a `pr-link` record matches the same URL pattern, so one
+    rule covers both."""
+    line = raw.decode("utf-8", "replace") if isinstance(raw, bytes) else raw
+    line = line.rstrip("\r\n")
+    if not line:
+        return
+    if "/pull/" in line:
+        for m in _PR_RE.finditer(line):
+            st["pr"] = m.group(0)
+    if ".claude/plans/" in line:
+        hits = _plan_re().findall(line)
+        if hits:
+            st["plan"] = hits[-1]
+    is_user = '"type":"user"' in line
+    is_asst = '"type":"assistant"' in line and '"type":"text"' in line
+    if not (is_user or is_asst or '"ai-title"' in line or '"custom-title"' in line
+            or (st["sid"] is None and '"sessionId"' in line)):
+        return
+    try:
+        rec = json.loads(line)
+    except ValueError:
+        return
+    if not isinstance(rec, dict):
+        return
+    if st["sid"] is None and rec.get("sessionId"):
+        st["sid"] = rec["sessionId"]
+    if st["cwd"] is None and rec.get("cwd"):
+        st["cwd"] = rec["cwd"]
+    if rec.get("gitBranch"):
+        st["branch"] = rec["gitBranch"]
+    ts = _iso_epoch(rec["timestamp"]) if rec.get("timestamp") else None
+    if ts:
+        st["first_ts"] = min(st["first_ts"] or ts, ts)
+        st["last_ts"] = max(st["last_ts"] or ts, ts)
+    t = rec.get("type")
+    if t == "ai-title" and rec.get("aiTitle"):
+        st["at"] = rec["aiTitle"]
+    elif t == "custom-title" and rec.get("customTitle"):
+        st["ct"] = rec["customTitle"]
+    elif t == "user":
+        txt = _tx_user_text(rec)
+        if txt:
+            st["prompts"].append({"ts": ts, "text": txt[:_INDEX_TEXT]})
+            st["n_prompts"] += 1
+            _index_trim(st["prompts"])
+    elif t == "assistant" and not rec.get("isSidechain"):
+        msg = rec.get("message")
+        c = msg.get("content") if isinstance(msg, dict) else None
+        if isinstance(c, list):
+            txt = " ".join(" ".join(x.get("text", "") for x in c
+                                    if isinstance(x, dict) and x.get("type") == "text").split())
+            if txt:
+                st["last_asst"] = txt[:_INDEX_ASST]
+
+
+def _tx_scan(st, data):
+    """Fold a block of whole lines (bytes) into `st`."""
+    for raw in data.split(b"\n"):
+        _tx_scan_line(st, raw)
+    return st
+
+
+def _index_key(path):
+    return hashlib.sha1(path.encode("utf-8", "surrogateescape")).hexdigest()[:20]
+
+
+def _index_save(cpath, st):
+    """tmp + os.replace, pid-suffixed: every Claude session spawns its own `t mcp`, so
+    two processes can refresh the same transcript at once — a shared tmp name would
+    let one replace the other's half-written file. Never raises: an unwritable cache
+    just means the next process re-reads."""
+    tmp = "%s.%d.tmp" % (cpath, os.getpid())
+    try:
+        os.makedirs(os.path.dirname(cpath), exist_ok=True)
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(st, fh, ensure_ascii=False)
+        os.replace(tmp, cpath)
+    except OSError:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+
+
+def _index_update(path, cache_dir):
+    """The index record for one transcript, refreshed from whatever was appended since
+    the cache last saw it. None when the transcript cannot be stat'ed.
+
+    Reset to a full rescan when the cache is missing/corrupt, from an older schema,
+    for a different inode (csync's rsync writes a NEW file), or claims more bytes than
+    exist (truncation). The delta is read line by line — never fh.read(): a cold ff
+    transcript is 100+ MB — and a final line without its newline is NOT consumed, so a
+    half-written record is re-read next time instead of parsed in halves."""
+    try:
+        info = os.stat(path)
+    except OSError:
+        return None
+    cpath = os.path.join(cache_dir, _index_key(path))
+    st = None
+    try:
+        with open(cpath, encoding="utf-8") as fh:
+            st = json.load(fh)
+    except (OSError, ValueError):
+        st = None
+    if (not isinstance(st, dict) or st.get("v") != _INDEX_V or st.get("ino") != info.st_ino
+            or not isinstance(st.get("off"), int) or st["off"] > info.st_size):
+        st = _index_empty(info.st_ino)
+    if st["off"] < info.st_size:
+        consumed = 0
+        try:
+            with open(path, "rb") as fh:
+                fh.seek(st["off"])
+                for line in fh:
+                    if not line.endswith(b"\n"):
+                        break
+                    _tx_scan_line(st, line)
+                    consumed += len(line)
+        except OSError:
+            return None
+        if consumed:
+            st["off"] += consumed
+            _index_save(cpath, st)
+    return dict(st, path=path, mtime=info.st_mtime, size=info.st_size)
+
+
+def _index_all(projects_dir, cache_dir):
+    """Records for every ~/.claude/projects/<enc>/<sid>.jsonl. One directory level by
+    construction, so the per-session subagent transcripts (<sid>/subagents/*.jsonl)
+    are not indexed — a subagent's prompts are Claude's, not the user's."""
+    out = []
+    for p in sorted(glob.glob(os.path.join(projects_dir, "*", "*.jsonl"))):
+        rec = _index_update(p, cache_dir)
+        if rec is not None:
+            out.append(rec)
+    return out
+
+
+def _index_dedupe(recs):
+    """One record per session id. A beam that relands into a new slot COPIES the
+    transcript into the new cwd's project dir (see _dev_beam_land_cwd), so the same
+    id can sit under two dirs; keep the larger file and remember the other cwds."""
+    by_sid, out = {}, []
+    for r in recs:
+        sid = r.get("sid")
+        if not sid:
+            out.append(r)
+            continue
+        cur = by_sid.get(sid)
+        if cur is None:
+            by_sid[sid] = r
+            continue
+        keep, drop = (r, cur) if r.get("size", 0) > cur.get("size", 0) else (cur, r)
+        also = [c for c in keep.get("also_at", []) + [drop.get("cwd")] if c and c != keep.get("cwd")]
+        keep["also_at"] = sorted(set(also))
+        by_sid[sid] = keep
+    return out + list(by_sid.values())
+
+
+# ── enrichment ──
+
+def _pr_info(pr, pr_dir):
+    """{url, repo, number, state} for a stored 'github.com/o/r/pull/N', else None.
+    State is the cached one only (~/.cache/claude-sessions/pr/<o>#<r>#<N>, written by
+    the zsh _pr_state_refresh) — a tool call must never block on `gh`."""
+    m = _PR_RE.search(pr or "")
+    if not m:
+        return None
+    owner, repo, num = m.groups()
+    state = "?"
+    try:
+        with open(os.path.join(pr_dir, "%s#%s#%s" % (owner, repo, num)), encoding="utf-8") as fh:
+            s = fh.read().strip().upper()
+        if s in ("MERGED", "CLOSED", "OPEN"):
+            state = s.lower()
+    except OSError:
+        pass
+    return {"url": "https://" + m.group(0), "repo": "%s/%s" % (owner, repo),
+            "number": int(num), "state": state}
+
+
+def _opened_stamp(sid, cache_root):
+    """mtime of the last-opened stamp claude-stamp-tmux touches on every start; 0 if
+    none. Resuming appends nothing, so by transcript mtime alone a just-reopened
+    session looks days old."""
+    try:
+        return os.path.getmtime(os.path.join(cache_root, "opened", sid))
+    except OSError:
+        return 0
+
+
+def _origin_of(path):
+    """Contents of the <sid>.origin sidecar (hostname -s of where it last ran)."""
+    try:
+        with open(path[:-6] + ".origin", encoding="utf-8") as fh:
+            return fh.read().strip() or None
+    except OSError:
+        return None
+
+
+def _activity(rec, opened=0):
+    return int(max(rec.get("last_ts") or 0, rec.get("mtime") or 0, opened or 0))
+
+
+def _ago(epoch, now):
+    d = max(0, int(now - epoch))
+    if d < 90:
+        return "just now"
+    if d < 3600:
+        return "%dm ago" % (d // 60)
+    if d < 2 * 86400:
+        return "%dh ago" % (d // 3600)
+    return "%dd ago" % (d // 86400)
+
+
+def _fmt_ts(epoch):
+    return time.strftime("%Y-%m-%d %H:%M", time.localtime(epoch)) if epoch else None
+
+
+def _fmt_short(epoch):
+    return time.strftime("%m-%d %H:%M", time.localtime(epoch)) if epoch else None
+
+
+def _rec_title(rec):
+    prompts = rec.get("prompts") or []
+    return rec.get("ct") or rec.get("at") or (prompts[0]["text"][:80] if prompts else "") or None
+
+
+def _local_host():
+    return socket.gethostname().split(".")[0]
+
+
+def _session_row(cfg, rec, live_by_sid, now, cache_root=None, this_sid=None, todo_counts=None,
+                 local_host=None):
+    """The dict every tool returns per session. Pure given the record: the only I/O is
+    an isdir on the worktree, a stat on the opened stamp, and reads of the two
+    sidecar files (PR-state cache, .origin). `origin` is null for this host — it is a
+    "last ran ELSEWHERE" signal, like t resume's column."""
+    sid = rec.get("sid") or ""
+    cwd = rec.get("cwd") or ""
+    alias, slot = cfg.repo_of_dir(cwd) if cwd else (None, None)
+    live = live_by_sid.get(sid) if sid else None
+    key = worktree = None
+    if alias and slot:
+        key = "%s-%s" % (alias, slot)
+        worktree = os.path.join(cfg.worktree_root, os.path.basename(cfg.repos[alias]), slot)
+    branch = rec.get("branch")
+    if not branch and key:
+        branch = "dev/%s-%s" % (os.path.basename(cfg.repos[alias]), slot)
+    prompts = rec.get("prompts") or []
+    opened = _opened_stamp(sid, cache_root) if (cache_root and sid) else 0
+    act = _activity(rec, opened)
+    pr_dir = os.path.join(cache_root, "pr") if cache_root else ""
+    origin = _origin_of(rec["path"]) if rec.get("path") else None
+    if origin and origin == (local_host or _local_host()):
+        origin = None
+    return {
+        "sid": sid, "short": sid[:8], "title": _rec_title(rec),
+        "repo": alias, "slot": live["slot"] if live else key,
+        "cwd": cwd, "worktree": worktree,
+        "worktree_exists": bool(worktree and os.path.isdir(worktree)),
+        "branch": branch, "live": bool(live),
+        "state": live["state"] if live else "dead",
+        "context": live.get("context") if live else None,
+        "host": "local",
+        "origin": origin,
+        "started": _fmt_ts(rec.get("first_ts")),
+        "last_activity": _fmt_ts(act), "ago": _ago(act, now), "activity_epoch": act,
+        "pr": _pr_info(rec.get("pr"), pr_dir), "plan": rec.get("plan"),
+        "prompts_total": rec.get("n_prompts", 0),
+        "first_prompts": [p["text"] for p in prompts[:3]],
+        "last_prompts": [p["text"] for p in prompts[-3:]] if len(prompts) > 3 else [],
+        "todo_open": (todo_counts or {}).get(key, 0) if key else 0,
+        "url": None,
+        "this_session": bool(this_sid and sid == this_sid),
+    }
+
+
+# ── liveness ──
+
+def _live_index(tmux_rows, panes, parents, registry, cfg):
+    """Join the pid registry to tmux → ({sid: {slot, cwd, state, kind, context}},
+    [idle dev-* slots with no registered claude]).
+
+    tmux_rows: (session_name, session_path, attached|detached); panes: (session_name,
+    pane_pid); parents: {pid: ppid} for the whole process table; registry: {pid: (sid,
+    cwd)} per live claude. A registered claude whose ANCESTRY reaches a dev-* pane is
+    that slot's session — the pid walk _dev_session_sid does, rather than a cwd
+    compare, because two claudes in one directory (a slot plus a foreground one, or
+    two slots opened in a shared tree) are indistinguishable by cwd. Any other
+    registered claude is a foreground one, labelled <repo>:<sid[:8]> the way t ls
+    does. Ordered by pid so the older claude in a pane wins a tie (a `claude -p`
+    child spawned inside a session registers too, briefly)."""
+    sess = {name: (path, state) for name, path, state in tmux_rows if name.startswith("dev-")}
+    pane_session = {int(pid): name for name, pid in panes
+                    if name in sess and str(pid).isdigit()}
+    out, claimed = {}, {}
+    for pid in sorted(registry, key=int):
+        sid, cwd = registry[pid]
+        if not sid or sid in out:
+            continue
+        cur, hops, found = int(pid), 0, None
+        while cur and cur > 1 and hops < 64:
+            if cur in pane_session:
+                found = pane_session[cur]
+                break
+            cur, hops = parents.get(cur, 0), hops + 1
+        if found and found not in claimed:
+            claimed[found] = sid
+            path, state = sess[found]
+            out[sid] = {"slot": found[4:], "cwd": cwd or path, "state": state,
+                        "kind": "tmux", "context": "active"}
+        else:
+            alias, _ = cfg.repo_of_dir(cwd) if cwd else (None, None)
+            label = "%s:%s" % (alias or os.path.basename(cwd or "") or "?", sid[:8])
+            out[sid] = {"slot": label, "cwd": cwd, "state": "foreground",
+                        "kind": "foreground", "context": "active"}
+    idle = [{"slot": name[4:], "cwd": path, "state": state, "context": "idle"}
+            for name, (path, state) in sess.items() if name not in claimed]
+    return out, idle
+
+
+def _live_rows(cache_root, projects_dir):
+    """Gather for _live_index: two tmux forks, one ps, and the registry files whose
+    pid is alive. A dev-* session with no registered claude falls back to its
+    CLAUDE_RESUME_ID stamp — accepted only when the transcript exists under that
+    slot's own project dir (a reused slot can carry a stale, even cross-repo, stamp)
+    — injected as a registry entry keyed on the PANE pid, so the join is uniform."""
+    def tmux(*fmt):
+        try:
+            r = subprocess.run(["tmux"] + list(fmt), stdout=subprocess.PIPE,
+                               stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL, text=True)
+        except OSError:
+            return ""
+        return r.stdout
+    tmux_rows, panes = [], []
+    for line in tmux("list-sessions", "-F", "#{session_name}\t#{session_path}\t"
+                     "#{?session_attached,attached,detached}").splitlines():
+        f = line.split("\t")
+        if len(f) == 3:
+            tmux_rows.append(tuple(f))
+    for line in tmux("list-panes", "-a", "-F", "#{session_name}\t#{pane_pid}").splitlines():
+        f = line.split("\t")
+        if len(f) == 2:
+            panes.append((f[0], f[1]))
+    parents = {}
+    try:
+        r = subprocess.run(["ps", "-Axo", "pid=,ppid="], stdout=subprocess.PIPE,
+                           stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL, text=True)
+        for line in r.stdout.splitlines():
+            f = line.split()
+            if len(f) == 2 and f[0].isdigit() and f[1].isdigit():
+                parents[int(f[0])] = int(f[1])
+    except OSError:
+        pass
+    registry = {}
+    for p in glob.glob(os.path.join(cache_root, "*")):
+        name = os.path.basename(p)
+        if not name.isdigit():
+            continue
+        try:
+            os.kill(int(name), 0)
+        except ProcessLookupError:
+            continue
+        except OSError:
+            pass                      # EPERM: alive, just not ours
+        try:
+            with open(p, encoding="utf-8") as fh:
+                sid, _, cwd = fh.read().strip().partition("\t")
+        except OSError:
+            continue
+        if sid:
+            registry[int(name)] = (sid, cwd)
+    pane_of = {name: int(pid) for name, pid in panes if str(pid).isdigit()}
+    # Which sessions are already covered by a registered claude's ancestry?
+    covered = set()
+    for pid in registry:
+        cur, hops = pid, 0
+        while cur and cur > 1 and hops < 64:
+            for name, ppid in pane_of.items():
+                if ppid == cur:
+                    covered.add(name)
+            cur, hops = parents.get(cur, 0), hops + 1
+    for name, path, _ in tmux_rows:
+        if not name.startswith("dev-") or name in covered or name not in pane_of:
+            continue
+        sid = tmux("show-environment", "-t", name, "CLAUDE_RESUME_ID").strip().partition("=")[2]
+        enc = re.sub(r"[^A-Za-z0-9]", "-", path)
+        if sid and os.path.exists(os.path.join(projects_dir, enc, sid + ".jsonl")):
+            registry[pane_of[name]] = (sid, path)
+    return tmux_rows, panes, parents, registry
+
+
+# ── search ──
+
+_KW_STOP = {"of", "the", "a", "an", "to", "on", "in", "for", "and", "is", "it", "with",
+            "at", "which", "session", "was", "working", "that", "this", "where", "did",
+            "i", "my", "we", "one", "had", "have", "has", "be", "do", "make", "making"}
+_KW_PUNCT = "\"'`,.;:!?()[]{}<>"
+
+
+def _kw_terms(query):
+    """Query → search terms. Lowercase, punctuation-stripped, stopwords and one-char
+    tokens dropped, crudely singularized (payments → payment; a substring match then
+    covers both), deduped in order. A leading `#` survives, so `#accounts` still
+    matches the page anchor the user actually typed."""
+    out = []
+    for tok in (query or "").lower().split():
+        tok = tok.strip(_KW_PUNCT)
+        core = tok.lstrip("#")
+        if len(core) < 2 or core in _KW_STOP:
+            continue
+        if len(core) > 3 and core.endswith("s") and not core.endswith("ss"):
+            core = core[:-1]
+        term = ("#" + core) if tok.startswith("#") else core
+        if term not in out:
+            out.append(term)
+    return out
+
+
+def _kw_score(rec, terms):
+    """Relevance of one record to the terms: body hits plus 4x for a hit in the head
+    (title or first prompt) — the same weighting .zshrc's _claude_session_rows uses,
+    so `t find -k` and this agree on order. Substring counting is deliberate
+    (`account` matches `#accounts`). Recall only: the caller reads the excerpts.
+
+    TODO(ranking): the one function here with real design latitude. Candidates —
+    a per-term presence bonus (a session naming every term beats one repeating one),
+    recency decay, an exact-match boost for #tags. Left as the plain count on purpose."""
+    prompts = rec.get("prompts") or []
+    head = (rec.get("ct") or rec.get("at") or (prompts[0]["text"] if prompts else "")).lower()
+    body = " ".join(p["text"] for p in prompts).lower()
+    return sum(body.count(t) + 4 * head.count(t) for t in terms)
+
+
+def _kw_excerpts(prompts, terms, n=3, width=240):
+    """The `n` prompts with the most term hits (ties → latest), each cut to a window
+    around its first hit and dated, so the caller can judge the match from what the
+    user actually said. A prompt with no hit is never shown."""
+    scored = []
+    for idx, p in enumerate(prompts):
+        low = p["text"].lower()
+        hits = sum(low.count(t) for t in terms)
+        if hits:
+            scored.append((hits, idx))
+    scored.sort(key=lambda x: (-x[0], -x[1]))
+    out = []
+    for _, idx in scored[:n]:
+        text = prompts[idx]["text"]
+        low = text.lower()
+        pos = min(low.find(t) for t in terms if t in low)
+        start = max(0, pos - width // 3)
+        end = min(len(text), start + width)
+        snip = ("…" if start else "") + text[start:end] + ("…" if end < len(text) else "")
+        when = _fmt_short(prompts[idx].get("ts"))
+        out.append("%s · %s" % (when, snip) if when else snip)
+    return out
+
+
+def _repo_path(cfg, alias):
+    return cfg.repos.get(alias) if alias else None
+
+
+def _find_sessions(recs, terms, live_by_sid, cfg, days=60, repo=None, limit=10, now=None,
+                   cache_root=None, this_sid=None, todo_counts=None):
+    now = now or time.time()
+    days = max(0, int(days or 0))
+    limit = max(1, min(30, int(limit or 10)))
+    cutoff = now - days * 86400 if days else 0
+    want = None
+    if repo:
+        want = cfg.repos.get(repo)
+        if not want:
+            raise ValueError("unknown repo alias %r — one of: %s"
+                             % (repo, ", ".join(sorted(cfg.repos)) or "(none configured)"))
+    hits, scanned = [], 0
+    for rec in recs:
+        if not rec.get("n_prompts"):
+            continue                    # a conversationless stub: nothing was said
+        scanned += 1
+        if want and _repo_path(cfg, cfg.repo_of_dir(rec.get("cwd") or "")[0]) != want:
+            continue
+        score = _kw_score(rec, terms)
+        if not score:
+            continue
+        row = _session_row(cfg, rec, live_by_sid, now, cache_root, this_sid, todo_counts)
+        if cutoff and row["activity_epoch"] < cutoff:
+            continue
+        row["score"] = score
+        row["excerpts"] = _kw_excerpts(rec.get("prompts") or [], terms)
+        hits.append(row)
+    hits.sort(key=lambda r: (r["score"], r["activity_epoch"]), reverse=True)
+    return {"query_terms": terms, "window_days": days, "scanned": scanned,
+            "matched": len(hits), "results": hits[:limit]}
+
+
+# ── one session ──
+
+_SLOT_REF_RE = re.compile(r"^([A-Za-z0-9_.-]+?)[- ](\d+)$")
+_HEX_REF_RE = re.compile(r"^[0-9a-f-]{4,}$")
+
+
+def _session_ref_resolve(ref, cfg, recs, live_by_sid):
+    """A tool's `session` argument → its index record, or ValueError with a teaching
+    message. Forms, most specific first: dev-<x> (stripped); <alias>-<n> / <alias> <n>
+    with a real DEV_REPOS alias and a numeric tail (rpartition on the last dash —
+    _todo_parent's rule, so `financial-forecast-17` is a slot of financial-forecast)
+    → the live session rooted at that slot's worktree, else the slot's newest real
+    transcript; <alias>:<hex> or a bare hex prefix → a unique session id."""
+    ref = (ref or "").strip()
+    if ref.startswith("dev-"):
+        ref = ref[4:]
+    by_sid = {r["sid"]: r for r in recs if r.get("sid")}
+    m = _SLOT_REF_RE.match(ref)
+    if m and m.group(1) in cfg.repos:
+        alias, n = m.groups()
+        path = cfg.repos[alias]
+        wt = os.path.join(cfg.worktree_root, os.path.basename(path), n)
+        for sid, info in live_by_sid.items():
+            if info.get("cwd") == wt and sid in by_sid:
+                return by_sid[sid]
+        for sid, info in live_by_sid.items():
+            head, _, num = info.get("slot", "").rpartition("-")
+            if num == n and cfg.repos.get(head) == path and sid in by_sid:
+                return by_sid[sid]
+        cands = [r for r in recs if r.get("cwd") == wt and r.get("n_prompts")]
+        if cands:
+            return max(cands, key=lambda r: (r.get("last_ts") or 0, r.get("mtime") or 0))
+        raise ValueError("no transcript for slot %s-%s here (never run, a shared-tree repo, "
+                         "or only on another host) — give a session id instead" % (alias, n))
+    if ":" in ref:
+        ref = ref.rsplit(":", 1)[1]
+    if _HEX_REF_RE.match(ref):
+        hits = [r for sid, r in by_sid.items() if sid.startswith(ref)]
+        if len(hits) == 1:
+            return hits[0]
+        if hits:
+            raise ValueError("ambiguous session id prefix %r: %s" % (
+                ref, "; ".join("%s %s" % (r["sid"][:8], _rec_title(r) or "(untitled)")
+                               for r in hits[:8])))
+        raise ValueError("no session id starting with %r" % ref)
+    raise ValueError("session must be a session id (or unique prefix) or a slot like "
+                     "ff-17 / dot-6 — aliases: %s" % (", ".join(sorted(cfg.repos)) or "(none)"))
+
+
+def _git_brief(path):
+    """{branch, log[≤10], status[≤20], dirty} for a checkout, None if absent/not git."""
+    if not path or not os.path.isdir(path):
+        return None
+
+    def run(args):
+        try:
+            r = subprocess.run(["git", "-C", path] + args, stdout=subprocess.PIPE,
+                               stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL,
+                               text=True, timeout=5)
+        except (OSError, subprocess.SubprocessError):
+            return None
+        return r.stdout if r.returncode == 0 else None
+
+    branch = run(["rev-parse", "--abbrev-ref", "HEAD"])
+    if branch is None:
+        return None
+    log = (run(["log", "--oneline", "-10"]) or "").splitlines()
+    status = (run(["status", "--porcelain"]) or "").splitlines()
+    return {"branch": branch.strip(), "log": log, "status": status[:20], "dirty": bool(status)}
+
+
+def _plan_head_lines(path, n=40):
+    """First n lines of a plan file, or None when it is not here (plans are per-host:
+    csync syncs them only periodically)."""
+    try:
+        n = max(1, int(n))
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            out = []
+            for line in fh:
+                out.append(line.rstrip("\n"))
+                if len(out) >= n:
+                    break
+            return out
+    except (OSError, TypeError, ValueError):
+        return None
+
+
+def _todo_rows(entries, cfg, live_rows, include_done=False, repo=None):
+    """The `t todo` lists as tool rows: one per list with anything to show. `repo`
+    keeps only that repo's lists (sibling aliases compare by path, like
+    _todo_live_nums); `live` says whether the slot has a tmux session."""
+    want = None
+    if repo:
+        want = cfg.repos.get(repo)
+        if not want:
+            raise ValueError("unknown repo alias %r — one of: %s"
+                             % (repo, ", ".join(sorted(cfg.repos)) or "(none configured)"))
+    out = []
+    for key, data in entries:
+        parent = _todo_parent(key, cfg.repos)
+        alias = parent or (key if key in cfg.repos else None)
+        if want and cfg.repos.get(alias) != want:
+            continue
+        items = _todo_visible(data, show_all=include_done)
+        if not items:
+            continue
+        num = key.rpartition("-")[2] if parent else ""
+        out.append({
+            "key": key, "repo": alias, "slot": key if parent else None,
+            "live": bool(parent) and num in _todo_live_nums(cfg.repos, parent, live_rows),
+            "open": [{"id": i["id"], "text": i["text"], "added": _fmt_ts(i.get("added"))}
+                     for i in items if not i.get("done")],
+            "done": [{"id": i["id"], "text": i["text"], "done_at": _fmt_ts(i.get("done_at"))}
+                     for i in items if i.get("done")],
+        })
+    return out
+
+
+# ── the tools ──
+
+_MCP_SERVER_INFO = {"name": "sessions", "version": "1"}
+_MCP_PROTOCOL_FALLBACK = "2025-06-18"
+_MCP_INSTRUCTIONS = (
+    "Claude Code session awareness for this machine: its tmux dev slots, foreground "
+    "claudes, and every saved transcript. Use these tools UNPROMPTED — the user will not "
+    "name this server — whenever they ask which session/slot/worktree/branch is or was "
+    "working on something ('which session had the accounts redesign?'), what a slot is "
+    "doing or where it left off, what is left to do (todo lists), or which PR a session "
+    "opened. find_sessions returns candidates WITH prompt excerpts: judge the match "
+    "yourself from the excerpts and titles, then session_detail for the winner. Slots are "
+    "named <repo>-<n> (tmux session dev-<repo>-<n>, worktree ~/code/.worktrees/<basename>/"
+    "<n>, branch dev/<basename>-<n>); a live one is attached with `t open <repo> <n>`, a "
+    "dead one revived with `t resume <repo> <n>`, its tasks with `t todo -s <repo>-<n>` — "
+    "tell the user those commands rather than running them. A result flagged "
+    "this_session is the conversation you are in.")
+
+_MCP_TOOLS = [
+    {"name": "find_sessions",
+     "description": (
+         "Keyword search over EVERY saved Claude Code transcript on this machine — titles "
+         "plus every prompt the user typed (not just the first). Use it when the user asks "
+         "which session, slot, worktree, or branch is or was working on something. Returns "
+         "candidates with prompt EXCERPTS: read them and judge the match yourself; the "
+         "score is recall, not truth. Then session_detail on the one that fits."),
+     "inputSchema": {"type": "object", "properties": {
+         "query": {"type": "string",
+                   "description": "a few keywords, e.g. 'accounts page redesign' or "
+                                  "'amex extra payment reschedule'"},
+         "days": {"type": "integer", "default": 60,
+                  "description": "only sessions active within N days; 0 = no window"},
+         "repo": {"type": "string",
+                  "description": "DEV_REPOS alias to restrict to (ff, dot, cfp, …)"},
+         "limit": {"type": "integer", "default": 10, "maximum": 30}},
+         "required": ["query"]}},
+    {"name": "list_sessions",
+     "description": (
+         "The live Claude sessions right now: tmux dev slots (<repo>-<n>) and foreground "
+         "claudes, with title, branch, PR + state, open todo count, dev-server URL, and "
+         "the last prompts. Use it for 'what is running', 'what is slot 17 doing', or to "
+         "map a slot to its worktree/branch. all_hosts also asks the other machines "
+         "(slow: several seconds)."),
+     "inputSchema": {"type": "object", "properties": {
+         "repo": {"type": "string", "description": "DEV_REPOS alias to restrict to"},
+         "all_hosts": {"type": "boolean", "default": False}}}},
+    {"name": "session_detail",
+     "description": (
+         "Everything about one session: title, cwd, worktree, branch, git log/status of "
+         "the worktree if it still exists, live state, PR + state, its todo lists, plan "
+         "file head, the first and last prompts, and the last assistant message (where it "
+         "left off). `session` is a session id or unique prefix, or a slot like ff-17 / "
+         "dot-6 (live slot → its session; dead slot → its newest transcript)."),
+     "inputSchema": {"type": "object", "properties": {
+         "session": {"type": "string"},
+         "plan_lines": {"type": "integer", "default": 40}},
+         "required": ["session"]}},
+    {"name": "list_todos",
+     "description": (
+         "The `t todo` task lists: every slot's open items (and recently finished), with "
+         "whether the slot is live. Use it for 'what is left to do on X' or 'which slot "
+         "has the task about Y'."),
+     "inputSchema": {"type": "object", "properties": {
+         "repo": {"type": "string", "description": "DEV_REPOS alias to restrict to"},
+         "include_done": {"type": "boolean", "default": False}}}},
+]
+
+
+def _mcp_context(cfg, state):
+    """Everything a tool call reads, gathered once per call (glue): the index (re-stat
+    at most every _INDEX_REFRESH_S — a back-to-back pair of calls must not walk 600
+    files twice), liveness, the todo store."""
+    now = time.time()
+    if state.get("recs") is None or now - state.get("at", 0) > _INDEX_REFRESH_S:
+        state["recs"] = _index_dedupe(_index_all(_projects_dir(), _index_dir()))
+        state["at"] = now
+    tmux_rows, panes, parents, registry = _live_rows(_cache_root(), _projects_dir())
+    live_by_sid, idle = _live_index(tmux_rows, panes, parents, registry, cfg)
+    entries = _todo_all_entries()
+    return {"recs": state["recs"], "live": live_by_sid, "idle": idle, "todo": entries,
+            "todo_counts": {k: len(_todo_open(d)) for k, d in entries},
+            "live_rows": [{"slot": v["slot"]} for v in live_by_sid.values()]
+                         + [{"slot": i["slot"]} for i in idle],
+            "now": now, "cache_root": _cache_root(),
+            "this_sid": os.environ.get("CLAUDE_CODE_SESSION_ID")}
+
+
+def _tool_find(cfg, ctx, args):
+    terms = _kw_terms(args.get("query", ""))
+    if not terms:
+        raise ValueError("give me a few keywords — e.g. 'accounts page redesign'")
+    return _find_sessions(ctx["recs"], terms, ctx["live"], cfg, days=args.get("days", 60),
+                          repo=args.get("repo"), limit=args.get("limit", 10), now=ctx["now"],
+                          cache_root=ctx["cache_root"], this_sid=ctx["this_sid"],
+                          todo_counts=ctx["todo_counts"])
+
+
+def _tool_list(cfg, ctx, args):
+    repo = args.get("repo")
+    want = cfg.repos.get(repo) if repo else None
+    if repo and not want:
+        raise ValueError("unknown repo alias %r — one of: %s"
+                         % (repo, ", ".join(sorted(cfg.repos)) or "(none configured)"))
+    by_sid = {r["sid"]: r for r in ctx["recs"] if r.get("sid")}
+    rows = []
+    for sid, info in ctx["live"].items():
+        rec = by_sid.get(sid) or {"sid": sid, "cwd": info.get("cwd"), "prompts": [],
+                                  "n_prompts": 0, "mtime": ctx["now"]}
+        row = _session_row(cfg, rec, ctx["live"], ctx["now"], ctx["cache_root"],
+                           ctx["this_sid"], ctx["todo_counts"])
+        if not by_sid.get(sid):
+            row["title"] = "(no transcript yet)"
+        rows.append(row)
+    for i in ctx["idle"]:
+        alias, _ = cfg.repo_of_dir(i["cwd"]) if i.get("cwd") else (None, None)
+        rows.append({"sid": "", "short": "", "title": "(no active conversation)",
+                     "repo": alias, "slot": i["slot"], "cwd": i["cwd"], "live": True,
+                     "state": i["state"], "context": "idle", "host": "local",
+                     "todo_open": ctx["todo_counts"].get(i["slot"], 0), "url": None,
+                     "this_session": False})
+    for row in rows:
+        if row.get("slot") and row.get("cwd"):
+            row["url"] = _dev_url(row["slot"], row["cwd"])
+    if want:
+        rows = [r for r in rows if cfg.repos.get(r.get("repo")) == want]
+    rows.sort(key=lambda r: (r.get("repo") or "~", _slot_sort_key(r.get("slot") or "")))
+    out = {"count": len(rows), "sessions": rows}
+    if args.get("all_hosts"):
+        remote = []
+        for r in _parse_rows(zsh_capture("_dev_rows_all", stdin=subprocess.DEVNULL),
+                             host_prefixed=True):
+            if r["host"] == "local":
+                continue
+            alias, _ = cfg.repo_of_dir(r["cwd"]) if r["cwd"] else (None, None)
+            remote.append({"host": r["host"], "sid": "" if r["sid"] == "-" else r["sid"],
+                           "repo": alias, "slot": r["slot"], "cwd": r["cwd"], "live": True,
+                           "state": r["state"], "context": r["context"],
+                           "title": r["summary"]})
+        out["remote"] = remote
+        out["hosts"] = sorted(cfg.hosts)
+    return out
+
+
+def _slot_sort_key(slot):
+    head, _, num = slot.rpartition("-")
+    return (head, int(num)) if num.isdigit() else (slot, 0)
+
+
+def _tool_detail(cfg, ctx, args):
+    rec = _session_ref_resolve(args.get("session", ""), cfg, ctx["recs"], ctx["live"])
+    row = _session_row(cfg, rec, ctx["live"], ctx["now"], ctx["cache_root"], ctx["this_sid"],
+                       ctx["todo_counts"])
+    prompts = rec.get("prompts") or []
+    row["first_prompts"] = [{"at": _fmt_short(p.get("ts")), "text": p["text"]} for p in prompts[:3]]
+    row["last_prompts"] = [{"at": _fmt_short(p.get("ts")), "text": p["text"]}
+                           for p in prompts[-10:]] if len(prompts) > 3 else []
+    row["last_assistant"] = rec.get("last_asst")
+    row["also_at"] = rec.get("also_at") or []
+    if row.get("slot") and row.get("cwd"):
+        row["url"] = _dev_url(row["slot"], row["cwd"])
+    row["git"] = _git_brief(row["worktree"] if row.get("worktree_exists") else row["cwd"])
+    row["plan_head"] = _plan_head_lines(row["plan"], args.get("plan_lines", 40)) if row.get("plan") else None
+    key = _todo_key(cfg, row["cwd"] or "")
+    todos = {}
+    for k, data in ctx["todo"]:
+        if k == key or (k == _todo_parent(key, cfg.repos)):
+            items = _todo_visible(data, show_all=True)
+            if items:
+                todos[k] = [{"id": i["id"], "text": i["text"], "done": bool(i.get("done"))}
+                            for i in items]
+    row["todos"] = todos
+    hints = []
+    alias, slot = cfg.repo_of_dir(row["cwd"] or "") if row.get("cwd") else (None, None)
+    if alias and slot:
+        hints.append(("t open %s %s" if row["live"] else "t resume %s %s") % (alias, slot))
+        hints.append("t todo -s %s-%s" % (alias, slot))
+        if not row["worktree_exists"]:
+            hints.append("worktree is gone (swept after merge?) — t resume rebuilds it from branch %s"
+                         % row["branch"])
+    row["hints"] = hints
+    return row
+
+
+def _tool_todos(cfg, ctx, args):
+    rows = _todo_rows(ctx["todo"], cfg, ctx["live_rows"], include_done=bool(args.get("include_done")),
+                      repo=args.get("repo"))
+    return {"count": len(rows), "lists": rows}
+
+
+_MCP_HANDLERS = {"find_sessions": _tool_find, "list_sessions": _tool_list,
+                 "session_detail": _tool_detail, "list_todos": _tool_todos}
+
+
+def _mcp_call(cfg, state, name, args):
+    return _MCP_HANDLERS[name](cfg, _mcp_context(cfg, state), args or {})
+
+
+# ── framing (mirrors hive's mcp_servers/protocol.py) ──
+
+def _mcp_result(mid, payload):
+    return {"jsonrpc": "2.0", "id": mid, "result": payload}
+
+
+def _mcp_error(mid, code, message):
+    return {"jsonrpc": "2.0", "id": mid, "error": {"code": code, "message": message}}
+
+
+def _mcp_text(text, is_error=False):
+    return {"content": [{"type": "text", "text": text}], "isError": is_error}
+
+
+def _mcp_handle(msg, tools, call, server_info=None, instructions=None):
+    """One decoded message → one response dict, or None for anything that must not be
+    answered (notifications). initialize echoes the client's protocolVersion so a
+    client-side bump alone cannot break the handshake; unknown requests get -32601;
+    a tool that raises becomes an isError result, never a dead loop."""
+    if not isinstance(msg, dict):
+        return _mcp_error(None, -32600, "invalid request")
+    method = msg.get("method")
+    mid = msg.get("id")
+    if method is None or method.startswith("notifications/"):
+        return None
+    if method == "initialize":
+        params = msg.get("params") or {}
+        result = {"protocolVersion": params.get("protocolVersion") or _MCP_PROTOCOL_FALLBACK,
+                  "capabilities": {"tools": {}},
+                  "serverInfo": server_info or _MCP_SERVER_INFO}
+        if instructions:
+            result["instructions"] = instructions
+        return _mcp_result(mid, result)
+    if method == "ping":
+        return _mcp_result(mid, {})
+    if method == "tools/list":
+        return _mcp_result(mid, {"tools": tools})
+    if method == "prompts/list":
+        return _mcp_result(mid, {"prompts": []})
+    if method == "resources/list":
+        return _mcp_result(mid, {"resources": []})
+    if method == "tools/call":
+        params = msg.get("params") or {}
+        name = params.get("name", "")
+        args = params.get("arguments") or {}
+        if not any(t["name"] == name for t in tools):
+            return _mcp_result(mid, _mcp_text(
+                "unknown tool: %s — one of: %s" % (name, ", ".join(t["name"] for t in tools)),
+                is_error=True))
+        try:
+            result = call(name, args)
+        except Exception as e:  # noqa: BLE001 — every failure must become a result
+            return _mcp_result(mid, _mcp_text("%s: %s" % (type(e).__name__, e), is_error=True))
+        return _mcp_result(mid, _mcp_text(
+            json.dumps(result, ensure_ascii=False, indent=1, default=str)))
+    return _mcp_error(mid, -32601, "method not found: %s" % method)
+
+
+def _mcp_serve(cfg):
+    """The stdio loop. stdout is the wire: one JSON line per request, nothing else."""
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    except (AttributeError, ValueError):
+        pass
+    state = {}
+
+    def call(name, args):
+        return _mcp_call(cfg, state, name, args)
+
+    for line in sys.stdin:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            msg = json.loads(line)
+        except ValueError:
+            sys.stdout.write(json.dumps(_mcp_error(None, -32700, "parse error")) + "\n")
+            sys.stdout.flush()
+            continue
+        resp = _mcp_handle(msg, _MCP_TOOLS, call, _MCP_SERVER_INFO, _MCP_INSTRUCTIONS)
+        if resp is not None:
+            sys.stdout.write(json.dumps(resp, ensure_ascii=False) + "\n")
+            sys.stdout.flush()
+    return 0
+
+
+def _mcp_registered(claude_json):
+    """Is the `sessions` server in ~/.claude.json's user-scope mcpServers? True/False,
+    None when the file is missing or unreadable. Read directly rather than via
+    `claude mcp get`, which SPAWNS the server to health-check it."""
+    try:
+        with open(claude_json, encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, ValueError):
+        return None
+    servers = data.get("mcpServers") if isinstance(data, dict) else None
+    return bool(isinstance(servers, dict) and "sessions" in servers)
+
+
+def _mcp_install():
+    """Register with Claude Code at user scope, via `claude mcp add` (Claude's own
+    writer — never a hand edit of the stateful ~/.claude.json). The EXPANDED path:
+    the stdio spawn does not go through a shell, so `$HOME/bin/t` would be exec'd
+    literally (the statusline command, by contrast, is run through one)."""
+    cmd = ["claude", "mcp", "add", "sessions", "-s", "user", "--",
+           os.path.join(HOME, "bin", "t"), "mcp"]
+    if _mcp_registered(os.path.join(HOME, ".claude.json")):
+        print("MCP server 'sessions' is already registered (user scope) — nothing to do")
+        return 0
+    try:
+        r = subprocess.run(cmd, stdin=subprocess.DEVNULL)
+    except OSError:
+        r = None
+    if r is None or r.returncode:
+        print("could not register — run by hand: %s" % " ".join(shlex.quote(c) for c in cmd),
+              file=sys.stderr)
+        return 1
+    print("registered MCP server 'sessions' (user scope) → %s mcp" % cmd[-2])
+    return 0
+
+
+def cmd_mcp(cfg, args):
+    if args.install:
+        return _mcp_install()
+    if args.list_tools:
+        for t in _MCP_TOOLS:
+            print("%-16s %s" % (t["name"], t["description"].split(". ")[0] + "."))
+        return 0
+    if args.reindex:
+        recs = _index_all(_projects_dir(), _index_dir())
+        print("indexed %d transcript(s), %.1f MB" % (len(recs), sum(r.get("size", 0) for r in recs) / 1e6))
+        return 0
+    if args.call:
+        name, rest = args.call[0], args.call[1:]
+        if name not in _MCP_HANDLERS:
+            print("t mcp --call: unknown tool %r — one of: %s"
+                  % (name, ", ".join(_MCP_HANDLERS)), file=sys.stderr)
+            return 2
+        try:
+            params = json.loads(rest[0]) if rest else {}
+        except ValueError as e:
+            print("t mcp --call: arguments must be JSON (%s)" % e, file=sys.stderr)
+            return 2
+        try:
+            result = _mcp_call(cfg, {}, name, params)
+        except ValueError as e:
+            print("t mcp --call: %s" % e, file=sys.stderr)
+            return 1
+        json.dump(result, sys.stdout, ensure_ascii=False, indent=1, default=str)
+        print()
+        return 0
+    return _mcp_serve(cfg)
+
+
 # ─── argument parsing (gh-style) ───────────────────────────────────────────────
 
 def build_parser():
@@ -2898,6 +3994,8 @@ examples:
   t cd ff 5               cd this shell into ff's slot-5 worktree (bare t cd: picker)
   t beam api --host mini  send a session to 'mini' and resume it there
   t find "auth refactor"  search saved sessions, then resume the pick
+  t mcp --call find_sessions '{"query":"accounts redesign"}'
+                          ask the sessions MCP by hand (Claude calls it for you)
   t on mini ls            run a command on a remote host
   t setup                 onboard this machine: register ~/code repos + ssh hosts
 
@@ -3133,6 +4231,19 @@ machines. Finished tasks leave the view at once and are dropped after a week."""
         description="Internal: stop the local live owner (dev slot) of a session id, enforcing "
             "`t beam`'s one-live-owner-per-conversation invariant. Invoked over ssh; not for "
             "direct use.")
+    mp = sub.add_parser("mcp", help="(internal) stdio MCP server: which session is working on what",
+        description="Internal: the stdio MCP server Claude Code spawns, registered at user "
+            "scope as `sessions` by install.sh (or `t mcp --install`). Exposes the live slots, "
+            "keyword search over every saved transcript's prompts, per-session detail, and the "
+            "todo lists, so any Claude session can answer \"which session was working on X?\". "
+            "Not for direct use except through the flags below.")
+    mp.add_argument("--install", action="store_true",
+                    help="register with Claude Code (user scope) if not already")
+    mp.add_argument("--list-tools", action="store_true", help="print the tool names")
+    mp.add_argument("--reindex", action="store_true", help="(re)build the transcript index now")
+    mp.add_argument("--call", nargs="+", metavar=("TOOL", "JSON"),
+                    help="run one tool by hand and print its result, e.g. "
+                         "--call find_sessions '{\"query\":\"accounts redesign\"}'")
     rp = sub.add_parser("__resolve", help="(internal) resolve a shell action for the t() shim",
         description="Internal: resolve a shell action for the t() zsh shim. Not for direct use.")
     rp.add_argument("rest", nargs=argparse.REMAINDER)
@@ -3143,7 +4254,7 @@ IMPLEMENTED = {
     "ls": cmd_ls, "session-rows": cmd_session_rows, "on": cmd_on, "read": cmd_read,
     "plan": cmd_plan, "paste": cmd_paste, "kill": cmd_kill, "setup": cmd_setup,
     "land": cmd_land, "kill-owner": cmd_kill_owner, "cursor": cmd_cursor,
-    "doctor": cmd_doctor, "todo": cmd_todo,
+    "doctor": cmd_doctor, "todo": cmd_todo, "mcp": cmd_mcp,
 }
 
 

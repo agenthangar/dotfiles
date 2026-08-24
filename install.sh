@@ -313,6 +313,43 @@ PY
 }
 install_claude_statusline
 
+# The `sessions` MCP server (bin/t mcp) — "which session is working on what?" from
+# inside any Claude session. Same contract as the statusline seed above, and here in
+# the links-only path for the same reason: a step only a manual install reaches lands
+# on one machine and silently not on another. Add-only — an entry that exists (or was
+# hand-edited) is never touched; `claude mcp remove sessions -s user` plus
+# DOTFILES_NO_MCP=1 in ~/.zshrc.local opts a machine out for good.
+#
+# Presence is read straight out of ~/.claude.json: `claude mcp get` SPAWNS the server
+# to health-check it, which is not a probe you want on every dots. Registration goes
+# through `claude mcp add` (Claude's own writer — that file holds OAuth state and
+# per-project history, never hand-merge it). The path is EXPANDED, unlike the
+# statusline's literal $HOME: a stdio MCP spawn does not go through a shell.
+install_claude_mcp() {
+    [[ -z "${DOTFILES_NO_MCP:-}" ]] || return 0
+    command -v claude  >/dev/null 2>&1 || return 0   # fresh box: t doctor / t mcp --install later
+    command -v python3 >/dev/null 2>&1 || return 0
+    python3 - "$HOME/.claude.json" <<'PY' && return 0
+import json, sys
+try:
+    with open(sys.argv[1], encoding="utf-8") as fh:
+        data = json.load(fh)
+except OSError:
+    sys.exit(1)          # no file yet: register
+except ValueError:
+    sys.exit(0)          # not ours to repair, and never loop-add into a broken file
+servers = data.get("mcpServers") if isinstance(data, dict) else None
+sys.exit(0 if isinstance(servers, dict) and "sessions" in servers else 1)
+PY
+    if command claude mcp add sessions -s user -- "$HOME/bin/t" mcp >/dev/null 2>&1; then
+        echo "Registered MCP server 'sessions' (user scope) -> $HOME/bin/t mcp"
+    else
+        echo "WARNING: could not register the sessions MCP server; run by hand:" >&2
+        echo "  claude mcp add sessions -s user -- $HOME/bin/t mcp" >&2
+    fi
+}
+install_claude_mcp
+
 # Everything below is the FULL install. The links-only relink stops here, before the
 # tmux source-file, the ssh Include rewrite, the ~/.zshrc.local and settings.json
 # seeds, the global gitconfig/hooksPath writes, the PII denylist branch (which would

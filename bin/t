@@ -152,6 +152,24 @@ def zsh_capture(snippet):
         return ""
 
 
+def _run(cmd, cwd=None, timeout=None):
+    """subprocess.run with captured text output that never raises: a missing binary
+    reads as rc 127 and a timeout as rc 124, both with the reason in .stderr, so
+    callers classify outcomes instead of catching exceptions (bin/pr-watch's run()).
+    stdin is /dev/null: nothing run through here may prompt, and a child that touched
+    the tty from inside the raw-mode wizard would leave it reading a terminal it no
+    longer owns (see _new_sh_whence)."""
+    try:
+        return subprocess.run(cmd, cwd=cwd, text=True, timeout=timeout, stdin=subprocess.DEVNULL,
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    except OSError as e:
+        return subprocess.CompletedProcess(cmd, 127, "", str(e))
+    except subprocess.TimeoutExpired as e:
+        err = e.stderr.decode(errors="replace") if isinstance(e.stderr, bytes) else (e.stderr or "")
+        out = e.stdout.decode(errors="replace") if isinstance(e.stdout, bytes) else (e.stdout or "")
+        return subprocess.CompletedProcess(cmd, 124, out, err + f"\ntimed out after {timeout}s")
+
+
 # ─── rendering ───────────────────────────────────────────────────────────────
 
 class Style:
@@ -731,11 +749,11 @@ def _hostval(target):
     return target if _BARE_HOST.match(target) else f'"{target}"'
 
 
-def _setup_block(repos, hosts, tbeam, date):
+def _setup_block(repos, hosts, tbeam, date, tool="t setup"):
     """The exact text appended to ~/.zshrc.local: a dated provenance marker + one
     assignment per pick (sorted for determinism). `date` is injected so the block
-    is testable byte-for-byte."""
-    lines = [f"# ── added by `t setup` ({date}) ──"]
+    is testable byte-for-byte; `tool` names the writer (t setup / t new)."""
+    lines = [f"# ── added by `{tool}` ({date}) ──"]
     lines += [f"DEV_REPOS[{k}]={_homeify(repos[k])}" for k in sorted(repos)]
     lines += [f"REMOTE_HOSTS[{k}]={_hostval(hosts[k])}" for k in sorted(hosts)]
     if tbeam:
@@ -1011,49 +1029,60 @@ def _pick_inline(title, rows, multi=False):
         out.flush()
 
 
-def _setup_wizard(items, taken):
-    """The t setup UI: a clack-style inline TWO-SCREEN flow. Screen one is the
-    whole selection — repos, hosts (with the '+ add a host' action row), and
-    options on a single list under one cursor; screen two is a diff-style review
-    of the exact ~/.zshrc.local changes: y applies, n/esc goes back to the
-    selection, q/ctrl-c aborts with nothing written. Rendered inline on a
-    vertical rail (redrawn in place via ANSI cursor-up, windowed when taller
-    than the terminal) so the whole transcript stays in scrollback. stdlib only
-    — termios/tty raw keys, readline prefill for the rename input. Returns True
-    on apply (items mutated in place), False on abort; raises when raw mode is
-    unavailable → _setup_prompt_flow."""
-    import select
-    import termios
-    import tty
+class _RailUI:
+    """The inline-wizard primitives shared by `t setup` and `t new`: raw single-key
+    reads, an input line with a readline-PREFILLED suggestion, and in-place repaint of
+    a block of rail lines via ANSI cursor-up — a step redraws itself while the finished
+    steps above it stay in normal scrollback (the clack / `npm create` aesthetic).
+    Constructing it off a tty (no line discipline to save) raises, which is the signal
+    the callers use to fall back to plain prompts. stdlib only — deliberately neither
+    fzf nor curses, for the reasons _pick_inline documents."""
 
-    st = Style()
-    out = sys.stdout
-    rail = f"{st.y}│{st.r}"
-    fd = sys.stdin.fileno()
-    old_attrs = termios.tcgetattr(fd)
-    width = max(40, shutil.get_terminal_size((100, 24)).columns)
+    def __init__(self):
+        import termios
+        self.st, self.out = Style(), sys.stdout
+        self.fd = sys.stdin.fileno()
+        self.old_attrs = termios.tcgetattr(self.fd)
+        self.rail = f"{self.st.y}│{self.st.r}"
+        self.width = max(40, shutil.get_terminal_size((100, 24)).columns)
+        self.painted = [0]   # lines of the block currently on screen (0 = nothing to erase)
 
-    def read_key():
-        ch = os.read(fd, 1).decode(errors="replace")
+    def raw(self):
+        import tty
+        tty.setcbreak(self.fd)
+        self.out.write("\x1b[?25l")
+        self.out.flush()
+
+    def restore(self):
+        import termios
+        termios.tcsetattr(self.fd, termios.TCSADRAIN, self.old_attrs)
+        self.out.write("\x1b[?25h")
+        self.out.flush()
+
+    def read_key(self):
+        import select
+        ch = os.read(self.fd, 1).decode(errors="replace")
         if ch == "\x1b":
-            r, _, _ = select.select([fd], [], [], 0.05)
+            r, _, _ = select.select([self.fd], [], [], 0.05)
             if r:
-                seq = os.read(fd, 2).decode(errors="replace")
+                seq = os.read(self.fd, 2).decode(errors="replace")
                 return {"[A": "up", "OA": "up", "[B": "down", "OB": "down"}.get(seq, "esc")
             return "esc"
         return {"\r": "enter", "\n": "enter", " ": "space", "\x03": "abort",
                 "\x04": "abort", "": "abort"}.get(ch, ch)
 
-    def cooked_input(prompt, default="", prefill=None):
+    def cooked_input(self, prompt, default="", prefill=None):
         # Temporarily restore the line discipline so input() gives real editing.
         # `prefill` puts the suggestion IN the input line, editable in place —
         # the clearest "you can change this" signal there is (readline startup
         # hook; on the rare build without readline it degrades to a [suggestion]
         # prompt). Prompts here stay ANSI-free: once readline is loaded it does
         # the cursor math for every input(), and escape codes break it.
-        termios.tcsetattr(fd, termios.TCSADRAIN, old_attrs)
-        out.write("\x1b[?25h")
-        out.flush()
+        import termios
+        import tty
+        termios.tcsetattr(self.fd, termios.TCSADRAIN, self.old_attrs)
+        self.out.write("\x1b[?25h")
+        self.out.flush()
         hooked = False
         if prefill:
             try:
@@ -1070,24 +1099,87 @@ def _setup_wizard(items, taken):
             if hooked:
                 import readline
                 readline.set_startup_hook()
-            tty.setcbreak(fd)
-            out.write("\x1b[?25l")
-            out.flush()
-        out.write("\x1b[1A\r\x1b[J")   # reclaim the input line for the repaint
+            tty.setcbreak(self.fd)
+            self.out.write("\x1b[?25l")
+            self.out.flush()
+        self.out.write("\x1b[1A\r\x1b[J")   # reclaim the input line for the repaint
         return s or default
+
+    def repaint(self, lines):
+        if self.painted[0]:
+            self.out.write(f"\x1b[{self.painted[0]}A\r\x1b[J")
+        self.out.write("\n".join(lines) + "\n")
+        self.painted[0] = len(lines)
+        self.out.flush()
+
+    def commit(self, lines):
+        """Repaint, then forget the block: the next repaint starts BELOW it, so these
+        lines are now permanent scrollback (a finished step's ◇ summary)."""
+        self.repaint(lines)
+        self.painted[0] = 0
+
+    def done(self, label, value):
+        st = self.st
+        self.commit([f"{st.g}◇{st.r}  {label:<11} {value}"])
+
+    def pick(self, label, rows, multi=False, default=0, marked=None):
+        """A list under a ◆ step, redrawn in place: ↑↓/jk move, space marks (multi),
+        enter picks, q/esc/ctrl-c cancels → None. rows: [(value, text)]. `default` is
+        the initial cursor row, `marked` the pre-marked rows (multi) — the two things
+        _pick_inline lacks, and what lets a wizard step open on its suggestion."""
+        st, rail = self.st, self.rail
+        cur = max(0, min(default or 0, len(rows) - 1))
+        marks = set(marked or ())
+        height = max(4, shutil.get_terminal_size((100, 24)).lines - 8)
+        keys = ("↑↓ move · space mark · enter pick · q quit" if multi
+                else "↑↓ move · enter pick · q quit")
+        while True:
+            lo = max(0, min(cur - height // 2, len(rows) - height)) if len(rows) > height else 0
+            hi = min(len(rows), lo + height)
+            lines = [f"{st.c}◆{st.r}  {st.b}{label}{st.r}  {st.y}{keys}{st.r}"]
+            if lo:
+                lines.append(f"{rail}   {st.y}… {lo} above{st.r}")
+            for n in range(lo, hi):
+                pre = f"{st.c}▸{st.r}" if n == cur else " "
+                box = (f"{st.c}◼{st.r} " if n in marks else "◻ ") if multi else ""
+                body = _truncate(rows[n][1], max(20, self.width - 10))
+                body = f"{st.b}{body}{st.r}" if n == cur else body
+                lines.append(f"{rail}  {pre}{box}{body}")
+            if hi < len(rows):
+                lines.append(f"{rail}   {st.y}… {len(rows) - hi} more{st.r}")
+            self.repaint(lines)
+            k = self.read_key()
+            if k in ("up", "k"):
+                cur = (cur - 1) % len(rows)
+            elif k in ("down", "j"):
+                cur = (cur + 1) % len(rows)
+            elif k == "space" and multi:
+                marks.symmetric_difference_update({cur})
+                cur = min(cur + 1, len(rows) - 1)
+            elif k == "enter":
+                return [rows[i][0] for i in sorted(marks)] if multi else rows[cur][0]
+            elif k in ("q", "esc", "abort"):
+                return None
+
+
+def _setup_wizard(items, taken, trailer=None):
+    """The t setup UI (on the _RailUI primitives): a clack-style inline TWO-SCREEN flow. Screen one is the
+    whole selection — repos, hosts (with the '+ add a host' action row), and
+    options on a single list under one cursor; screen two is a diff-style review
+    of the exact ~/.zshrc.local changes: y applies, n/esc goes back to the
+    selection, q/ctrl-c aborts with nothing written. Rendered inline on a
+    vertical rail (redrawn in place via ANSI cursor-up, windowed when taller
+    than the terminal) so the whole transcript stays in scrollback. stdlib only
+    — termios/tty raw keys, readline prefill for the rename input. Returns True
+    on apply (items mutated in place), False on abort; raises when raw mode is
+    unavailable → _setup_prompt_flow."""
+    ui = _RailUI()
+    st, out, rail, width = ui.st, ui.out, ui.rail, ui.width
+    read_key, cooked_input, repaint, painted = ui.read_key, ui.cooked_input, ui.repaint, ui.painted
 
     def used_aliases(skip=None):
         return taken | {it["alias"] for it in items
                         if it is not skip and it["t"] in ("toggle", "locked")}
-
-    painted = [0]
-
-    def repaint(lines):
-        if painted[0]:
-            out.write(f"\x1b[{painted[0]}A\r\x1b[J")
-        out.write("\n".join(lines) + "\n")
-        painted[0] = len(lines)
-        out.flush()
 
     def row_text(it, aw, cur):
         if it.get("kind") == "addhost":
@@ -1201,6 +1293,8 @@ def _setup_wizard(items, taken):
         if stale_ok:
             sv = next(x["value"] for x in items if x.get("kind") == "stale")
             lines.append(f"{rail}  {st.y}~ comment out stale entries: {sv}{st.r}")
+        if trailer and repos:
+            lines.append(f"{rail}  {st.c}→{st.r} {st.y}{trailer}{st.r}")
         repaint(lines)
         while True:
             k = read_key()
@@ -1216,8 +1310,7 @@ def _setup_wizard(items, taken):
 
     out.write(f"{st.y}┌{st.r}  {st.b}t setup{st.r} {st.y}· ~/.zshrc.local — nothing "
               f"is written until you confirm{st.r}\n{rail}\n")
-    tty.setcbreak(fd)
-    out.write("\x1b[?25l")
+    ui.raw()
     ok, msg = False, ""
     try:
         while True:
@@ -1236,15 +1329,13 @@ def _setup_wizard(items, taken):
     except KeyboardInterrupt:
         ok = False
     finally:
-        termios.tcsetattr(fd, termios.TCSADRAIN, old_attrs)
-        out.write("\x1b[?25h")
-        out.flush()
+        ui.restore()
     end = "" if ok else f" {st.y}· aborted — nothing written{st.r}"
     out.write(f"{st.y}└{st.r}{end}\n")
     return ok
 
 
-def _setup_prompt_flow(items, taken):
+def _setup_prompt_flow(items, taken, trailer=None):
     """Plain-prompt fallback when curses cannot initialize (TERM=dumb, hostile
     terminals): same item model, one y/N per candidate, a manual host loop, then
     the same review gate. Returns True when the review confirm passed."""
@@ -1303,6 +1394,8 @@ def _setup_prompt_flow(items, taken):
     if stale_ok:
         sv = next(x["value"] for x in items if x.get("kind") == "stale")
         print(f"  (and comment out the stale entries: {sv})")
+    if trailer and repos:
+        print(f"  → {trailer}")
     return _confirm("proceed?")
 
 
@@ -1316,6 +1409,11 @@ def cmd_setup(cfg, args):
     except OSError:
         local_text = ""
     f_repos, f_hosts, tbeam_set = _local_entries(local_text)
+    land_hosts, err = _new_pick_hosts(cfg.hosts, args.hosts, args.no_hosts)
+    if err:
+        print(f"t setup: {err}", file=sys.stderr)
+        return 1
+    trailer = _setup_hosts_trailer(land_hosts)
 
     # dedup state: union of the live file lines and the (possibly stale) cache
     reg_paths = ({os.path.realpath(_expand_home(v)) for v in f_repos.values()} |
@@ -1368,6 +1466,8 @@ def cmd_setup(cfg, args):
             print("would offer (shown as if everything were picked):\n")
             print(_setup_block({a: p for p, a in proposals.items()}, hp, None,
                                time.strftime("%Y-%m-%d")), end="")
+            if cands and trailer:
+                print(f"→ {trailer}")
         if args.dry_run:
             return 0
         print("\nt setup is interactive — run it from a terminal (or use --dry-run)",
@@ -1389,11 +1489,11 @@ def cmd_setup(cfg, args):
     all_keys = taken_keys | host_keys
     wizard_ran = True
     try:
-        confirmed = _setup_wizard(items, all_keys)
+        confirmed = _setup_wizard(items, all_keys, trailer)
     except Exception as e:
         wizard_ran = False
         print(f"(inline UI unavailable: {e} — falling back to prompts)", file=sys.stderr)
-        confirmed = _setup_prompt_flow(items, all_keys)
+        confirmed = _setup_prompt_flow(items, all_keys, trailer)
     if not confirmed:
         if not wizard_ran:   # the wizard already printed its └ aborted line
             print("t setup: aborted — nothing written")
@@ -1423,8 +1523,834 @@ def cmd_setup(cfg, args):
         print("✓ appended to ~/.zshrc.local:")
         for ln in block.splitlines():
             print(f"  {st.y}{ln}{st.r}" if ln.startswith("#") else f"  {ln}")
+    if add_repos and land_hosts:
+        _hosts_land(cfg, add_repos, args.hosts)
     if not os.environ.get("T_SETUP_SHIM"):
         print("run `source ~/.zshrc` (or open a new shell) to make the new shortcuts live")
+    return 0
+
+
+# ─── t new — create a repo here + on GitHub, register it here and on every host ──
+#
+# The wizard sibling of `t setup`: setup registers checkouts that already exist, new
+# makes one from nothing and finishes every wiring step the session tooling depends
+# on. Architecture is answers → pure plan → review → walk: the wizard (or the flags)
+# only collects ANSWERS; _new_plan turns answers + the probed state of ~/code/<name>
+# and GitHub into an ordered list of check-then-do step records; the review screen
+# (and --dry-run) render that list; y walks it. Nothing mutates before y, and because
+# every step re-checks its precondition, re-running after a failure (gh down, a host
+# unreachable) resumes with the done steps rendered as `=`.
+#
+# Why each step exists — the path is FIXED to ~/code/<name> because t beam / t open -r
+# resolve a repo by the same path on every host; origin/main MUST exist afterwards
+# because _dev_worktree_create (.zshrc) branches every session off it, so a merely
+# git-init'ed repo makes `t open` fall into the shared-tree fallback; squash-only +
+# auto-merge + delete-branch-on-merge because the standing workflow is `gh pr merge
+# --auto --squash`, which errors on a repo without auto-merge; and the host step
+# because a repo registered on one machine is invisible to the others until someone
+# clones + registers it there by hand — the manual sequence this verb replaces.
+
+NEW_OWNER = "agenthangar"
+_NEW_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$")
+_NEW_SLUG = re.compile(r"^(?:git@github\.com:|ssh://git@github\.com/|https://github\.com/)"
+                       r"([^/\s]+)/([^/\s]+?)(?:\.git)?/?$")
+_NEW_STALE = "invalid choice: 'new-land'"
+_NEW_SENTINEL = "new-land: "
+
+
+def _new_validate_name(name):
+    """GitHub repo-name rules (also the ~/code dir name): letters, digits, . _ -; no
+    leading - or .; at most 100 chars; not . / .. / *.git. → error text or None."""
+    if not name:
+        return "a repo name is required"
+    if not _NEW_NAME.match(name) or name.endswith(".git"):
+        return (f"'{name}' is not a valid repo name — letters, digits, '.', '_', '-' only; "
+                "no leading '-' or '.'; at most 100 chars")
+    return None
+
+
+def _new_name_warnings(name):
+    return (["GitHub compares names case-insensitively — lowercase is the convention"]
+            if name != name.lower() else [])
+
+
+def _new_path(name):
+    return os.path.join(HOME, "code", name)
+
+
+def _new_clone_url(owner, name):
+    return f"git@github.com:{owner}/{name}.git"
+
+
+def _new_repo_slug(url):
+    """'owner/name' from a github.com remote URL (ssh, ssh://, https; optional .git),
+    else None — a non-GitHub origin is one t new cannot wire."""
+    m = _NEW_SLUG.match((url or "").strip())
+    return f"{m.group(1)}/{m.group(2)}" if m else None
+
+
+def _new_gh_repo_state(rc, out, err):
+    """Classify `gh api repos/<slug>` (REST, because `gh repo view --json` has no
+    auto-merge field): ('present', info) with the merge-setting fields, ('absent',
+    None) on 404, ('error', msg) otherwise — the not-logged-in case gets its own
+    message since it is the usual first-run failure."""
+    e = (err or "").strip()
+    if rc == 0:
+        try:
+            return "present", (json.loads(out or "null") or {})
+        except json.JSONDecodeError:
+            return "error", "gh returned unparseable JSON"
+    if "HTTP 404" in e or "Not Found" in e:
+        return "absent", None
+    if "gh auth login" in e or "not logged in" in e.lower():
+        return "error", "gh is not logged in — run `gh auth login`"
+    return "error", (e.splitlines()[-1].strip() if e else f"gh api failed (rc {rc})")
+
+
+def _new_settings_ok(info):
+    """The merge policy every repo here runs on: squash-only PRs, auto-merge on, head
+    branches deleted on merge (what `gh pr merge --auto --squash` needs)."""
+    return bool(info.get("allow_auto_merge") and info.get("delete_branch_on_merge")
+                and info.get("allow_squash_merge", True)
+                and not info.get("allow_merge_commit") and not info.get("allow_rebase_merge"))
+
+
+def _new_whence_kind(text):
+    """`whence -w name` prints 'name: kind' — the kind, unless none/empty."""
+    kind = (text or "").strip().rpartition(":")[2].strip()
+    return kind if kind and kind != "none" else None
+
+
+def _new_alias_check(alias, path, f_repos, cfg_repos, whence_kind=None):
+    """Decide the register step: ('skip', why) when the alias already maps to this
+    path (a path under a SECOND alias is fine — dot + dotfiles is the precedent),
+    ('error', why) when the alias maps elsewhere, is not a valid key, or would shadow
+    a zsh command/builtin/function (the generated `alias <k>="cd …"` shadows whatever
+    <k> was — `t new test` must not break the shell), else ('run', None)."""
+    if not _SETUP_KEY.match(alias or ""):
+        return "error", f"'{alias}' is not a valid key (no spaces, ']' or '='; no leading '-')"
+    real = os.path.realpath(path)
+    reg = {k: os.path.realpath(v) for k, v in cfg_repos.items()}
+    reg.update({k: os.path.realpath(_expand_home(v)) for k, v in f_repos.items()})
+    if alias in reg:
+        if reg[alias] == real:
+            return "skip", f"DEV_REPOS[{alias}] already registered"
+        return "error", f"alias '{alias}' already maps to {_tilde(reg[alias])} — pick another alias"
+    if whence_kind:
+        return "error", (f"'{alias}' is a zsh {whence_kind} — the cd shortcut would shadow it; "
+                         "pick another alias")
+    return "run", None
+
+
+def _new_owner_rows(login, orgs, default):
+    """Picker rows for the GitHub owner: the default first, then the rest sorted, the
+    token's own user labelled (you). Only owners the token can actually see."""
+    orgs = set(orgs or ())
+    names = [n for n in [default] + sorted(orgs | ({login} if login else set()))
+             if n and (n == login or n in orgs)]
+    names = list(dict.fromkeys(names))
+    return [(n, f"{n} (you)" if n == login else n) for n in names]
+
+
+def _new_pick_hosts(cfg_hosts, only, none):
+    """The hosts to clone + register on: none → [], `only` ('a,b') → those (an unknown
+    alias is an error), else every REMOTE_HOSTS entry sorted. → (rows, error)."""
+    if none:
+        return [], None
+    if only:
+        picked = [h.strip() for h in only.split(",") if h.strip()]
+        unknown = [h for h in picked if h not in cfg_hosts]
+        if unknown:
+            return [], (f"unknown host(s): {', '.join(unknown)} — REMOTE_HOSTS has: "
+                        f"{', '.join(sorted(cfg_hosts)) or '(none)'}")
+        return [(h, cfg_hosts[h]) for h in picked], None
+    return sorted(cfg_hosts.items()), None
+
+
+def _new_answers(args):
+    """What the flags already decided; None = the wizard asks. hosts: None (ask),
+    [] (--no-hosts) or the --hosts list."""
+    vis = ("public" if getattr(args, "public", False)
+           else "private" if getattr(args, "private", False) else None)
+    hosts = None
+    if getattr(args, "no_hosts", False):
+        hosts = []
+    elif getattr(args, "hosts", None):
+        hosts = [h.strip() for h in args.hosts.split(",") if h.strip()]
+    return {"name": getattr(args, "name", None) or None, "owner": getattr(args, "owner", None),
+            "visibility": vis, "alias": getattr(args, "alias", None), "hosts": hosts}
+
+
+def _new_state_summary(state):
+    if not state["exists"]:
+        return "new"
+    if state["is_repo"]:
+        o = _new_repo_slug(state.get("origin_url")) or state.get("origin_url")
+        return (f"exists — repo on {state.get('branch') or 'detached HEAD'}"
+                + (f", origin {o}" if o else ", no origin")
+                + ("" if state["has_commits"] else ", no commits"))
+    return "exists — NOT a git repo" if state["nonempty"] else "exists (empty)"
+
+
+def _new_plan(name, alias, owner, private, path, state, gh, register, hosts):
+    """The ordered check-then-do steps. Each record: step, do (run|skip|error), label,
+    cmd (argv for subprocess steps; None for the python register step), warn. An
+    origin that already points elsewhere RETARGETS the slug (with a warn) — settings
+    and host clones must aim at the repo that exists, which also makes `t new
+    <existing>` an adopt-and-finish-wiring command."""
+    steps = []
+
+    def rec(step, do, label, cmd=None, warn=None, **kw):
+        steps.append({"step": step, "do": do, "label": label, "cmd": cmd, "warn": warn, **kw})
+
+    slug, url = f"{owner}/{name}", _new_clone_url(owner, name)
+    gh_kind, gh_info = gh
+    p, br = _tilde(path), state.get("branch")
+    if state["is_repo"]:
+        if br != "main" and state["has_commits"]:
+            rec("init", "error", f"{p} is on '{br or 'detached HEAD'}' with commits — expected main "
+                                 "(git branch -m main, then re-run)")
+        elif br != "main":
+            rec("init", "run", f"switch {p} to main (no commits yet)",
+                ["git", "-C", path, "symbolic-ref", "HEAD", "refs/heads/main"])
+        else:
+            rec("init", "skip", f"{p} exists on main")
+    elif state["exists"] and state["nonempty"]:
+        rec("init", "error", f"{p} exists and is not a git repo — move it aside or pick another name")
+    else:
+        rec("init", "run", f"git init -b main {p}", ["git", "init", "-q", "-b", "main", path])
+    if state["has_commits"]:
+        rec("commit", "skip", "already has commits")
+    else:
+        rec("commit", "run", f'git commit --allow-empty -m "init: {name}"',
+            ["git", "-C", path, "commit", "-q", "--allow-empty", "-m", f"init: {name}"])
+    created, origin = False, state.get("origin_url")
+    if origin:
+        oslug = _new_repo_slug(origin)
+        if oslug is None:
+            rec("remote", "error", f"origin {origin} is not a github.com repo — t new only wires GitHub")
+        else:
+            warn = None
+            if oslug != slug:
+                warn = f"origin is {oslug}, not {slug} — keeping the existing origin"
+                slug, url = oslug, origin
+            rec("remote", "skip", f"origin → {slug}", warn=warn)
+    elif gh_kind == "error":
+        rec("remote", "error", gh_info)
+    elif gh_kind == "present":
+        rec("remote", "run", f"git remote add origin {url} (already on GitHub)",
+            ["git", "-C", path, "remote", "add", "origin", url])
+    else:
+        created, vis = True, ("--private" if private else "--public")
+        rec("remote", "run", f"gh repo create {slug} {vis} --source {p} --push",
+            ["gh", "repo", "create", slug, vis, "--source", path, "--remote", "origin", "--push"])
+    if state["has_origin_main"]:
+        rec("push", "skip", "origin/main present")
+    elif created:
+        rec("push", "skip", "pushed by gh repo create")
+    elif steps[-1]["do"] != "error":
+        rec("push", "run", "git push -u origin main",
+            ["git", "-C", path, "push", "-q", "-u", "origin", "main"])
+    if gh_kind == "error":
+        rec("settings", "error", gh_info)
+    elif gh_kind == "present" and _new_settings_ok(gh_info):
+        rec("settings", "skip", f"{slug}: squash-only + auto-merge already set")
+    else:
+        warn = None
+        if gh_kind == "present" and bool(gh_info.get("private")) != private:
+            warn = (f"{slug} exists as {'private' if gh_info.get('private') else 'public'} — "
+                    "visibility left as is")
+        rec("settings", "run", f"gh repo edit {slug}: squash-only + auto-merge + delete-branch-on-merge",
+            ["gh", "repo", "edit", slug, "--enable-auto-merge", "--delete-branch-on-merge",
+             "--enable-squash-merge", "--enable-merge-commit=false", "--enable-rebase-merge=false"],
+            warn=warn)
+    rk, rmsg = register
+    rec("register", rk, rmsg or f"DEV_REPOS[{alias}]={_homeify(path)} → ~/.zshrc.local",
+        alias=alias, path=path)
+    for h, target in hosts:
+        rec(f"host:{h}", "run", f"{h}: clone + register", _new_ssh_argv(target, url, name, alias),
+            host=h, target=target, url=url)
+    return steps
+
+
+def _new_ssh_argv(target, url, name, alias):
+    """`ssh <target> "zsh -lic 't new-land …'"` — two quoting layers (the cmd_on
+    precedent): the inner words for the far zsh -c, the whole thing as ONE ssh token
+    since ssh re-splits its command on spaces. zsh -lic because ~/bin/t is only on
+    the interactive PATH (the _dev_rows_all contract)."""
+    inner = " ".join(shlex.quote(a) for a in ("t", "new-land", url, name, alias))
+    return ["ssh", "-o", "ConnectTimeout=5", "-o", "BatchMode=yes", target,
+            f"zsh -lic {shlex.quote(inner)}"]
+
+
+def _new_host_outcome(rc, out, err):
+    """Classify one host's `t new-land` run → (status, detail). An unreachable host
+    (ssh rc 255, or our own timeout 124 — ConnectTimeout does not cover DNS when
+    tailscale is down) vs stale dotfiles there (argparse rejects the verb: rc 2 +
+    'invalid choice') vs no `t` at all (rc 127) vs a real failure (the last stderr
+    lines). Success reads the far side's `new-land: …` stdout sentinel — a `zsh -lic`
+    stdout can carry rc noise, so the summary is prefixed, not bare."""
+    e, o = (err or "").strip(), (out or "").strip()
+    if rc in (255, 124):
+        return "unreachable", ""
+    if rc == 2 and _NEW_STALE in e:
+        return "stale", ""
+    if rc == 127 or "command not found: t" in e:
+        return "missing", ""
+    if rc == 0:
+        for ln in reversed(o.splitlines()):
+            if ln.startswith(_NEW_SENTINEL):
+                return "ok", ln[len(_NEW_SENTINEL):].strip()
+        return "ok", "done"
+    tail = [ln.strip() for ln in e.splitlines() if ln.strip()][-3:]
+    return "failed", (" / ".join(tail) if tail else f"rc {rc}")
+
+
+def _new_host_line(host, status, detail, name):
+    """The one line per host, shared by t new and t setup."""
+    if status == "ok":
+        return f"✓ {host}: {detail}"
+    if status == "unreachable":
+        return f"⚠ {host}: unreachable — re-run `t new {name}` later, it resumes"
+    if status == "stale":
+        return f"⚠ {host}: stale dotfiles — run `dots` there, then re-run `t new {name}`"
+    if status == "missing":
+        return f"⚠ {host}: no `t` there — run install.sh on it, then re-run `t new {name}`"
+    return f"⚠ {host}: failed — {detail}"
+
+
+def _new_land_plan(name, alias, url, path, state, register):
+    """The far side's steps: clone unless the dir already is a clone of the same
+    repo (ssh vs https origins match by slug), then the same register record."""
+    steps, want, p = [], _new_repo_slug(url), _tilde(path)
+
+    def rec(step, do, label, cmd=None, **kw):
+        steps.append({"step": step, "do": do, "label": label, "cmd": cmd, "warn": None, **kw})
+
+    if state["is_repo"]:
+        have = _new_repo_slug(state.get("origin_url"))
+        if have and have == want:
+            rec("clone", "skip", f"{p} already cloned")
+        elif have:
+            rec("clone", "error", f"{p} exists with origin {have}, expected {want}")
+        else:
+            rec("clone", "error", f"{p} exists with no origin — expected a clone of {want}")
+    elif state["exists"] and state["nonempty"]:
+        rec("clone", "error", f"{p} exists and is not a git repo")
+    else:
+        rec("clone", "run", f"git clone {url} {p}", ["git", "clone", "-q", url, path])
+    rk, rmsg = register
+    rec("register", rk, rmsg or f"DEV_REPOS[{alias}]={_homeify(path)}", alias=alias, path=path)
+    return steps
+
+
+def _new_land_summary(steps):
+    do = {s["step"]: s["do"] for s in steps}
+    c, r = do.get("clone"), do.get("register")
+    if c == "run" and r == "run":
+        return "cloned + registered"
+    if c == "skip" and r == "skip":
+        return "already set up"
+    if c == "skip":
+        return "clone present, registered"
+    return "cloned (alias already registered)"
+
+
+def _new_render(steps, st):
+    """Review / dry-run lines: + run, = skip, ✗ error, ⚠ warn, → the hosts."""
+    lines, hosts = [], []
+    for s in steps:
+        if s["step"].startswith("host:"):
+            hosts.append(s["host"])
+            continue
+        if s["do"] == "run":
+            lines.append(f"{st.g}+{st.r} {s['label']}")
+        elif s["do"] == "skip":
+            lines.append(f"{st.y}= {s['label']}{st.r}")
+        else:
+            lines.append(f"{st.b}✗ {s['label']}{st.r}")
+        if s.get("warn"):
+            lines.append(f"{st.y}  ⚠ {s['warn']}{st.r}")
+    if hosts:
+        lines.append(f"{st.c}→{st.r} {', '.join(hosts)}: clone + register")
+    return lines
+
+
+def _setup_hosts_trailer(hosts):
+    """The review-screen line that says `t setup` will ALSO clone + register the
+    picked repos on every host — the review must state everything `y` does."""
+    return ("then clone + register the picked repos on: " + ", ".join(h for h, _ in hosts)
+            if hosts else None)
+
+
+def _new_sh_state(path):
+    """Probe ~/code/<name>: existence, emptiness, repo-ness (.git file OR dir, the
+    _scan_repos rule), commits, current branch, origin, and whether origin/main is
+    known locally — everything _new_plan's check-then-do needs, in one place."""
+    s = {"exists": os.path.exists(path), "nonempty": False, "is_repo": False,
+         "has_commits": False, "branch": None, "origin_url": None, "has_origin_main": False}
+    if not s["exists"]:
+        return s
+    try:
+        s["nonempty"] = bool(os.listdir(path))
+    except OSError:
+        s["nonempty"] = True
+    s["is_repo"] = os.path.exists(os.path.join(path, ".git"))
+    if not s["is_repo"]:
+        return s
+
+    def g(*a):
+        return _run(["git", "-C", path, *a])
+    s["has_commits"] = g("rev-parse", "-q", "--verify", "HEAD").returncode == 0
+    r = g("symbolic-ref", "--short", "-q", "HEAD")
+    s["branch"] = r.stdout.strip() or None if r.returncode == 0 else None
+    r = g("remote", "get-url", "origin")
+    s["origin_url"] = r.stdout.strip() if r.returncode == 0 and r.stdout.strip() else None
+    s["has_origin_main"] = g("rev-parse", "-q", "--verify", "refs/remotes/origin/main").returncode == 0
+    return s
+
+
+def _new_sh_gh(slug):
+    if not shutil.which("gh"):
+        return "error", "gh not found — brew install gh (Linux: apt install gh)"
+    r = _run(["gh", "api", f"repos/{slug}"], timeout=30)
+    return _new_gh_repo_state(r.returncode, r.stdout, r.stderr)
+
+
+def _new_sh_owners():
+    """(login, [orgs]) the gh token can create under; ([], None) without gh."""
+    if not shutil.which("gh"):
+        return None, []
+    u = _run(["gh", "api", "user", "--jq", ".login"], timeout=30)
+    o = _run(["gh", "api", "user/orgs", "--jq", ".[].login"], timeout=30)
+    return ((u.stdout.strip() or None) if u.returncode == 0 else None,
+            o.stdout.split() if o.returncode == 0 else [])
+
+
+def _new_sh_whence(alias):
+    """`whence -w <alias>` in a login+interactive zsh (so functions/aliases from .zshrc
+    count), run DETACHED — stdin /dev/null + its own session. This is called from
+    inside the raw-mode wizard, and an interactive zsh that inherits the tty makes
+    itself the terminal's foreground process group on startup; when it exits the
+    wizard's next read of the tty fails with EIO (or SIGTTIN) — the same family of bug
+    as the SIGTTOU suspension _todo_pick_target hit with a `zsh -lic` scan. Detached,
+    it has no controlling terminal to take. None on any failure (no zsh, timeout)."""
+    try:
+        r = subprocess.run(["zsh", "-lic", ZSH_PRELUDE + f"whence -w {shlex.quote(alias)}"],
+                           stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                           stderr=subprocess.DEVNULL, text=True, start_new_session=True,
+                           timeout=20)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    return _new_whence_kind(r.stdout)
+
+
+def _new_sh_register(alias, path, tool):
+    _append_local(ZSHRC_LOCAL, _setup_block({alias: path}, {}, None,
+                                            time.strftime("%Y-%m-%d"), tool=tool))
+    zsh_capture("_t_sync_config")   # regenerate the config cache (fresh zsh -lic sources .zshrc.local)
+
+
+def _new_sh_host(argv):
+    r = _run(argv, timeout=300)
+    return _new_host_outcome(r.returncode, r.stdout, r.stderr)
+
+
+def _hosts_land(cfg, repos, only=None):
+    """Clone + register {alias: path} on every REMOTE_HOSTS host (or the `only` subset)
+    via `t new-land` over ssh; one line per (repo, host). Shared by t new and t setup.
+    A repo with no origin has nothing to clone — noted, never an error."""
+    st = Style()
+    hosts, err = _new_pick_hosts(cfg.hosts, only, False)
+    if err:
+        print(f"⚠ {err}")
+        return
+    if not hosts:
+        print(f"{st.y}(no REMOTE_HOSTS configured — nothing to clone elsewhere){st.r}")
+        return
+    for alias, path in repos.items():
+        r = _run(["git", "-C", path, "remote", "get-url", "origin"])
+        url = r.stdout.strip() if r.returncode == 0 else ""
+        name = os.path.basename(path.rstrip("/"))
+        if not url:
+            print(f"{st.y}↷ {alias}: no origin remote — nothing to clone on hosts{st.r}")
+            continue
+        for h, target in hosts:
+            status, detail = _new_sh_host(_new_ssh_argv(target, url, name, alias))
+            print(_new_host_line(h, status, detail, name))
+
+
+def _new_wizard(cfg, answers, ctx):
+    """The t new UI: clack-style steps on the rail — name, path (info), owner,
+    visibility, alias, hosts — each collapsing to a ◇ line (a step a flag already
+    answered collapses at once; owner + visibility LOCK to the existing origin/GitHub
+    repo when there is one), then a diff-style review of the plan: y applies, n goes
+    back to the owner step, q/ctrl-c aborts with nothing created. Returns (steps,
+    answers) — steps may hold error records the caller reports — or None on abort.
+    Raises when raw mode is unavailable → _new_prompt_flow."""
+    ui = _RailUI()
+    st, rail = ui.st, ui.rail
+    ui.out.write(f"{st.y}┌{st.r}  {st.b}t new{st.r} {st.y}· create a repo — nothing is created "
+                 f"until you confirm{st.r}\n{rail}\n")
+    ui.raw()
+    result = None
+    try:
+        name = answers["name"]
+        while not name:
+            n = ui.cooked_input("│  repo name → ")
+            if not n:
+                return None
+            err = _new_validate_name(n)
+            if err:
+                ui.commit([f"{rail}  {st.y}⚠ {err}{st.r}"])
+                continue
+            name = n
+        answers["name"] = name
+        ui.done("name", name)
+        path, state = ctx["probe"](name)
+        ui.done("path", f"{_tilde(path)} {st.y}· {_new_state_summary(state)}{st.r}")
+        for w in _new_name_warnings(name):
+            ui.commit([f"{rail}  {st.y}⚠ {w}{st.r}"])
+        oslug = _new_repo_slug(state.get("origin_url")) if state.get("origin_url") else None
+        owner_rows = None
+        while True:
+            if oslug:
+                owner = oslug.split("/")[0]
+                ui.done("owner", f"{owner} {st.y}· from origin {oslug}{st.r}")
+            elif answers["owner"]:
+                owner = answers["owner"]
+                ui.done("owner", owner)
+            else:
+                if owner_rows is None:
+                    owner_rows = _new_owner_rows(*ctx["owners"](), NEW_OWNER)
+                if owner_rows:
+                    owner = ui.pick("owner", owner_rows)
+                    if owner is None:
+                        return None
+                else:
+                    owner = ui.cooked_input("│  github owner → ", NEW_OWNER, prefill=NEW_OWNER)
+                ui.done("owner", owner)
+            slug = oslug or f"{owner}/{name}"
+            gh = ctx["gh"](slug)
+            if gh[0] == "present":
+                private = bool(gh[1].get("private"))
+                ui.done("visibility", f"{'private' if private else 'public'} {st.y}· {slug} exists{st.r}")
+            elif answers["visibility"]:
+                private = answers["visibility"] == "private"
+                ui.done("visibility", answers["visibility"])
+            else:
+                v = ui.pick("visibility", [("private", "private"), ("public", "public")])
+                if v is None:
+                    return None
+                private = v == "private"
+                ui.done("visibility", v)
+            alias = answers["alias"] or name
+            while True:
+                a = ui.cooked_input("│  alias (cd shortcut + DEV_REPOS key) → ", alias, prefill=alias)
+                register = _new_alias_check(a, path, ctx["f_repos"], cfg.repos, ctx["whence"](a))
+                if register[0] == "error":
+                    ui.commit([f"{rail}  {st.y}⚠ {register[1]}{st.r}"])
+                    alias = a
+                    continue
+                alias = a
+                break
+            ui.done("alias", alias + (f" {st.y}· already registered{st.r}" if register[0] == "skip" else ""))
+            if answers["hosts"] is not None:
+                hosts = [(h, cfg.hosts[h]) for h in answers["hosts"]]
+                ui.done("hosts", ", ".join(h for h, _ in hosts) or "none")
+            elif not cfg.hosts:
+                hosts = []
+                ui.done("hosts", f"{st.y}none configured (REMOTE_HOSTS){st.r}")
+            else:
+                rows = [(h, f"{h}  {st.y}{t}{st.r}") for h, t in sorted(cfg.hosts.items())]
+                picked = ui.pick("hosts", rows, multi=True, marked=range(len(rows)))
+                if picked is None:
+                    return None
+                hosts = [(h, cfg.hosts[h]) for h in picked]
+                ui.done("hosts", ", ".join(picked) or "none")
+            answers.update({"owner": owner, "visibility": "private" if private else "public",
+                            "alias": alias, "hosts": [h for h, _ in hosts]})
+            steps = _new_plan(name, alias, owner, private, path, state, gh, register, hosts)
+            errs = [s for s in steps if s["do"] == "error"]
+            head = (f"{st.c}◆{st.r}  {st.b}review — what will run{st.r}  "
+                    f"{st.y}y apply · n back · q quit{st.r}")
+            lines = [head] + [f"{rail}  {ln}" for ln in _new_render(steps, st)]
+            if errs:
+                lines[0] = f"{st.b}✗{st.r}  {st.b}review — cannot continue{st.r}"
+                ui.commit(lines)
+                result = (steps, answers)
+                return result
+            ui.repaint(lines)
+            while True:
+                k = ui.read_key()
+                if k == "y":
+                    lines[0] = f"{st.g}◇{st.r}  {st.b}review{st.r}"
+                    ui.commit(lines)
+                    result = (steps, answers)
+                    return result
+                if k in ("n", "esc"):
+                    ui.commit([f"{rail}  {st.y}↶ back — from the owner step{st.r}"])
+                    break
+                if k in ("q", "abort"):
+                    return None
+    except KeyboardInterrupt:
+        return None
+    finally:
+        ui.restore()
+        if result is None:
+            ui.out.write(f"{st.y}└{st.r} {st.y}· aborted — nothing created{st.r}\n")
+
+
+def _new_prompt_flow(cfg, answers, ctx):
+    """Plain-prompt fallback (TERM=dumb, no raw mode): the same questions as
+    _new_wizard over input(), then the same review gate. → (steps, answers) or None."""
+    st = Style()
+    name = answers["name"]
+    while not name:
+        n = _prompt("repo name: ")
+        if n is None:
+            return None
+        err = _new_validate_name(n)
+        if err:
+            print(f"  {err}", file=sys.stderr)
+            continue
+        name = n
+    answers["name"] = name
+    path, state = ctx["probe"](name)
+    print(f"  path: {_tilde(path)} · {_new_state_summary(state)}")
+    oslug = _new_repo_slug(state.get("origin_url")) if state.get("origin_url") else None
+    if oslug:
+        owner = oslug.split("/")[0]
+        print(f"  owner: {owner} (from origin {oslug})")
+    elif answers["owner"]:
+        owner = answers["owner"]
+    else:
+        rows = _new_owner_rows(*ctx["owners"](), NEW_OWNER)
+        choices = ", ".join(v for v, _ in rows)
+        owner = _prompt(f"  github owner [{NEW_OWNER}]{' (' + choices + ')' if choices else ''}: ",
+                        NEW_OWNER)
+        if owner is None:
+            return None
+    slug = oslug or f"{owner}/{name}"
+    gh = ctx["gh"](slug)
+    if gh[0] == "present":
+        private = bool(gh[1].get("private"))
+        print(f"  visibility: {'private' if private else 'public'} ({slug} exists)")
+    elif answers["visibility"]:
+        private = answers["visibility"] == "private"
+    else:
+        private = not _confirm("  public?")
+    alias = answers["alias"] or name
+    while True:
+        a = _prompt(f"  alias [{alias}]: ", alias)
+        if a is None:
+            return None
+        register = _new_alias_check(a, path, ctx["f_repos"], cfg.repos, ctx["whence"](a))
+        if register[0] == "error":
+            print(f"  {register[1]}", file=sys.stderr)
+            alias = a
+            continue
+        alias = a
+        break
+    if answers["hosts"] is not None:
+        hosts = [(h, cfg.hosts[h]) for h in answers["hosts"]]
+    else:
+        hosts = []
+        for h, t in sorted(cfg.hosts.items()):
+            r = _prompt(f"  clone + register on {h} ({t})? [Y/n] ", "y")
+            if r is None:
+                return None
+            if r.lower() in ("y", "yes"):
+                hosts.append((h, t))
+    answers.update({"owner": owner, "visibility": "private" if private else "public",
+                    "alias": alias, "hosts": [h for h, _ in hosts]})
+    steps = _new_plan(name, alias, owner, private, path, state, gh, register, hosts)
+    print(f"\n{st.b}review{st.r} — what will run:\n")
+    for ln in _new_render(steps, st):
+        print(f"  {ln}")
+    if any(s["do"] == "error" for s in steps):
+        return steps, answers
+    return (steps, answers) if _confirm("proceed?") else None
+
+
+def _new_resolve(cfg, answers, ctx):
+    """The no-wizard path (-y / --dry-run / no tty): fill every unanswered step with
+    its default — owner from the origin else NEW_OWNER, private, alias = name, every
+    host — and build the plan."""
+    name = answers["name"]
+    path, state = ctx["probe"](name)
+    oslug = _new_repo_slug(state.get("origin_url")) if state.get("origin_url") else None
+    owner = oslug.split("/")[0] if oslug else (answers["owner"] or NEW_OWNER)
+    gh = ctx["gh"](oslug or f"{owner}/{name}")
+    if gh[0] == "present":
+        private = bool(gh[1].get("private"))
+    else:
+        private = answers["visibility"] != "public"
+    alias = answers["alias"] or name
+    register = _new_alias_check(alias, path, ctx["f_repos"], cfg.repos, ctx["whence"](alias))
+    if answers["hosts"] is None:
+        hosts, _ = _new_pick_hosts(cfg.hosts, None, False)
+    else:
+        hosts = [(h, cfg.hosts[h]) for h in answers["hosts"]]
+    answers.update({"owner": owner, "visibility": "private" if private else "public",
+                    "alias": alias, "hosts": [h for h, _ in hosts]})
+    return _new_plan(name, alias, owner, private, path, state, gh, register, hosts)
+
+
+def _new_walk(steps, answers, pre="", close=False):
+    """Run the plan in order: `=` for a skip, ✓ per step, the register step through
+    _new_sh_register, then one line per host. A failing step stops with the resume
+    hint; host outcomes never change the rc (the local repo is complete, and the
+    shim's `source ~/.zshrc` reload rides on rc 0)."""
+    st = Style()
+    name, alias, registered = answers["name"], answers["alias"], False
+    for s in steps:
+        if s["step"].startswith("host:"):
+            continue
+        if s["do"] == "skip":
+            print(f"{pre}{st.y}= {s['label']}{st.r}")
+            continue
+        if s["step"] == "register":
+            _new_sh_register(alias, s["path"], "t new")
+            registered = True
+        else:
+            if s["step"] == "init" and s["cmd"][:2] == ["git", "init"]:
+                os.makedirs(os.path.dirname(s["cmd"][-1]), exist_ok=True)
+            r = _run(s["cmd"], timeout=300)
+            if r.returncode != 0:
+                tail = [ln.strip() for ln in (r.stderr or "").splitlines() if ln.strip()][-3:]
+                print(f"{pre}{st.b}✗ {s['label']}{st.r}")
+                print(f"t new: {s['step']} failed — {' / '.join(tail) or f'rc {r.returncode}'}\n"
+                      f"  (fix that, then re-run `t new {name}` — it resumes)", file=sys.stderr)
+                if close:
+                    print(f"{st.y}└{st.r} {st.y}· stopped{st.r}")
+                return 1
+        print(f"{pre}✓ {s['label']}")
+        if s.get("warn"):
+            print(f"{pre}{st.y}  ⚠ {s['warn']}{st.r}")
+    for s in steps:
+        if s["step"].startswith("host:"):
+            status, detail = _new_sh_host(s["cmd"])
+            print(f"{pre}{_new_host_line(s['host'], status, detail, name)}")
+    tail = f"next: {st.b}t open {alias}{st.r}"
+    print(f"{st.y}└{st.r}  {st.g}✓{st.r} {name} — {tail}" if close else f"✓ {name} — {tail}")
+    if registered and not os.environ.get("T_SETUP_SHIM"):
+        print("run `source ~/.zshrc` (or open a new shell) to make the new shortcut live")
+    return 0
+
+
+def cmd_new(cfg, args):
+    """See the section comment above. Flags pre-answer wizard steps; -y / --dry-run /
+    no tty skip the wizard and take the defaults for the rest."""
+    answers = _new_answers(args)
+    if answers["name"]:
+        err = _new_validate_name(answers["name"])
+        if err:
+            print(f"t new: {err}", file=sys.stderr)
+            return 1
+    if answers["hosts"]:
+        _, err = _new_pick_hosts(cfg.hosts, ",".join(answers["hosts"]), False)
+        if err:
+            print(f"t new: {err}", file=sys.stderr)
+            return 1
+    try:
+        with open(ZSHRC_LOCAL, errors="ignore") as fh:
+            local_text = fh.read()
+    except OSError:
+        local_text = ""
+    f_repos, _, _ = _local_entries(local_text)
+    registered = set(f_repos) | set(cfg.repos)
+    gh_cache = {}
+
+    def gh_for(slug):
+        if slug not in gh_cache:
+            gh_cache[slug] = _new_sh_gh(slug)
+        return gh_cache[slug]
+    ctx = {"probe": lambda n: (_new_path(n), _new_sh_state(_new_path(n))),
+           "gh": gh_for, "owners": _new_sh_owners, "f_repos": f_repos,
+           "whence": lambda a: None if a in registered else _new_sh_whence(a)}
+    st = Style()
+    tty_ok = sys.stdin.isatty() and sys.stdout.isatty()
+    if args.dry_run or args.yes or not tty_ok:
+        if not answers["name"]:
+            print("t new: a repo name is required without the wizard (t new <name> …)",
+                  file=sys.stderr)
+            return 1
+        steps = _new_resolve(cfg, answers, ctx)
+        errs = [s for s in steps if s["do"] == "error"]
+        if args.dry_run or not args.yes:
+            print(f"t new {answers['name']} → {answers['owner']} ({answers['visibility']}), "
+                  f"alias {answers['alias']}:")
+            for ln in _new_render(steps, st):
+                print(f"  {ln}")
+        for e in errs:
+            print(f"t new: {e['label']}", file=sys.stderr)
+        if args.dry_run or errs:
+            return 1 if errs else 0
+        if not args.yes:
+            print("\nt new is interactive — run it from a terminal, or pass -y with the flags",
+                  file=sys.stderr)
+            return 1
+        return _new_walk(steps, answers)
+    wizard_ran = True
+    try:
+        r = _new_wizard(cfg, answers, ctx)
+    except Exception as e:
+        wizard_ran = False
+        print(f"(inline UI unavailable: {e} — falling back to prompts)", file=sys.stderr)
+        r = _new_prompt_flow(cfg, answers, ctx)
+    if r is None:
+        if not wizard_ran:
+            print("t new: aborted — nothing created")
+        return 1
+    steps, answers = r
+    errs = [s for s in steps if s["do"] == "error"]
+    if errs:
+        for e in errs:
+            print(f"t new: {e['label']}", file=sys.stderr)
+        if wizard_ran:
+            print(f"{st.y}└{st.r} {st.y}· nothing created{st.r}")
+        return 1
+    return _new_walk(steps, answers, pre=f"{st.y}│{st.r}  " if wizard_ran else "", close=wizard_ran)
+
+
+def cmd_new_land(cfg, args):
+    """ON the host (over ssh from t new / t setup): clone <url> to ~/code/<name> unless
+    it is already that clone, register DEV_REPOS[<alias>] here, print the sentinel
+    summary line the caller parses. Errors go to stderr with rc 1."""
+    err = _new_validate_name(args.name)
+    if err:
+        print(f"t new-land: {err}", file=sys.stderr)
+        return 1
+    path = _new_path(args.name)
+    try:
+        with open(ZSHRC_LOCAL, errors="ignore") as fh:
+            local_text = fh.read()
+    except OSError:
+        local_text = ""
+    f_repos, _, _ = _local_entries(local_text)
+    whence = None if args.alias in (set(f_repos) | set(cfg.repos)) else _new_sh_whence(args.alias)
+    register = _new_alias_check(args.alias, path, f_repos, cfg.repos, whence)
+    steps = _new_land_plan(args.name, args.alias, args.url, path, _new_sh_state(path), register)
+    errs = [s for s in steps if s["do"] == "error"]
+    if errs:
+        for e in errs:
+            print(f"t new-land: {e['label']}", file=sys.stderr)
+        return 1
+    for s in steps:
+        if s["do"] != "run":
+            continue
+        if s["step"] == "clone":
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            r = _run(s["cmd"], timeout=600)
+            if r.returncode != 0:
+                tail = [ln.strip() for ln in (r.stderr or "").splitlines() if ln.strip()][-3:]
+                print(f"t new-land: clone failed — {' / '.join(tail) or f'rc {r.returncode}'}",
+                      file=sys.stderr)
+                return 1
+        else:
+            _new_sh_register(args.alias, path, "t new")
+    print(_NEW_SENTINEL + _new_land_summary(steps))
     return 0
 
 
@@ -2691,6 +3617,7 @@ examples:
   t find "auth refactor"  search saved sessions, then resume the pick
   t on mini ls            run a command on a remote host
   t setup                 onboard this machine: register ~/code repos + ssh hosts
+  t new tool-x            wizard: create ~/code/tool-x + github <owner>/tool-x, register it everywhere
 
 Run `t <verb> -h` for a verb's own flags.""")
     sub = p.add_subparsers(dest="verb", metavar="<verb>")
@@ -2880,6 +3807,36 @@ Run `t <verb> -h` for a verb's own flags.""")
     sp.add_argument("dirs", nargs="*", help="directories to scan for git repos (default: ~/code)")
     sp.add_argument("--dry-run", action="store_true",
                     help="print what would be offered/appended, change nothing")
+    hg = sp.add_mutually_exclusive_group()
+    hg.add_argument("--hosts", metavar="A,B", help="clone + register the picked repos only on these hosts")
+    hg.add_argument("--no-hosts", action="store_true",
+                    help="skip the clone + register on other hosts (default: every REMOTE_HOSTS host)")
+
+    sp = sub.add_parser("new", help="create a repo: ~/code/<name> + GitHub, registered here and on every host",
+        description="A wizard (the `t setup` style — stepped, inline, nothing created until you "
+            "confirm) that makes a brand-new repo wired for `t open`: git init ~/code/<name> on "
+            "main with an empty initial commit (the path is fixed — t beam / t open -r need the "
+            "same path on every host); a GitHub repo <owner>/<name> pushed as origin, the owner "
+            f"picked from your user + orgs (default {NEW_OWNER}), private unless you say public, "
+            "set squash-only + auto-merge + delete-branch-on-merge (what `gh pr merge --auto "
+            "--squash` needs); a DEV_REPOS[<alias>] line in ~/.zshrc.local (alias defaults to "
+            "<name>); then a clone + registration on every REMOTE_HOSTS host over ssh. Every "
+            "step is check-then-do, so re-running after a failure (gh down, a host unreachable) "
+            "resumes where it stopped — and running it on an existing repo just finishes the "
+            "wiring. Flags pre-answer wizard steps; -y takes the defaults for the rest. Run it "
+            "from the shell — the t() shim reloads your config afterward.")
+    sp.add_argument("name", nargs="?", help="repo name (GitHub rules: letters, digits, . _ -)")
+    sp.add_argument("--owner", metavar="OWNER", help=f"GitHub owner, user or org (default: {NEW_OWNER})")
+    vg = sp.add_mutually_exclusive_group()
+    vg.add_argument("--public", action="store_true", help="create it public")
+    vg.add_argument("--private", action="store_true", help="create it private (the default)")
+    sp.add_argument("--alias", metavar="KEY", help="DEV_REPOS key / cd shortcut (default: <name>)")
+    hg = sp.add_mutually_exclusive_group()
+    hg.add_argument("--hosts", metavar="A,B", help="clone + register only on these REMOTE_HOSTS aliases")
+    hg.add_argument("--no-hosts", action="store_true", help="skip the clone + register on other hosts")
+    sp.add_argument("-y", "--yes", action="store_true",
+                    help="no wizard, no review: the flags plus defaults, then run")
+    sp.add_argument("--dry-run", action="store_true", help="print the steps it would run, change nothing")
 
     sub.add_parser("doctor", help="diagnose this machine's dotfiles/tmux/Claude setup",
         description="Read-only diagnostics for when the tooling misbehaves: which checkout the "
@@ -2931,6 +3888,13 @@ machines. Finished tasks leave the view at once and are dropped after a week."""
         description="Internal: stop the local live owner (dev slot) of a session id, enforcing "
             "`t beam`'s one-live-owner-per-conversation invariant. Invoked over ssh; not for "
             "direct use.")
+    lp = sub.add_parser("new-land", help="(internal) clone + register a `t new` repo on this host",
+        description="Internal: clone <url> to ~/code/<name> (skipped when it already is that "
+            "clone) and append DEV_REPOS[<alias>] to this host's ~/.zshrc.local. Invoked over "
+            "ssh by `t new` / `t setup`; not for direct use.")
+    lp.add_argument("url")
+    lp.add_argument("name")
+    lp.add_argument("alias")
     rp = sub.add_parser("__resolve", help="(internal) resolve a shell action for the t() shim",
         description="Internal: resolve a shell action for the t() zsh shim. Not for direct use.")
     rp.add_argument("rest", nargs=argparse.REMAINDER)
@@ -2941,7 +3905,7 @@ IMPLEMENTED = {
     "ls": cmd_ls, "session-rows": cmd_session_rows, "on": cmd_on, "read": cmd_read,
     "plan": cmd_plan, "paste": cmd_paste, "kill": cmd_kill, "setup": cmd_setup,
     "land": cmd_land, "kill-owner": cmd_kill_owner, "cursor": cmd_cursor,
-    "doctor": cmd_doctor, "todo": cmd_todo,
+    "doctor": cmd_doctor, "todo": cmd_todo, "new": cmd_new, "new-land": cmd_new_land,
 }
 
 

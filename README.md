@@ -20,6 +20,7 @@ shim in `.zshrc` for verbs that must run in your shell).
 | `t beam <repo> [slot] --host <h>` | Teleport a running session to another machine; pull one back with `t open … --here` |
 | `t find <query>` | Semantic search across saved sessions ("which one was working on X?"), reranked by Claude |
 | `t todo [add\|done\|rm] …` | A task list scoped to the slot you are in — bare to list, `t todo <id>` to act on one, `-A` for every slot. Also `/todo` inside Claude, and the statusline |
+| `t new [name]` | Wizard: create `~/code/<name>` + a GitHub repo (owner picked from your orgs; squash-only, auto-merge), register it here and clone + register it on every remote host. Re-running resumes; on an existing repo it just finishes the wiring |
 
 Run `t -h` for the full verb list.
 

@@ -5231,7 +5231,9 @@ t() {
     # _t_sync_config cache go live at once (precedent: dots reloads every run).
     # T_SETUP_SHIM tells the bin to skip its "source ~/.zshrc" hint.
     setup)  T_SETUP_SHIM=1 command t setup "$@" && source ~/.zshrc ;;
-    *)      command t "$verb" "$@" ;; # ls/read/plan/paste/kill/on/session-rows/land/kill-owner
+    # new writes DEV_REPOS too (the repo it just created) → the same reload.
+    new)    T_SETUP_SHIM=1 command t new "$@" && source ~/.zshrc ;;
+    *)      command t "$verb" "$@" ;; # ls/read/plan/paste/kill/on/session-rows/land/kill-owner/new-land
   esac
 }
 
@@ -5519,7 +5521,7 @@ alias h=help   # `h` is a shorthand for `help`
 # key for `on`), and slot/flags after. Pulls live from the ${(k)DEV_REPOS} /
 # ${(k)REMOTE_HOSTS} arrays so it stays current with ~/.zshrc.local.
 _t() {
-  local -a verbs=(open ls kill push pop resume beam read plan paste find on cursor setup)
+  local -a verbs=(open ls kill push pop resume beam read plan paste find on cursor setup new)
   if (( CURRENT == 2 )); then
     _describe -t verbs 't verb' verbs
     return
@@ -5541,7 +5543,11 @@ _t() {
     find)
       _values 'flag' -k --keyword -h --help ;;
     setup)
-      _files -/ ;;   # scan-dir arguments
+      if [[ ${words[CURRENT]} == -* ]]; then _values 'flag' --hosts --no-hosts --dry-run -h --help
+      else _files -/; fi ;;   # scan-dir arguments
+    new)
+      if (( CURRENT == 3 )) && [[ ${words[CURRENT]} != -* ]]; then _message 'repo name'
+      else _values 'flag' --owner --public --private --alias --hosts --no-hosts -y --yes --dry-run -h --help; fi ;;
   esac
 }
 _sleepmgr_cmd() { _arguments '1:command:(status disable enable help)' }

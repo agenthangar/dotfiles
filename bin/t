@@ -1585,6 +1585,10 @@ def _doctor_findings(facts):
     if facts.get("mcp_sessions") is False:
         out.append("⚠ MCP server 'sessions' is not registered in ~/.claude.json — run "
                    "t mcp --install (dots does it when claude is on PATH)")
+    if facts.get("mcp_allow") == "none":
+        out.append("⚠ no %s allow rule in ~/.claude/settings.json, so every sessions "
+                   "lookup prompts — run t mcp --install (dots seeds it too)"
+                   % _MCP_ALLOW_RULE)
     if not out:
         out.append("✓ nothing suspicious found")
     return out
@@ -1711,6 +1715,12 @@ def cmd_doctor(cfg, args):
         print("  mcp sessions   %s" % {True: "registered (user scope) → t mcp",
                                       False: "NOT registered — t mcp --install",
                                       None: "~/.claude.json unreadable"}[facts["mcp_sessions"]])
+        facts["mcp_allow"] = _mcp_allow_state(os.path.join(HOME, ".claude", "settings.json"))
+        print("  mcp permission %s"
+              % {"server": "allowed (%s) — its tools never prompt" % _MCP_ALLOW_RULE,
+                 "tools": "allowed per tool (%s__*) — hand-narrowed, left alone" % _MCP_ALLOW_RULE,
+                 "none": "no allow rule — every call prompts",
+                 None: "~/.claude/settings.json missing or unreadable"}[facts["mcp_allow"]])
 
     section("Tmux")
     tmux_running = run(["tmux", "list-sessions", "-F", "#{session_name}"]) is not None
@@ -3915,6 +3925,71 @@ def _mcp_registered(claude_json):
     return bool(isinstance(servers, dict) and "sessions" in servers)
 
 
+# Registration alone still leaves every tool call behind a permission prompt, and a
+# prompt per lookup makes the server useless mid-turn — the model asks "which slot had
+# X?" three times in a row and stalls three times. This server is ours and read-only
+# (four lookups over local transcripts, tmux, and the todo store, spawned by `t mcp`
+# from this very checkout), so the allow rule is seeded BY DEFAULT: the blanket
+# server-wide form, so a tool added to `t mcp` later is covered the day it ships.
+# Deliberate consequence: a future WRITE-capable sessions tool would inherit the
+# allowance — narrow this to explicit `mcp__sessions__<tool>` rules if that ever lands.
+_MCP_ALLOW_RULE = "mcp__sessions"
+
+
+def _mcp_allow_state(settings):
+    """How ~/.claude/settings.json permits the sessions tools:
+
+    "server" — the blanket `mcp__sessions` rule (what we seed),
+    "tools"  — only per-tool `mcp__sessions__<name>` rules, i.e. a deliberate
+               hand-narrowing, so it counts as configured and is never widened
+               back out from under you,
+    "none"   — nothing matches, so every call prompts,
+    None     — the file is missing or unreadable (not ours to judge or repair).
+    """
+    try:
+        with open(settings, encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, ValueError):
+        return None
+    perms = data.get("permissions") if isinstance(data, dict) else None
+    allow = perms.get("allow") if isinstance(perms, dict) else None
+    rules = [r for r in allow if isinstance(r, str)] if isinstance(allow, list) else []
+    if _MCP_ALLOW_RULE in rules:
+        return "server"
+    if any(r.startswith(_MCP_ALLOW_RULE + "__") for r in rules):
+        return "tools"
+    return "none"
+
+
+def _mcp_allow_write(settings):
+    """Append the blanket allow rule. Add-only, the same stance as the registration
+    itself: a hand-narrowed per-tool set, a deny/ask rule, or an unreadable file is
+    left exactly as found. Written tmp + os.replace because Claude Code owns this
+    file at runtime. True only when the file actually changed."""
+    if _mcp_allow_state(settings) != "none":
+        return False
+    try:
+        with open(settings, encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, ValueError):
+        return False
+    if not isinstance(data, dict):
+        return False
+    perms = data.setdefault("permissions", {})
+    if not isinstance(perms, dict):
+        return False
+    allow = perms.setdefault("allow", [])
+    if not isinstance(allow, list):
+        return False
+    allow.append(_MCP_ALLOW_RULE)
+    tmp = settings + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(data, fh, indent=2)
+        fh.write("\n")
+    os.replace(tmp, settings)
+    return True
+
+
 def _mcp_install():
     """Register with Claude Code at user scope, via `claude mcp add` (Claude's own
     writer — never a hand edit of the stateful ~/.claude.json). The EXPANDED path:
@@ -3922,8 +3997,10 @@ def _mcp_install():
     literally (the statusline command, by contrast, is run through one)."""
     cmd = ["claude", "mcp", "add", "sessions", "-s", "user", "--",
            os.path.join(HOME, "bin", "t"), "mcp"]
+    settings = os.path.join(HOME, ".claude", "settings.json")
     if _mcp_registered(os.path.join(HOME, ".claude.json")):
-        print("MCP server 'sessions' is already registered (user scope) — nothing to do")
+        print("MCP server 'sessions' is already registered (user scope)")
+        _mcp_allow_announce(settings)
         return 0
     try:
         r = subprocess.run(cmd, stdin=subprocess.DEVNULL)
@@ -3934,7 +4011,19 @@ def _mcp_install():
               file=sys.stderr)
         return 1
     print("registered MCP server 'sessions' (user scope) → %s mcp" % cmd[-2])
+    _mcp_allow_announce(settings)
     return 0
+
+
+def _mcp_allow_announce(settings):
+    """Seed the allow rule and say so — the manual twin of install.sh's merge, so
+    `t mcp --install` on a box `dots` has not reached is a complete setup."""
+    if _mcp_allow_write(settings):
+        print("allowed %s in %s (its tools no longer prompt)"
+              % (_MCP_ALLOW_RULE, settings.replace(HOME, "~")))
+    elif _mcp_allow_state(settings) == "tools":
+        print("leaving the per-tool %s__* allow rules in %s alone"
+              % (_MCP_ALLOW_RULE, settings.replace(HOME, "~")))
 
 
 def cmd_mcp(cfg, args):

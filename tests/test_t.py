@@ -2551,3 +2551,73 @@ def test_doctor_reports_unregistered_mcp(t_mod):
     assert any("t mcp --install" in l for l in t_mod._doctor_findings({"mcp_sessions": False}))
     assert t_mod._doctor_findings({"mcp_sessions": True}) == ["✓ nothing suspicious found"]
     assert t_mod._doctor_findings({"mcp_sessions": None}) == ["✓ nothing suspicious found"]
+
+
+def test_mcp_allow_state(t_mod, tmp_path):
+    p = tmp_path / "settings.json"
+    assert t_mod._mcp_allow_state(str(p)) is None          # no file yet
+    p.write_text("{bad")
+    assert t_mod._mcp_allow_state(str(p)) is None          # unreadable: not ours to judge
+    p.write_text(json.dumps({"model": "opus"}))
+    assert t_mod._mcp_allow_state(str(p)) == "none"
+    p.write_text(json.dumps({"permissions": {"allow": ["Bash(ls)"]}}))
+    assert t_mod._mcp_allow_state(str(p)) == "none"
+    p.write_text(json.dumps({"permissions": {"allow": ["Bash(ls)", "mcp__sessions"]}}))
+    assert t_mod._mcp_allow_state(str(p)) == "server"
+    p.write_text(json.dumps({"permissions": {"allow": ["mcp__sessions__list_todos"]}}))
+    assert t_mod._mcp_allow_state(str(p)) == "tools"
+    # a neighbouring server must not read as ours
+    p.write_text(json.dumps({"permissions": {"allow": ["mcp__sessionsX"]}}))
+    assert t_mod._mcp_allow_state(str(p)) == "none"
+    p.write_text(json.dumps({"permissions": {"allow": [{"rule": "mcp__sessions"}]}}))
+    assert t_mod._mcp_allow_state(str(p)) == "none"        # non-string entries ignored
+
+
+def test_mcp_allow_write_is_add_only_and_idempotent(t_mod, tmp_path):
+    p = tmp_path / "settings.json"
+    p.write_text(json.dumps({"model": "opus", "permissions": {"allow": ["Bash(ls)"]}}))
+    assert t_mod._mcp_allow_write(str(p)) is True
+    data = json.loads(p.read_text())
+    assert data["permissions"]["allow"] == ["Bash(ls)", "mcp__sessions"]
+    assert data["model"] == "opus"                          # everything else survives
+    assert t_mod._mcp_allow_write(str(p)) is False          # runs on every dots
+    assert not list(tmp_path.glob("*.tmp"))                 # tmp + os.replace, nothing left
+
+    # no permissions block at all: create one
+    q = tmp_path / "bare.json"
+    q.write_text(json.dumps({"model": "opus"}))
+    assert t_mod._mcp_allow_write(str(q)) is True
+    assert json.loads(q.read_text())["permissions"]["allow"] == ["mcp__sessions"]
+
+
+def test_mcp_allow_write_never_widens_a_hand_narrowed_set(t_mod, tmp_path):
+    # per-tool rules are a deliberate choice — never silently widened back out
+    p = tmp_path / "settings.json"
+    p.write_text(json.dumps({"permissions": {"allow": ["mcp__sessions__list_todos"]}}))
+    assert t_mod._mcp_allow_write(str(p)) is False
+    assert json.loads(p.read_text())["permissions"]["allow"] == ["mcp__sessions__list_todos"]
+    # and an unreadable/foreign-shaped file is left exactly as found
+    for junk in ("{bad", json.dumps([1, 2]), json.dumps({"permissions": {"allow": "all"}})):
+        p.write_text(junk)
+        assert t_mod._mcp_allow_write(str(p)) is False
+        assert p.read_text() == junk
+
+
+def test_doctor_reports_missing_mcp_allow_rule(t_mod):
+    out = t_mod._doctor_findings({"mcp_allow": "none"})
+    assert any("mcp__sessions" in l and "every sessions lookup prompts" in l for l in out)
+    for state in ("server", "tools", None):
+        assert t_mod._doctor_findings({"mcp_allow": state}) == ["✓ nothing suspicious found"]
+
+
+def test_sessions_mcp_is_allowed_by_default_in_the_shipped_setup(t_mod):
+    # the two halves of "allowed by default": the seed a fresh box copies, and the
+    # merge every existing box gets — the latter only if it sits ABOVE the
+    # DOTFILES_LINKS_ONLY exit, or a plain `dots` would never reach it
+    import os
+    root = os.path.dirname(os.path.dirname(os.path.abspath(t_mod.__file__)))
+    with open(os.path.join(root, "claude", "settings.json.example")) as f:
+        assert t_mod._MCP_ALLOW_RULE in json.load(f)["permissions"]["allow"]
+    with open(os.path.join(root, "install.sh")) as f:
+        sh = f.read()
+    assert sh.index("install_claude_mcp_allow\n") < sh.index('if [[ -n "${DOTFILES_LINKS_ONLY:-}" ]]; then\n    exit 0')

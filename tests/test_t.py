@@ -1806,6 +1806,29 @@ def test_port_is_live_sees_an_ipv6_only_listener(t_mod):
     assert t_mod._port_is_live(port) is False
 
 
+def test_todo_repo_arg_takes_the_repo_positionally(t_mod):
+    repos = {"ff": "/code/financial-forecast", "dotfiles": "/code/dotfiles"}
+    # `t todo ff add keep forecast` — the case that failed with "unknown action 'ff'".
+    assert t_mod._todo_repo_arg("ff", ["add", "keep", "forecast"], repos) \
+        == ("ff", "add", ["keep", "forecast"])
+    # A bare repo views it; a repo + number is the slot, then the action.
+    assert t_mod._todo_repo_arg("ff", [], repos) == ("ff", None, [])
+    assert t_mod._todo_repo_arg("ff", ["3"], repos) == ("ff-3", None, [])
+    assert t_mod._todo_repo_arg("ff", ["3", "add", "x"], repos) == ("ff-3", "add", ["x"])
+    # An explicit <alias>-<n> key works too, like -s.
+    assert t_mod._todo_repo_arg("ff-3", ["done", "2"], repos) == ("ff-3", "done", ["2"])
+
+
+def test_todo_repo_arg_leaves_non_repos_alone(t_mod):
+    repos = {"ff": "/code/financial-forecast", "add": "/code/add"}
+    # Not a repo → untouched, including a slot-shaped key of an unknown repo.
+    assert t_mod._todo_repo_arg("done", ["2"], repos) == (None, "done", ["2"])
+    assert t_mod._todo_repo_arg("api-3", ["ls"], repos) == (None, "api-3", ["ls"])
+    assert t_mod._todo_repo_arg(None, [], repos) == (None, None, [])
+    assert t_mod._todo_repo_arg("7", [], repos) == (None, "7", [])
+    # An action name always wins over a repo that happens to share it.
+    assert t_mod._todo_repo_arg("add", ["x"], repos) == (None, "add", ["x"])
+    assert t_mod._todo_repo_arg("list", [], repos) == (None, "list", [])
 def test_todo_ls_target_number_is_a_slot_of_the_cwd_repo(t_mod):
     # `t todo ls 17` from the repo dir — the bug: the number was dropped and the whole
     # repo rendered, so there was no way to see one slot.

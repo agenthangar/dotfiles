@@ -2302,6 +2302,15 @@ def _dev_url(key, cwd):
     return "http://localhost:%d" % port if _port_is_live(port) else None
 
 
+# A single item's share of the one-line bar. The bar is a reminder, not the list —
+# `t todo` shows the full text — and without a cap one 140-char task fits a wide
+# terminal outright and hides every item behind it (the width fit only ever
+# ellipses an item that OVERFLOWS the bar). Sized so a hand-off's usual lead-in,
+# a name plus the URL it is checked at, survives whole:
+#   "Accounts ledger (http://localhost:5217/#accounts) Aug 21…"
+_TODO_BAR_ITEM_MAX = 56
+
+
 def _todo_statusline(payload, cfg, items_n=1, width=80, tmux_name=None):
     """Claude Code's statusLine. The payload arrives as JSON on stdin;
     workspace.current_dir is preferred over cwd (they differ when Claude is run from a
@@ -2318,7 +2327,8 @@ def _todo_statusline(payload, cfg, items_n=1, width=80, tmux_name=None):
     many, and a bare number sitting next to a checkbox read as an item.
 
     items_n == 1 packs as many open items onto ONE line as `width` allows (the safe
-    default: a single line renders anywhere). items_n > 1 emits a header plus one line
+    default: a single line renders anywhere), each capped at _TODO_BAR_ITEM_MAX so
+    one long task cannot take the whole line. items_n > 1 emits a header plus one line
     per item, which is only useful if the host renders a multi-line statusline.
 
     Colour is emitted UNCONDITIONALLY (honouring NO_COLOR) — Style() gates on
@@ -2381,7 +2391,8 @@ def _todo_statusline(payload, cfg, items_n=1, width=80, tmux_name=None):
     limit = width - tail_room
     plain, line, shown = head_p, head_c, 0
     for g, _, text in items:
-        sep = "  " if shown else ""
+        text = _truncate(text, _TODO_BAR_ITEM_MAX)   # every item; the width fit below
+        sep = "  " if shown else ""                  # only ever ellipses the first
         if len(plain) + len(sep) + 2 + len(text) > limit:
             if shown:
                 break                      # a mid-list ellipsis reads noisier than a +N

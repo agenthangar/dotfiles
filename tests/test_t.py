@@ -1263,6 +1263,20 @@ def test_todo_statusline_truncates_a_long_item(t_mod, tmp_path, monkeypatch):
         assert line.endswith("…") and len(line) <= width and "\n" not in line
 
 
+def test_todo_statusline_caps_each_item(t_mod, tmp_path, monkeypatch):
+    # The width fit only ellipses an item that OVERFLOWS the bar, so on a wide
+    # terminal one 140-char task fit outright and hid every item behind it. Each
+    # item is capped independently of the width; the next one still shows.
+    long = "Accounts ledger (http://localhost:5217/#accounts) Aug 21: " + "x" * 90
+    line = _statusline(t_mod, tmp_path, monkeypatch,
+                       {"workspace": {"current_dir": "/wt/dotfiles/1"}},
+                       key="dotfiles-1", texts=(long, "second"), width=240)
+    first = line.split("◻ ")[1].rstrip()
+    assert first.endswith("…") and len(first) == t_mod._TODO_BAR_ITEM_MAX
+    assert first.startswith("Accounts ledger (http://localhost:5217/#accounts)")
+    assert line.endswith("◻ second") and len(line) <= 240
+
+
 def test_todo_statusline_colours_unconditionally(t_mod, tmp_path, monkeypatch):
     # Style() gates on isatty and this stdout is always the pipe Claude Code reads,
     # so the shared helper would render every bar plain. NO_COLOR still opts out.

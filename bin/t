@@ -1947,6 +1947,31 @@ def _todo_repo_arg(action, rest, repos):
     if key is None:
         return (None, action, rest)
     return (key, rest[0] if rest else None, rest[1:])
+def _todo_ls_target(key, repos, rest):
+    """Resolve `t todo ls <what>` to the list to show -> (key, None) or (None, error).
+
+    A bare number is the slot of the repo `key` resolves to -- the same reading `add`
+    gives a leading number (`t todo add 17 fix it`), so `t todo ls 17` from a repo dir
+    OR from inside a sibling's worktree shows slot 17 and nothing else. No repo to
+    resolve against (scratch, ~) is an error naming the full-key form, not a silent
+    fall-through to the widened view -- that was the bug: the number was ignored and
+    the whole repo rendered, which read as "can't ls only slot 17".
+
+    Anything else is a list key verbatim (`t todo ls dotfiles-3`), the positional twin
+    of -s. Only ONE token is taken: the view is one list, and extra words would be
+    silently dropped otherwise."""
+    rest = list(rest or [])
+    if not rest:
+        return (key, None)
+    if len(rest) > 1:
+        return (None, "one slot or list at a time -- t todo ls %s" % rest[0])
+    tok = rest[0]
+    if not tok.isdigit():
+        return (tok, None)
+    alias = key if key in repos else key.rpartition("-")[0]
+    if alias not in repos:
+        return (None, "no repo here to read slot %s against -- t todo ls <repo>-%s" % (tok, tok))
+    return ("%s-%s" % (alias, tok), None)
 
 
 def _todo_apply(data, action, rest, now=None):
@@ -2123,7 +2148,7 @@ def _todo_pick_candidates(data, action):
 
 
 _TODO_FOOT = ('add: t todo add "…" · done: t todo done <id> · one item: t todo <id> '
-              '· every slot: t todo -A')
+              '· one slot: t todo ls <n> · every slot: t todo -A')
 
 
 def _todo_parent(key, repos):
@@ -2612,6 +2637,13 @@ def cmd_todo(cfg, args):
             # No repo to resolve a number against (or no number): ask. The leading token
             # stays part of the text — a slot needs a repo, and the picker shows both.
             key = _todo_pick_target(cfg, alias) or key
+    # `t todo ls 17` names a slot the way `add 17 …` does; `ls` used to drop its args on
+    # the floor and render the widened repo view, so there was no way to see ONE slot.
+    if _todo_canon(args.action or "ls") == "ls" and args.rest:
+        key, err = _todo_ls_target(key, cfg.repos, args.rest)
+        if err:
+            print("t todo ls: %s" % err, file=sys.stderr)
+            return 2
     path = _todo_path(key)
     data = _todo_load(path)
     action = args.action or "ls"
@@ -2996,6 +3028,7 @@ Usage: t todo [repo [slot]] [action] [args]
 
   (no action)        show this slot's tasks
   <repo> [slot]      another list, positionally: t todo ff add …  ·  t todo ff 3
+  ls [slot|key]      show one slot's tasks (t todo ls 17; t todo ls dotfiles-3)
   add <text…>        add a task
   done [id…]         tick off      — no id: pick from a list
   rm   [id…]         remove        — no id: pick from a list

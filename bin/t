@@ -141,17 +141,27 @@ class Config:
 
 # ─── shell-out helpers ─────────────────────────────────────────────────────────
 
-def zsh_capture(snippet, stdin=None):
+def zsh_capture(snippet, stdin=subprocess.DEVNULL):
     """Run a zsh login+interactive snippet, return stdout (stderr passes through).
 
     `-lic` is the same context the remote fan-out uses: ~/bin and Homebrew tmux/fzf
     are only on the login/interactive PATH, and the _dev_* helpers are defined there.
-    `stdin` is for the MCP server, whose own stdin is the JSON-RPC wire: it passes
-    DEVNULL so the spawned interactive shell can never read a request off it.
+
+    The child gets NO terminal: a fresh session, stdin from /dev/null. An interactive
+    zsh that can see a tty moves itself into its own process group and makes THAT the
+    terminal's foreground group — measured under a pty: the foreground pgrp flipped to
+    the child's pid and STAYED there after it exited, leaving this process in the
+    background. Nothing notices until something touches the terminal: the next
+    tcsetattr (the inline picker's raw mode, fzf) is answered with SIGTTOU — "zsh:
+    suspended (tty output)", the #90 bug, blamed then on the scan's cost. `t ls` never
+    noticed because it only prints. Detached, the child cannot take the terminal, and
+    nothing captured here needs one: tmux talks over its socket, ssh runs BatchMode.
+    (`stdin` predates this as the MCP server's escape hatch — its own stdin is the
+    JSON-RPC wire, so it passed DEVNULL explicitly; that is now the default.)
     """
     try:
         r = subprocess.run(["zsh", "-lic", ZSH_PRELUDE + snippet], stdout=subprocess.PIPE,
-                           stdin=stdin, text=True)
+                           stdin=stdin, start_new_session=True, text=True)
         return r.stdout
     except FileNotFoundError:
         return ""
@@ -160,8 +170,10 @@ def zsh_capture(snippet, stdin=None):
 # ─── rendering ───────────────────────────────────────────────────────────────
 
 class Style:
-    def __init__(self):
-        tty = sys.stdout.isatty()
+    def __init__(self, tty=None):
+        """tty=False forces plain text — for a label a picker measures and truncates
+        by len(), where an escape sequence would count as width."""
+        tty = sys.stdout.isatty() if tty is None else tty
         self.g = "\033[32m" if tty else ""
         self.c = "\033[36m" if tty else ""
         self.y = "\033[2m" if tty else ""
@@ -259,6 +271,33 @@ def cmd_ls(cfg, args):
     return 0
 
 
+def _slot_line(r, st, name_w, avail, host_w=None):
+    """ONE row of the slot view: `● ✓     <slot>  <working on>`. `t ls` and every
+    slot picker draw their rows through this, so a slot reads the same wherever it is
+    offered — the point of a shared view is that you never re-learn a slot's row.
+    state attached → ●, detached → ○, anything else (a dead slot from
+    _dev_dead_slot_rows, a synthetic list row) → blank, and its summary carries the
+    story instead; context active → ✓. host_w adds the `t ls -r` HOST column. The
+    Style is the only colour, so Style(tty=False) yields a label a picker can measure."""
+    amark = {"attached": f"{st.g}●{st.r}", "detached": "○"}.get(r.get("state"), " ")
+    cmark = f"{st.c}✓{st.r}" if r.get("context") == "active" else " "
+    host = ""
+    if host_w is not None:
+        cell = "" if r.get("host", "local") == "local" else r["host"]
+        host = f"{cell:<{host_w}} "
+    summary = _truncate(r.get("summary") or "", avail)
+    return f"{amark} {cmark}     {host}{r['slot']:<{name_w}} {st.y}{summary}{st.r}"
+
+
+def _slot_rows(cfg, aliases):
+    """Every slot of these repos as row dicts, live AND dead, from ONE zsh: the live
+    rows exactly as `t ls` renders them (_dev_session_rows — every repo; the caller
+    filters), then _dev_dead_slot_rows for the named repos, whose rows carry what
+    `t resume` knows about a dead slot. Gathering only; the model is pure."""
+    snippet = "_dev_session_rows; _dev_dead_slot_rows " + " ".join(shlex.quote(a) for a in aliases)
+    return _parse_rows(zsh_capture(snippet))
+
+
 def _render_local(rows, scope, st, has_remote=False):
     name_w = max([7] + [len(r["slot"]) for r in rows])
     avail = _columns() - 11 - name_w
@@ -269,10 +308,7 @@ def _render_local(rows, scope, st, has_remote=False):
     print(f"  {st.y}{'STATUS':<8}{'SESSION':<{name_w}} WORKING ON{st.r}")
     has_fg = False
     for r in rows:
-        amark = f"{st.g}●{st.r}" if r["state"] == "attached" else "○"
-        cmark = f"{st.c}✓{st.r}" if r["context"] == "active" else " "
-        summary = _truncate(r["summary"], avail)
-        print(f"  {amark} {cmark}     {r['slot']:<{name_w}} {st.y}{summary}{st.r}")
+        print("  " + _slot_line(r, st, name_w, avail))
         if ":" in r["slot"]:                       # colon marks a foreground row
             has_fg = True
     foot = "reattach: t open <repo> <slot>"
@@ -295,11 +331,7 @@ def _render_remote(rows, scope, st):
     print(f"  {st.y}{'STATUS':<8}{'HOST':<{host_w}} {'SESSION':<{name_w}} WORKING ON{st.r}")
     has_fg = False
     for r in rows:
-        amark = f"{st.g}●{st.r}" if r["state"] == "attached" else "○"
-        cmark = f"{st.c}✓{st.r}" if r["context"] == "active" else " "
-        summary = _truncate(r["summary"], avail)
-        hostcell = "" if r["host"] == "local" else r["host"]
-        print(f"  {amark} {cmark}     {hostcell:<{host_w}} {r['slot']:<{name_w}} {st.y}{summary}{st.r}")
+        print("  " + _slot_line(r, st, name_w, avail, host_w))
         if ":" in r["slot"]:                       # colon marks a foreground row
             has_fg = True
     foot = ("attach (auto-finds its host): t open <repo> <slot> · "
@@ -1820,7 +1852,10 @@ def _todo_key(cfg, cwd, tmux_name=None, override=None):
     if tmux_name and tmux_name.startswith("dev-"):
         repo, dash, num = tmux_name[4:].rpartition("-")
         if dash and repo and num.isdigit():
-            return "%s-%s" % (repo, num)
+            # By the CANONICAL alias: a `dev-dot-3` window and the .worktrees/dotfiles/3
+            # path are one slot and must key ONE list (step 2 and `t todo add dot 3 …`
+            # both say dotfiles-3); the raw name split them across two files.
+            return "%s-%s" % (_todo_alias_map(cfg).get(repo, repo), num)
     if alias:
         return alias
     return "scratch"
@@ -2016,6 +2051,34 @@ def _todo_slot_arg(rest):
     return (None, rest)
 
 
+def _todo_dest_args(rest, aliases, alias=None):
+    """Split an explicit destination off an `add` → (key, text tokens), or (None, rest).
+
+    The `<repo> [slot]` positionals every slot verb takes, most explicit first:
+      t todo add ff 22 fix the ledger   → ff-22
+      t todo add ff fix the ledger      → ff             (the repo-level list)
+      t todo add 22 fix the ledger      → <cwd repo>-22  (a bare slot needs `alias`)
+    `aliases` maps every DEV_REPOS key to its canonical one, so `dot 3` and
+    `dotfiles 3` file into ONE list: ids are per-list and a slot's own key is the
+    canonical alias (repo_of_dir's choice), so a sibling-alias key would silently
+    split one slot's list across two files. A destination is taken only when TEXT
+    FOLLOWS — `t todo add ff 22` stays the item "ff 22", the way a lone number stays
+    an item (_todo_slot_arg's rule) — and quoting is the escape hatch for text that
+    really does start with a repo's name. Pure."""
+    rest = list(rest or [])
+    if rest and rest[0] in aliases:
+        repo = aliases[rest[0]]
+        if len(rest) >= 3 and rest[1].isdigit():
+            return ("%s-%s" % (repo, rest[1]), rest[2:])
+        if len(rest) >= 2 and not rest[1].isdigit():
+            return (repo, rest[1:])
+        return (None, rest)
+    slot, stripped = _todo_slot_arg(rest)
+    if slot and alias:
+        return ("%s-%s" % (alias, slot), stripped)
+    return (None, rest)
+
+
 def _todo_repo_arg(action, rest, repos):
     """Split a leading `<repo> [slot]` off the positionals -> (key, action, rest), the
     `t <verb> <repo> [slot]` grammar every other slot verb speaks: `t todo ff add x`
@@ -2045,6 +2108,8 @@ def _todo_repo_arg(action, rest, repos):
     if key is None:
         return (None, action, rest)
     return (key, rest[0] if rest else None, rest[1:])
+
+
 def _todo_ls_target(key, repos, rest):
     """Resolve `t todo ls <what>` to the list to show -> (key, None) or (None, error).
 
@@ -2308,60 +2373,100 @@ def _todo_scoped(entries, alias, live_nums=None):
     return out
 
 
-def _todo_add_targets(alias, rows, list_keys, wt_slots):
-    """Ordered destinations for a slotless `t todo add` → [(key, label)].
+def _synth_row(slot, summary):
+    """A row in _dev_session_rows' shape for something that is not a session — a
+    list-level destination, or a slot the scan did not return — so one renderer
+    (_slot_line) draws every row of a picker."""
+    return {"host": "local", "sid": "-", "cwd": "", "slot": slot,
+            "state": "", "context": "", "summary": summary}
+
+
+_LIVE_STATES = ("attached", "detached")
+
+
+def _todo_add_targets(alias, rows, list_keys, wt_slots, aliases=None):
+    """Ordered destinations for a slotless `t todo add` → [(key, row)], each row in
+    _dev_session_rows' shape so _slot_line draws it: the picker IS the `t ls` view,
+    with the dead slots `t resume` knows about underneath — one slot view everywhere.
 
     Standing in a repo dir names no slot, and with 20+ live slots for one repo a guess
     would be worse than asking. The repo-level list stays FIRST so it is the default
-    pick (fzf preselects line 1) — the picker adds a choice, it does not take one away.
+    pick — the picker adds a choice, it does not take one away.
 
-    Slots come from three unioned sources, cheapest last-resort first: a live session
-    (labelled with what it is working on — the only label that is actually recognisable
-    among twenty), a worktree on disk, an existing list. Pure: the caller gathers."""
-    live = {}
+    Slots are the union of three sources: a scan row (live — labelled with what it is
+    working on, the only label recognisable among twenty — or dead, with its last
+    conversation), a worktree on disk (the no-scan fallback, labelled "worktree"), and
+    an existing list ("N open" rides on the summary). A live row beats a dead one for
+    the same slot (a session rooted outside its worktree is both), and a sibling
+    alias's live session (`dot-4` when asked about dotfiles) counts through `aliases`,
+    keyed canonically. Pure: the caller gathers."""
+    aliases = aliases or {}
+    by_num = {}
     for r in rows:
-        slot = r.get("slot", "")
-        head, _, num = slot.rpartition("-")
-        if head == alias and num.isdigit():
-            live[num] = (r.get("summary") or "").strip()
-    seen = set(live) | {s for s in wt_slots if s.isdigit()}
+        head, _, num = r.get("slot", "").rpartition("-")
+        if not num.isdigit() or (head != alias and aliases.get(head) != alias):
+            continue
+        prev = by_num.get(num)
+        if prev is None or (prev.get("state") not in _LIVE_STATES
+                            and r.get("state") in _LIVE_STATES):
+            by_num[num] = dict(r, slot="%s-%s" % (alias, num))
+    seen = set(by_num) | {s for s in wt_slots if s.isdigit()}
     open_counts = {}
     for key, n in list_keys.items():
         head, _, num = key.rpartition("-")
         if head == alias and num.isdigit():
             seen.add(num)
             open_counts[num] = n
-    out = [(alias, "%s   (no slot — the repo-level list)" % alias)]
+    out = [(alias, _synth_row(alias, "(no slot — the repo-level list)"))]
     for num in sorted(seen, key=int):
-        bits = []
-        if num in live:
-            bits.append(live[num] or "(live)")
-        elif num in wt_slots:
-            bits.append("worktree")
+        row = by_num.get(num) or _synth_row(
+            "%s-%s" % (alias, num), "worktree" if num in wt_slots else "")
+        summary = (row.get("summary") or "").strip()
+        if not summary and row.get("state") in _LIVE_STATES:
+            summary = "(live)"
+        bits = [summary] if summary else []
         if open_counts.get(num):
             bits.append("%d open" % open_counts[num])
-        out.append(("%s-%s" % (alias, num),
-                    "%s-%s   %s" % (alias, num, " · ".join(bits) or "-")))
+        row["summary"] = " · ".join(bits) or "-"
+        out.append((row["slot"], row))
+    return out
+
+
+def _todo_target_labels(targets, width=80):
+    """Picker labels for [(key, row)] targets: each row drawn by _slot_line with a plain
+    Style, so the picker can measure and truncate what it shows — the `t ls` row,
+    minus colour. Width accounts for the picker's own `│ ›` rail."""
+    st = Style(tty=False)
+    name_w = max([7] + [len(r["slot"]) for _, r in targets])
+    avail = max(12, width - 8 - 8 - name_w - 1)
+    return [(key, _slot_line(r, st, name_w, avail)) for key, r in targets]
+
+
+def _todo_alias_map(cfg):
+    """Every DEV_REPOS key → the canonical alias for its dir. Sibling keys (dot +
+    dotfiles) name one tree, and repo_of_dir only ever resolves to one of them — the
+    key equal to the basename, else the shortest — so that is the key a slot's list
+    lives under, and the one every alias must resolve to."""
+    by_dir = {}
+    for key, path in (cfg.repos or {}).items():
+        by_dir.setdefault(os.path.realpath(path), []).append(key)
+    out = {}
+    for path, keys in by_dir.items():
+        base = os.path.basename(path)
+        canon = base if base in keys else min(keys, key=len)
+        for k in keys:
+            out[k] = canon
     return out
 
 
 def _todo_canon_aliases(cfg):
-    """One alias per repo DIR. Sibling keys (dot + dotfiles) name one tree, and
-    repo_of_dir only ever resolves to one of them, so offering both would list the same
-    slots twice under two names. Same choice repo_of_dir makes: the key equal to the
-    basename wins, else the shortest key."""
-    by_dir = {}
-    for key, path in (cfg.repos or {}).items():
-        by_dir.setdefault(os.path.realpath(path), []).append(key)
-    out = []
-    for path, keys in by_dir.items():
-        base = os.path.basename(path)
-        out.append(base if base in keys else min(keys, key=len))
-    return sorted(out)
+    """One alias per repo DIR, sorted — offering both `dot` and `dotfiles` would list
+    the same slots twice under two names. The canonical side of _todo_alias_map."""
+    return sorted(set(_todo_alias_map(cfg).values()))
 
 
-def _todo_add_targets_all(aliases, rows, list_keys, wt_slots):
-    """Destinations for an add from NOWHERE -- no repo in the cwd -> [(key, label)].
+def _todo_add_targets_all(aliases, rows, list_keys, wt_slots, amap=None):
+    """Destinations for an add from NOWHERE -- no repo in the cwd -> [(key, row)].
 
     "scratch" stays FIRST so Enter keeps the old fallback behaviour: the picker adds a
     choice, it never takes one away. Then every repo that has somewhere to file -- a
@@ -2370,9 +2475,9 @@ def _todo_add_targets_all(aliases, rows, list_keys, wt_slots):
     `-s <key>` still reaches any list by name. Pure: the caller gathers.
 
     wt_slots is keyed by alias here (one repo per key), unlike the single-repo twin."""
-    out = [("scratch", "scratch   (no repo -- the catch-all list)")]
+    out = [("scratch", _synth_row("scratch", "(no repo — the catch-all list)"))]
     for alias in aliases:
-        targets = _todo_add_targets(alias, rows, list_keys, wt_slots.get(alias) or set())
+        targets = _todo_add_targets(alias, rows, list_keys, wt_slots.get(alias) or set(), amap)
         if len(targets) == 1 and alias not in list_keys:
             continue                     # no slots, no list -- nothing to file against
         out.extend(targets)
@@ -2474,16 +2579,25 @@ def _todo_statusline(payload, cfg, items_n=1, width=80, tmux_name=None):
     Layout is two zones split by │: a dim head (slot · model, plus ● and the URL the
     slot is testable at when a dev server is live) and the tasks, each carrying its own
     checkbox — so the box, not a separator, is what delimits an item.
-    A slot's bar also carries its REPO-level list, marked ◇ instead of ◻ and sorted
-    after the slot's own: the cross-slot notes live there, and keying the bar strictly
-    on the slot hid them from every place you actually work.
     The open COUNT is deliberately gone: the ◻s and the trailing +N already say how
     many, and a bare number sitting next to a checkbox read as an item.
 
-    items_n == 1 packs as many open items onto ONE line as `width` allows (the safe
-    default: a single line renders anywhere), each capped at _TODO_BAR_ITEM_MAX so
-    one long task cannot take the whole line. items_n > 1 emits a header plus one line
-    per item, which is only useful if the host renders a multi-line statusline.
+    A slot's bar also carries its REPO-level list — the cross-slot notes live there,
+    and keying the bar strictly on the slot hid them from every place you actually
+    work — on a SECOND LINE, dim throughout, headed by the repo key with its │ aligned
+    under the first line's:
+        ff-22 · Fable 5 ● http://localhost:5222 │ ◻ integrate into ff 11
+        ff                                      │ ◇ keep forecast on aug 15  +2 more
+    The two used to share one line (◻ then ◇), and at 20+ live slots that read as one
+    undifferentiated run of tasks in which the slot's OWN work — the thing the bar is
+    for — was one glyph-shape away from the repo's. Now the hierarchy is structural:
+    line 1 is always mine, line 2 always the repo's, and a slot with no repo notes is
+    the single line it always was. Claude Code renders each printed line as its own
+    row (and sets $COLUMNS, which _columns() reads, so both lines fit the terminal).
+
+    Every item is capped at _TODO_BAR_ITEM_MAX before the width fit, so one long task
+    cannot take a line. items_n > 1 is the older -n form: a header plus one line per
+    item, own then shared.
 
     Colour is emitted UNCONDITIONALLY (honouring NO_COLOR) — Style() gates on
     isatty and stdout here is always the pipe Claude Code reads, so the shared helper
@@ -2501,11 +2615,11 @@ def _todo_statusline(payload, cfg, items_n=1, width=80, tmux_name=None):
     model = payload.get("model") if isinstance(payload.get("model"), dict) else {}
     name = (model.get("display_name") or "").strip()
     key = _todo_key(cfg, cwd, tmux_name)
-    items = [("◻", i["id"], i["text"]) for i in _todo_open(_todo_load(_todo_path(key)))]
+    own = [("◻", i["id"], i["text"]) for i in _todo_open(_todo_load(_todo_path(key)))]
     parent = _todo_parent(key, cfg.repos)
-    if parent:                             # the slot's own work first, shared notes after
-        items += [("◇", i["id"], i["text"])
-                  for i in _todo_open(_todo_load(_todo_path(parent)))]
+    shared = [("◇", i["id"], i["text"])
+              for i in _todo_open(_todo_load(_todo_path(parent)))] if parent else []
+    items = own + shared                   # the slot's own work first, shared notes after
 
     dim, cyan, green, rst = ("", "", "", "") if os.environ.get("NO_COLOR") else \
         ("\033[2m", "\033[36m", "\033[32m", "\033[0m")
@@ -2539,8 +2653,29 @@ def _todo_statusline(payload, cfg, items_n=1, width=80, tmux_name=None):
             out.append("  %s+%d more%s" % (dim, len(items) - items_n, rst))
         return "\n".join(out)
 
-    # One line, newest ask first. Fit against a limit that already reserves the
-    # "+N more" tail, so the assembled bar can never exceed `width`.
+    if not shared:
+        return _todo_pack(head_c, head_p, own, width, cyan, dim, rst)
+    first = (_todo_pack(head_c, head_p, own, width, cyan, dim, rst) if own
+             else head_c + dim + "nothing open here" + rst)
+    # The repo line: its key padded so the │ sits under line 1's (a two-row table,
+    # not two bars), unless that padding would leave no room for an item to say
+    # anything (20 columns after the │ — less renders as a bare "N open").
+    pad = len(head_p) - 3
+    label = parent.ljust(pad) if pad + 3 + 20 <= width else parent
+    second = _todo_pack(dim + label + " │ ", label + " │ ", shared, width, "", dim, rst)
+    if rst and not second.endswith(rst):
+        second += rst
+    return first + "\n" + second
+
+
+def _todo_pack(head_c, head_p, items, width, gc, dim, rst):
+    """One bar line: after the head, as many items as `width` allows, each behind its
+    glyph, then "+N more". Fits against a limit that already reserves that tail, so
+    the assembled line can never exceed `width`; only the FIRST item is ever ellipsed
+    (a mid-list ellipsis reads noisier than a +N). head_c/head_p are the coloured and
+    printable heads — the packer measures the printable one. gc colours each glyph;
+    empty leaves the line's own colour alone, for the repo line that is dim
+    throughout."""
     tail_room = len("  +%d more" % len(items)) if len(items) > 1 else 0
     limit = width - tail_room
     plain, line, shown = head_p, head_c, 0
@@ -2549,13 +2684,13 @@ def _todo_statusline(payload, cfg, items_n=1, width=80, tmux_name=None):
         sep = "  " if shown else ""                  # only ever ellipses the first
         if len(plain) + len(sep) + 2 + len(text) > limit:
             if shown:
-                break                      # a mid-list ellipsis reads noisier than a +N
+                break
             avail = limit - len(plain) - 2
             if avail < 10:
                 break
             text = _truncate(text, avail)
         plain += sep + g + " " + text
-        line += sep + cyan + g + rst + " " + text
+        line += sep + (gc + g + rst if gc else g) + " " + text
         shown += 1
     if not shown:                          # a width too narrow for even one item
         return head_c + dim + "%d open" % len(items) + rst
@@ -2565,11 +2700,12 @@ def _todo_statusline(payload, cfg, items_n=1, width=80, tmux_name=None):
 
 
 def _todo_live_slots():
-    """Live dev slots by name, straight from tmux. This replaced
-    zsh_capture("_dev_session_rows"): that spawned a login+interactive zsh to fetch each
-    slot's "working on" summary, cost 5 SECONDS, and suspended the caller with SIGTTOU
-    when the interactive shell went for the terminal. 8ms here, and a slot number plus
-    its open count is enough to choose between lists."""
+    """Live dev slots by name, straight from tmux (8ms) — for the gates that run on
+    every view and behind the statusline, where a slot NUMBER is all that is asked.
+    The pickers use _slot_rows instead: the full `t ls` scan (~0.3s), which #90 pulled
+    out of here for "suspending the shell" — that was zsh_capture's child taking the
+    terminal (fixed there, see its note), not the scan; the 5s was the pre-batch
+    transcript reading, gone since _transcript_meta_batch."""
     try:
         r = subprocess.run(["tmux", "list-sessions", "-F", "#{session_name}"],
                            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
@@ -2596,18 +2732,24 @@ def _todo_pick_target(cfg, alias):
         return None
     list_keys = {os.path.basename(p)[:-5]: len(_todo_open(_todo_load(p)))
                  for p in glob.glob(os.path.join(_todo_dir(), "*.json"))}
-    rows = _todo_live_slots()
+    amap = _todo_alias_map(cfg)
+    aliases = [amap.get(alias, alias)] if alias else _todo_canon_aliases(cfg)
+    # The `t ls` scan plus the dead slots, in one zsh — the rows the picker shows are
+    # the rows `t ls` and `t resume` show, drawn by the same _slot_line.
+    rows = _slot_rows(cfg, aliases)
     if alias:
-        targets = _todo_add_targets(alias, rows, list_keys,
-                                    _todo_worktree_slots(cfg, alias))
+        targets = _todo_add_targets(aliases[0], rows, list_keys,
+                                    _todo_worktree_slots(cfg, aliases[0]), amap)
     else:
-        aliases = _todo_canon_aliases(cfg)
         targets = _todo_add_targets_all(
             aliases, rows, list_keys,
-            {a: _todo_worktree_slots(cfg, a) for a in aliases})
+            {a: _todo_worktree_slots(cfg, a) for a in aliases}, amap)
     if len(targets) == 1:
         return None                      # nowhere to file but here — nothing to choose
-    return _pick_inline("add to which list?", targets)
+    legend = "   ● attached · ✓ active" if any(
+        r.get("state") in _LIVE_STATES for _, r in targets) else ""
+    return _pick_inline("add to which list?" + legend,
+                        _todo_target_labels(targets, _columns()))
 
 
 def _todo_pick_action(item):
@@ -2668,6 +2810,12 @@ def cmd_todo(cfg, args):
     # action shifts left, so nothing below has to know the list was named positionally.
     target, action, rest = _todo_repo_arg(args.action, args.rest, cfg.repos)
     if target:
+        # Canonical alias, as `t todo add dot 3 …` and the key ladder resolve it: one
+        # slot, one list (see _todo_alias_map). An explicit -s stays verbatim.
+        head, dash, num = target.rpartition("-")
+        amap = _todo_alias_map(cfg)
+        target = ("%s-%s" % (amap.get(head, head), num) if dash and num.isdigit()
+                  else amap.get(target, target))
         if args.slot and args.slot != target:
             print("t todo: -s %s and %s name different lists — drop one"
                   % (args.slot, target), file=sys.stderr)
@@ -2723,18 +2871,20 @@ def cmd_todo(cfg, args):
         shared = _todo_shared(cfg, key)
         return [(key, data), shared] if shared else [(key, data)]
     # An `add` resolves its destination three ways, most explicit first: -s names a list
-    # outright; a leading bare slot number files ACROSS slots without leaving the dir
-    # (`t todo add 11 fix the ledger`); otherwise the list is ASKED for rather than
-    # guessed. The picker used to be gated on `key in cfg.repos`, so an add from ~ fell
-    # through to the `scratch` catch-all with no prompt — and since the ✓ line named no
-    # list either, `t todo add 11` looked like it had gone to a slot 11 that was never
-    # involved. Both halves are fixed here and at the ✓ print below.
+    # outright; the `<repo> [slot]` positionals every slot verb takes name one from
+    # anywhere (`t todo add ff 22 fix the ledger`), and a leading bare slot number
+    # files ACROSS slots without leaving the dir (`t todo add 11 fix the ledger`);
+    # otherwise the list is ASKED for rather than guessed. The picker used to be gated
+    # on `key in cfg.repos`, so an add from ~ fell through to the `scratch` catch-all
+    # with no prompt — and since the ✓ line named no list either, `t todo add 11`
+    # looked like it had gone to a slot 11 that was never involved. Both halves are
+    # fixed here and at the ✓ print below.
     if _todo_canon(args.action or "ls") == "add" and not args.slot:
-        alias = key if key in cfg.repos else key.rpartition("-")[0]
-        alias = alias if alias in cfg.repos else None
-        slot, stripped = _todo_slot_arg(args.rest)
-        if slot and alias:
-            key, args.rest = "%s-%s" % (alias, slot), stripped
+        amap = _todo_alias_map(cfg)
+        alias = amap.get(key if key in cfg.repos else key.rpartition("-")[0])
+        dest, stripped = _todo_dest_args(args.rest, amap, alias)
+        if dest:
+            key, args.rest = dest, stripped
         elif " ".join(args.rest).strip():
             # No repo to resolve a number against (or no number): ask. The leading token
             # stays part of the text — a slot needs a repo, and the picker shows both.
@@ -4294,7 +4444,7 @@ Usage: t todo [repo [slot]] [action] [args]
   (no action)        show this slot's tasks
   <repo> [slot]      another list, positionally: t todo ff add …  ·  t todo ff 3
   ls [slot|key]      show one slot's tasks (t todo ls 17; t todo ls dotfiles-3)
-  add <text…>        add a task
+  add [repo [slot]] <text…>   add a task — here, or to a named repo/slot
   done [id…]         tick off      — no id: pick from a list
   rm   [id…]         remove        — no id: pick from a list
   mv   [id] [slot]   move to another slot's list

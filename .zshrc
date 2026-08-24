@@ -2066,6 +2066,95 @@ _dev_session_rows() {
   _pr_state_flush
 }
 
+# _dev_dead_slot_rows <repo>… — the DEAD slots of these repos, in _dev_session_rows'
+# row format ("<sid>\t<worktree>\t<repo>-<n>\tdead\tnone\t<summary>"), so anything
+# that already renders live rows renders these with the same code. This is the
+# data half of the shared slot view (bin/t's _slot_line is the rendering half):
+# a picker that lists slots — `t todo add`'s destination list — shows a live slot
+# exactly as `t ls` does and a dead one with what `t resume` knows about it, instead
+# of a bare "worktree". A slot is dead when no live dev session is rooted at its
+# worktree (matched by PATH, never by name — alias drift) and no sibling-alias
+# session carries its name (that one is a live row already; listing it here too
+# would double it). summary = the slot's newest conversation title + its PR tag +
+# when it last ran, from the same _transcript_meta_batch cache `t resume` reads, so
+# a warm scan costs one python start. Recency = max(transcript mtime, opened stamp)
+# with ↻ when the stamp is newer, as in `t resume`; and like `t resume`, a
+# conversationless stub (open-then-exit: no title) is skipped — only the THREE most
+# recent transcripts per slot go to the batch, enough to get past a stub without
+# reading a busy slot's whole history on a cold cache. The slot set is discovered
+# (_dev_repo_slots), so a reaped slot with a saved conversation still lists — it is
+# still a place `t resume` can revive and a list can be filed against.
+_dev_dead_slot_rows() {
+  setopt local_options null_glob bare_glob_qual
+  local repo dir base n wt slot txf ep opf title when sid k s p re
+  local -a cand mpaths mrows mt
+  local -a slots                     # in discovery order, so the output is stable
+  local -A livepath livename meta_title meta_pr slot_wt slot_cands
+  local -a _PR_STALE; local -A _PR_SPAWNED; local REPLY mr mrest
+  local opdir="${XDG_CACHE_HOME:-$HOME/.cache}/claude-sessions/opened"
+  while IFS=$'\t' read -r s p; do
+    [[ $s == dev-* ]] || continue
+    livename[${s#dev-}]=1; [[ -n $p ]] && livepath[$p]=1
+  done < <(tmux list-sessions -F '#{session_name}'$'\t''#{session_path}' 2>/dev/null)
+  # Pass 1: find each dead slot's newest transcripts; collect them for ONE batch.
+  for repo in "$@"; do
+    dir=${DEV_REPOS[$repo]:-}; [[ -n $dir ]] || continue
+    base=${dir:t}
+    for n in ${(f)"$(_dev_repo_slots "$repo")"}; do
+      [[ $n == <-> ]] || continue
+      wt="$DEV_WORKTREE_ROOT/$base/$n"
+      [[ -n ${livepath[$wt]:-} ]] && continue
+      for k in ${(k)DEV_REPOS}; do
+        [[ ${DEV_REPOS[$k]} == $dir && -n ${livename[$k-$n]:-} ]] && continue 2
+      done
+      cand=()
+      for txf in "$HOME/.claude/projects/${wt//[^A-Za-z0-9]/-}"/*.jsonl; do
+        # zstat -A: no $(…) fork per file — a repo with 20 dead slots holds hundreds.
+        zstat -A mt +mtime "$txf" 2>/dev/null || continue
+        ep=$mt[1]; re=0
+        opf="$opdir/${${txf:t}%.jsonl}"
+        if [[ -f $opf ]] && zstat -A mt +mtime "$opf" 2>/dev/null && (( mt[1] > ep )); then
+          ep=$mt[1]; re=1
+        fi
+        cand+=("$ep"$'\t'"$re"$'\t'"$txf")
+      done
+      slot="$repo-$n"; slots+=("$slot"); slot_wt[$slot]=$wt
+      cand=(${(On)cand})                          # newest first, by the leading epoch
+      slot_cands[$slot]=${(pj:\n:)cand[1,3]}
+      for s in "${(@)cand[1,3]}"; do mpaths+=("${s##*$'\t'}"); done
+    done
+  done
+  (( $#slots )) || return 0
+  # Pass 2: one batched, cached metadata read (title + last PR URL) for all of them.
+  (( $#mpaths )) && mrows=("${(@f)$(_transcript_meta_batch "${(@)mpaths}")}")
+  for mr in "${(@)mrows}"; do
+    [[ -n $mr ]] || continue
+    mrest=${mr#*$'\t'}                      # peeled, not split: an empty title must
+    meta_title[${mr%%$'\t'*}]=${mrest%%$'\t'*}  # not collapse the column away
+    meta_pr[${mr%%$'\t'*}]=${mrest#*$'\t'}
+  done
+  # Pass 3: print, newest titled conversation per slot.
+  for slot in "${(@)slots}"; do
+    sid=-; title=
+    for s in "${(@f)slot_cands[$slot]}"; do
+      [[ -n $s ]] || continue
+      txf=${s##*$'\t'}
+      title=${meta_title[$txf]:-}
+      [[ -n $title ]] || continue           # conversationless stub — as `t resume` skips it
+      ep=${s%%$'\t'*}; re=${${s#*$'\t'}%%$'\t'*}
+      sid=${${txf:t}%.jsonl}
+      _pr_state_tag "${meta_pr[$txf]:-}"; title+=$REPLY
+      when=; (( ep )) && when=$(strftime '%b %d %H:%M' "$ep" 2>/dev/null)
+      [[ $re == 1 && -n $when ]] && when+=" ↻"
+      [[ -n $when ]] && title+=" · $when"
+      break
+    done
+    printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$sid" "$slot_wt[$slot]" "$slot" dead none \
+      "${title:-(no conversation)}"
+  done
+  _pr_state_flush
+}
+
 # _dev_rows_all — fan _dev_session_rows out over THIS machine + every $REMOTE_HOSTS
 # entry and print each row prefixed with its host ("<host>\t<sid>\t<cwd>\t<slot>\t
 # <state>\t<context>\t<summary>"; host = the REMOTE_HOSTS key, or "local"). The data

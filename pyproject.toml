@@ -47,6 +47,15 @@ exclude_lines = [
     "def _setup_prompt_flow\\(",
     "def _prompt\\(",
     "def _confirm\\(",
+    # bin/t `t new` subprocess / ssh / wizard glue (the pure _new_* helpers are tested)
+    "def _run\\(",
+    "class _RailUI",
+    "def _new_sh_",
+    "def _hosts_land\\(",
+    "def _new_wizard\\(",
+    "def _new_prompt_flow\\(",
+    "def _new_resolve\\(",
+    "def _new_walk\\(",
     # bin/t mcp server glue (tmux/registry gathering, git, the stdio loop, claude mcp add)
     "def _live_rows\\(",
     "def _git_brief\\(",

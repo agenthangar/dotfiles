@@ -2017,6 +2017,312 @@ def test_todo_locate_skips_tombstones(t_mod):
     assert [k for k, _ in t_mod._todo_locate(entries, "1")] == ["dotfiles-3"]
 
 
+# ─── t new: pure helpers (name/url/slug, gh state, alias check, plan, hosts) ────
+
+import pytest
+from types import SimpleNamespace as _NS
+
+
+def _new_state(**kw):
+    s = {"exists": False, "nonempty": False, "is_repo": False, "has_commits": False,
+         "branch": None, "origin_url": None, "has_origin_main": False}
+    s.update(kw)
+    return s
+
+
+_GH_OK = {"allow_auto_merge": True, "delete_branch_on_merge": True, "allow_squash_merge": True,
+          "allow_merge_commit": False, "allow_rebase_merge": False, "private": True}
+_GH_HIVE = {"allow_auto_merge": True, "delete_branch_on_merge": False, "allow_squash_merge": True,
+            "allow_merge_commit": True, "allow_rebase_merge": True, "private": True}
+
+
+@pytest.mark.parametrize("name", ["ok", "my-tool_1.2", "x.y", "A" * 100, "Mixed"])
+def test_new_validate_name_accepts(t_mod, name):
+    assert t_mod._new_validate_name(name) is None
+
+
+@pytest.mark.parametrize("name", ["", None, "a/b", "-x", ".x", "..", "x.git", "a b", "a" * 101, "ünï"])
+def test_new_validate_name_rejects(t_mod, name):
+    assert t_mod._new_validate_name(name)
+
+
+def test_new_name_warnings_only_for_uppercase(t_mod):
+    assert t_mod._new_name_warnings("lower") == []
+    assert len(t_mod._new_name_warnings("Upper")) == 1
+
+
+def test_new_path_and_clone_url(t_mod, monkeypatch):
+    monkeypatch.setattr(t_mod, "HOME", "/Users/me")
+    assert t_mod._new_path("x") == "/Users/me/code/x"
+    assert t_mod._new_clone_url("agenthangar", "x") == "git@github.com:agenthangar/x.git"
+
+
+@pytest.mark.parametrize("url,slug", [
+    ("git@github.com:agenthangar/x.git", "agenthangar/x"),
+    ("ssh://git@github.com/o/n.git", "o/n"),
+    ("https://github.com/o/n", "o/n"),
+    ("https://github.com/o/n.git/", "o/n"),
+    ("git@gitlab.com:o/n.git", None),
+    ("/srv/git/n.git", None),
+    ("", None),
+    (None, None),
+])
+def test_new_repo_slug_forms(t_mod, url, slug):
+    assert t_mod._new_repo_slug(url) == slug
+
+
+def test_new_gh_repo_state_classifies(t_mod):
+    kind, info = t_mod._new_gh_repo_state(0, '{"private": true}', "")
+    assert kind == "present" and info == {"private": True}
+    assert t_mod._new_gh_repo_state(1, "", "gh: Not Found (HTTP 404)") == ("absent", None)
+    kind, msg = t_mod._new_gh_repo_state(4, "", "To get started with GitHub CLI, please run:  gh auth login")
+    assert kind == "error" and "gh auth login" in msg
+    kind, msg = t_mod._new_gh_repo_state(1, "", "error: boom\nHTTP 403: forbidden")
+    assert (kind, msg) == ("error", "HTTP 403: forbidden")
+    assert t_mod._new_gh_repo_state(0, "not json", "")[0] == "error"
+    assert t_mod._new_gh_repo_state(127, "", "")[0] == "error"
+
+
+def test_new_settings_ok_shapes(t_mod):
+    assert t_mod._new_settings_ok(_GH_OK)
+    assert not t_mod._new_settings_ok(_GH_HIVE)
+    assert not t_mod._new_settings_ok({})
+
+
+def test_new_whence_kind(t_mod):
+    assert t_mod._new_whence_kind("test: builtin") == "builtin"
+    assert t_mod._new_whence_kind("t: function\n") == "function"
+    assert t_mod._new_whence_kind("x: none") is None
+    assert t_mod._new_whence_kind("") is None
+
+
+def test_new_alias_check_outcomes(t_mod, monkeypatch):
+    monkeypatch.setattr(t_mod, "HOME", "/Users/me")
+    f = {"api": '"$HOME/code/api"'}
+    cfg = {"cf": "/Users/me/code/cashfwd"}
+    assert t_mod._new_alias_check("api", "/Users/me/code/api", f, cfg)[0] == "skip"
+    kind, msg = t_mod._new_alias_check("api", "/Users/me/code/other", f, cfg)
+    assert kind == "error" and "~/code/api" in msg
+    assert t_mod._new_alias_check("cf", "/Users/me/code/other", f, cfg)[0] == "error"   # cache-only collision
+    kind, msg = t_mod._new_alias_check("test", "/Users/me/code/test", f, cfg, "builtin")
+    assert kind == "error" and "shadow" in msg
+    assert t_mod._new_alias_check("fresh", "/Users/me/code/fresh", f, cfg, None) == ("run", None)
+    # a second alias for an already-registered path is allowed (dot + dotfiles)
+    assert t_mod._new_alias_check("api2", "/Users/me/code/api", f, cfg)[0] == "run"
+    assert t_mod._new_alias_check("bad key", "/Users/me/code/x", f, cfg)[0] == "error"
+    assert t_mod._new_alias_check("", "/Users/me/code/x", f, cfg)[0] == "error"
+
+
+def test_new_owner_rows_default_first_and_you(t_mod):
+    rows = t_mod._new_owner_rows("me", ["cashfwd", "agenthangar"], "agenthangar")
+    assert rows == [("agenthangar", "agenthangar"), ("cashfwd", "cashfwd"), ("me", "me (you)")]
+    assert t_mod._new_owner_rows("me", [], "agenthangar") == [("me", "me (you)")]   # not a member → not offered
+    assert t_mod._new_owner_rows(None, [], "agenthangar") == []
+
+
+def test_new_pick_hosts(t_mod):
+    cfg = {"openclaw": "u@oc", "mini": "u@mini"}
+    assert t_mod._new_pick_hosts(cfg, None, True) == ([], None)
+    assert t_mod._new_pick_hosts(cfg, None, False) == ([("mini", "u@mini"), ("openclaw", "u@oc")], None)
+    assert t_mod._new_pick_hosts(cfg, "mini", False) == ([("mini", "u@mini")], None)
+    rows, err = t_mod._new_pick_hosts(cfg, "mini,nope", False)
+    assert rows == [] and "nope" in err
+
+
+def test_new_answers_from_flags(t_mod):
+    a = t_mod._new_answers(_NS(name="x", owner=None, public=True, private=False, alias=None,
+                               hosts="mini, openclaw", no_hosts=False))
+    assert a == {"name": "x", "owner": None, "visibility": "public", "alias": None,
+                 "hosts": ["mini", "openclaw"]}
+    a = t_mod._new_answers(_NS(name=None, owner="o", public=False, private=True, alias="k",
+                               hosts=None, no_hosts=True))
+    assert a == {"name": None, "owner": "o", "visibility": "private", "alias": "k", "hosts": []}
+    assert t_mod._new_answers(_NS(name=None, owner=None, public=False, private=False, alias=None,
+                                  hosts=None, no_hosts=False))["hosts"] is None
+
+
+def test_new_state_summary(t_mod):
+    assert t_mod._new_state_summary(_new_state()) == "new"
+    assert t_mod._new_state_summary(_new_state(exists=True)) == "exists (empty)"
+    assert "NOT a git repo" in t_mod._new_state_summary(_new_state(exists=True, nonempty=True))
+    s = _new_state(exists=True, nonempty=True, is_repo=True, has_commits=True, branch="main",
+                   origin_url="git@github.com:o/n.git")
+    assert t_mod._new_state_summary(s) == "exists — repo on main, origin o/n"
+    s = _new_state(exists=True, nonempty=True, is_repo=True, branch="main")
+    assert t_mod._new_state_summary(s) == "exists — repo on main, no origin, no commits"
+
+
+def _plan(t_mod, state, gh, register=("run", None), hosts=(("mini", "u@mini"),), owner="agenthangar",
+          private=True, alias="x"):
+    return t_mod._new_plan("x", alias, owner, private, "/Users/me/code/x", state, gh, register, list(hosts))
+
+
+def _by(steps):
+    return {s["step"]: s for s in steps}
+
+
+def test_new_plan_fresh_repo(t_mod, monkeypatch):
+    monkeypatch.setattr(t_mod, "HOME", "/Users/me")
+    steps = _plan(t_mod, _new_state(), ("absent", None))
+    assert [s["step"] for s in steps] == ["init", "commit", "remote", "push", "settings", "register", "host:mini"]
+    b = _by(steps)
+    assert b["init"]["do"] == "run" and b["init"]["cmd"] == ["git", "init", "-q", "-b", "main", "/Users/me/code/x"]
+    assert b["commit"]["cmd"][-3:] == ["--allow-empty", "-m", "init: x"]
+    assert b["remote"]["cmd"] == ["gh", "repo", "create", "agenthangar/x", "--private", "--source",
+                                  "/Users/me/code/x", "--remote", "origin", "--push"]
+    assert b["push"]["do"] == "skip" and "gh repo create" in b["push"]["label"]
+    assert b["settings"]["cmd"] == ["gh", "repo", "edit", "agenthangar/x", "--enable-auto-merge",
+                                    "--delete-branch-on-merge", "--enable-squash-merge",
+                                    "--enable-merge-commit=false", "--enable-rebase-merge=false"]
+    assert b["register"]["do"] == "run" and 'DEV_REPOS[x]="$HOME/code/x"' in b["register"]["label"]
+    assert b["host:mini"]["cmd"] == t_mod._new_ssh_argv("u@mini", "git@github.com:agenthangar/x.git", "x", "x")
+    assert not any(s["do"] == "error" for s in steps)
+
+
+def test_new_plan_public_and_no_hosts(t_mod):
+    b = _by(_plan(t_mod, _new_state(), ("absent", None), private=False, hosts=()))
+    assert "--public" in b["remote"]["cmd"] and not any(k.startswith("host:") for k in b)
+
+
+def test_new_plan_resumes_local_repo_without_remote(t_mod):
+    st = _new_state(exists=True, nonempty=True, is_repo=True, has_commits=True, branch="main")
+    b = _by(_plan(t_mod, st, ("absent", None)))
+    assert b["init"]["do"] == "skip" and b["commit"]["do"] == "skip"
+    assert b["remote"]["cmd"][:3] == ["gh", "repo", "create"]
+
+
+def test_new_plan_repo_on_github_only_adds_origin_and_pushes(t_mod):
+    st = _new_state(exists=True, nonempty=True, is_repo=True, has_commits=True, branch="main")
+    b = _by(_plan(t_mod, st, ("present", _GH_OK)))
+    assert b["remote"]["cmd"] == ["git", "-C", "/Users/me/code/x", "remote", "add", "origin",
+                                  "git@github.com:agenthangar/x.git"]
+    assert b["push"]["do"] == "run" and b["push"]["cmd"][-3:] == ["-u", "origin", "main"]
+    assert b["settings"]["do"] == "skip"
+
+
+def test_new_plan_resumes_after_failed_push(t_mod):
+    st = _new_state(exists=True, nonempty=True, is_repo=True, has_commits=True, branch="main",
+                    origin_url="git@github.com:agenthangar/x.git", has_origin_main=False)
+    b = _by(_plan(t_mod, st, ("present", _GH_OK)))
+    assert b["remote"]["do"] == "skip" and b["push"]["do"] == "run"
+
+
+def test_new_plan_origin_mismatch_warns_and_retargets(t_mod):
+    st = _new_state(exists=True, nonempty=True, is_repo=True, has_commits=True, branch="main",
+                    origin_url="https://github.com/chrisooob/x", has_origin_main=True)
+    b = _by(_plan(t_mod, st, ("present", _GH_HIVE)))
+    assert "chrisooob/x" in b["remote"]["warn"]
+    assert b["settings"]["cmd"][3] == "chrisooob/x"
+    assert b["host:mini"]["url"] == "https://github.com/chrisooob/x"
+
+
+def test_new_plan_all_done_is_all_skips(t_mod):
+    st = _new_state(exists=True, nonempty=True, is_repo=True, has_commits=True, branch="main",
+                    origin_url="git@github.com:agenthangar/x.git", has_origin_main=True)
+    steps = _plan(t_mod, st, ("present", _GH_OK), register=("skip", "already"), hosts=())
+    assert all(s["do"] == "skip" for s in steps)
+
+
+def test_new_plan_settings_drift_and_visibility_warn(t_mod):
+    st = _new_state(exists=True, nonempty=True, is_repo=True, has_commits=True, branch="main",
+                    origin_url="git@github.com:agenthangar/x.git", has_origin_main=True)
+    b = _by(_plan(t_mod, st, ("present", {**_GH_HIVE, "private": False})))
+    assert b["settings"]["do"] == "run" and "exists as public" in b["settings"]["warn"]
+
+
+def test_new_plan_error_cases(t_mod):
+    b = _by(_plan(t_mod, _new_state(exists=True, nonempty=True), ("absent", None)))
+    assert b["init"]["do"] == "error" and "not a git repo" in b["init"]["label"]
+    st = _new_state(exists=True, nonempty=True, is_repo=True, has_commits=True, branch="master")
+    assert "expected main" in _by(_plan(t_mod, st, ("absent", None)))["init"]["label"]
+    st = _new_state(exists=True, nonempty=True, is_repo=True, branch="master")
+    b = _by(_plan(t_mod, st, ("absent", None)))
+    assert b["init"]["do"] == "run" and b["init"]["cmd"][-2:] == ["HEAD", "refs/heads/main"]
+    b = _by(_plan(t_mod, _new_state(), ("error", "gh is not logged in")))
+    assert b["remote"]["do"] == "error" and b["settings"]["do"] == "error" and "push" not in b
+    st = _new_state(exists=True, nonempty=True, is_repo=True, has_commits=True, branch="main",
+                    origin_url="git@gitlab.com:o/x.git")
+    assert "not a github.com" in _by(_plan(t_mod, st, ("absent", None)))["remote"]["label"]
+    b = _by(_plan(t_mod, _new_state(), ("absent", None), register=("error", "alias taken")))
+    assert b["register"]["do"] == "error" and b["register"]["label"] == "alias taken"
+
+
+def test_new_ssh_argv_two_quoting_layers(t_mod):
+    argv = t_mod._new_ssh_argv("u@mini", "git@github.com:o/x.git", "x", "it's")
+    assert argv[:5] == ["ssh", "-o", "ConnectTimeout=5", "-o", "BatchMode=yes"]
+    assert argv[5] == "u@mini"
+    inner = t_mod.shlex.split(argv[6])
+    assert inner[:2] == ["zsh", "-lic"]
+    assert t_mod.shlex.split(inner[2]) == ["t", "new-land", "git@github.com:o/x.git", "x", "it's"]
+
+
+def test_new_host_outcome_classes(t_mod):
+    assert t_mod._new_host_outcome(255, "", "ssh: connect timed out") == ("unreachable", "")
+    assert t_mod._new_host_outcome(124, "", "timed out") == ("unreachable", "")
+    assert t_mod._new_host_outcome(2, "", "t: error: argument <verb>: invalid choice: 'new-land'") == ("stale", "")
+    assert t_mod._new_host_outcome(2, "", "usage: t new-land [-h] url name alias") == ("failed", "usage: t new-land [-h] url name alias")
+    assert t_mod._new_host_outcome(127, "", "zsh:1: command not found: t") == ("missing", "")
+    assert t_mod._new_host_outcome(0, "noise\nnew-land: cloned + registered\n", "") == ("ok", "cloned + registered")
+    assert t_mod._new_host_outcome(0, "", "") == ("ok", "done")
+    st, detail = t_mod._new_host_outcome(1, "", "a\n\nb\nc\nd\n")
+    assert st == "failed" and detail == "b / c / d"
+    assert t_mod._new_host_outcome(3, "", "") == ("failed", "rc 3")
+
+
+def test_new_host_line_texts(t_mod):
+    assert t_mod._new_host_line("mini", "ok", "cloned + registered", "x") == "✓ mini: cloned + registered"
+    assert "re-run `t new x`" in t_mod._new_host_line("mini", "unreachable", "", "x")
+    assert "run `dots` there" in t_mod._new_host_line("mini", "stale", "", "x")
+    assert "install.sh" in t_mod._new_host_line("mini", "missing", "", "x")
+    assert t_mod._new_host_line("mini", "failed", "boom", "x") == "⚠ mini: failed — boom"
+
+
+def test_new_land_plan_cases(t_mod, monkeypatch):
+    monkeypatch.setattr(t_mod, "HOME", "/Users/me")
+    url, path = "git@github.com:o/x.git", "/Users/me/code/x"
+    b = _by(t_mod._new_land_plan("x", "x", url, path, _new_state(), ("run", None)))
+    assert b["clone"]["cmd"] == ["git", "clone", "-q", url, path] and b["register"]["do"] == "run"
+    assert 'DEV_REPOS[x]="$HOME/code/x"' == b["register"]["label"]
+    st = _new_state(exists=True, nonempty=True, is_repo=True, origin_url="https://github.com/o/x")
+    assert _by(t_mod._new_land_plan("x", "x", url, path, st, ("skip", "already")))["clone"]["do"] == "skip"
+    st = _new_state(exists=True, nonempty=True, is_repo=True, origin_url="git@github.com:other/x.git")
+    assert "expected o/x" in _by(t_mod._new_land_plan("x", "x", url, path, st, ("run", None)))["clone"]["label"]
+    st = _new_state(exists=True, nonempty=True, is_repo=True)
+    assert _by(t_mod._new_land_plan("x", "x", url, path, st, ("run", None)))["clone"]["do"] == "error"
+    st = _new_state(exists=True, nonempty=True)
+    assert _by(t_mod._new_land_plan("x", "x", url, path, st, ("run", None)))["clone"]["do"] == "error"
+    st = _new_state(exists=True)
+    assert _by(t_mod._new_land_plan("x", "x", url, path, st, ("run", None)))["clone"]["do"] == "run"
+
+
+def test_new_land_summary_variants(t_mod):
+    mk = lambda c, r: [{"step": "clone", "do": c}, {"step": "register", "do": r}]
+    assert t_mod._new_land_summary(mk("run", "run")) == "cloned + registered"
+    assert t_mod._new_land_summary(mk("skip", "skip")) == "already set up"
+    assert t_mod._new_land_summary(mk("skip", "run")) == "clone present, registered"
+    assert t_mod._new_land_summary(mk("run", "skip")) == "cloned (alias already registered)"
+
+
+def test_new_render_prefixes(t_mod):
+    steps = [{"step": "init", "do": "run", "label": "git init", "warn": None},
+             {"step": "commit", "do": "skip", "label": "already", "warn": None},
+             {"step": "remote", "do": "error", "label": "nope", "warn": "careful"},
+             {"step": "host:mini", "do": "run", "label": "mini", "warn": None, "host": "mini"},
+             {"step": "host:oc", "do": "run", "label": "oc", "warn": None, "host": "oc"}]
+    lines = t_mod._new_render(steps, t_mod.Style())
+    assert lines == ["+ git init", "= already", "✗ nope", "  ⚠ careful", "→ mini, oc: clone + register"]
+
+
+def test_setup_hosts_trailer(t_mod):
+    assert t_mod._setup_hosts_trailer([]) is None
+    assert t_mod._setup_hosts_trailer([("mini", "u@m"), ("oc", "u@o")]) == \
+        "then clone + register the picked repos on: mini, oc"
+
+
+def test_setup_block_tool_header(t_mod, monkeypatch):
+    monkeypatch.setattr(t_mod, "HOME", "/Users/me")
+    block = t_mod._setup_block({"x": "/Users/me/code/x"}, {}, None, "2026-08-24", tool="t new")
+    assert block == "# ── added by `t new` (2026-08-24) ──\nDEV_REPOS[x]=\"$HOME/code/x\"\n"
 def test_port_is_live_sees_an_ipv6_only_listener(t_mod):
     # Vite without --host binds ONLY [::1] on modern macOS/Node; a 127.0.0.1 probe
     # called ff-12's live :5212 dead and the bar fell through to the shared :5173.

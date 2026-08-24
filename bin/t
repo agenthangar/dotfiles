@@ -1778,7 +1778,7 @@ def _todo_path(key):
 
 def _todo_key(cfg, cwd, tmux_name=None, override=None):
     """The list a given cwd belongs to. Ladder, most specific first:
-      1. an explicit -s override;
+      1. an explicit -s override (or the `<repo> [slot]` positionals, which become one);
       2. a per-session worktree — cfg.repo_of_dir gives (alias, slot) straight off the
          path, which is the normal case since Claude's Bash tool runs in the worktree;
       3. the tmux session name (dev-<repo>-<slot>) for a shared-tree / opt-out repo,
@@ -1916,6 +1916,37 @@ def _todo_slot_arg(rest):
     if len(rest) >= 2 and rest[0].isdigit():
         return (rest[0], rest[1:])
     return (None, rest)
+
+
+def _todo_repo_arg(action, rest, repos):
+    """Split a leading `<repo> [slot]` off the positionals -> (key, action, rest), the
+    `t <verb> <repo> [slot]` grammar every other slot verb speaks: `t todo ff add x`
+    files into ff's repo-level list, `t todo ff 3 add x` into ff-3, `t todo ff` views
+    the repo, `t todo ff-3 done 2` names a list outright. (None, action, rest) when
+    the first token is not a repo -- an ACTION name always wins, so a repo aliased
+    `add` could never shadow the verb (it just needs -s).
+
+    A bare number right after the repo is read as a SLOT, never as an item: that is
+    the grammar's slot position, and an item wants an action anyway -- `t todo ff 3 4`
+    still reaches item #4 of ff-3 through the bare-id path.
+
+    Pure -- the caller turns the key into the -s override."""
+    rest = list(rest or [])
+    if not action or action in _TODO_ACTIONS or action in _TODO_ALIASES \
+            or action in _TODO_RETIRED:
+        return (None, action, rest)
+    key = None
+    if action in repos:
+        key = action
+        if rest and rest[0].isdigit():
+            key, rest = "%s-%s" % (action, rest[0]), rest[1:]
+    else:
+        alias, dash, num = action.rpartition("-")
+        if dash and num.isdigit() and alias in repos:
+            key = action
+    if key is None:
+        return (None, action, rest)
+    return (key, rest[0] if rest else None, rest[1:])
 
 
 def _todo_apply(data, action, rest, now=None):
@@ -2509,10 +2540,28 @@ def cmd_todo(cfg, args):
             print("")
         return 0
 
+    # `t todo ff add …` / `t todo ff 3` — the `<repo> [slot]` positionals every other
+    # slot verb takes. They are sugar for -s: the key lands in args.slot and the real
+    # action shifts left, so nothing below has to know the list was named positionally.
+    target, action, rest = _todo_repo_arg(args.action, args.rest, cfg.repos)
+    if target:
+        if args.slot and args.slot != target:
+            print("t todo: -s %s and %s name different lists — drop one"
+                  % (args.slot, target), file=sys.stderr)
+            return 2
+        # Re-parse the shifted tail as `todo -s <key> …`: REMAINDER swallowed anything
+        # after the repo on the first pass, so `t todo ff -a` arrived with `-a` as the
+        # action. Flags already parsed ahead of the repo are kept; -h prints and exits.
+        tail = build_parser().parse_args(["todo", "-s", target]
+                                         + ([action] if action is not None else []) + rest)
+        for name in ("all", "all_slots", "json", "statusline", "items"):
+            setattr(args, name, getattr(args, name) or getattr(tail, name))
+        args.slot, args.action, args.rest = target, tail.action, tail.rest
+
     # `t todo add -h` must print help, not file an item called "-h". REMAINDER swallows
     # flags after the action, so the t() shim's -h check and argparse both miss it.
     # Only the FIRST token counts, so `t todo add fix the -h flag` still adds normally.
-    if args.rest and args.rest[0] in ("-h", "--help"):
+    if args.action in ("-h", "--help") or (args.rest and args.rest[0] in ("-h", "--help")):
         build_parser().parse_args(["todo", "--help"])   # prints, then SystemExit(0)
 
     width = _columns()
@@ -2534,7 +2583,12 @@ def cmd_todo(cfg, args):
     def scope():
         """Lists this invocation acts on, exactly the set the view shows: a slotless cwd
         widens DOWN to the repo's slots, a slot widens UP to its repo-level list. The
-        actions have to track the view either way, or you see an item you cannot touch."""
+        actions have to track the view either way, or you see an item you cannot touch.
+        An EXPLICITLY named list (-s, or the repo/slot positionals) is exactly that
+        list: the ambiguous-id error says "name one with -s", and naming one has to
+        actually narrow, or the advice is a dead end."""
+        if args.slot:
+            return [(key, data)]
         if key in cfg.repos:
             found = _todo_scoped(_todo_all_entries(), key, live_gate())
             if found:
@@ -2938,9 +2992,10 @@ Run `t <verb> -h` for a verb's own flags.""")
     sp = sub.add_parser("todo", help="a scratch task list scoped to this dev slot",
         description="""t todo — tasks for the slot you are standing in
 
-Usage: t todo [action] [args]
+Usage: t todo [repo [slot]] [action] [args]
 
   (no action)        show this slot's tasks
+  <repo> [slot]      another list, positionally: t todo ff add …  ·  t todo ff 3
   add <text…>        add a task
   done [id…]         tick off      — no id: pick from a list
   rm   [id…]         remove        — no id: pick from a list

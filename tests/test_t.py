@@ -1804,3 +1804,34 @@ def test_port_is_live_sees_an_ipv6_only_listener(t_mod):
     finally:
         srv.close()
     assert t_mod._port_is_live(port) is False
+
+
+def test_todo_ls_target_number_is_a_slot_of_the_cwd_repo(t_mod):
+    # `t todo ls 17` from the repo dir — the bug: the number was dropped and the whole
+    # repo rendered, so there was no way to see one slot.
+    assert t_mod._todo_ls_target("ff", {"ff": "/x/ff"}, ["17"]) == ("ff-17", None)
+
+
+def test_todo_ls_target_resolves_from_inside_a_sibling_slot(t_mod):
+    # From slot 15's worktree the key is ff-15; a number still means "slot N of ff".
+    assert t_mod._todo_ls_target("ff-15", {"ff": "/x/ff"}, ["17"]) == ("ff-17", None)
+
+
+def test_todo_ls_target_no_args_keeps_the_key(t_mod):
+    assert t_mod._todo_ls_target("ff-15", {"ff": "/x/ff"}, []) == ("ff-15", None)
+    assert t_mod._todo_ls_target("ff", {"ff": "/x/ff"}, None) == ("ff", None)
+
+
+def test_todo_ls_target_non_number_is_a_key_verbatim(t_mod):
+    # The positional twin of -s.
+    assert t_mod._todo_ls_target("ff", {"ff": "/x/ff"}, ["dotfiles-3"]) == ("dotfiles-3", None)
+
+
+def test_todo_ls_target_number_needs_a_repo(t_mod):
+    key, err = t_mod._todo_ls_target("scratch", {"ff": "/x/ff"}, ["17"])
+    assert key is None and "<repo>-17" in err
+
+
+def test_todo_ls_target_takes_one_token(t_mod):
+    key, err = t_mod._todo_ls_target("ff", {"ff": "/x/ff"}, ["17", "18"])
+    assert key is None and "one slot" in err

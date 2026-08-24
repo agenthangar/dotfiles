@@ -1900,6 +1900,80 @@ def _todo_canon(action):
     return _TODO_ALIASES.get(action, action)
 
 
+def _todo_options(p):
+    """The `t todo` flags. One table, two parsers: build_parser() puts them on the
+    subcommand, and _todo_hoist_flags() re-reads them out of `rest` — a second
+    hand-copied list would drift the moment a flag was added to one and not the other."""
+    p.add_argument("-a", "--all", action="store_true",
+                   help="show finished items too, and inactive slots from a repo dir")
+    p.add_argument("-A", "--all-slots", action="store_true",
+                   help="every slot's open items, grouped")
+    p.add_argument("-s", "--slot", metavar="KEY",
+                   help="target another list by key (e.g. dotfiles-3) instead of the cwd's")
+    # Working but off the everyday surface: the statusLine config and CLAUDE.md depend
+    # on these, nobody types them.
+    p.add_argument("--json", action="store_true", help=argparse.SUPPRESS)
+    p.add_argument("--statusline", action="store_true", help=argparse.SUPPRESS)
+    p.add_argument("-n", "--items", type=int, metavar="N", help=argparse.SUPPRESS)
+
+
+# Flags that take a value: when scanning `add` text for a leading run of flags, the
+# token after one of these is its argument, not the first word of the task.
+_TODO_VALUE_FLAGS = ("-s", "--slot", "-n", "--items")
+
+
+def _todo_flaggy(tok):
+    """A token the hoist lets argparse see as an option: dash-led and whitespace-free.
+    A quoted "-A literal" is ONE space-bearing token — argparse's short-option prefix
+    match runs BEFORE its "contains a space → positional" rule, so left to itself it
+    reads that as -A plus junk. Holding such tokens back makes quoting a real escape
+    hatch, whatever argparse version is installed."""
+    return tok.startswith("-") and len(tok) > 1 and not any(c.isspace() for c in tok)
+
+
+def _todo_hoist_flags(args):
+    """Lift the todo flags out of `rest`, where argparse's REMAINDER parks every token
+    that follows the action — flags included. `t todo ls -A` parsed as action=ls,
+    rest=['-A'], all_slots=False: the flag sat unread and the view answered as a plain
+    `t todo` would, which reads as "-A can't see all slots". Only flags BEFORE the
+    action were ever seen (`t todo -A ls`), a gh-style order nobody types.
+
+    For `add` only a LEADING run of flags is hoisted (`t todo add -s dot-3 fix it`),
+    because the text that follows is prose and a `-s` inside it is a word, not a flag
+    (`t todo add handle -s in t setup` must stay one task, not file "in t setup" into a
+    list called `in`). The other actions take ids, so a flag anywhere is a flag.
+    Quoting is still the escape hatch for a task whose FIRST word is dash-shaped."""
+    rest = list(args.rest or [])
+    if not any(_todo_flaggy(tok) for tok in rest):
+        return args
+    verbatim = []
+    # A `--` ends the flags. (One placed directly after the action never reaches us —
+    # argparse eats it as the REMAINDER delimiter — so for a task whose FIRST word is
+    # dash-shaped, quote it: `t todo add "-A literal"` is one space-bearing token, which
+    # argparse never reads as an option.)
+    if "--" in rest:
+        cut = rest.index("--")
+        rest, verbatim = rest[:cut], rest[cut + 1:]
+    p = argparse.ArgumentParser(add_help=False, allow_abbrev=False)
+    _todo_options(p)
+    if _todo_canon(args.action) == "add":
+        i = 0
+        while i < len(rest) and _todo_flaggy(rest[i]):
+            i += 2 if rest[i] in _TODO_VALUE_FLAGS else 1
+        head, tail = rest[:i], rest[i:]
+        found, extra = p.parse_known_args(head)
+        rest = extra + tail
+    else:
+        held = [tok for tok in rest if tok.startswith("-") and not _todo_flaggy(tok)]
+        found, rest = p.parse_known_args([tok for tok in rest if tok not in held])
+        rest += held
+    for name, val in vars(found).items():
+        if val not in (None, False):             # a flag that was actually given
+            setattr(args, name, val)
+    args.rest = rest + verbatim
+    return args
+
+
 def _todo_slot_arg(rest):
     """Split a leading bare slot number off an `add` -> ("11", ["fix","it"]) for
     `t todo add 11 fix the ledger`; (None, rest) when there is none.
@@ -2582,6 +2656,10 @@ def cmd_todo(cfg, args):
         for name in ("all", "all_slots", "json", "statusline", "items"):
             setattr(args, name, getattr(args, name) or getattr(tail, name))
         args.slot, args.action, args.rest = target, tail.action, tail.rest
+    # `t todo ls -A`: flags typed after the action live in rest. Deliberately AFTER the
+    # repo shift — the hoist's rule depends on the real action (`add` text is prose, ids
+    # are not), and the shift's re-parse parks after-action flags in rest all over again.
+    _todo_hoist_flags(args)
 
     # `t todo add -h` must print help, not file an item called "-h". REMAINDER swallows
     # flags after the action, so the t() shim's -h check and argparse both miss it.
@@ -3040,17 +3118,7 @@ machines. Finished tasks leave the view at once and are dropped after a week."""
         formatter_class=argparse.RawDescriptionHelpFormatter)
     sp.add_argument("action", nargs="?", help=argparse.SUPPRESS)
     sp.add_argument("rest", nargs=argparse.REMAINDER, help=argparse.SUPPRESS)
-    sp.add_argument("-a", "--all", action="store_true",
-                    help="show finished items too, and inactive slots from a repo dir")
-    sp.add_argument("-A", "--all-slots", action="store_true",
-                    help="every slot's open items, grouped")
-    sp.add_argument("-s", "--slot", metavar="KEY",
-                    help="target another list by key (e.g. dotfiles-3) instead of the cwd's")
-    # Working but off the everyday surface: the statusLine config and CLAUDE.md depend
-    # on these, nobody types them.
-    sp.add_argument("--json", action="store_true", help=argparse.SUPPRESS)
-    sp.add_argument("--statusline", action="store_true", help=argparse.SUPPRESS)
-    sp.add_argument("-n", "--items", type=int, metavar="N", help=argparse.SUPPRESS)
+    _todo_options(sp)
 
     # machine-readable / internal (hidden-ish; still have -h)
     sub.add_parser("session-rows", help="machine-readable per-host scan (remote contract)",

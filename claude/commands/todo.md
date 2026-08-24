@@ -1,6 +1,6 @@
 ---
 description: Show or edit this dev slot's task list
-argument-hint: "[add <text…> | done <id…> | rm <id…> | mv <id> <slot>]"
+argument-hint: "[add [repo [slot]] <text…> | done <id…> | rm <id…> | mv <id> <slot>]"
 allowed-tools: Bash(t todo:*)
 ---
 

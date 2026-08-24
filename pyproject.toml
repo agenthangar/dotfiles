@@ -26,6 +26,7 @@ exclude_lines = [
     "def cmd_",
     # bin/t subprocess / rendering / tty glue
     "def zsh_capture\\(",
+    "def _slot_rows\\(",
     "def _delegate\\(",
     "def _try_remote_delegate\\(",
     "def _set_term_title\\(",

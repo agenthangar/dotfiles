@@ -553,6 +553,17 @@ _dev_worktree_create() {
   if [[ -e "$wt/.git" ]]; then          # already materialized → reuse (idempotent)
     print -r -- "$wt"; return 0
   fi
+  # A dir with NO .git here is debris, never a worktree: the sweep removed the tree but
+  # a process still rooted in it (the slot's vite dev server, rewriting .vite/deps)
+  # recreated the path. `git worktree add` refuses a non-empty target, which used to
+  # fail this function and drop the session into the SHARED tree. Move it aside —
+  # nothing tracked can live in it, but nothing is deleted either.
+  if [[ -d $wt ]]; then
+    local debris="${wt}.debris-${EPOCHSECONDS}"
+    if mv "$wt" "$debris" 2>/dev/null; then
+      print -r -- "⚠ $wt existed without a worktree (leftover files, e.g. a dev server still running there) — moved to $debris" >&2
+    fi
+  fi
   git -C "$repodir" worktree prune 2>/dev/null    # clear any stale registration first
   git -C "$repodir" fetch -q origin 2>/dev/null   # refresh origin/main before branching
   if git -C "$repodir" show-ref --verify --quiet "refs/heads/$br"; then
@@ -566,21 +577,16 @@ _dev_worktree_create() {
   print -r -- "$wt"
 }
 
-# _dev_shared_tree_ok <repo> — may a session fall back to this repo's SHARED tree when
-# worktree creation failed? No, if that tree is the live surface. The canonical
-# dotfiles checkout is parked on `main` and IS what $HOME points at, so dropping a
-# session into it means editing live config on a protected branch — every save lands
-# in $HOME instantly and every commit targets main. `_dev_repo_prepare` already
-# refuses to switch its branch, but that does not stop the session cd'ing in and
-# editing. Better to fail loudly than to hand an agent the live tree.
-_dev_shared_tree_ok() {
-  local repodir="${DEV_REPOS[$1]}" live
-  [[ -n $repodir ]] || return 0
-  live=$(_dots_live_tree 2>/dev/null) || return 0
-  [[ -n $live && ${repodir:A} == ${live:A} ]] || return 0
-  print -r -- "✗ worktree setup failed for $1 — refusing to fall back to ${repodir}: it is the LIVE surface (\$HOME symlinks point there)." >&2
-  print -r -- "  retry, or clear a stale registration: git -C ${repodir} worktree prune" >&2
-  return 1
+# _dev_worktree_refuse <repo> <slot> — a worktree-enabled repo whose worktree could not
+# be created does NOT get a session in the shared tree. That fallback used to be a
+# one-line ↷ note scrolling past as the session started, and twice it parked an agent
+# in ~/code/financial-forecast on the old shared dev branch, committing there for hours
+# before anyone noticed (ff-12, ff-15). Failing loudly is cheaper than that.
+_dev_worktree_refuse() {
+  local repo="$1" slot="$2" repodir="${DEV_REPOS[$1]}"
+  print -r -- "✗ could not create the worktree for $repo $slot — refusing to start in the shared tree $repodir" >&2
+  print -r -- "  try: git -C $repodir worktree prune; git -C $repodir worktree add $(_dev_worktree_path "$repo" "$slot") -b $(_dev_worktree_branch "$repo" "$slot") origin/main" >&2
+  print -r -- "  (DEV_WORKTREE[$repo]=0 in ~/.zshrc.local opts this repo out of worktrees entirely)" >&2
 }
 
 # _dev_worktree_beam_push <wt> <host> — ON THE ORIGIN, carry the slot worktree's LIVE edits
@@ -926,6 +932,52 @@ _clawsync_periodic() {
 }
 add-zsh-hook precmd _clawsync_periodic
 
+# _dev_procs_rooted_in <dir> — pids of every process whose cwd is <dir> or below it,
+# minus shells and this process. The dev server a slot starts (`npm run dev` → vite)
+# is what this exists for: it is detached from the slot's tmux session, so it outlives
+# both `t kill` and the sweep, keeps serving the OLD code on the slot's port (the next
+# tenant of that slot number sees its URL in the statusline and trusts it), and
+# rewrites .vite/deps into the reaped path — the debris dir that blocked the next
+# `git worktree add`. Sixteen of them were found running, the oldest two weeks old.
+# Shells are excluded because a user's terminal sitting inside a dead slot is not a
+# leak; killing it would be. One lsof over the whole table (~0.25s) on macOS, /proc
+# on Linux — never a per-pid fork.
+_dev_procs_rooted_in() {
+  local dir="${1:A}" pid cwd comm line
+  [[ -n $dir && $dir != / ]] || return 1
+  local -a hits
+  if [[ -d /proc ]]; then
+    for pid in /proc/<->(N:t); do
+      cwd=$(readlink "/proc/$pid/cwd" 2>/dev/null) || continue
+      [[ $cwd == $dir || $cwd == $dir/* ]] && hits+=("$pid")
+    done
+  else
+    for line in "${(@f)$(lsof -a -d cwd -Fpn 2>/dev/null)}"; do   # p<pid> / fcwd / n<path>
+      case $line in
+        p*) pid=${line#p} ;;
+        n*) cwd=${line#n}; [[ $cwd == $dir || $cwd == $dir/* ]] && hits+=("$pid") ;;
+      esac
+    done
+  fi
+  for pid in $hits; do
+    [[ $pid == $$ || $pid == $PPID ]] && continue
+    comm=$(ps -o comm= -p "$pid" 2>/dev/null); comm=${comm:t}
+    case $comm in zsh|bash|sh|fish|dash|tmux|login|-*) continue ;; esac
+    print -r -- "$pid"
+  done
+}
+
+# _dev_stop_rooted <dir> [why] — SIGTERM every non-shell process rooted in <dir>
+# and print one summary line (nothing when there was nothing to stop).
+_dev_stop_rooted() {
+  local dir="$1" why="${2:-}" n=0 pid
+  for pid in $(_dev_procs_rooted_in "$dir"); do
+    kill -TERM "$pid" 2>/dev/null && (( n++ ))
+  done
+  (( n )) && print -r -- "stopped $n process(es) still rooted in $dir${why:+ ($why)}"
+  return 0
+}
+
 # Worktree sweep — reap per-session worktrees whose work has landed. A slot's worktree
 # + branch (dev/<basename>-<slot>) are removed only when ALL THREE hold: the tmux session
 # is dead (matched by session_path, never by name — dodges alias drift), the branch is
@@ -998,9 +1050,20 @@ _dev_worktree_sweep_run() {
     dirt=$(git -C "$wt" status --porcelain 2>/dev/null) || dirt='?'
     [[ -z $dirt ]] || continue
     print -r -- "[$(strftime '%F %T' $EPOCHSECONDS 2>/dev/null)] sweep: $wt (branch $br merged)"
+    # The slot's dev server first: left running it serves stale code on the slot's
+    # port and rewrites .vite/deps into the path we are about to remove.
+    _dev_stop_rooted "$wt" "reaped"
     git -C "$repodir" worktree remove --force "$wt" 2>/dev/null \
       && git -C "$repodir" branch -D "$br" 2>/dev/null
     git -C "$repodir" worktree prune 2>/dev/null
+  done
+  # Debris: a reaped path that _dev_worktree_create moved aside because a process
+  # still rooted there had recreated it. Nothing tracked can live in it (the remove
+  # above already cleared the tree), so once its processes are stopped it is cache.
+  for wt in $root/*/*.debris-<->(N/); do
+    print -r -- "[$(strftime '%F %T' $EPOCHSECONDS 2>/dev/null)] sweep: debris $wt"
+    _dev_stop_rooted "$wt" "debris"
+    rm -rf "$wt" 2>/dev/null
   done
 }
 _dev_worktree_sweep() {
@@ -1927,9 +1990,9 @@ _dev_session_rows() {
   # instead of two display-message forks per session, over the shared
   # _dev_ps_snapshot); pass 2 prints, after ONE _transcript_meta_batch has read
   # every title at once rather than forking python3 per slot.
-  local -a rows rowtx tpaths tx mrows f
-  local -A title_of
-  local s short sid psid dir state context summary i mr mrest
+  local -a rows rowtx tpaths tx mrows f _PR_STALE
+  local -A title_of pr_of _PR_SPAWNED
+  local s short sid psid dir state context summary i mr mrest REPLY
   _dev_ps_snapshot
   while IFS=$'\t' read -r s dir state; do
     [[ $s == dev-* && -n $dir ]] || continue
@@ -1966,6 +2029,7 @@ _dev_session_rows() {
     [[ -n $mr ]] || continue
     mrest=${mr#*$'\t'}                      # peeled, not split: an empty title must
     title_of[${mr%%$'\t'*}]=${mrest%%$'\t'*}  # not collapse the column away
+    pr_of[${mr%%$'\t'*}]=${mrest#*$'\t'}     # the batch already read the PR url
   done
 
   for (( i = 1; i <= $#rows; i++ )); do
@@ -1982,12 +2046,113 @@ _dev_session_rows() {
           summary=$(_dev_session_summary "dev-$short" "$dir" "$psid")
         fi
         [[ -n $summary ]] || summary='(untitled session)'
+        # " · #N <state>" for the session's PR — the same tag `t resume` renders,
+        # from the same cache, so a slot whose PR has landed says so where you
+        # actually look at slots. It rides on the summary instead of a column of
+        # its own because _transcript_meta_batch caps titles at 50 chars, leaving
+        # title+tag comfortably inside WORKING ON at any sane width — and because a
+        # dedicated column would sit empty for every slot that has not opened a PR
+        # yet, which is most of them. Only a row with a known transcript can carry
+        # one; the _dev_session_summary fallback below never resolved a URL.
+        if [[ ${rowtx[$i]} != - ]]; then _pr_state_tag "${pr_of[${rowtx[$i]}]:-}"; summary+=$REPLY; fi
         ;;
     esac
     printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$sid" "$dir" "$short" "$state" "$context" "$summary"
   done
   # plus any FOREGROUND (non-tmux) claudes on this machine, same row format.
   _dev_fg_rows
+  # Dead last, and stdio-detached inside: stdout here IS the row stream (and is an
+  # ssh pipe under `t ls -r`), so the refresh must not write a byte or hold it open.
+  _pr_state_flush
+}
+
+# _dev_dead_slot_rows <repo>… — the DEAD slots of these repos, in _dev_session_rows'
+# row format ("<sid>\t<worktree>\t<repo>-<n>\tdead\tnone\t<summary>"), so anything
+# that already renders live rows renders these with the same code. This is the
+# data half of the shared slot view (bin/t's _slot_line is the rendering half):
+# a picker that lists slots — `t todo add`'s destination list — shows a live slot
+# exactly as `t ls` does and a dead one with what `t resume` knows about it, instead
+# of a bare "worktree". A slot is dead when no live dev session is rooted at its
+# worktree (matched by PATH, never by name — alias drift) and no sibling-alias
+# session carries its name (that one is a live row already; listing it here too
+# would double it). summary = the slot's newest conversation title + its PR tag +
+# when it last ran, from the same _transcript_meta_batch cache `t resume` reads, so
+# a warm scan costs one python start. Recency = max(transcript mtime, opened stamp)
+# with ↻ when the stamp is newer, as in `t resume`; and like `t resume`, a
+# conversationless stub (open-then-exit: no title) is skipped — only the THREE most
+# recent transcripts per slot go to the batch, enough to get past a stub without
+# reading a busy slot's whole history on a cold cache. The slot set is discovered
+# (_dev_repo_slots), so a reaped slot with a saved conversation still lists — it is
+# still a place `t resume` can revive and a list can be filed against.
+_dev_dead_slot_rows() {
+  setopt local_options null_glob bare_glob_qual
+  local repo dir base n wt slot txf ep opf title when sid k s p re
+  local -a cand mpaths mrows mt
+  local -a slots                     # in discovery order, so the output is stable
+  local -A livepath livename meta_title meta_pr slot_wt slot_cands
+  local -a _PR_STALE; local -A _PR_SPAWNED; local REPLY mr mrest
+  local opdir="${XDG_CACHE_HOME:-$HOME/.cache}/claude-sessions/opened"
+  while IFS=$'\t' read -r s p; do
+    [[ $s == dev-* ]] || continue
+    livename[${s#dev-}]=1; [[ -n $p ]] && livepath[$p]=1
+  done < <(tmux list-sessions -F '#{session_name}'$'\t''#{session_path}' 2>/dev/null)
+  # Pass 1: find each dead slot's newest transcripts; collect them for ONE batch.
+  for repo in "$@"; do
+    dir=${DEV_REPOS[$repo]:-}; [[ -n $dir ]] || continue
+    base=${dir:t}
+    for n in ${(f)"$(_dev_repo_slots "$repo")"}; do
+      [[ $n == <-> ]] || continue
+      wt="$DEV_WORKTREE_ROOT/$base/$n"
+      [[ -n ${livepath[$wt]:-} ]] && continue
+      for k in ${(k)DEV_REPOS}; do
+        [[ ${DEV_REPOS[$k]} == $dir && -n ${livename[$k-$n]:-} ]] && continue 2
+      done
+      cand=()
+      for txf in "$HOME/.claude/projects/${wt//[^A-Za-z0-9]/-}"/*.jsonl; do
+        # zstat -A: no $(…) fork per file — a repo with 20 dead slots holds hundreds.
+        zstat -A mt +mtime "$txf" 2>/dev/null || continue
+        ep=$mt[1]; re=0
+        opf="$opdir/${${txf:t}%.jsonl}"
+        if [[ -f $opf ]] && zstat -A mt +mtime "$opf" 2>/dev/null && (( mt[1] > ep )); then
+          ep=$mt[1]; re=1
+        fi
+        cand+=("$ep"$'\t'"$re"$'\t'"$txf")
+      done
+      slot="$repo-$n"; slots+=("$slot"); slot_wt[$slot]=$wt
+      cand=(${(On)cand})                          # newest first, by the leading epoch
+      slot_cands[$slot]=${(pj:\n:)cand[1,3]}
+      for s in "${(@)cand[1,3]}"; do mpaths+=("${s##*$'\t'}"); done
+    done
+  done
+  (( $#slots )) || return 0
+  # Pass 2: one batched, cached metadata read (title + last PR URL) for all of them.
+  (( $#mpaths )) && mrows=("${(@f)$(_transcript_meta_batch "${(@)mpaths}")}")
+  for mr in "${(@)mrows}"; do
+    [[ -n $mr ]] || continue
+    mrest=${mr#*$'\t'}                      # peeled, not split: an empty title must
+    meta_title[${mr%%$'\t'*}]=${mrest%%$'\t'*}  # not collapse the column away
+    meta_pr[${mr%%$'\t'*}]=${mrest#*$'\t'}
+  done
+  # Pass 3: print, newest titled conversation per slot.
+  for slot in "${(@)slots}"; do
+    sid=-; title=
+    for s in "${(@f)slot_cands[$slot]}"; do
+      [[ -n $s ]] || continue
+      txf=${s##*$'\t'}
+      title=${meta_title[$txf]:-}
+      [[ -n $title ]] || continue           # conversationless stub — as `t resume` skips it
+      ep=${s%%$'\t'*}; re=${${s#*$'\t'}%%$'\t'*}
+      sid=${${txf:t}%.jsonl}
+      _pr_state_tag "${meta_pr[$txf]:-}"; title+=$REPLY
+      when=; (( ep )) && when=$(strftime '%b %d %H:%M' "$ep" 2>/dev/null)
+      [[ $re == 1 && -n $when ]] && when+=" ↻"
+      [[ -n $when ]] && title+=" · $when"
+      break
+    done
+    printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$sid" "$slot_wt[$slot]" "$slot" dead none \
+      "${title:-(no conversation)}"
+  done
+  _pr_state_flush
 }
 
 # _dev_rows_all — fan _dev_session_rows out over THIS machine + every $REMOTE_HOSTS
@@ -2124,7 +2289,14 @@ _dev_kill_one() {
       || { print; echo "Skipped $session."; return 1; }
     print
   fi
-  tmux kill-session -t "$session" 2>/dev/null && echo "Killed $session"
+  local path; path=$(tmux display-message -p -t "$session" '#{session_path}' 2>/dev/null)
+  tmux kill-session -t "$session" 2>/dev/null && echo "Killed $session" || return 1
+  # A slot's dev server is detached from its tmux session and would outlive it,
+  # serving the old code on the slot's port. Only a per-session worktree is swept
+  # this way — a shared tree's processes belong to everyone.
+  [[ -n $DEV_WORKTREE_ROOT && -n $path && $path == $DEV_WORKTREE_ROOT/* ]] \
+    && _dev_stop_rooted "$path"
+  return 0
 }
 
 # _dev_tmux_session_of_pid <pid> — print the tmux session <pid> runs inside (walk its
@@ -2599,7 +2771,7 @@ _t_dev() {
       fi
       local _wt; _wt="$(_dev_worktree_create "$repo" "$_wslot")"
       if [[ -n $_wt ]]; then dir="$_wt"; skip_prepare=1
-      else _dev_shared_tree_ok "$repo" || return 1; fi
+      else _dev_worktree_refuse "$repo" "$_wslot"; return 1; fi
     fi
     echo "Starting claude in $dir (no tmux)"
     cd "$dir" || return 1
@@ -2679,10 +2851,7 @@ _t_dev() {
     if _dev_worktree_enabled "$repo"; then
       local _wt; _wt="$(_dev_worktree_create "$repo" "$slot")"
       if [[ -n $_wt ]]; then dir="$_wt"; skip_prepare=1
-      else
-        _dev_shared_tree_ok "$repo" || return 1
-        echo "↷ worktree setup failed for $repo $slot — using shared tree $dir" >&2
-      fi
+      else _dev_worktree_refuse "$repo" "$slot"; return 1; fi
     fi
     echo "Starting $session in $dir (logging to $logfile)"
     _dev_new_session "$session" "$dir" "$branch" "$skip_prepare"
@@ -3382,6 +3551,69 @@ _pr_state_refresh() {
   done
 }
 
+# _pr_state_tag <pr-url> — the shared " · #N <state>" renderer behind the PR tag in
+# both `t resume` and `t ls`. Sets $REPLY to the tag for a transcript's last PR URL
+# (empty for an empty url), reading the pr/ cache ONLY — never a blocking gh call.
+#
+# It returns through REPLY rather than stdout for two reasons, and the first is a
+# correctness one: a `$(_pr_state_tag …)` caller would run this in a SUBSHELL, so
+# the $_PR_STALE appends below would mutate a copy and be thrown away — the batched
+# refresh would then never fire and every unknown row would stay "?" forever.
+# Second, it saves a fork per row, which is the cost `t ls` was just optimized to
+# avoid paying per session.
+#
+# Refs whose cached state is missing or stale are appended to the caller's
+# $_PR_STALE array rather than fetched here, so ONE batched _pr_state_refresh
+# covers a whole scan; the caller calls _pr_state_flush when the scan is done.
+# Callers must declare `local -a _PR_STALE` + `local -A _PR_SPAWNED` (dynamic
+# scoping puts the caller's copies in reach) so two scans never share state.
+#
+# Unknown renders "?" rather than a bare "#N": a blank state is indistinguishable
+# from "this session opened no PR", and the row you most want an answer about — the
+# newest one — is ALWAYS the uncached one, since its PR was created after the last
+# scan. Where gh cannot answer at all (the Linux node) it degrades to a bare "#N",
+# because "?" on every row is noise, not information.
+_pr_state_tag() {
+  local pru=$1
+  REPLY=
+  [[ -n $pru ]] || return 0
+  local prdir="${XDG_CACHE_HOME:-$HOME/.cache}/claude-sessions/pr"
+  local prp=${pru#github.com/}; prp=${prp/\/pull\//\/}
+  local prkey=${prp//\//#} prnum=${pru##*/}
+  local prcf="$prdir/$prkey" prraw= prst= prlab= prmt
+  if [[ -f $prcf ]]; then
+    prraw=$(<$prcf)
+    [[ $prraw == MERGED || $prraw == CLOSED || $prraw == OPEN ]] && prst=$prraw
+  fi
+  prlab=${prst:+${(L)prst}}
+  [[ -z $prlab ]] && command -v gh >/dev/null 2>&1 && prlab='?'
+  if [[ -z ${_PR_SPAWNED[$prkey]:-} ]]; then
+    prmt=$(zstat +mtime "$prcf" 2>/dev/null || echo 0)
+    if _pr_state_stale "$prraw" $(( prmt ? EPOCHSECONDS - prmt : 999999999 )); then
+      _PR_SPAWNED[$prkey]=1
+      _PR_STALE+=("${prp%/*}#$prnum")
+    fi
+  fi
+  REPLY=" · #$prnum${prlab:+ $prlab}"
+}
+
+# _pr_state_flush — spawn ONE detached, per-repo-batched refresh for everything
+# $_PR_STALE collected, then clear it. Two details are load-bearing, not tidy:
+#   `&!` (background AND disown) rather than a plain `&`, because the shortest-lived
+#   caller is the throwaway `zsh -lic` that bin/t runs _dev_session_rows in: it
+#   calls this LAST and exits immediately, and an interactive zsh HUPs its running
+#   jobs on exit, which would kill the refresh mid-`gh` and leave the state to be
+#   refetched on every single run.
+#   Stdio fully redirected, because that same stdout IS the machine-readable row
+#   stream, and an ssh pipe under `t ls -r`: a stray byte from a child would slide
+#   the table columns, and an inherited pipe would hold the connection open until
+#   gh finished.
+_pr_state_flush() {
+  (( ${#_PR_STALE} )) || return 0
+  _pr_state_refresh "${(@)_PR_STALE}" >/dev/null 2>&1 </dev/null &!
+  _PR_STALE=()
+}
+
 # _t_resume — the `t resume` verb: revive a DEAD dev slot's last conversation.
 # `t open` on a dead slot deliberately starts a FRESH claude (the worktree and its
 # uncommitted work are reused, but not the chat); this is the counterpart that brings
@@ -3574,24 +3806,21 @@ _t_resume() {
   # of the loops — an assignmentless `local x` re-run on an already-local x
   # does not redeclare, it PRINTS `x=value` (the `_ok=claw` junk-output bug).
   local -a cands slots tx
-  local -a pending _mpaths _mrows _mf prstale
+  local -a pending _mpaths _mrows _mf _PR_STALE
   local -A remote_live_host remote_live_alias remote_live_sum
   local -A meta_title meta_pr
   local _p _mr _mrest
   local n wt sid busy rhost _rdir _rbase _rhost _rn _ralias _rsum _ok _stale stale_path
   local txf title when ep org orgf hf skipped=0
-  local reopened opf opep pru prp prkey prnum prst prcf prmt prraw prlab
+  local reopened opf opep REPLY
   local _rwtr=${DEV_WORKTREE_ROOT:-}
   # The two picker signals shared with _claude_session_rows/tfind (see the
   # claude-stamp-tmux notes): opened/ = the last-opened stamps (recency =
-  # max(transcript, stamp), ↻ on stamp-newer rows); pr/ = the PR-state cache
-  # (cache-only reads — NEVER a blocking gh call — refreshed by ONE detached
-  # child per run, batched per repo, so state shows on the next invocation;
-  # the freshness policy lives in _pr_state_stale).
+  # max(transcript, stamp), ↻ on stamp-newer rows); the PR tag is _pr_state_tag,
+  # which owns the pr/ cache (cache-only reads — NEVER a blocking gh call) and
+  # collects stale refs into _PR_STALE for the one batched _pr_state_flush below.
   local opdir="${XDG_CACHE_HOME:-$HOME/.cache}/claude-sessions/opened"
-  local prdir="${XDG_CACHE_HOME:-$HOME/.cache}/claude-sessions/pr"
-  local -A _prspawned
-  local prgh=; command -v gh >/dev/null 2>&1 && prgh=1
+  local -A _PR_SPAWNED
   # Recency window (--days, default 30; 'all' disables) + this machine's short
   # hostname, to blank the origin column for locally-run conversations.
   local cutoff=0 selfhost=$(hostname -s 2>/dev/null)
@@ -3741,34 +3970,7 @@ _t_resume() {
     # the pr/ cache ONLY — never a blocking gh call — with the freshness policy in
     # _pr_state_stale and the (detached, per-repo batched) refetch fired once for
     # the whole scan below, so a new state shows on the next invocation.
-    pru=${meta_pr[$txf]:-}
-    if [[ -n $pru ]]; then
-      prp=${pru#github.com/}; prp=${prp/\/pull\//\/}
-      prkey=${prp//\//#}; prnum=${pru##*/}
-      prcf="$prdir/$prkey"; prraw=; prst=
-      if [[ -f $prcf ]]; then
-        prraw=$(<$prcf)
-        [[ $prraw == MERGED || $prraw == CLOSED || $prraw == OPEN ]] && prst=$prraw
-      fi
-      # An unknown state renders "?", never a bare "#N". A blank tag is
-      # indistinguishable from "this session opened no PR", and the row you most
-      # want an answer about — the newest one — is ALWAYS the uncached one (its PR
-      # was created after the last scan), so the tag that mattered most was
-      # precisely the one that silently said nothing.
-      prlab=${prst:+${(L)prst}}
-      # "?" only where gh could actually answer: on a host without it (the Linux
-      # node) every row would read "?" forever, which is noise, not information —
-      # there the tag degrades to the old bare "#N".
-      [[ -z $prlab && -n $prgh ]] && prlab='?'
-      title+=" · #$prnum${prlab:+ $prlab}"
-      if [[ -z ${_prspawned[$prkey]:-} ]]; then
-        prmt=$(zstat +mtime "$prcf" 2>/dev/null || echo 0)
-        if _pr_state_stale "$prraw" $(( prmt ? EPOCHSECONDS - prmt : 999999999 )); then
-          _prspawned[$prkey]=1
-          prstale+=("${prp%/*}#$prnum")
-        fi
-      fi
-    fi
+    _pr_state_tag "${meta_pr[$txf]:-}"; title+=$REPLY
     # Origin: which machine the conversation LAST RAN on — the <sid>.origin
     # stamp claude-stamp-tmux writes next to the transcript (syncs with it).
     # Blank for this machine / unstamped (pre-feature) transcripts; a raw
@@ -3786,7 +3988,7 @@ _t_resume() {
   # stale row: _pr_state_refresh batches the refs by repo, so a scan that turned up
   # six unknown PRs in one repo costs a single gh call rather than six. Still
   # strictly fire-and-forget — the render above already used the cache and is done.
-  (( $#prstale )) && ( _pr_state_refresh "${(@)prstale}" & ) 2>/dev/null
+  _pr_state_flush
 
   (( skipped )) && echo "(${skipped} older conversation(s) outside the last ${days}d hidden — t resume --days all shows them)" >&2
 

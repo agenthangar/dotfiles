@@ -20,6 +20,7 @@ shim in `.zshrc` for verbs that must run in your shell).
 | `t beam <repo> [slot] --host <h>` | Teleport a running session to another machine; pull one back with `t open … --here` |
 | `t find <query>` | Semantic search across saved sessions ("which one was working on X?"), reranked by Claude |
 | `t todo [add\|done\|rm] …` | A task list scoped to the slot you are in — bare to list, `t todo <id>` to act on one, `-A` for every slot. Also `/todo` inside Claude, and the statusline |
+| `t mcp` | The `sessions` MCP server Claude Code spawns, so any Claude session can answer "which session is/was working on X?" from every saved transcript, the live slots, and the todo lists. `--install` registers it (`dots` does), `--call <tool> '<json>'` runs one tool by hand |
 
 Run `t -h` for the full verb list.
 
@@ -131,8 +132,10 @@ MCP is two separate things:
 - **claude.ai connectors** (Gmail, Calendar, Drive, Canva, Hugging Face, …) are
   bound to your Anthropic account and sync automatically on login. Nothing to copy.
 - **Local/stdio MCP servers** live in `~/.claude.json`, a stateful file (OAuth
-  tokens, history) that is **not** symlinked. If you add one, sync it with a merge
-  step rather than committing `~/.claude.json`.
+  tokens, history) that is **not** symlinked and never committed. The one this repo
+  ships — `sessions`, i.e. `t mcp` — is registered by `install.sh`/`dots` through
+  `claude mcp add` (add-only; `DOTFILES_NO_MCP=1` opts a machine out). Any other
+  local server you add stays your own business.
 
 ## PII guard
 

@@ -578,7 +578,11 @@ _dev_worktree_create() {
     fi
   fi
   git -C "$repodir" worktree prune 2>/dev/null    # clear any stale registration first
-  git -C "$repodir" fetch -q origin 2>/dev/null   # refresh origin/main before branching
+  # --prune is load-bearing: without it a branch GitHub already deleted on merge lives on
+  # as a stale refs/remotes/origin/<br>, and the origin-only arm below would resurrect
+  # THAT — so the merged-corpse bug is not hive-only, it reaches every delete-on-merge
+  # repo whose remote-tracking refs were never pruned.
+  git -C "$repodir" fetch -q --prune origin 2>/dev/null   # refresh origin/* before branching
   # Which line does the slot start on? `fresh` unless a lingering branch still carries
   # unmerged work: a local one (kill-without-merge) is resumed, an origin-only one (a
   # slot pushed from another machine, or a beam) is checked out tracking origin.
@@ -628,7 +632,7 @@ _dev_worktree_freshen() {
   [[ $(git -C "$wt" symbolic-ref --short -q HEAD 2>/dev/null) == "$br" ]] || return 0   # detached / hand-switched → not ours to move
   local dirt; dirt=$(git -C "$wt" status --porcelain 2>/dev/null) || return 0
   [[ -z $dirt ]] || return 0
-  git -C "$repodir" fetch -q origin 2>/dev/null
+  git -C "$repodir" fetch -q --prune origin 2>/dev/null
   _dev_branch_merged "$repodir" "$br" || return 0
   local main_oid; main_oid=$(git -C "$repodir" rev-parse --verify -q refs/remotes/origin/main 2>/dev/null)
   [[ -n $main_oid ]] || return 0
@@ -656,6 +660,34 @@ _dev_worktree_drop_remote() {
   else
     print -r -- "  ⚠ couldn't delete origin/$br — the slot's first push may be rejected as non-fast-forward" >&2
   fi
+}
+
+# _dev_slot_fresh <repo> <n> — is slot <n> a FRESH start for a new task? The one rule
+# behind every "pick me a slot" path (`t open <repo>` with nothing to reattach, `--new`,
+# `--fg`), replacing three loops that each answered differently: the auto-pick counted
+# any slot with no tmux session as free — so a new task landed on a dead slot's parked
+# worktree, or on a lingering branch it then resumed — while `new`/`--fg` skipped a
+# worktree on disk but not a branch. Fresh means: no tmux session; and in worktree mode
+# no worktree on disk (parked or merely unreaped work — the sweep clears merged+clean
+# ones within ~10 min) and no lingering branch, local OR on origin, that still carries
+# UNMERGED work. A merged leftover is fresh: _dev_worktree_create drops it and cuts the
+# slot off origin/main, so counting it would only skip slot numbers forever in a repo
+# without delete-branch-on-merge (hive). Cheap→dear: tmux, a stat, two show-refs; the
+# gh call is paid only for a slot that actually has a lingering branch, and the drop
+# makes it a one-time cost per slot. Shared-tree repos have no per-slot branch, so a slot
+# there is fresh the moment its tmux name is free.
+_dev_slot_fresh() {
+  local repo="$1" n="$2"
+  tmux has-session -t "dev-${repo}-${n}" 2>/dev/null && return 1
+  _dev_worktree_enabled "$repo" || return 0
+  local repodir="${DEV_REPOS[$repo]}" wt br ref
+  wt="$(_dev_worktree_path "$repo" "$n")"; br="$(_dev_worktree_branch "$repo" "$n")"
+  [[ -e "$wt/.git" ]] && return 1
+  for ref in "refs/heads/$br" "refs/remotes/origin/$br"; do
+    git -C "$repodir" show-ref --verify --quiet "$ref" || continue
+    _dev_branch_merged "$repodir" "$br" "$ref" || return 1   # lingering line with unmerged work
+  done
+  return 0
 }
 
 # _dev_worktree_refuse <repo> <slot> — a worktree-enabled repo whose worktree could not
@@ -1264,19 +1296,14 @@ _t_paste() {
     return 1
   fi
 
-  # no slot → pick the next FREE slot, so the default is always a fresh session
+  # no slot → the next FRESH slot (_dev_slot_fresh: no session, no worktree on disk, no
+  # lingering unmerged branch — the same rule `t open` uses), so the default is always
+  # a genuinely fresh session, never a dead slot's parked work. Unbounded like `t open
+  # --new`: slot numbers grow past 20 in practice, and a cap here read as "all in use".
   if [[ -z "$slot" ]]; then
     local n=1
-    while (( n <= 20 )); do
-      if ! tmux has-session -t "dev-${repo}-${n}" 2>/dev/null; then
-        slot=$n; break
-      fi
-      (( n++ ))
-    done
-    if [[ -z "$slot" ]]; then
-      echo "All 20 slots for '$repo' are in use."
-      return 1
-    fi
+    while ! _dev_slot_fresh "$repo" "$n"; do (( n++ )); done
+    slot=$n
   fi
 
   local session="dev-${repo}-${slot}"
@@ -2854,15 +2881,15 @@ _t_dev() {
       return
     fi
     # Fresh inline claude. In worktree mode give it an isolated worktree too, keyed
-    # to a slot number (the named one, else the next free) so it can't collide with a
-    # tmux slot's worktree; on failure/opt-out fall back to the shared tree + prepare.
+    # to a slot number (the named one, else the next FRESH one — _dev_slot_fresh) so it
+    # can't collide with a tmux slot's worktree or land on parked work; on failure/opt-out
+    # fall back to the shared tree + prepare.
     local skip_prepare=
     if _dev_worktree_enabled "$repo"; then
       local _wslot="$slot"
       if [[ -z $_wslot || $_wslot == new ]]; then
         _wslot=1
-        while tmux has-session -t "dev-${repo}-${_wslot}" 2>/dev/null \
-              || [[ -e "$(_dev_worktree_path "$repo" "$_wslot")/.git" ]]; do (( _wslot++ )); done
+        while ! _dev_slot_fresh "$repo" "$_wslot"; do (( _wslot++ )); done
       fi
       local _wt; _wt="$(_dev_worktree_create "$repo" "$_wslot")"
       if [[ -n $_wt ]]; then dir="$_wt"; skip_prepare=1
@@ -2876,33 +2903,31 @@ _t_dev() {
   fi
 
   # `dev <repo> new` — force the next never-used slot (skip reattaching to an
-  # existing unattached session); always spins up a fresh Claude. In worktree mode
-  # also skip slots whose worktree dir still exists on disk (e.g. kill-without-merge
-  # left dev/<basename>-<n> behind): _dev_worktree_create is idempotent and would
-  # REUSE that tree + branch, contradicting `new`. Mirrors the --fg path's check.
+  # existing unattached session); always spins up a fresh Claude. "Never-used" is
+  # _dev_slot_fresh's rule — no session, no worktree on disk, no lingering unmerged
+  # branch — the same one the auto-pick and --fg use.
   if [[ "$slot" == new ]]; then
     local n=1
-    if _dev_worktree_enabled "$repo"; then
-      while tmux has-session -t "dev-${repo}-${n}" 2>/dev/null \
-            || [[ -e "$(_dev_worktree_path "$repo" "$n")/.git" ]]; do (( n++ )); done
-    else
-      while tmux has-session -t "dev-${repo}-${n}" 2>/dev/null; do (( n++ )); done
-    fi
+    while ! _dev_slot_fresh "$repo" "$n"; do (( n++ )); done
     slot=$n
   fi
 
   # auto-pick slot: REATTACH to the lowest-numbered existing-but-unattached
-  # session before ever spawning a fresh one. A free *gap* (e.g. slot 1 was
-  # killed, leaving 2 live) is only a fallback — so `t open <repo>` lands on the
-  # session that's actually there (slot 2) instead of creating a new slot 1.
-  # Bounded scan (free is a non-breaking fallback now, so `while true` would
-  # spin past the highest slot forever); 20 matches the cap `t paste`/`t kill` use.
+  # session before ever spawning a fresh one — so `t open <repo>` lands on the
+  # session that's actually there (a detached slot 2) instead of minting slot 1.
+  # Nothing to reattach → the lowest FRESH slot (_dev_slot_fresh): a gap with no
+  # session is not enough — a dead slot's worktree or lingering unmerged branch is
+  # parked work, and a new task must never start on it (it used to: a bare
+  # `t open hive` reused slot 4, whose merged branch was then resurrected 42
+  # commits behind main). Bounded scan (fresh is a non-breaking fallback, so
+  # `while true` would spin past the highest slot forever); 20 matches the cap
+  # `t kill` uses.
   if [[ -z "$slot" ]]; then
     local n=1 free=
     while (( n <= 20 )); do
       local sname="dev-${repo}-${n}"
       if ! tmux has-session -t "$sname" 2>/dev/null; then
-        [[ -z $free ]] && free=$n                                  # first free gap → fallback
+        [[ -z $free ]] && _dev_slot_fresh "$repo" "$n" && free=$n  # lowest fresh slot → fallback
       elif ! tmux list-clients -t "$sname" 2>/dev/null | grep -q .; then
         slot=$n; break                                            # existing + unattached → reattach (wins)
       fi
@@ -2910,17 +2935,18 @@ _t_dev() {
     done
     if [[ -z $slot ]]; then
       if [[ -n $free ]]; then
-        slot=$free                                                 # nothing to reattach → first free gap
+        slot=$free                                                 # nothing to reattach → lowest fresh slot
       else
-        # all 1..20 live → keep scanning unbounded, still preferring an
+        # nothing fresh in 1..20 → keep scanning unbounded, still preferring an
         # existing-but-unattached session above 20 over a fresh slot.
-        while tmux has-session -t "dev-${repo}-${n}" 2>/dev/null; do
-          if ! tmux list-clients -t "dev-${repo}-${n}" 2>/dev/null | grep -q .; then
+        while ! _dev_slot_fresh "$repo" "$n"; do
+          if tmux has-session -t "dev-${repo}-${n}" 2>/dev/null \
+             && ! tmux list-clients -t "dev-${repo}-${n}" 2>/dev/null | grep -q .; then
             slot=$n; break
           fi
           (( n++ ))
         done
-        [[ -z $slot ]] && slot=$n                                  # nothing to reattach → next never-used slot
+        [[ -z $slot ]] && slot=$n                                  # nothing to reattach → next fresh slot
       fi
     fi
   fi

@@ -209,6 +209,51 @@ def _truncate(s, avail):
     return s
 
 
+_ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
+
+
+def _vis_len(s):
+    """Columns a styled line takes on screen: its length with the SGR escapes out."""
+    return len(_ANSI_RE.sub("", s))
+
+
+def _term_rows(line, cols):
+    """Screen rows a printed line occupies — a line wider than the terminal WRAPS,
+    and the in-place repaint moves the cursor up by rows, not by lines. Counting
+    lines was exactly right on a wide terminal and off by one per wrapped line on
+    a phone (Termius: ~44 columns), where every keypress left a stale row behind
+    and the block crept down the screen."""
+    return max(1, -(-_vis_len(line) // max(1, cols)))
+
+
+def _page_window(heights, top, avail):
+    """Which lines of a block fit on screen: heights = rows per line, top = the first
+    line wanted, avail = rows the block may take INCLUDING its markers. → (lo, hi):
+    show lines[lo:hi], with an "… N above" row when lo > 0 and an "… N below" row
+    when hi < len. top is clamped so the block never scrolls past its own end, and
+    at least one line is always shown even when it alone overflows."""
+    n = len(heights)
+    if n == 0 or sum(heights) <= avail:
+        return 0, n
+
+    def extent(lo):
+        room = avail - (1 if lo else 0)
+        used, hi = 0, lo
+        while hi < n:
+            need = heights[hi] + (0 if hi + 1 == n else 1)
+            if used + need > room and hi > lo:
+                break
+            used += heights[hi]
+            hi += 1
+            if used > room:
+                break
+        return hi
+
+    last_top = next((lo for lo in range(n) if extent(lo) == n), n - 1)
+    lo = max(0, min(top, last_top))
+    return lo, extent(lo)
+
+
 def _parse_rows(text, host_prefixed=False):
     """Parse _dev_session_rows / _dev_rows_all output into dicts."""
     rows = []
@@ -1031,14 +1076,16 @@ def _pick_inline(title, rows, multi=False):
             lines.append("%s│%s %s%s%s%s%s" % (st.y, st.r, paint_on, sel, box, body, st.r))
         if hi < len(rows):
             lines.append("%s│%s   … %d more" % (st.y, st.r, len(rows) - hi))
-        keys = "↑↓ move · space mark · enter pick · q cancel" if multi \
-            else "↑↓ move · enter pick · q cancel"
+        keys = "↑↓/jk move · space mark · enter pick · q cancel" if multi \
+            else "↑↓/jk move · enter pick · q cancel"
         lines.append("%s└%s %s%s%s" % (st.y, st.r, st.y, keys, st.r))
         if painted[0]:
             out.write("\x1b[%dA\r\x1b[J" % painted[0])
         out.write("\n".join(lines) + "\n")
         out.flush()
-        painted[0] = len(lines)
+        # erase by screen ROWS next time: the title / keys line wraps on a phone
+        cols = shutil.get_terminal_size((80, 24)).columns
+        painted[0] = sum(_term_rows(ln, cols) for ln in lines)
 
     try:
         tty.setcbreak(fd)
@@ -1082,7 +1129,25 @@ class _RailUI:
         self.old_attrs = termios.tcgetattr(self.fd)
         self.rail = f"{self.st.y}│{self.st.r}"
         self.width = max(40, shutil.get_terminal_size((100, 24)).columns)
-        self.painted = [0]   # lines of the block currently on screen (0 = nothing to erase)
+        self.painted = [0]   # screen ROWS of the block currently on screen (0 = nothing to erase)
+
+    def cols(self):
+        # re-read per paint: a phone rotates, a window resizes, mid-wizard
+        return max(20, shutil.get_terminal_size((100, 24)).columns)
+
+    def lines(self):
+        return max(8, shutil.get_terminal_size((100, 24)).lines)
+
+    def head(self, label, hint, marker=None):
+        """The ◆ step line(s): the key hint rides on the label when the terminal is
+        wide enough and drops to a rail line of its own when it is not (a phone),
+        so the picker stays compact where it can and readable where it cannot."""
+        st = self.st
+        mark = marker or f"{st.c}◆{st.r}"
+        one = f"{mark}  {st.b}{label}{st.r}  {st.y}{hint}{st.r}"
+        if not hint or _vis_len(one) <= self.cols():
+            return [one if hint else f"{mark}  {st.b}{label}{st.r}"]
+        return [f"{mark}  {st.b}{label}{st.r}", f"{self.rail}  {st.y}{hint}{st.r}"]
 
     def raw(self):
         import tty
@@ -1139,14 +1204,19 @@ class _RailUI:
             tty.setcbreak(self.fd)
             self.out.write("\x1b[?25l")
             self.out.flush()
-        self.out.write("\x1b[1A\r\x1b[J")   # reclaim the input line for the repaint
+        # reclaim the input line for the repaint — every row it wrapped onto
+        self.out.write(f"\x1b[{_term_rows(prompt + s, self.cols())}A\r\x1b[J")
         return s or default
 
     def repaint(self, lines):
+        """Erase the block painted last time and draw this one in its place. The
+        erase is cursor-up by the ROWS the old block occupied (_term_rows — a line
+        wider than the terminal wraps), never by its line count."""
         if self.painted[0]:
             self.out.write(f"\x1b[{self.painted[0]}A\r\x1b[J")
         self.out.write("\n".join(lines) + "\n")
-        self.painted[0] = len(lines)
+        cols = self.cols()
+        self.painted[0] = sum(_term_rows(ln, cols) for ln in lines)
         self.out.flush()
 
     def commit(self, lines):
@@ -1167,19 +1237,24 @@ class _RailUI:
         st, rail = self.st, self.rail
         cur = max(0, min(default or 0, len(rows) - 1))
         marks = set(marked or ())
-        height = max(4, shutil.get_terminal_size((100, 24)).lines - 8)
-        keys = ("↑↓ move · space mark · enter pick · q quit" if multi
-                else "↑↓ move · enter pick · q quit")
+        # j/k are advertised on purpose: a phone keyboard has no arrow keys
+        keys = ("↑↓/jk move · space mark · enter pick · q quit" if multi
+                else "↑↓/jk move · enter pick · q quit")
+        flash = ""
         while True:
+            head = self.head(label, flash or keys)
+            flash = ""
+            height = max(3, self.lines() - 7 - len(head))
             lo = max(0, min(cur - height // 2, len(rows) - height)) if len(rows) > height else 0
             hi = min(len(rows), lo + height)
-            lines = [f"{st.c}◆{st.r}  {st.b}{label}{st.r}  {st.y}{keys}{st.r}"]
+            lines = list(head)
             if lo:
                 lines.append(f"{rail}   {st.y}… {lo} above{st.r}")
+            width = self.cols()
             for n in range(lo, hi):
                 pre = f"{st.c}▸{st.r}" if n == cur else " "
                 box = (f"{st.c}◼{st.r} " if n in marks else "◻ ") if multi else ""
-                body = _truncate(rows[n][1], max(20, self.width - 10))
+                body = _truncate(rows[n][1], max(12, width - 8))
                 body = f"{st.b}{body}{st.r}" if n == cur else body
                 lines.append(f"{rail}  {pre}{box}{body}")
             if hi < len(rows):
@@ -1197,6 +1272,51 @@ class _RailUI:
                 return [rows[i][0] for i in sorted(marks)] if multi else rows[cur][0]
             elif k in ("q", "esc", "abort"):
                 return None
+            else:
+                # a key that does nothing must SAY so — a silent no-op reads as broken
+                flash = f"⚠ no binding for that key — {keys}"
+
+    def page(self, label, body, accept, keys=""):
+        """A read-only block under a ◆ step (the review screens), windowed to the
+        terminal and scrolled in place with ↑↓/jk (space = a screenful) when taller
+        than it; a key in `accept` returns it. Rows are counted through _term_rows,
+        so a review whose command lines wrap on a phone keeps its head — and the
+        y/n/q hint — on screen instead of pushing them off the top with no way back."""
+        st, rail = self.st, self.rail
+        scroll_hint = f"↑↓/jk scroll · {keys}" if keys else "↑↓/jk scroll"
+        top, flash = 0, ""
+        while True:
+            cols, lines = self.cols(), self.lines()
+            heights = [_term_rows(ln, cols) for ln in body]
+
+            def window(hint):
+                head = self.head(label, hint)
+                avail = max(3, lines - 2 - sum(_term_rows(h, cols) for h in head))
+                return head, _page_window(heights, top, avail)
+
+            head, (lo, hi) = window(flash or keys)
+            scrolls = (lo, hi) != (0, len(body))
+            if scrolls and not flash:
+                head, (lo, hi) = window(scroll_hint)
+            flash, top = "", lo
+            out = list(head)
+            if lo:
+                out.append(f"{rail}   {st.y}… {lo} above{st.r}")
+            out.extend(body[lo:hi])
+            if hi < len(body):
+                out.append(f"{rail}   {st.y}… {len(body) - hi} below{st.r}")
+            self.repaint(out)
+            k = self.read_key()
+            if k in accept:
+                return k
+            if k in ("up", "k"):
+                top = max(0, top - 1)
+            elif k in ("down", "j"):
+                top += 1
+            elif k == "space":
+                top += max(1, hi - lo - 1)
+            else:
+                flash = f"⚠ no binding for that key — {scroll_hint if scrolls else keys}"
 
 
 def _setup_wizard(items, taken, trailer=None):
@@ -1212,7 +1332,7 @@ def _setup_wizard(items, taken, trailer=None):
     unavailable → _setup_prompt_flow."""
     ui = _RailUI()
     st, out, rail, width = ui.st, ui.out, ui.rail, ui.width
-    read_key, cooked_input, repaint, painted = ui.read_key, ui.cooked_input, ui.repaint, ui.painted
+    read_key, cooked_input, repaint = ui.read_key, ui.cooked_input, ui.repaint
 
     def used_aliases(skip=None):
         return taken | {it["alias"] for it in items
@@ -1250,8 +1370,9 @@ def _setup_wizard(items, taken, trailer=None):
             aw = max([len(items[i]["alias"]) for i in sel
                       if items[i].get("kind") != "addhost"] +
                      [len(x["alias"]) for x in items if x["t"] == "locked"] + [1])
-            disp = [(f"{st.c}◆{st.r}  {st.b}pick what to add{st.r}  "
-                     f"{st.y}{msg or HINTS}{st.r}", None)]
+            head = ui.head("pick what to add", msg or HINTS)
+            nh = len(head)   # 1, or 2 when the hint dropped to its own rail line
+            disp = [(h, None) for h in head]
             for idx, it in enumerate(items):
                 if it["t"] == "spacer":
                     disp.append((rail, None))
@@ -1262,15 +1383,15 @@ def _setup_wizard(items, taken, trailer=None):
                 else:
                     disp.append((row_text(it, aw, idx == cur), idx))
             # window the list when taller than the terminal, cursor kept visible
-            body = max(6, shutil.get_terminal_size((100, 24)).lines - 3)
+            body = max(6, ui.lines() - 2 - nh)
             if len(disp) > body:
-                cur_line = next((n for n, d in enumerate(disp) if d[1] == cur), 1)
-                lo = max(1, min(cur_line - body // 2, len(disp) - (body - 1)))
-                lines = [disp[0][0]] + [d[0] for d in disp[lo:lo + body - 1]]
-                if lo > 1:
-                    lines[1] = f"{rail}  {st.y}… {lo - 1} more above{st.r}"
-                if lo + body - 1 < len(disp):
-                    lines[-1] = f"{rail}  {st.y}… {len(disp) - (lo + body - 1)} more below{st.r}"
+                cur_line = next((n for n, d in enumerate(disp) if d[1] == cur), nh)
+                lo = max(nh, min(cur_line - body // 2, len(disp) - (body - nh)))
+                lines = [d[0] for d in disp[:nh]] + [d[0] for d in disp[lo:lo + body - nh]]
+                if lo > nh:
+                    lines[nh] = f"{rail}  {st.y}… {lo - nh} more above{st.r}"
+                if lo + body - nh < len(disp):
+                    lines[-1] = f"{rail}  {st.y}… {len(disp) - (lo + body - nh)} more below{st.r}"
             else:
                 lines = [d[0] for d in disp]
             repaint(lines)
@@ -1322,8 +1443,7 @@ def _setup_wizard(items, taken, trailer=None):
         repos, hosts, tbeam, stale_ok = _setup_result(items)
         if not (repos or hosts or tbeam or stale_ok):
             return "empty"
-        lines = [f"{st.c}◆{st.r}  {st.b}review — changes to ~/.zshrc.local{st.r}  "
-                 f"{st.y}y apply · n back · q quit{st.r}"]
+        lines = []
         for ln in _setup_block(repos, hosts, tbeam, time.strftime("%Y-%m-%d")).splitlines():
             shown = f"{st.y}{ln}{st.r}" if ln.startswith("#") else ln
             lines.append(f"{rail}  {st.g}+{st.r} {shown}")
@@ -1332,18 +1452,14 @@ def _setup_wizard(items, taken, trailer=None):
             lines.append(f"{rail}  {st.y}~ comment out stale entries: {sv}{st.r}")
         if trailer and repos:
             lines.append(f"{rail}  {st.c}→{st.r} {st.y}{trailer}{st.r}")
-        repaint(lines)
-        while True:
-            k = read_key()
-            if k == "y":
-                lines[0] = f"{st.g}◇{st.r}  {st.b}applied to ~/.zshrc.local{st.r}"
-                repaint(lines)
-                painted[0] = 0
-                return True
-            if k in ("n", "esc"):
-                return False
-            if k in ("q", "abort"):
-                return None
+        k = ui.page("review — changes to ~/.zshrc.local", lines,
+                    accept=("y", "n", "esc", "q", "abort"), keys="y apply · n back · q quit")
+        if k == "y":
+            ui.commit([f"{st.g}◇{st.r}  {st.b}applied to ~/.zshrc.local{st.r}"] + lines)
+            return True
+        if k in ("n", "esc"):
+            return False
+        return None
 
     out.write(f"{st.y}┌{st.r}  {st.b}t setup{st.r} {st.y}· ~/.zshrc.local — nothing "
               f"is written until you confirm{st.r}\n{rail}\n")
@@ -2109,27 +2225,23 @@ def _new_wizard(cfg, answers, ctx):
                             "alias": alias, "hosts": [h for h, _ in hosts]})
             steps = _new_plan(name, alias, owner, private, path, state, gh, register, hosts)
             errs = [s for s in steps if s["do"] == "error"]
-            head = (f"{st.c}◆{st.r}  {st.b}review — what will run{st.r}  "
-                    f"{st.y}y apply · n back · q quit{st.r}")
-            lines = [head] + [f"{rail}  {ln}" for ln in _new_render(steps, st)]
+            body = [f"{rail}  {ln}" for ln in _new_render(steps, st)]
             if errs:
-                lines[0] = f"{st.b}✗{st.r}  {st.b}review — cannot continue{st.r}"
-                ui.commit(lines)
+                ui.commit([f"{st.b}✗{st.r}  {st.b}review — cannot continue{st.r}"] + body)
                 result = (steps, answers)
                 return result
-            ui.repaint(lines)
-            while True:
-                k = ui.read_key()
-                if k == "y":
-                    lines[0] = f"{st.g}◇{st.r}  {st.b}review{st.r}"
-                    ui.commit(lines)
-                    result = (steps, answers)
-                    return result
-                if k in ("n", "esc"):
-                    ui.commit([f"{rail}  {st.y}↶ back — from the owner step{st.r}"])
-                    break
-                if k in ("q", "abort"):
-                    return None
+            # windowed + scrollable: on a phone the argv lines wrap and the whole
+            # plan is taller than the screen — the y/n/q hint must stay reachable
+            k = ui.page("review — what will run", body, accept=("y", "n", "esc", "q", "abort"),
+                        keys="y apply · n back · q quit")
+            if k == "y":
+                ui.commit([f"{st.g}◇{st.r}  {st.b}review{st.r}"] + body)
+                result = (steps, answers)
+                return result
+            if k in ("n", "esc"):
+                ui.commit([f"{rail}  {st.y}↶ back — from the owner step{st.r}"])
+                continue
+            return None
     except KeyboardInterrupt:
         return None
     finally:

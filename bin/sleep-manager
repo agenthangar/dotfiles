@@ -93,8 +93,9 @@ disable_sleep() {
     # Belt and suspenders, matching the user's ~/.zshrc nosleep style:
     #   1. pmset disablesleep 1 — the strongest macOS setting (survives logout)
     #   2. caffeinate -dimsu     — process assertion as a second layer
-    # Unlike the interactive zshrc version, this runs caffeinate in the
-    # background and records its PID so `enable` can stop it later.
+    # Unlike the interactive zshrc version — which lets go on its own once no
+    # local claude is working or the network is down — this holds unconditionally
+    # and records the caffeinate PID so `enable` can stop it later.
     if [[ -f "$CAFFEINATE_PIDFILE" ]] && kill -0 "$(cat "$CAFFEINATE_PIDFILE")" 2>/dev/null; then
         echo "Sleep is already disabled (caffeinate pid $(cat "$CAFFEINATE_PIDFILE"))."
         exit 0

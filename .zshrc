@@ -157,13 +157,108 @@ prview() {
   '
 }
 
-# nosleep — keep the Mac awake until Ctrl-C (interactive)
+# nosleep — keep the Mac awake while Claude is working and the network is up
 #
-# Usage: nosleep
+# Usage: nosleep [-f|--forever] [--grace <secs>] [--every <secs>]
 #
-# Blocks sleep via `pmset disablesleep 1` + a foreground caffeinate, restoring on
-# exit/Ctrl-C. For a backgrounded, persistent block use `sleep-manager` instead.
-nosleep() { [[ "$1" == -h || "$1" == --help ]] && { _help_for nosleep; return 0; }; trap 'sudo pmset -a disablesleep 0' EXIT INT; sudo pmset -a disablesleep 1 && caffeinate -dimsu; }
+# Options:
+#   -f, --forever    hold sleep off until Ctrl-C, unconditionally (the old behaviour)
+#   --grace <secs>   how long a signal may be absent before nosleep lets go (default 300)
+#   --every <secs>   how often the two signals are re-checked (default 30)
+#
+# Blocks sleep via `pmset disablesleep 1` + a background caffeinate, then keeps
+# holding only while BOTH signals stay fresh: internet (an HTTPS exchange with
+# api.anthropic.com) and tokens burning (a live local claude whose transcript was
+# written recently). Once either has been missing for the grace window it restores
+# sleep and exits — so a Claude run that finishes, or a network that drops, lets
+# the Mac sleep on its own instead of holding it awake until you remember Ctrl-C.
+# For a persistent, unconditional block use `sleep-manager disable` instead.
+nosleep() {
+  [[ "$1" == -h || "$1" == --help ]] && { _help_for nosleep; return 0; }
+  local forever=0 grace=300 every=30
+  while (( $# )); do
+    case $1 in
+      -f|--forever) forever=1 ;;
+      --grace) grace=${2:-}; shift ;;
+      --every) every=${2:-}; shift ;;
+      *) echo "nosleep: unknown option '$1' (see nosleep -h)" >&2; return 2 ;;
+    esac
+    shift
+  done
+  [[ $grace == <-> && $every == <-> && $every -gt 0 ]] || { echo "nosleep: --grace/--every take a number of seconds" >&2; return 2; }
+
+  # Teardown is idempotent: it runs from the INT trap, the EXIT trap (zsh scopes a
+  # function's EXIT trap to the function, so it fires on every return path), and
+  # the let-go branch below — whichever gets there first does the work. Its state
+  # is GLOBAL on purpose: the EXIT trap fires after the function's locals are
+  # unwound (verified — a local pid read as empty there, leaving caffeinate running
+  # and the restore firing twice).
+  typeset -g _NOSLEEP_CAF='' _NOSLEEP_DONE=0
+  _nosleep_restore() {
+    (( _NOSLEEP_DONE )) && return 0; _NOSLEEP_DONE=1
+    [[ -n $_NOSLEEP_CAF ]] && kill "$_NOSLEEP_CAF" 2>/dev/null
+    sudo -n pmset -a disablesleep 0 2>/dev/null || sudo pmset -a disablesleep 0
+  }
+  trap '_nosleep_restore' EXIT
+  trap '_nosleep_restore; return 130' INT TERM
+
+  sudo pmset -a disablesleep 1 || return 1
+  caffeinate -dimsu & _NOSLEEP_CAF=$!
+  if (( forever )); then
+    echo "nosleep: holding sleep off until Ctrl-C"
+    wait "$_NOSLEEP_CAF"
+    return 0
+  fi
+
+  # Each signal carries the epoch it was LAST seen at; nosleep lets go when the
+  # OLDER of the two falls more than $grace behind now. One failed probe (a wifi
+  # blip) therefore does nothing on its own, and there is no double window: a
+  # transcript last written at T can hold the Mac awake until exactly T+grace.
+  local now busy_at online_at=$EPOCHSECONDS oldest why
+  echo "nosleep: holding sleep off while a local claude is working and the network is up (grace ${grace}s, Ctrl-C to stop)"
+  while :; do
+    now=$EPOCHSECONDS
+    _nosleep_online && online_at=$now
+    busy_at=$(_nosleep_busy_at)
+    oldest=$(( busy_at < online_at ? busy_at : online_at ))
+    if (( now - oldest > grace )); then
+      (( busy_at < online_at )) && why="no claude has written a transcript in ${grace}s" || why="the network has been down for ${grace}s"
+      echo "nosleep: letting go — $why"
+      _nosleep_restore
+      return 0
+    fi
+    [[ -t 1 ]] && printf '\r\e[K  claude active %ds ago · network ok %ds ago' $(( now - busy_at )) $(( now - online_at ))
+    # Keep the sudo timestamp warm so the restore never blocks on a password prompt
+    # that nobody is at the keyboard to answer — the whole point is running unattended.
+    sudo -n -v 2>/dev/null
+    sleep "$every"
+  done
+}
+# _nosleep_online — true when an HTTPS exchange with api.anthropic.com completes.
+# Any HTTP status counts (no -f): a 404 proves the network path; only DNS/connect/
+# TLS failures — the outages that actually stop tokens burning — return nonzero.
+_nosleep_online() { curl -s -o /dev/null --max-time 4 https://api.anthropic.com/ 2>/dev/null; }
+# _nosleep_busy_at — epoch of the newest transcript write by a LIVE local claude
+# (0 when none). Reads the claude-stamp-tmux pid registry (~/.cache/claude-sessions/
+# <pid> = "<sid>\t<cwd>") rather than scanning every transcript's mtime: csync's
+# rsync preserves mtimes, so a transcript another machine is writing looks freshly
+# written here too, and only a registered pid that is still alive ties a write to
+# THIS Mac. Subagent transcripts count — the main file can sit untouched for
+# minutes while a subagent works, and that is still tokens burning.
+_nosleep_busy_at() {
+  local reg="${XDG_CACHE_HOME:-$HOME/.cache}/claude-sessions" f sid cwd tx best=0
+  local -a mt
+  for f in "$reg"/<->(N.); do
+    kill -0 "${f:t}" 2>/dev/null || continue
+    IFS=$'\t' read -r sid cwd < "$f" || continue
+    [[ -n $sid ]] || continue
+    for tx in ~/.claude/projects/*/"$sid".jsonl(N) ~/.claude/projects/*/"$sid"/subagents/*.jsonl(N); do
+      zstat -A mt +mtime "$tx" 2>/dev/null || continue
+      (( mt[1] > best )) && best=$mt[1]
+    done
+  done
+  echo "$best"
+}
 
 # _dots_tmux_apply — push ~/.tmux.conf into an already-running tmux server. tmux
 # reads the file only at SERVER START, so a released config change is silently

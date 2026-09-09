@@ -3086,3 +3086,61 @@ def test_sessions_mcp_is_allowed_by_default_in_the_shipped_setup(t_mod):
     with open(os.path.join(root, "install.sh")) as f:
         sh = f.read()
     assert sh.index("install_claude_mcp_allow\n") < sh.index('if [[ -n "${DOTFILES_LINKS_ONLY:-}" ]]; then\n    exit 0')
+
+
+# ─── _vis_len / _term_rows / _page_window (the phone-width wizard fixes) ────────
+
+def test_vis_len_ignores_sgr_escapes(t_mod):
+    st = t_mod.Style(tty=True)
+    assert t_mod._vis_len(f"{st.c}◆{st.r}  {st.b}hosts{st.r}") == len("◆  hosts")
+    assert t_mod._vis_len("plain") == 5
+
+
+def test_term_rows_counts_wrapped_rows_not_lines(t_mod):
+    # a 53-column picker head on a 44-column phone terminal takes TWO rows —
+    # the off-by-one that drifted the wizard down the screen on every keypress
+    head = "◆  hosts  ↑↓ move · space mark · enter pick · q quit"
+    assert len(head) == 52
+    assert t_mod._term_rows(head, 44) == 2
+    assert t_mod._term_rows(head, 80) == 1
+    assert t_mod._term_rows("", 44) == 1          # an empty line still occupies a row
+    assert t_mod._term_rows("x" * 88, 44) == 2    # exact multiple: no phantom row
+    assert t_mod._term_rows("x" * 89, 44) == 3
+
+
+def test_page_window_shows_everything_when_it_fits(t_mod):
+    assert t_mod._page_window([1, 1, 1], 0, 5) == (0, 3)
+    assert t_mod._page_window([], 0, 5) == (0, 0)
+    # top is irrelevant when the whole block fits
+    assert t_mod._page_window([1, 1, 1], 2, 3) == (0, 3)
+
+
+def test_page_window_reserves_the_markers(t_mod):
+    # 6 single-row lines in 4 rows: at the top there is no "above" marker, so
+    # 3 lines + the "below" marker fill the 4 rows
+    assert t_mod._page_window([1] * 6, 0, 4) == (0, 3)
+    # scrolled one down: "above" + 2 lines + "below"
+    assert t_mod._page_window([1] * 6, 1, 4) == (1, 3)
+
+
+def test_page_window_clamps_top_so_the_block_never_scrolls_past_its_end(t_mod):
+    heights = [1] * 6
+    # from lo=3: "above" + lines 3,4,5 = 4 rows, no "below" needed → the last top
+    assert t_mod._page_window(heights, 3, 4) == (3, 6)
+    assert t_mod._page_window(heights, 99, 4) == (3, 6)
+    assert t_mod._page_window(heights, -5, 4) == (0, 3)
+
+
+def test_page_window_accounts_for_wrapped_lines(t_mod):
+    # a review whose argv lines wrap to 2–3 rows each on a phone
+    heights = [1, 3, 3, 2, 3, 1]
+    lo, hi = t_mod._page_window(heights, 0, 8)
+    assert (lo, hi) == (0, 3)            # 1 + 3 + 3 = 7 rows + the "below" marker
+    lo, hi = t_mod._page_window(heights, 2, 8)
+    assert (lo, hi) == (2, 4)            # "above" + 3 + 2 + "below" = 7 ≤ 8; +3 would not fit
+
+
+def test_page_window_always_shows_at_least_one_line(t_mod):
+    # a single line taller than the whole window is still shown rather than nothing
+    assert t_mod._page_window([9, 1], 0, 4) == (0, 1)
+    assert t_mod._page_window([1, 9], 1, 4) == (1, 2)

@@ -168,9 +168,9 @@ prview() {
 #
 # Blocks sleep via `pmset disablesleep 1` + a background caffeinate, then keeps
 # holding only while BOTH signals stay fresh: internet (an HTTPS exchange with
-# api.anthropic.com) and tokens burning (a live local claude whose transcript was
-# written recently). Once either has been missing for the grace window it restores
-# sleep and exits — so a Claude run that finishes, or a network that drops, lets
+# api.anthropic.com) and tokens burning (a local claude mid-turn — Claude Code runs
+# its own caffeinate while a request is in flight). Once either has been missing for
+# the grace window it restores sleep and exits — so a Claude run that finishes, or a network that drops, lets
 # the Mac sleep on its own instead of holding it awake until you remember Ctrl-C.
 # For a persistent, unconditional block use `sleep-manager disable` instead.
 nosleep() {
@@ -202,6 +202,12 @@ nosleep() {
   trap '_nosleep_restore' EXIT
   trap '_nosleep_restore; return 130' INT TERM
 
+  # A caffeinate -dimsu that outlived its shell (an old unconditional nosleep whose
+  # terminal closed; sleep-manager's is tracked by its pidfile) holds the Mac awake
+  # no matter what this run decides — two were found from days earlier. Say so.
+  local -a strays
+  strays=( ${(f)"$(ps -Axo pid=,ppid=,command= 2>/dev/null | awk '$2 == 1 && $3 ~ /caffeinate$/ && $4 == "-dimsu" {print $1}')"} )
+  (( ${#strays} )) && echo "nosleep: ⚠ orphaned caffeinate -dimsu still holding sleep off (pid ${(j:, :)strays}) — kill ${(j: :)strays} to let it go" >&2
   sudo pmset -a disablesleep 1 || return 1
   caffeinate -dimsu & _NOSLEEP_CAF=$!
   if (( forever )); then
@@ -222,7 +228,7 @@ nosleep() {
     busy_at=$(_nosleep_busy_at)
     oldest=$(( busy_at < online_at ? busy_at : online_at ))
     if (( now - oldest > grace )); then
-      (( busy_at < online_at )) && why="no claude has written a transcript in ${grace}s" || why="the network has been down for ${grace}s"
+      (( busy_at < online_at )) && why="no local claude has been mid-turn for ${grace}s" || why="the network has been down for ${grace}s"
       echo "nosleep: letting go — $why"
       _nosleep_restore
       return 0
@@ -238,26 +244,24 @@ nosleep() {
 # Any HTTP status counts (no -f): a 404 proves the network path; only DNS/connect/
 # TLS failures — the outages that actually stop tokens burning — return nonzero.
 _nosleep_online() { curl -s -o /dev/null --max-time 4 https://api.anthropic.com/ 2>/dev/null; }
-# _nosleep_busy_at — epoch of the newest transcript write by a LIVE local claude
-# (0 when none). Reads the claude-stamp-tmux pid registry (~/.cache/claude-sessions/
-# <pid> = "<sid>\t<cwd>") rather than scanning every transcript's mtime: csync's
-# rsync preserves mtimes, so a transcript another machine is writing looks freshly
-# written here too, and only a registered pid that is still alive ties a write to
-# THIS Mac. Subagent transcripts count — the main file can sit untouched for
-# minutes while a subagent works, and that is still tokens burning.
+# _nosleep_busy_at — now when a local claude is mid-turn, else 0. Claude Code itself
+# spawns `caffeinate -i -t 300` under the `claude` process for exactly as long as a
+# request is in flight (respawned per turn, self-expiring at 5 min), so "a caffeinate
+# whose parent is claude" IS tokens burning, read off one ps. This replaced a
+# transcript-mtime check that was wrong both ways on a real machine: csync's rsync
+# bulk-touches IDLE sessions' transcripts (five idle slots shared one mtime), and a
+# session mid-way through a long tool call had not written its transcript in 31 min.
 _nosleep_busy_at() {
-  local reg="${XDG_CACHE_HOME:-$HOME/.cache}/claude-sessions" f sid cwd tx best=0
-  local -a mt
-  for f in "$reg"/<->(N.); do
-    kill -0 "${f:t}" 2>/dev/null || continue
-    IFS=$'\t' read -r sid cwd < "$f" || continue
-    [[ -n $sid ]] || continue
-    for tx in ~/.claude/projects/*/"$sid".jsonl(N) ~/.claude/projects/*/"$sid"/subagents/*.jsonl(N); do
-      zstat -A mt +mtime "$tx" 2>/dev/null || continue
-      (( mt[1] > best )) && best=$mt[1]
-    done
+  local pid ppid comm; local -A pcomm; local -a caf
+  while read -r pid ppid comm; do
+    [[ $pid == <-> ]] || continue
+    pcomm[$pid]=${comm:t}
+    [[ ${comm:t} == caffeinate ]] && caf+=("$ppid")
+  done < <(ps -Axo pid=,ppid=,comm= 2>/dev/null)
+  for ppid in "${caf[@]}"; do
+    [[ ${pcomm[$ppid]:-} == claude ]] && { echo "$EPOCHSECONDS"; return 0; }
   done
-  echo "$best"
+  echo 0
 }
 
 # _dots_tmux_apply — push ~/.tmux.conf into an already-running tmux server. tmux

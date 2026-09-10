@@ -460,3 +460,104 @@ def test_zsh_repo_slots_sees_codex_only_slots(zsh):
                       ("aaaaaaaa-0000-0000-0000-000000000009", f"{zsh.home}/code/api", "t", 100, 0, None)])
     (zsh.home / "code" / "api").mkdir(parents=True)
     assert zsh("_dev_repo_slots api").stdout.split() == ["7", "12"]
+
+
+# ─── across machines: the rollout scan, the beam sync, csync's codex pair ────────
+
+RSYNC_STUB = "#!/bin/bash\nprintf '%s\\n' \"$*\" >> \"$RSYNC_LOG\"\nexit 0\n"
+
+
+def test_zsh_rollout_scan_finds_unindexed_rollouts_and_caches(zsh):
+    wt = f"{zsh.home}/code/.worktrees/api/3"
+    # two rollouts on disk, only ONE in the index (the other was just synced in)
+    paths = _codex_home(zsh, [("aaaaaaaa-0000-0000-0000-000000000001", wt, "indexed", 100, 0, None)])
+    day = zsh.home / ".codex" / "sessions" / "2026" / "09" / "10"
+    day.mkdir(parents=True)
+    synced = day / "rollout-2026-09-10T01-00-00-aaaaaaaa-0000-0000-0000-000000000002.jsonl"
+    synced.write_text(FIXTURE_ROLLOUT.read_text().replace(SID, "aaaaaaaa-0000-0000-0000-000000000002")
+                      .replace("/Users/me/code/.worktrees/api/3", wt))
+    other = day / "rollout-2026-09-10T02-00-00-aaaaaaaa-0000-0000-0000-000000000003.jsonl"
+    other.write_text(FIXTURE_ROLLOUT.read_text().replace("/Users/me/code/.worktrees/api/3", "/elsewhere"))
+    os.utime(synced, (2_000_000_000, 2_000_000_000))
+    r = zsh(f"_codex_rollout_scan {wt}")
+    assert r.stdout.splitlines() == [str(synced)]                   # only this cwd's rollouts
+    cache = zsh.home / ".cache" / "claude-sessions" / "rollout-cwd.json"
+    assert cache.exists() and str(other) in json.loads(cache.read_text())
+    # the union view: index rows first, then the scan's extra, no duplicates
+    r = zsh(f"_dev_agent_transcripts_for_cwd codex {wt}")
+    assert r.stdout.splitlines() == [str(paths["aaaaaaaa-0000-0000-0000-000000000001"]), str(synced)]
+    # a settled tree answers from the cache (same result, no re-read needed)
+    assert zsh(f"_codex_rollout_scan {wt}").stdout.splitlines() == [str(synced)]
+    assert zsh("_codex_rollout_scan /nowhere").stdout == ""
+
+
+def test_zsh_beam_sync_transcript_ships_a_rollout_relative_to_codex_home(zsh, tmp_path):
+    wt = f"{zsh.home}/code/.worktrees/api/3"
+    paths = _codex_home(zsh, [(SID, wt, "t", 100, 0, None)])
+    origin = paths[SID].with_suffix(".origin")
+    origin.write_text("laptop\n")
+    stub = tmp_path / "stubbin" / "rsync"
+    stub.write_text(RSYNC_STUB)
+    stub.chmod(0o755)
+    log = tmp_path / "rsync.log"
+    r = zsh(f"_tbeam_sync_transcript {wt} me@mini codex {SID}; echo rc=$?", RSYNC_LOG=str(log))
+    assert r.stdout.strip() == "rc=0", r.stderr
+    argv = log.read_text().strip()
+    assert argv.startswith("-azR --update -e ssh ")
+    assert f"{zsh.home}/.codex/./sessions/2026/09/09/rollout-2026-09-09T22-20-09-{SID}.jsonl" in argv
+    assert f"rollout-2026-09-09T22-20-09-{SID}.origin" in argv
+    assert argv.endswith(" me@mini:.codex/")
+    # an unknown codex id is an error, not an empty rsync
+    r = zsh("_tbeam_sync_transcript /x me@mini codex ffffffff-0000-0000-0000-000000000000; echo rc=$?", RSYNC_LOG=str(log))
+    assert r.stdout.strip() == "rc=1" and "no rollout" in r.stderr
+    # claude: the project dir, exactly as before
+    proj = zsh.home / ".claude" / "projects" / re.sub(r"[^A-Za-z0-9]", "-", wt)
+    proj.mkdir(parents=True)
+    log.write_text("")
+    r = zsh(f"_tbeam_sync_transcript {wt} me@mini; echo rc=$?", RSYNC_LOG=str(log))
+    assert r.stdout.strip() == "rc=0"
+    assert log.read_text().strip().endswith(f" me@mini:.claude/projects/{proj.name}/")
+
+
+CSYNC = REPO_ROOT / "bin" / "csync"
+
+
+def _csync_run(home, rsync_log, extra_bins):
+    bins = home.parent / "csyncbin"
+    bins.mkdir(exist_ok=True)
+    (bins / "rsync").write_text(RSYNC_STUB)
+    (bins / "rsync").chmod(0o755)
+    (bins / "brctl").write_text("#!/bin/bash\nexit 0\n")   # macOS-only; a no-op stand-in
+    (bins / "brctl").chmod(0o755)
+    env = {**os.environ, "HOME": str(home), "RSYNC_LOG": str(rsync_log),
+           "CSYNC_RSYNC": str(bins / "rsync"), "PATH": f"{bins}:{os.environ.get('PATH', '')}"}
+    return subprocess.run([str(CSYNC)], env=env, capture_output=True, text=True)
+
+
+def test_csync_codex_pair_is_gated_on_either_side(tmp_path):
+    home = tmp_path / "home"
+    icloud = home / "Library" / "Mobile Documents" / "com~apple~CloudDocs"
+    icloud.mkdir(parents=True)
+    log = tmp_path / "rsync.log"
+    # neither side exists → no codex pair (the claude + plan pairs always run)
+    r = _csync_run(home, log, {})
+    assert r.returncode == 0, r.stderr
+    argv = log.read_text()
+    assert "codex-sessions" not in argv and "claude-sessions" in argv
+    # the local tree exists → the pair runs, sessions/ only, never the sqlite state
+    (home / ".codex" / "sessions").mkdir(parents=True)
+    (home / ".codex" / "state_5.sqlite").write_text("x")
+    log.write_text("")
+    assert _csync_run(home, log, {}).returncode == 0
+    lines = [ln for ln in log.read_text().splitlines() if "codex-sessions/" in ln]
+    assert len(lines) == 2                                   # both directions, once
+    assert all("/.codex/sessions/" in ln for ln in lines)
+    assert not any("state_5" in ln for ln in log.read_text().splitlines())
+    # only the iCloud side exists (another machine ran codex) → still converges
+    import shutil as _sh
+    _sh.rmtree(home / ".codex")
+    (icloud / "codex-sessions").mkdir(exist_ok=True)   # the 2nd run already mirrored it
+    log.write_text("")
+    assert _csync_run(home, log, {}).returncode == 0
+    assert "codex-sessions" in log.read_text()
+    assert (home / ".codex" / "sessions").is_dir()   # sync_pair mkdir -p's both sides

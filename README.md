@@ -30,7 +30,7 @@ Run `t -h` for the full verb list.
 | Command | What it does |
 | --- | --- |
 | `dots [--dev]` | Sync the live checkout to `origin/main` HEAD and reload zsh; `--dev` makes the session worktree you are standing in live instead ([details](#keeping-machines-in-sync)) |
-| `csync` | Two-way sync of Claude session history and plans across machines via iCloud Drive |
+| `csync` | Two-way sync of Claude session history and plans, Codex rollouts, and Cursor chats across machines via iCloud Drive |
 | `sleep-manager` | Block or restore macOS sleep (`status`, `disable`, `enable`) |
 | `pii-scan` | Keep personal data out of this public repo ([details](#pii-guard)) |
 | `help` / `h` | Auto-generated, grouped list of every command ([details](#the-help-command)) |
@@ -124,6 +124,10 @@ transcripts), `t pop`/`t push` move it with `codex resume`, and `t resume` lists
 a dead codex slot's conversations from Codex's own thread index, marked `⬡` in
 the picker. Codex mints its thread id at the first prompt (there is no
 `--session-id`), so an untouched codex slot reads as idle until you type.
+Across machines, `t beam` ships a codex slot's rollout (and its origin stamp)
+with its date path intact and `csync` mirrors `~/.codex/sessions` to iCloud as
+`codex-sessions` — Codex indexes a copied-in rollout on the first resume, so only
+the append-only rollouts travel, never its sqlite state.
 
 Not every verb supports every agent yet. The matrix below is **generated from
 `bin/t`** (a test pins this block to it), so a verb cannot gain or lose agent
@@ -136,8 +140,8 @@ support without the README saying so:
   dev slots: t open / ls / kill / read / paste      ✓                     ✓ t open --codex · DEV_AGENT           ✗ no slot — t cursor ls
   t push / t pop                                    ✓                     ✓                                      ✗ no slot
   t resume (dead slots)                             ✓                     ✓ (its sqlite thread index)            → t cursor resume
-  t beam / --from (move a session)                  ✓                     planned                                → t cursor [id] --host / --from
-  csync (iCloud union of transcripts)               ✓ projects + plans    planned                                ✓ cursor-chats
+  t beam / --from (move a session)                  ✓                     ✓ (rollout + .origin)                  → t cursor [id] --host / --from
+  csync (iCloud union of transcripts)               ✓ projects + plans    ✓ codex-sessions                       ✓ cursor-chats
   SessionStart stamps (registry · opened · origin)  ✓ settings.json hook  ✓ hooks.json + /hooks trust            ✗ no hook wired
   t plan                                            ✓                     ✗ codex keeps no plan files (says so)  ✗
   t find / t mcp (transcript search)                ✓                     planned                                ✗

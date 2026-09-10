@@ -1977,3 +1977,49 @@ def test_page_window_always_shows_at_least_one_line(t_mod):
     # a single line taller than the whole window is still shown rather than nothing
     assert t_mod._page_window([9, 1], 0, 4) == (0, 1)
     assert t_mod._page_window([1, 9], 1, 4) == (1, 2)
+
+
+# ─── _ls_scope (t ls [repo] [-a]) ────────────────────────────────────────────────
+
+def test_ls_scope_explicit_repo_from_anywhere(t_mod, tmp_path, monkeypatch):
+    # `t ls dot -r` from ~ must scope to dot's dir — the alias, not the cwd, decides.
+    cfg = _config_with(t_mod, tmp_path, monkeypatch,
+                       {"dot": "/Users/me/code/dotfiles", "api": "/Users/me/code/api"},
+                       worktree_root="/Users/me/code/.worktrees")
+    scope, wt = t_mod._ls_scope(cfg, "dot", False, "/Users/me")
+    assert scope == "/Users/me/code/dotfiles"
+    assert wt == "/Users/me/code/.worktrees/dotfiles"
+
+
+def test_ls_scope_defaults_to_cwd_repo(t_mod, tmp_path, monkeypatch):
+    cfg = _config_with(t_mod, tmp_path, monkeypatch, {"api": "/Users/me/code/api"},
+                       worktree_root="/Users/me/wt")
+    assert t_mod._ls_scope(cfg, None, False, "/Users/me/code/api/src") == \
+        ("/Users/me/code/api", "/Users/me/wt/api")
+    assert t_mod._ls_scope(cfg, None, False, "/Users/me") == ("", "")
+
+
+def test_ls_scope_all_widens(t_mod, tmp_path, monkeypatch):
+    cfg = _config_with(t_mod, tmp_path, monkeypatch, {"api": "/Users/me/code/api"})
+    assert t_mod._ls_scope(cfg, None, True, "/Users/me/code/api") == ("", "")
+
+
+def test_ls_scope_unknown_repo_names_choices(t_mod, tmp_path, monkeypatch):
+    cfg = _config_with(t_mod, tmp_path, monkeypatch, {"api": "/x", "dot": "/y"})
+    with pytest.raises(ValueError) as e:
+        t_mod._ls_scope(cfg, "nope", False, "/")
+    assert "api, dot" in str(e.value)
+
+
+def test_ls_scope_repo_with_all_is_refused(t_mod, tmp_path, monkeypatch):
+    cfg = _config_with(t_mod, tmp_path, monkeypatch, {"api": "/x"})
+    with pytest.raises(ValueError):
+        t_mod._ls_scope(cfg, "api", True, "/")
+
+
+def test_ls_parser_accepts_optional_repo(t_mod):
+    p = t_mod.build_parser()
+    a = p.parse_args(["ls", "dot", "-r"])
+    assert (a.repo, a.remote, a.all) == ("dot", True, False)
+    a = p.parse_args(["ls", "-a"])
+    assert (a.repo, a.all) == (None, True)

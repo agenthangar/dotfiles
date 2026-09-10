@@ -5870,7 +5870,8 @@ _t() {
     on)
       (( CURRENT == 3 )) && _values 'host' ${(k)REMOTE_HOSTS} || _normal ;;
     ls)
-      _values 'flag' -r --remote -a --all -h --help ;;
+      if (( CURRENT == 3 )) && [[ ${words[CURRENT]} != -* ]]; then _values 'repo' ${(k)DEV_REPOS}
+      else _values 'flag' -r --remote -a --all -h --help; fi ;;
     push)
       _values 'flag' -p --pick -a --all -h --help ;;
     find)

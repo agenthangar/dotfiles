@@ -57,8 +57,10 @@ ZSH_PRELUDE = "setopt no_monitor no_notify 2>/dev/null; "
 # ─── config ──────────────────────────────────────────────────────────────────
 
 _CFG_LINE = re.compile(
-    r"^(DEV_REPOS|DEV_BRANCHES|REMOTE_HOSTS|DEV_WORKTREE)\[([^\]]+)\]=(.*)$"
-    r"|^(DEV_BRANCH|DEV_WORKTREE_ROOT|DEV_WORKTREE_DEFAULT)=(.*)$")
+    r"^(DEV_REPOS|DEV_BRANCHES|REMOTE_HOSTS|DEV_WORKTREE|DEV_AGENT)\[([^\]]+)\]=(.*)$"
+    r"|^(DEV_BRANCH|DEV_WORKTREE_ROOT|DEV_WORKTREE_DEFAULT|DEV_AGENT_DEFAULT)=(.*)$")
+
+AGENTS = ("claude", "codex")   # the closed set a dev slot can run (the zsh _dev_agent_valid twin)
 
 
 def _unquote(v):
@@ -82,6 +84,8 @@ class Config:
         self.worktree = {}   # alias -> opt-out flag (0/no/off → shared-tree)
         self.worktree_root = os.path.join(HOME, "code", ".worktrees")
         self.worktree_default = "1"
+        self.agents = {}     # alias -> claude|codex (DEV_AGENT[alias])
+        self.agent_default = "claude"
         self._load()
 
     def _load(self):
@@ -97,13 +101,25 @@ class Config:
             if m.group(1):
                 arr, key, val = m.group(1), m.group(2), _unquote(m.group(3))
                 {"DEV_REPOS": self.repos, "DEV_BRANCHES": self.branches,
-                 "REMOTE_HOSTS": self.hosts, "DEV_WORKTREE": self.worktree}[arr][key] = val
+                 "REMOTE_HOSTS": self.hosts, "DEV_WORKTREE": self.worktree,
+                 "DEV_AGENT": self.agents}[arr][key] = val
             elif m.group(4) == "DEV_BRANCH":
                 self.branch = _unquote(m.group(5))
             elif m.group(4) == "DEV_WORKTREE_ROOT":
                 self.worktree_root = _unquote(m.group(5))
             elif m.group(4) == "DEV_WORKTREE_DEFAULT":
                 self.worktree_default = _unquote(m.group(5))
+            elif m.group(4) == "DEV_AGENT_DEFAULT":
+                self.agent_default = _unquote(m.group(5))
+
+    def agent_for(self, alias, override=None):
+        """The agent a NEW slot of `alias` runs — the Python twin of zsh _dev_agent_for:
+        an explicit override (--codex / --claude) > DEV_AGENT[alias] > DEV_AGENT_DEFAULT;
+        anything outside AGENTS falls back to claude (never launch a typo)."""
+        for a in (override, self.agents.get(alias), self.agent_default):
+            if a in AGENTS:
+                return a
+        return "claude"
 
     def repo_of_dir(self, cwd):
         """(alias, slot) for a path — the Python twin of zsh _dev_repo_of_dir. slot is
@@ -265,13 +281,18 @@ def _parse_rows(text, host_prefixed=False):
             if len(f) < 7:
                 continue
             host, sid, cwd, slot, state, context, summary = f[:7]
+            extra = f[7:]
         else:
             if len(f) < 6:
                 continue
             host = "local"
             sid, cwd, slot, state, context, summary = f[:6]
+            extra = f[6:]
+        # field 7 (8 host-prefixed) = agent, trailing so a host on older dotfiles that
+        # still emits six fields parses as claude
+        agent = extra[0] if extra and extra[0] in AGENTS else "claude"
         rows.append(dict(host=host, sid=sid, cwd=cwd, slot=slot,
-                         state=state, context=context, summary=summary))
+                         state=state, context=context, summary=summary, agent=agent))
     return rows
 
 
@@ -301,13 +322,18 @@ def _scope_filter(rows, scope, wt_scope=""):
     return [r for r in rows if ok(r["cwd"])]
 
 
-def _header(st, scope):
+AGENT_GLYPH = {"codex": "⬡"}   # the STATUS glyph per non-default agent; claude adds no noise
+
+
+def _header(st, scope, agents=()):
     note = ""
     if scope:
         # Make the scoped repo prominent (bold cyan) — the rest of the note stays dim.
         repo = os.path.basename(scope)
         note = f"   {st.y}(repo: {st.r}{st.b}{st.c}{repo}{st.r}{st.y} — --all for all){st.r}"
-    return f"dev sessions   {st.g}●{st.r} attached · {st.c}✓{st.r} active context{note}"
+    # the agent legend appears only when a non-claude slot is on screen
+    legend = "".join(f" · {AGENT_GLYPH[a]} {a}" for a in AGENT_GLYPH if a in set(agents))
+    return f"dev sessions   {st.g}●{st.r} attached · {st.c}✓{st.r} active context{legend}{note}"
 
 
 def _ls_scope(cfg, repo, all_repos, cwd):
@@ -370,12 +396,14 @@ def _slot_line(r, st, name_w, avail, host_w=None):
     Style is the only colour, so Style(tty=False) yields a label a picker can measure."""
     amark = {"attached": f"{st.g}●{st.r}", "detached": "○"}.get(r.get("state"), " ")
     cmark = f"{st.c}✓{st.r}" if r.get("context") == "active" else " "
+    # third glyph = the agent, blank for claude: same 8-column STATUS budget as before
+    gmark = AGENT_GLYPH.get(r.get("agent", "claude"), " ")
     host = ""
     if host_w is not None:
         cell = "" if r.get("host", "local") == "local" else r["host"]
         host = f"{cell:<{host_w}} "
     summary = _truncate(r.get("summary") or "", avail)
-    return f"{amark} {cmark}     {host}{r['slot']:<{name_w}} {st.y}{summary}{st.r}"
+    return f"{amark} {cmark} {gmark}   {host}{r['slot']:<{name_w}} {st.y}{summary}{st.r}"
 
 
 def _render_local(rows, scope, st, has_remote=False):
@@ -383,7 +411,7 @@ def _render_local(rows, scope, st, has_remote=False):
     avail = _columns() - 11 - name_w
     if avail < 12:
         avail = 80 - 11 - name_w
-    print(_header(st, scope))
+    print(_header(st, scope, [r.get("agent") for r in rows]))
     print()
     print(f"  {st.y}{'STATUS':<8}{'SESSION':<{name_w}} WORKING ON{st.r}")
     has_fg = False
@@ -406,7 +434,7 @@ def _render_remote(rows, scope, st):
     avail = _columns() - 12 - host_w - name_w
     if avail < 12:
         avail = 80 - 12 - host_w - name_w
-    print(_header(st, scope))
+    print(_header(st, scope, [r.get("agent") for r in rows]))
     print()
     print(f"  {st.y}{'STATUS':<8}{'HOST':<{host_w}} {'SESSION':<{name_w}} WORKING ON{st.r}")
     has_fg = False
@@ -3166,7 +3194,7 @@ def cmd_install(cfg, args):
 _AGENT_PARITY = [
     ("surface", "claude", "codex", "cursor"),
     ("t install (install · login · update)", "✓", "✓", "✓"),
-    ("dev slots: t open / ls / kill / read / paste", "✓", "planned", "✗ no slot — t cursor ls"),
+    ("dev slots: t open / ls / kill / read / paste", "✓", "✓ t open --codex · DEV_AGENT", "✗ no slot — t cursor ls"),
     ("t push / t pop", "✓", "planned", "✗ no slot"),
     ("t resume (dead slots)", "✓", "planned", "→ t cursor resume"),
     ("t beam / --from (move a session)", "✓", "planned", "→ t cursor [id] --host / --from"),
@@ -4756,6 +4784,7 @@ def build_parser():
 examples:
   t open api              open/reattach the next free api slot
   t open api 3 --new      force a fresh session in api slot 3
+  t open api --codex      a fresh slot running Codex CLI instead of Claude (DEV_AGENT[api]=codex makes it the default)
   t open                  open/reattach in the repo cwd is in
   t paste 4               slot-only args mean the cwd repo (all verbs)
   t open ff -r --new      start a fresh session on the default remote host
@@ -4795,6 +4824,9 @@ Run `t <verb> -h` for a verb's own flags.""")
     sp.add_argument("-l", "--local", "--here", dest="local", action="store_true", help="force this machine: skip the remote auto-attach probe (combine with --fg for local foreground)")
     sp.add_argument("-r", "--remote", action="store_true", help="remote: attach a live slot on any host; with --new, start one on the default host")
     sp.add_argument("--host", help="which host to open/attach on (sets the host for -r; default for --new: first $REMOTE_HOSTS)")
+    ag = sp.add_mutually_exclusive_group()
+    ag.add_argument("--codex", action="store_true", help="run OpenAI Codex CLI in a FRESH slot (default: DEV_AGENT[repo] / DEV_AGENT_DEFAULT, claude)")
+    ag.add_argument("--claude", action="store_true", help="run Claude Code in a fresh slot even if the repo defaults to codex")
 
     sp = sub.add_parser("ls", help="list dev sessions (attached + active context)",
         description="List live Claude dev sessions: whether each is attached, and whether it "

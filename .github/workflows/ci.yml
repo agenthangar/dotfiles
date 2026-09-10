@@ -133,6 +133,16 @@ jobs:
           }
           tmux -V
 
+      # The agent-seam tests source the real .zshrc under a sandbox $HOME and call
+      # its _dev_agent_* helpers, so they need zsh (they skip without it — same
+      # silent-no-op risk as tmux above, hence the explicit install).
+      - name: Ensure zsh is available
+        run: |
+          command -v zsh >/dev/null || {
+            sudo apt-get update -qq && sudo apt-get install -y -qq zsh
+          }
+          zsh --version
+
       - name: Run tests with coverage gate
         run: pytest --cov --cov-report=term-missing --cov-fail-under=97
 

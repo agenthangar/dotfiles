@@ -427,6 +427,7 @@ install_codex_hooks() {
     [[ -z "${DOTFILES_NO_CODEX_HOOKS:-}" ]] || return 0
     command -v codex >/dev/null 2>&1 || [[ -d "$HOME/.codex" ]] || return 0
     command -v python3 >/dev/null 2>&1 || return 0
+    # shellcheck disable=SC2016  # the literal $HOME is the point: Codex expands it at hook time
     python3 - "$HOME/.codex/hooks.json" '$HOME/bin/claude-stamp-tmux --agent codex' <<'PY'
 import json, os, sys
 

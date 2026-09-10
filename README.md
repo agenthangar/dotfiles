@@ -19,9 +19,8 @@ shim in `.zshrc` for verbs that must run in your shell).
 | `t push` / `t pop` | Move a session between a foreground terminal and a detached tmux slot — one-live-owner guarantee |
 | `t beam <repo> [slot] --host <h>` | Teleport a running session to another machine; pull one back with `t open … --here` |
 | `t find <query>` | Semantic search across saved sessions ("which one was working on X?"), reranked by Claude |
-| `t todo [add\|done\|rm] …` | A task list scoped to the slot you are in — bare to list, `t todo <id>` to act on one, `-A` for every slot. Also `/todo` inside Claude, and the statusline |
 | `t new [name]` | Wizard: create `~/code/<name>` + a GitHub repo (owner picked from your orgs; squash-only, auto-merge), register it here and clone + register it on every remote host. Re-running resumes; on an existing repo it just finishes the wiring |
-| `t mcp` | The `sessions` MCP server Claude Code spawns, so any Claude session can answer "which session is/was working on X?" from every saved transcript, the live slots, and the todo lists. `--install` registers it (`dots` does), `--call <tool> '<json>'` runs one tool by hand |
+| `t mcp` | The `sessions` MCP server Claude Code spawns, so any Claude session can answer "which session is/was working on X?" from every saved transcript and the live slots. `--install` registers it (`dots` does), `--call <tool> '<json>'` runs one tool by hand |
 
 Run `t -h` for the full verb list.
 
@@ -30,7 +29,7 @@ Run `t -h` for the full verb list.
 | Command | What it does |
 | --- | --- |
 | `dots [--dev]` | Sync the live checkout to `origin/main` HEAD and reload zsh; `--dev` makes the session worktree you are standing in live instead ([details](#keeping-machines-in-sync)) |
-| `csync` | Two-way sync of Claude session history, plans, and `t todo` lists across machines via iCloud Drive |
+| `csync` | Two-way sync of Claude session history and plans across machines via iCloud Drive |
 | `sleep-manager` | Block or restore macOS sleep (`status`, `disable`, `enable`) |
 | `pii-scan` | Keep personal data out of this public repo ([details](#pii-guard)) |
 | `help` / `h` | Auto-generated, grouped list of every command ([details](#the-help-command)) |

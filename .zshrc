@@ -698,15 +698,16 @@ _dev_agent_new_cmd() {
 _dev_agent_resume_cmd() {
   case "$1" in codex) print -r -- "codex resume $2" ;; *) print -r -- "claude -r $2" ;; esac
 }
-# _DEV_CODEX_SPLASH_RE — the pane text that marks a codex slot parked on its startup
-# screen with no conversation yet (claude's is 'Welcome back'). Empty = unknown → a live
-# codex reads as active, so `t kill` still confirms. Set it in ~/.zshrc.local once
-# captured from a fresh pane (tmux capture-pane -p).
-: ${_DEV_CODEX_SPLASH_RE:=}
-# _dev_agent_at_welcome <agent> <session> — idle-on-splash test per agent.
+# _dev_agent_at_welcome <agent> <session> — "live but no conversation yet", per agent.
+# claude: the 'Welcome back' banner (_dev_session_at_welcome). codex: whether a thread
+# has been STAMPED on the session — codex mints its thread id (and fires SessionStart,
+# so the hook's CLAUDE_RESUME_ID lands) at the FIRST prompt, not at launch, so an
+# unstamped codex pane is exactly one with nothing typed yet. Pane text was rejected:
+# codex's boxed `>_ OpenAI Codex (v…)` banner stays visible through a short exchange,
+# which read a real conversation as idle.
 _dev_agent_at_welcome() {
   case "$1" in
-    codex) [[ -n $_DEV_CODEX_SPLASH_RE ]] && tmux capture-pane -t "$2" -p 2>/dev/null | grep -Eq -- "$_DEV_CODEX_SPLASH_RE" ;;
+    codex) [[ -z $(tmux show-environment -t "$2" CLAUDE_RESUME_ID 2>/dev/null | cut -d= -f2) ]] ;;
     *)     _dev_session_at_welcome "$2" ;;
   esac
 }
@@ -723,6 +724,122 @@ _dev_agent_pid_above() {
     [[ -n $pid ]] || return 1
   done
   return 1
+}
+
+# ─── Codex thread store + the agent-agnostic transcript locators ─────────────────
+#
+# A claude conversation lives at a cwd-keyed path (~/.claude/projects/<enc cwd>/<sid>
+# .jsonl), which is how every "what is this slot working on" question was answered:
+# glob the slot's project dir. A codex conversation is a DATE-keyed rollout
+# (~/.codex/sessions/YYYY/MM/DD/rollout-<ts>-<sid>.jsonl) — nothing about its path
+# says which directory it belongs to. Two sources fill that gap: the hook's
+# rollouts/<sid> cache (sid → path, written at SessionStart) and codex's own sqlite
+# thread index (~/.codex/state_5.sqlite, table threads: id, rollout_path, cwd, title,
+# name, first_user_message, updated_at — the row exists while the session is LIVE and
+# its cwd follows the last resume). Reads are python3 stdlib sqlite3 in read-only URI
+# mode; a missing or locked DB reads as "no threads", never an error, so a box that
+# never ran codex pays one failed open and nothing else.
+_codex_db() { print -r -- "${CODEX_HOME:-$HOME/.codex}/state_5.sqlite" }
+# _codex_threads <where> <arg> — rows `sid\tpath\tcwd\ttitle\tupdated_at` newest first;
+# <where> is cwd | prefix | sid. Internal; the wrappers below name the intent.
+_codex_threads() {
+  local db; db=$(_codex_db)
+  [[ -r $db ]] || return 0
+  python3 - "$db" "$1" "$2" <<'PY' 2>/dev/null
+import sqlite3, sys
+db, mode, arg = sys.argv[1:4]
+try:
+    c = sqlite3.connect('file:%s?mode=ro' % db, uri=True, timeout=0.5)
+    c.execute('pragma busy_timeout=500')
+    q = ("select id, rollout_path, cwd, coalesce(nullif(name,''), title, ''), updated_at "
+         "from threads where archived=0 and ")
+    if mode == 'cwd':
+        rows = c.execute(q + "cwd=? order by updated_at desc", (arg,)).fetchall()
+    elif mode == 'prefix':
+        rows = c.execute(q + "cwd like ? order by updated_at desc", (arg.replace('%', '') + '%',)).fetchall()
+    else:
+        rows = c.execute(q + "id=? order by updated_at desc", (arg,)).fetchall()
+except Exception:
+    rows = []
+for r in rows:
+    sys.stdout.write('\t'.join(str(x if x is not None else '').replace('\t', ' ').replace('\n', ' ') for x in r) + '\n')
+PY
+}
+# _codex_threads_for_cwd <cwd> — the codex conversations recorded in <cwd>, newest first.
+_codex_threads_for_cwd() { _codex_threads cwd "$1" }
+# _codex_thread_lookup <sid> — one row for a thread id (empty if unknown).
+_codex_thread_lookup()   { _codex_threads sid "$1" }
+
+# _dev_transcript_agent <path> — which agent wrote this transcript, from its name
+# (a codex rollout is `rollout-…`; everything else is a claude <sid>.jsonl).
+_dev_transcript_agent() { [[ ${1:t} == rollout-* ]] && print -r -- codex || print -r -- claude }
+# _dev_transcript_sid <path> — the session id a transcript belongs to: the filename
+# for claude, the trailing uuid of `rollout-<ts>-<uuid>.jsonl` for codex.
+_dev_transcript_sid() {
+  local b=${1:t}; b=${b%.jsonl}
+  if [[ $b == rollout-* ]]; then print -r -- "${b: -36}"; else print -r -- "$b"; fi
+}
+# _dev_agent_transcript <agent> <sid> [cwd] — the transcript path for a session id, or
+# nothing. claude: the cwd-keyed project dir (any project dir when cwd is omitted).
+# codex: the hook's rollouts/<sid> cache, else the sqlite row, else a glob over the
+# date tree (a synced-in rollout on a host whose hook never saw it).
+_dev_agent_transcript() {
+  setopt local_options null_glob
+  local agent="$1" sid="$2" cwd="${3:-}" p
+  [[ -n $sid && $sid != - ]] || return 1
+  if [[ $agent == codex ]]; then
+    p="${XDG_CACHE_HOME:-$HOME/.cache}/claude-sessions/rollouts/$sid"
+    [[ -r $p ]] && { p=$(<"$p"); [[ -f $p ]] && { print -r -- "$p"; return 0; }; }
+    p=$(_codex_thread_lookup "$sid"); p=${${p#*$'\t'}%%$'\t'*}
+    [[ -n $p && -f $p ]] && { print -r -- "$p"; return 0; }
+    local -a g=( "${CODEX_HOME:-$HOME/.codex}"/sessions/*/*/*/rollout-*-"$sid".jsonl )
+    [[ -n ${g[1]} ]] && { print -r -- "${g[1]}"; return 0; }
+    return 1
+  fi
+  local -a tx
+  if [[ -n $cwd ]]; then tx=( "$HOME/.claude/projects/${cwd//[^A-Za-z0-9]/-}/$sid".jsonl )
+  else tx=( "$HOME/.claude/projects"/*/"$sid".jsonl ); fi
+  [[ -n ${tx[1]} && -f ${tx[1]} ]] && { print -r -- "${tx[1]}"; return 0; }   # -f: a literal path has no glob to null
+  return 1
+}
+# _dev_agent_transcripts_for_cwd <agent> <cwd> — every transcript recorded in <cwd>,
+# newest first, one path per line (claude: the project dir by mtime; codex: the
+# sqlite rows). The dead-slot scan behind `t resume` is built on this.
+_dev_agent_transcripts_for_cwd() {
+  setopt local_options null_glob bare_glob_qual
+  local agent="$1" cwd="$2" row p
+  if [[ $agent == codex ]]; then
+    for row in ${(f)"$(_codex_threads_for_cwd "$cwd")"}; do
+      p=${${row#*$'\t'}%%$'\t'*}; [[ -f $p ]] && print -r -- "$p"
+    done
+    return 0
+  fi
+  local -a tx=( "$HOME/.claude/projects/${cwd//[^A-Za-z0-9]/-}"/*.jsonl(Nom) )
+  (( $#tx )) && print -rl -- "${(@)tx}"
+  return 0
+}
+# _dev_agent_newest_sid <agent> <cwd> — the id of the newest conversation in <cwd>:
+# the pre-hook fallback every pop/plan path had, now per agent.
+_dev_agent_newest_sid() {
+  local p; p=$(_dev_agent_transcripts_for_cwd "$1" "$2" | head -1)
+  [[ -n $p ]] && _dev_transcript_sid "$p"
+}
+# _dev_self_agent / _dev_self_sid — "am I running inside an agent's tool shell, and
+# which conversation?" claude exports CLAUDE_CODE_SESSION_ID; codex exports nothing
+# (openai/codex#8923), so its answer is the pid registry entry the hook wrote for the
+# codex process above this shell (_dev_agent_pid_above). Both print nothing when
+# this is a plain terminal.
+_dev_self_agent() {
+  [[ -n $CLAUDE_CODE_SESSION_ID ]] && { print -r -- claude; return 0; }
+  local pid; pid=$(_dev_agent_pid_above) || return 1
+  _dev_agent_of_comm "$(ps -o comm= -p "$pid" 2>/dev/null)"
+}
+_dev_self_sid() {
+  [[ -n $CLAUDE_CODE_SESSION_ID ]] && { print -r -- "$CLAUDE_CODE_SESSION_ID"; return 0; }
+  local pid reg; pid=$(_dev_agent_pid_above) || return 1
+  reg="${XDG_CACHE_HOME:-$HOME/.cache}/claude-sessions/$pid"
+  [[ -r $reg ]] || return 1
+  local line; line="$(<"$reg")"; print -r -- "${line%%$'\t'*}"
 }
 
 # Worktree-per-session helpers. The path + branch are derived from the repo's BASENAME
@@ -767,6 +884,13 @@ _dev_repo_slots() {
   enc=${${:-${DEV_WORKTREE_ROOT}/${base}}//[^A-Za-z0-9]/-}
   for p in "$HOME/.claude/projects/${enc}-"*(N/); do
     n=${${p:t}#${enc}-}; [[ $n == <-> ]] && seen[$n]=1
+  done
+  # codex: its thread index knows which worktree paths have had a conversation
+  # (a codex-only slot whose worktree was swept leaves no claude project dir)
+  local row c
+  for row in ${(f)"$(_codex_threads prefix "${DEV_WORKTREE_ROOT}/${base}/")"}; do
+    c=${${row#*$'\t'}#*$'\t'}; c=${c%%$'\t'*}
+    n=${${c#${DEV_WORKTREE_ROOT}/${base}/}%%/*}; [[ $n == <-> ]] && seen[$n]=1
   done
   (( $#seen )) || return 1
   print -rl -- ${(no)${(k)seen}}
@@ -1793,7 +1917,33 @@ def save(key, st):
         pass
 
 
+def scan_codex(st, text):
+    # A codex rollout: `response_item` records whose payload is a user `message`
+    # carry the prompts as content [{type: input_text, text}]; the first line is
+    # session_meta. The same "first real prompt" rule as claude, with codex's own
+    # injected user-role context skipped: the <recommended_plugins> /
+    # <environment_context> notices (the `<` filter) and the `# AGENTS.md
+    # instructions for <dir>` message it fronts a session with (verified on 0.154).
+    for line in text.splitlines():
+        if st['msg'] is None and '"response_item"' in line and '"role":"user"' in line.replace(' ', ''):
+            try:
+                pl = json.loads(line).get('payload', {})
+                if pl.get('type') == 'message' and pl.get('role') == 'user':
+                    txt = ' '.join(x.get('text', '') for x in pl.get('content') or []
+                                   if isinstance(x, dict)).strip()
+                    if txt and not txt.startswith('<') and not txt.startswith('# AGENTS.md instructions'):
+                        st['msg'] = txt
+            except SOFT: pass
+        hits = PR.findall(line)
+        if hits: st['pr'] = hits[-1]
+
+
 def scan(st, text):
+    if st.get('fmt') is None:
+        # sniff ONCE per transcript: a rollout's first line is session_meta
+        st['fmt'] = 'codex' if text[:4096].find('"session_meta"') >= 0 else 'claude'
+    if st['fmt'] == 'codex':
+        return scan_codex(st, text)
     for line in text.splitlines():
         if '"custom-title"' in line:                    # /rename — wins
             try:
@@ -1829,7 +1979,7 @@ for path in sys.argv[1:]:
     key = hashlib.sha1(path.encode('utf-8', 'surrogateescape')).hexdigest()[:20]
     st = load(key)
     if not st or st.get('ino') != info.st_ino or st.get('off', 0) > info.st_size:
-        st = {'ino': info.st_ino, 'off': 0, 'ct': None, 'at': None, 'msg': None, 'pr': None}
+        st = {'ino': info.st_ino, 'off': 0, 'ct': None, 'at': None, 'msg': None, 'pr': None, 'fmt': None}
     if st['off'] < info.st_size:
         data = b''
         try:
@@ -1923,8 +2073,9 @@ _dev_session_sid() {
   fi
   sid=$(tmux show-environment -t "$session" CLAUDE_RESUME_ID 2>/dev/null | cut -d= -f2)
   [[ -n $sid ]] || return 0
-  local -a tx=( "$HOME/.claude/projects/${dir//[^A-Za-z0-9]/-}/$sid".jsonl(N) )
-  [[ -n ${tx[1]} ]] && print -r -- "$sid"
+  # per agent: claude's transcript must sit in THIS slot's project dir; a codex
+  # rollout is date-keyed, so its existence (hook cache / sqlite / glob) is the test
+  _dev_agent_transcript "$(_dev_agent_of_session "$session")" "$sid" "$dir" >/dev/null && print -r -- "$sid"
   return 0
 }
 
@@ -1938,13 +2089,21 @@ _dev_session_summary() {
   # <sid> is optional: callers that already resolved it (_dev_session_rows) pass it
   # in, because resolving it walks the process table and used to be done TWICE per
   # session — once for the row's id column and again in here.
-  local session="$1" dir="$2" sid="${3:-}"
+  local session="$1" dir="$2" sid="${3:-}" agent tx
+  agent=$(_dev_agent_of_session "$session")
   [[ -n $sid ]] || sid=$(_dev_session_sid "$session" "$dir")
   if [[ -n $sid ]]; then
     # A valid id (registry or validated stamp) always has its transcript under this
-    # slot's own project dir, since the dir IS the conversation's cwd.
-    local -a tx=( "$HOME/.claude/projects/${dir//[^A-Za-z0-9]/-}/$sid".jsonl(N) )
-    [[ -n ${tx[1]} ]] && { _transcript_title "${tx[1]}"; return 0; }
+    # slot's own project dir, since the dir IS the conversation's cwd (claude); the
+    # codex locator answers from the hook cache / sqlite instead.
+    tx=$(_dev_agent_transcript "$agent" "$sid" "$dir") && { _transcript_title "$tx"; return 0; }
+  fi
+  if [[ $agent == codex ]]; then
+    # no birthtime heuristic for codex: its sqlite row names the newest thread in
+    # this dir directly
+    tx=$(_dev_agent_transcripts_for_cwd codex "$dir" | head -1)
+    [[ -n $tx ]] && _transcript_title "$tx"
+    return 0
   fi
   _dev_summary_for_pid "$dir" "$(_dev_session_claude_pid "$session")"
 }
@@ -2006,11 +2165,9 @@ _dev_fg_rows() {
     # foreground row UNIQUE (two `dot` foreground claudes were both "dot:fg" before)
     # and is the handle `t open <id>` reattaches by. The colon marks an fg row (tmux
     # slots use "<repo>-<num>"). A pre-registry session (no id) falls back to ":fg".
-    if [[ -n $sid && $agent == codex ]]; then
-      label="${repo}:${sid[1,8]}"; context=active; summary='(codex session)'
-    elif [[ -n $sid ]]; then
+    if [[ -n $sid ]]; then
       label="${repo}:${sid[1,8]}"
-      local -a tx=( "$HOME/.claude/projects"/*/"$sid".jsonl(N) )
+      local -a tx=( $(_dev_agent_transcript "$agent" "$sid" 2>/dev/null) )
       title=$([[ -n ${tx[1]} ]] && _transcript_title "${tx[1]}")
       if [[ -n $title ]]; then context=active; summary=$title
       else context=idle; summary='(idle — no conversation)'; fi
@@ -2095,10 +2252,10 @@ _dev_adopt_fg() {
       [[ -n $insc ]] && resumable=$insc
     fi
   fi
-  local sid cwd
+  local sid cwd agent
   local -a lines=( ${(f)resumable} )
   if (( ${#lines} == 1 )); then
-    IFS=$'\t' read -r sid cwd _ <<< "${lines[1]}"
+    IFS=$'\t' read -r sid cwd _ _ _ _ agent <<< "${lines[1]}"
   else
     [[ -t 0 && -t 1 ]] || { echo "t open: several foreground sessions — name one (\`t open <id>\`) or pick from a terminal:" >&2; print -r -- "$resumable" | awk -F'\t' '{printf "  %s  %s\n",$3,$6}' >&2; return 1; }
     local pick
@@ -2106,10 +2263,12 @@ _dev_adopt_fg() {
              | fzf --with-nth=2.. --delimiter='\t' --prompt="t open > ") || return 1
     sid=${pick%%$'\t'*}
     cwd=$(print -r -- "$resumable" | awk -F'\t' -v s="$sid" '$1==s{print $2; exit}')
+    agent=$(print -r -- "$resumable" | awk -F'\t' -v s="$sid" '$1==s{print $7; exit}')
   fi
   [[ -n $sid ]] || return 1
+  _dev_agent_valid "$agent" || agent=claude   # a 6-field row (older producer) is claude
 
-  echo "Adopting foreground session → here (claude -r ${sid[1,8]}… in $cwd)"
+  echo "Adopting foreground session → here ($(_dev_agent_resume_cmd "$agent" "${sid[1,8]}…") in $cwd)"
   # Stop the foreground owner and wait for it to actually exit (≤5s) before resuming,
   # so only one live claude ever holds the id — same race tpop guards against.
   local pid; pid=$(_dev_pid_for_sid "$sid")
@@ -2120,7 +2279,8 @@ _dev_adopt_fg() {
     kill -0 "$pid" 2>/dev/null && \
       echo "warning: foreground owner ($pid) didn't exit; resuming anyway — transcript may interleave." >&2
   fi
-  cd "$cwd" && claude -r "$sid"
+  cd "$cwd" || return 1
+  if [[ $agent == codex ]]; then codex resume "$sid"; else claude -r "$sid"; fi
 }
 
 # _dev_list — print every dev-<repo>-<slot> tmux session, compact enough to read
@@ -2381,7 +2541,13 @@ _dev_session_rows() {
       # which owns the birthtime-matching heuristic for that case. (claude only —
       # a codex slot's rollout is not cwd-keyed; its title lands with the seam's
       # transcript locator.)
-      [[ $sid != - && $agent == claude ]] && tx=( "$HOME/.claude/projects/${dir//[^A-Za-z0-9]/-}/$sid".jsonl(N) )
+      if [[ $agent == claude ]]; then
+        [[ $sid != - ]] && tx=( "$HOME/.claude/projects/${dir//[^A-Za-z0-9]/-}/$sid".jsonl(N) )
+      else
+        # codex: the locator (hook cache / sqlite / glob) for a known id, else the
+        # newest thread recorded in this dir — same batch, same cache
+        tx=( $(_dev_agent_transcript codex "$sid" "$dir" 2>/dev/null || _dev_agent_transcripts_for_cwd codex "$dir" | head -1) )
+      fi
     fi
     rows+=("$sid"$'\t'"$dir"$'\t'"$short"$'\t'"$state"$'\t'"$context"$'\t'"$agent")
     if [[ -n ${tx[1]:-} ]]; then rowtx+=("${tx[1]}"); tpaths+=("${tx[1]}")
@@ -2403,15 +2569,13 @@ _dev_session_rows() {
       none) summary='(no active session)' ;;
       idle) summary='(idle — no conversation)' ;;
       *)
-        if [[ $agent == codex ]]; then
-          summary='(codex session)'
-        elif [[ ${rowtx[$i]} != - ]]; then
+        if [[ ${rowtx[$i]} != - ]]; then
           summary=${title_of[${rowtx[$i]}]:-}
         else
           psid=$sid; [[ $psid == - ]] && psid=
           summary=$(_dev_session_summary "dev-$short" "$dir" "$psid")
         fi
-        [[ -n $summary ]] || summary='(untitled session)'
+        [[ -n $summary ]] || summary="(untitled $agent session)"
         # " · #N <state>" for the session's PR — the same tag `t resume` renders,
         # from the same cache, so a slot whose PR has landed says so where you
         # actually look at slots. It rides on the summary instead of a column of
@@ -2561,10 +2725,11 @@ _dev_list_remote() {
 # the prompt. Mirrors _dev_list's two-signal distinction; without it `dev kill`
 # prompted "Claude is live there" for the very sessions ls calls idle.
 _dev_kill_one() {
-  local session="$1" force="$2"
+  local session="$1" force="$2" agent
+  agent=$(_dev_agent_of_session "$session")
   if [[ -z "$force" ]] && _dev_session_has_claude "$session" \
-       && ! _dev_session_at_welcome "$session"; then
-    read -q "REPLY?Kill $session? Claude is live there (context interrupted). [y/N] " \
+       && ! _dev_agent_at_welcome "$agent" "$session"; then
+    read -q "REPLY?Kill $session? $agent is live there (context interrupted). [y/N] " \
       || { print; echo "Skipped $session."; return 1; }
     print
   fi
@@ -2765,7 +2930,7 @@ _dev_kill() {
     echo "Specify a slot to kill (or 'all'). Sessions for '$repo':"
     local s
     for s in $sessions; do
-      if _dev_session_has_claude "$s"; then echo "  $s  ✓ (Claude live)"; else echo "  $s"; fi
+      if _dev_session_has_claude "$s"; then echo "  $s  ✓ ($(_dev_agent_of_session "$s") live)"; else echo "  $s"; fi
     done
     return 1
   fi
@@ -3151,7 +3316,8 @@ _t_dev() {
       else _dev_worktree_refuse "$repo" "$slot"; return 1; fi
     fi
     _dev_agent_check "$agent" || return 1
-    echo "Starting $session in $dir${agent:#claude:+ · $agent} (logging to $logfile)"
+    local agent_note=; [[ $agent != claude ]] && agent_note=" · $agent"
+    echo "Starting $session in $dir$agent_note (logging to $logfile)"
     _dev_new_session "$session" "$dir" "$branch" "$skip_prepare" "$agent"
     tmux attach-session -t "$session"
   fi
@@ -3693,6 +3859,10 @@ _t_plan() {
       _dev_session_remote_fallback "$session" plan && return
       echo "No such session: $session" >&2; return 1
     fi
+    if [[ $(_dev_agent_of_session "$session") == codex ]]; then
+      echo "t plan: $session runs codex, which keeps no plan files (~/.claude/plans is Claude's)." >&2
+      return 1
+    fi
     sid=$(tmux show-environment -t "$session" CLAUDE_RESUME_ID 2>/dev/null | cut -d= -f2)
     if [[ -z $sid ]]; then
       local dir; dir=$(tmux display-message -p -t "$session" '#{session_path}')
@@ -4113,7 +4283,7 @@ _t_resume() {
   local -A remote_live_host remote_live_alias remote_live_sum
   local -A meta_title meta_pr
   local _p _mr _mrest
-  local n wt sid busy rhost _rdir _rbase _rhost _rn _ralias _rsum _ok _stale stale_path
+  local n wt sid busy rhost _rdir _rbase _rhost _rn _ralias _rsum _ok _stale stale_path agent _ag
   local txf title when ep org orgf hf skipped=0 hidden_live=0
   local reopened opf opep REPLY
   local _rwtr=${DEV_WORKTREE_ROOT:-}
@@ -4219,14 +4389,17 @@ _t_resume() {
         cands+=(9999999999$'\t'"$repo"$'\t'"$n"$'\t'-$'\t'"${stale_path:-$wt}"$'\t'"● active"$'\t'"${local_sum[${_stale#dev-}]:-(live session)}"$'\t'here$'\t'-$'\t'-)
         continue
       fi
-      tx=( "$HOME/.claude/projects/${wt//[^A-Za-z0-9]/-}"/*.jsonl(Nom) )
+      # every conversation either agent recorded in this worktree: claude's project
+      # dir by mtime, codex's threads from its sqlite index (rollouts are date-keyed)
+      tx=( "$HOME/.claude/projects/${wt//[^A-Za-z0-9]/-}"/*.jsonl(Nom)
+           ${(f)"$(_dev_agent_transcripts_for_cwd codex "$wt")"} )
       for txf in "${(@)tx}"; do
         ep=$(zstat +mtime "$txf" 2>/dev/null || echo 0)   # sort key + --days gate
         # Effective recency = max(transcript mtime, opened stamp): resuming
         # writes nothing to the .jsonl, so without the stamp a just-reopened
         # conversation sorts — and --days-gates — as days old. Stamp newer →
         # the row is dated by the stamp and marked ↻.
-        reopened=; opf="$opdir/${${txf:t}%.jsonl}"
+        reopened=; opf="$opdir/$(_dev_transcript_sid "$txf")"
         if [[ -f $opf ]]; then
           opep=$(zstat +mtime "$opf" 2>/dev/null || echo 0)
           (( opep > ep )) && { ep=$opep; reopened=1; }
@@ -4290,7 +4463,11 @@ _t_resume() {
       elif [[ -n ${host_alias[$org]:-} ]]; then org=${host_alias[$org]}
       fi
     fi
-    cands+=("$ep"$'\t'"$repo"$'\t'"$n"$'\t'"${${txf:t}%.jsonl}"$'\t'"$wt"$'\t'"$when"$'\t'"$title"$'\t'-$'\t'-$'\t'"${org[1,10]}")
+    # a codex row is marked in its date cell (⬡ — the `t ls` glyph) so a picker with
+    # both agents says which binary each pick will run; field 4 is the real sid (the
+    # trailing uuid of a rollout filename), field 11 the agent for the spawn
+    _ag=$(_dev_transcript_agent "$txf"); [[ $_ag == codex ]] && when="⬡ $when"
+    cands+=("$ep"$'\t'"$repo"$'\t'"$n"$'\t'"$(_dev_transcript_sid "$txf")"$'\t'"$wt"$'\t'"$when"$'\t'"$title"$'\t'-$'\t'-$'\t'"${org[1,10]}"$'\t'"$_ag")
   done
   # ONE detached refresh for the whole scan, instead of a `gh pr view` child per
   # stale row: _pr_state_refresh batches the refs by repo, so a scan that turned up
@@ -4414,11 +4591,11 @@ _t_resume() {
       return 1
     fi
     local -A mp_taken
-    local mp_first_repo= mp_first_slot= mp_cwd mp_session mp_loc mp_pair
+    local mp_first_repo= mp_first_slot= mp_cwd mp_session mp_loc mp_pair mp_agent
     local -a mp_rest mp_unopened
     for pick in "${(@)picks}"; do
       f=("${(@ps:\t:)pick}")
-      repo=$f[1]; slot=$f[2]; sid=$f[3]; wt=$f[4]; mp_loc="${f[7]:-}"
+      repo=$f[1]; slot=$f[2]; sid=$f[3]; wt=$f[4]; mp_loc="${f[7]:-}"; mp_agent="${f[10]:-claude}"
       if [[ $mp_loc == here ]]; then
         echo "· $repo $slot is already live here — attach with: t open $repo $slot"
         continue
@@ -4437,7 +4614,7 @@ _t_resume() {
       mp_taken[$repo/$slot]=1
       mp_session="dev-${repo}-${slot}"
       echo "Resuming ${sid:0:8} in $mp_session ($mp_cwd)"
-      _dev_resume_session "$mp_session" "$mp_cwd" "$sid"
+      _dev_resume_session "$mp_session" "$mp_cwd" "$sid" "$mp_agent"
       if [[ -z $mp_first_repo ]]; then
         mp_first_repo=$repo; mp_first_slot=$slot
       else
@@ -4473,7 +4650,7 @@ _t_resume() {
   fi
   pick=$picks[1]
   f=("${(@ps:\t:)pick}")
-  repo=$f[1]; slot=$f[2]; sid=$f[3]; wt=$f[4]
+  repo=$f[1]; slot=$f[2]; sid=$f[3]; wt=$f[4]; agent="${f[10]:-claude}"
   local loc="${f[7]:-}" lalias="${f[8]:-}"
 
   # A LIVE row was picked: attach in place (local or on its host) — resuming it
@@ -4502,13 +4679,13 @@ _t_resume() {
       return 1
     fi
     cd "$cwd" || return 1
-    claude -r "$sid"
+    if [[ $agent == codex ]]; then codex resume "$sid"; else claude -r "$sid"; fi
     return
   fi
 
   local session="dev-${repo}-${slot}"
   echo "Resuming ${sid:0:8} in $session ($cwd)"
-  _dev_resume_session "$session" "$cwd" "$sid"
+  _dev_resume_session "$session" "$cwd" "$sid" "$agent"
   if [[ -z $TMUX && -t 0 && -t 1 ]]; then
     tmux attach-session -t "$session"
   else
@@ -5009,20 +5186,30 @@ _dev_slot_for_cwd() {
 # No sentinel written → behaves exactly like plain `claude`. The wrapper has to
 # own this: tpush runs in Claude's Bash subprocess, which has no TTY to attach
 # and can't exit (let alone outlive) its own parent.
-claude() {
+claude() { _dev_agent_wrap claude "$@" }
+# codex — the same wrapper for Codex CLI, so `t push` from inside a codex session
+# hands off the same way (its shell tool inherits the sentinel env like claude's).
+codex()  { _dev_agent_wrap codex "$@" }
+# _dev_agent_wrap <agent> [args…] — the shared body: arm the sentinel, run the real
+# binary, act on the instruction it left. SPAWN's payload carries a trailing agent
+# field (session, cwd, sid, agent); a payload without it — an older `t push` — is
+# claude, so the two never disagree about who resumes what.
+_dev_agent_wrap() {
+  local agent="$1"; shift
   local sentinel="${TMPDIR:-/tmp}/claude-tpush-attach.$$"
   rm -f "$sentinel"
-  CLAUDE_TPUSH_ATTACH="$sentinel" command claude "$@"
+  CLAUDE_TPUSH_ATTACH="$sentinel" command "$agent" "$@"
   local rc=$?
   if [[ -s "$sentinel" ]]; then
     local payload="$(<"$sentinel")"
     rm -f "$sentinel"
-    local verb="${payload%%$'\t'*}" rest="${payload#*$'\t'}" target cwd sid
+    local verb="${payload%%$'\t'*}" rest="${payload#*$'\t'}" target cwd sid sagent
     case "$verb" in
       SPAWN)
-        target="${rest%%$'\t'*}"; rest="${rest#*$'\t'}"
-        cwd="${rest%%$'\t'*}"; sid="${rest#*$'\t'}"
-        tmux has-session -t "$target" 2>/dev/null || _dev_resume_session "$target" "$cwd" "$sid"
+        local -a f=("${(@ps:\t:)rest}")
+        target=$f[1]; cwd=$f[2]; sid=$f[3]; sagent=${f[4]:-claude}
+        _dev_agent_valid "$sagent" || sagent=claude
+        tmux has-session -t "$target" 2>/dev/null || _dev_resume_session "$target" "$cwd" "$sid" "$sagent"
         ;;
       ATTACH) target="$rest" ;;
       *)      target="$payload" ;;   # legacy: whole line is a bare session name
@@ -5063,9 +5250,11 @@ _t_push() {
     return 1
   fi
 
-  local sid cwd
-  if [[ -n $CLAUDE_CODE_SESSION_ID && -z $pick ]]; then
-    sid=$CLAUDE_CODE_SESSION_ID; cwd=$PWD          # current-session mode
+  local sid cwd agent=claude self_sid
+  self_sid=$(_dev_self_sid)
+  if [[ -n $self_sid && -z $pick ]]; then
+    sid=$self_sid; cwd=$PWD                        # current-session mode (claude or codex)
+    agent=$(_dev_self_agent); agent=${agent:-claude}
   else
     local row filter="$PWD"
     [[ -n $all ]] && filter=""                     # --all: every project
@@ -5117,7 +5306,7 @@ _t_push() {
   # transcript with no lock, and they diverge (the backgrounded copy freezes).
   # The wrapper spawns once we've exited and $sid is free; see claude() above.
   local defer=
-  [[ -n $CLAUDE_CODE_SESSION_ID && -n $CLAUDE_TPUSH_ATTACH && -z $existing ]] && defer=1
+  [[ -n $self_sid && -n $CLAUDE_TPUSH_ATTACH && -z $existing ]] && defer=1
 
   if [[ -n $existing ]]; then
     echo "This conversation is already backgrounded in $session."
@@ -5128,12 +5317,12 @@ _t_push() {
   elif [[ -n $defer ]]; then
     echo "Will resume ${sid[1,8]}… into detached $session ($cwd) on exit."
   else
-    _dev_resume_session "$session" "$cwd" "$sid"
+    _dev_resume_session "$session" "$cwd" "$sid" "$agent"
     echo "Resumed ${sid[1,8]}… in detached $session ($cwd)"
   fi
 
   # Land you in the session. Three cases:
-  if [[ -z $CLAUDE_CODE_SESSION_ID ]]; then
+  if [[ -z $self_sid ]]; then
     # Plain-shell picker mode: we own a real terminal and the picked session
     # isn't live, so spawn (above) + attach straight in. No overlap to worry about.
     echo "$attach_hint"
@@ -5145,7 +5334,8 @@ _t_push() {
     if [[ -n $existing ]]; then
       print -r -- "ATTACH"$'\t'"$session" > "$CLAUDE_TPUSH_ATTACH"
     else
-      print -r -- "SPAWN"$'\t'"$session"$'\t'"$cwd"$'\t'"$sid" > "$CLAUDE_TPUSH_ATTACH"
+      # trailing agent field: the wrapper defaults a missing one to claude
+      print -r -- "SPAWN"$'\t'"$session"$'\t'"$cwd"$'\t'"$sid"$'\t'"$agent" > "$CLAUDE_TPUSH_ATTACH"
     fi
     # Auto-exit: signal the controlling `claude` to quit so you don't have to type
     # /exit. The sentinel above is already written and closed (the `>` redirection
@@ -5165,7 +5355,7 @@ _t_push() {
   else
     # Inside Claude without the wrapper (older shell): can't defer, so spawn now
     # and warn — exit immediately, two live copies of one session diverge.
-    [[ -z $existing ]] && _dev_resume_session "$session" "$cwd" "$sid"
+    [[ -z $existing ]] && _dev_resume_session "$session" "$cwd" "$sid" "$agent"
     echo "$attach_hint"
     echo "(Exit this foreground Claude NOW — two live copies of one session diverge.)"
   fi
@@ -5253,17 +5443,14 @@ _t_pop() {
   # newest-fallback is only for pre-hook sessions and is ambiguous when several
   # slots share one repo dir (it returns whichever sibling wrote last); the hook
   # is what makes targeting a specific slot reliable.
-  local dir sid
+  local dir sid agent
   dir=$(tmux display-message -p -t "$session" '#{session_path}')
+  agent=$(_dev_agent_of_session "$session")
   sid=$(tmux show-environment -t "$session" CLAUDE_RESUME_ID 2>/dev/null | cut -d= -f2)
-  if [[ -z $sid ]]; then
-    # newest transcript for the dir: (N)ullglob, (om) order by mtime, [1] = first
-    local -a tx=( "$HOME/.claude/projects/${dir//[^A-Za-z0-9]/-}"/*.jsonl(Nom[1]) )
-    sid=${${tx[1]:t}%.jsonl}
-  fi
+  [[ -n $sid ]] || sid=$(_dev_agent_newest_sid "$agent" "$dir")   # newest conversation in the dir, per agent
   [[ -n $sid ]] || { echo "Couldn't find a session id for $session ($dir)."; return 1; }
 
-  echo "Popping $session → foreground (claude -r ${sid[1,8]}… in $dir)"
+  echo "Popping $session → foreground ($(_dev_agent_resume_cmd "$agent" "${sid[1,8]}…") in $dir)"
   # Capture the live claude PID inside the session so we can wait for it to fully
   # exit before resuming. Claude Code takes NO lock on a session's transcript: if
   # the old (tmux) process and the new (foreground) one are both live on $sid they
@@ -5279,9 +5466,10 @@ _t_pop() {
     local n=0
     while kill -0 "$cpid" 2>/dev/null && (( n++ < 100 )); do sleep 0.05; done   # wait ≤5s for it to die
     kill -0 "$cpid" 2>/dev/null && \
-      echo "warning: $session's claude ($cpid) didn't exit; resuming anyway — transcript may interleave." >&2
+      echo "warning: $session's $agent ($cpid) didn't exit; resuming anyway — transcript may interleave." >&2
   fi
-  cd "$dir" && claude -r "$sid"
+  cd "$dir" || return 1
+  if [[ $agent == codex ]]; then codex resume "$sid"; else claude -r "$sid"; fi
 }
 
 # _tbeam_sync_transcript <cwd> <host> — copy a session's transcript dir to <host>

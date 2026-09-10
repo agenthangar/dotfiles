@@ -310,9 +310,35 @@ def _header(st, scope):
     return f"dev sessions   {st.g}●{st.r} attached · {st.c}✓{st.r} active context{note}"
 
 
-def cmd_ls(cfg, args):
-    scope = "" if args.all else cfg.repo_dir_for_cwd(os.getcwd())
+def _ls_scope(cfg, repo, all_repos, cwd):
+    """Resolve `t ls [repo] [-a]` to (scope, wt_scope): the canonical repo dir the
+    rows are filtered to (plus its worktree root), or ("", "") for every repo.
+
+    An explicit repo is the scope from ANY directory — `t ls dot -r` from ~ was the
+    ask, and every other slot verb already takes `<repo>` this way. Unknown alias →
+    ValueError naming the choices (never a silent fall-through to the cwd repo,
+    which would render the WRONG repo under a heading that looks right). Combined
+    with -a it is a contradiction and is refused rather than one flag quietly
+    winning."""
+    if repo:
+        if all_repos:
+            raise ValueError("t ls: a repo and --all are contradictory — pick one")
+        if repo not in cfg.repos:
+            raise ValueError("unknown repo %r — one of: %s"
+                             % (repo, ", ".join(sorted(cfg.repos)) or "(none registered)"))
+        scope = cfg.repos[repo]
+    else:
+        scope = "" if all_repos else cfg.repo_dir_for_cwd(cwd)
     wt_scope = os.path.join(cfg.worktree_root, os.path.basename(scope)) if scope else ""
+    return scope, wt_scope
+
+
+def cmd_ls(cfg, args):
+    try:
+        scope, wt_scope = _ls_scope(cfg, args.repo, args.all, os.getcwd())
+    except ValueError as e:
+        print(e, file=sys.stderr)
+        return 1
     st = Style()
     if args.remote:
         rows = _scope_filter(_parse_rows(zsh_capture("_dev_rows_all"), host_prefixed=True), scope, wt_scope)
@@ -3973,9 +3999,11 @@ Run `t <verb> -h` for a verb's own flags.""")
     sp = sub.add_parser("ls", help="list dev sessions (attached + active context)",
         description="List live Claude dev sessions: whether each is attached, and whether it "
             "has an active conversation loaded (vs. parked on the startup splash). Scoped to the "
-            "repo your cwd is in by default; `-a` widens to every repo, and `-r` spans every "
+            "repo your cwd is in by default (`t ls <repo>` scopes to a named repo from anywhere); "
+            "`-a` widens to every repo, and `-r` spans every "
             "$REMOTE_HOSTS machine in one table with a HOST column. Read-only — attach with "
             "`t open`, move with `t beam`.")
+    sp.add_argument("repo", nargs="?", help="scope to this repo from any directory (default: the repo cwd is in)")
     sp.add_argument("-r", "--remote", action="store_true", help="span every $REMOTE_HOSTS host")
     sp.add_argument("-a", "--all", action="store_true", help="every repo (not just the current)")
 

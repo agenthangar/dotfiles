@@ -19,7 +19,7 @@ shim in `.zshrc` for verbs that must run in your shell).
 | `t push` / `t pop` | Move a session between a foreground terminal and a detached tmux slot — one-live-owner guarantee |
 | `t beam <repo> [slot] --host <h>` | Teleport a running session to another machine; pull one back with `t open … --here` |
 | `t find <query>` | Semantic search across saved sessions ("which one was working on X?"), reranked by Claude |
-| `t new [name]` | Wizard: create `~/code/<name>` + a GitHub repo (owner picked from your orgs; squash-only, auto-merge), register it here and clone + register it on every remote host. Re-running resumes; on an existing repo it just finishes the wiring |
+| `t new [name\|--prompt TEXT]` | Wizard: create `~/code/<name>` + a GitHub repo (owner picked from your orgs; squash-only, auto-merge), register it here and clone + register it on every remote host. No name in mind? Describe it (a sentence at the name step, or `--prompt`) and Claude suggests names to pick from. Re-running resumes; on an existing repo it just finishes the wiring |
 | `t mcp` | The `sessions` MCP server Claude Code spawns, so any Claude session can answer "which session is/was working on X?" from every saved transcript and the live slots. `--install` registers it (`dots` does), `--call <tool> '<json>'` runs one tool by hand |
 
 Run `t -h` for the full verb list.

@@ -1063,12 +1063,46 @@ def test_new_answers_from_flags(t_mod):
     a = t_mod._new_answers(_NS(name="x", owner=None, public=True, private=False, alias=None,
                                hosts="mini, openclaw", no_hosts=False))
     assert a == {"name": "x", "owner": None, "visibility": "public", "alias": None,
-                 "hosts": ["mini", "openclaw"]}
+                 "hosts": ["mini", "openclaw"], "prompt": None}
     a = t_mod._new_answers(_NS(name=None, owner="o", public=False, private=True, alias="k",
-                               hosts=None, no_hosts=True))
-    assert a == {"name": None, "owner": "o", "visibility": "private", "alias": "k", "hosts": []}
+                               hosts=None, no_hosts=True, prompt="  a cli for X  "))
+    assert a == {"name": None, "owner": "o", "visibility": "private", "alias": "k", "hosts": [],
+                 "prompt": "a cli for X"}
     assert t_mod._new_answers(_NS(name=None, owner=None, public=False, private=False, alias=None,
                                   hosts=None, no_hosts=False))["hosts"] is None
+
+
+def test_new_name_input_one_token_is_a_name_anything_else_a_prompt(t_mod):
+    assert t_mod._new_name_input("  cashfwd ") == ("name", "cashfwd")
+    assert t_mod._new_name_input("-bad") == ("name", "-bad")     # still validated as a name
+    assert t_mod._new_name_input("a cli that forecasts cash") == ("prompt", "a cli that forecasts cash")
+    assert t_mod._new_name_input("two\twords") == ("prompt", "two\twords")
+
+
+def test_new_name_prompt_carries_rules_and_taken(t_mod):
+    txt = t_mod._new_name_prompt("a cash-flow forecaster", {"cashfwd", "dotfiles"})
+    assert '"a cash-flow forecaster"' in txt
+    assert "cashfwd, dotfiles" in txt
+    assert "JSON array" in txt and str(t_mod._NEW_NAME_MAX) in txt
+    assert "taken" not in t_mod._new_name_prompt("x", set())
+
+
+def test_new_parse_names_tolerates_prose_validates_and_dedupes(t_mod):
+    reply = ('Here you go:\n```json\n[{"name": "CashFwd", "why": "short"}, '
+             '{"name": "cashfwd", "why": "dup"}, {"name": "-bad", "why": "invalid"}, '
+             '{"name": "taken-one"}, "bare-string", {"why": "no name"}]\n```')
+    assert t_mod._new_parse_names(reply, taken={"taken-one"}) == [
+        ("cashfwd", "short"), ("bare-string", "")]
+    assert t_mod._new_parse_names("no array here") == []
+    assert t_mod._new_parse_names("[not json") == []
+    assert t_mod._new_parse_names("") == []
+    many = json.dumps([{"name": f"n{i}"} for i in range(20)])
+    assert len(t_mod._new_parse_names(many)) == t_mod._NEW_NAME_MAX
+
+
+def test_new_taken_names_is_basenames_plus_code_entries(t_mod):
+    assert t_mod._new_taken_names(["/Users/x/code/dotfiles", "/Users/x/work/api/", ""],
+                                  ["api", "hive", ""]) == {"dotfiles", "api", "hive"}
 
 
 def test_new_state_summary(t_mod):

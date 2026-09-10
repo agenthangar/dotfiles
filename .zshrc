@@ -5877,7 +5877,7 @@ _t() {
       else _files -/; fi ;;   # scan-dir arguments
     new)
       if (( CURRENT == 3 )) && [[ ${words[CURRENT]} != -* ]]; then _message 'repo name'
-      else _values 'flag' --owner --public --private --alias --hosts --no-hosts -y --yes --dry-run -h --help; fi ;;
+      else _values 'flag' -p --prompt --owner --public --private --alias --hosts --no-hosts -y --yes --dry-run -h --help; fi ;;
   esac
 }
 _sleepmgr_cmd() { _arguments '1:command:(status disable enable help)' }

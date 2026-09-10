@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# csync — two-way sync of Claude Code sessions, plans, and Cursor
-# CLI chats with iCloud.
+# csync — two-way sync of Claude Code sessions, plans, Codex CLI
+# rollouts, and Cursor CLI chats with iCloud.
 # One command, no direction: merges both ways (newest file wins, nothing
 # deleted) so every machine converges to the union of all sessions and plans.
 # Safe to run anytime; --update never clobbers a newer copy and no --delete means
@@ -22,6 +22,8 @@ case "${1:-}" in
 esac
 
 icloud_base="$HOME/Library/Mobile Documents/com~apple~CloudDocs"
+# CSYNC_RSYNC: the rsync to run (tests point it at a stub that logs its argv).
+RSYNC="${CSYNC_RSYNC:-rsync}"
 
 if [[ ! -d "$icloud_base" ]]; then
   echo "iCloud Drive not found on this machine."
@@ -56,8 +58,8 @@ sync_pair() {
   # Merge both directions. --update keeps the newer side on each file; no
   # --delete, so files only ever accumulate.
   echo "⟳ Syncing $label  iCloud ↔ $local_dir"
-  rsync -a --update --exclude='.DS_Store' "$icloud/" "$local_dir/"
-  rsync -a --update --exclude='.DS_Store' "$local_dir/" "$icloud/"
+  "$RSYNC" -a --update --exclude='.DS_Store' "$icloud/" "$local_dir/"
+  "$RSYNC" -a --update --exclude='.DS_Store' "$local_dir/" "$icloud/"
 }
 
 # Transcripts and saved plans both live under ~/.claude but in separate trees.
@@ -76,5 +78,16 @@ sync_pair "$HOME/.claude/plans"    "$icloud_base/claude-plans"    "plans"
 # machines at once. cursor-beam moves a single chat immediately over ssh.
 if [[ -d "$HOME/.cursor/chats" || -d "$icloud_base/cursor-chats" ]]; then
   sync_pair "$HOME/.cursor/chats" "$icloud_base/cursor-chats" "cursor chats"
+fi
+
+# Codex CLI rollouts: ~/.codex/sessions/YYYY/MM/DD/rollout-<ts>-<id>.jsonl (+ the
+# <id>.origin stamps the SessionStart hook writes beside them). Append-only JSONL,
+# so the union rule is the same as Claude's transcripts. Same either-side gate as
+# cursor. ONLY the sessions tree: codex's sqlite state (state_*.sqlite and friends
+# in ~/.codex) is per-host runtime state and rebuilds itself — codex indexes a
+# synced-in rollout on the first resume (verified on 0.154).
+codex_home="${CODEX_HOME:-$HOME/.codex}"
+if [[ -d "$codex_home/sessions" || -d "$icloud_base/codex-sessions" ]]; then
+  sync_pair "$codex_home/sessions" "$icloud_base/codex-sessions" "codex rollouts"
 fi
 echo "✓ csync complete"

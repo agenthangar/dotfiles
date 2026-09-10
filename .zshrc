@@ -802,15 +802,60 @@ _dev_agent_transcript() {
   [[ -n ${tx[1]} && -f ${tx[1]} ]] && { print -r -- "${tx[1]}"; return 0; }   # -f: a literal path has no glob to null
   return 1
 }
+# _codex_rollout_scan <cwd> — rollouts whose session_meta says <cwd>, newest first,
+# from the date tree itself: the index only learns a rollout when codex next touches
+# it (verified: a copied-in rollout is resumable and gets indexed ON resume), so a
+# rollout that csync / `t resume -r` / a beam just synced in would otherwise be
+# invisible to `t resume` until then. One first-line read per rollout, cached by
+# inode in ~/.cache/claude-sessions/rollout-cwd.json so a settled tree costs a stat
+# per file; a missing tree prints nothing.
+_codex_rollout_scan() {
+  local root="${CODEX_HOME:-$HOME/.codex}/sessions"
+  [[ -d $root ]] || return 0
+  python3 - "$root" "$1" "${XDG_CACHE_HOME:-$HOME/.cache}/claude-sessions/rollout-cwd.json" <<'PY' 2>/dev/null
+import glob, json, os, sys
+root, want, cache = sys.argv[1:4]
+try:
+    with open(cache) as fh: known = json.load(fh)
+except (OSError, ValueError): known = {}
+out, changed = [], False
+for p in glob.glob(os.path.join(root, '*', '*', '*', 'rollout-*.jsonl')):
+    try: st = os.stat(p)
+    except OSError: continue
+    k = known.get(p)
+    if not (isinstance(k, list) and len(k) == 2 and k[0] == st.st_ino):
+        cwd = ''
+        try:
+            with open(p, 'rb') as fh: first = fh.readline(65536).decode('utf-8', 'replace')
+            d = json.loads(first)
+            if d.get('type') == 'session_meta': cwd = (d.get('payload') or {}).get('cwd') or ''
+        except (OSError, ValueError, AttributeError): pass
+        known[p] = k = [st.st_ino, cwd]; changed = True
+    if k[1] == want: out.append((st.st_mtime, p))
+if changed:
+    try:
+        os.makedirs(os.path.dirname(cache), exist_ok=True)
+        tmp = '%s.%d.tmp' % (cache, os.getpid())
+        with open(tmp, 'w') as fh: json.dump(known, fh)
+        os.replace(tmp, cache)
+    except OSError: pass
+for _, p in sorted(out, reverse=True): sys.stdout.write(p + '\n')
+PY
+}
 # _dev_agent_transcripts_for_cwd <agent> <cwd> — every transcript recorded in <cwd>,
-# newest first, one path per line (claude: the project dir by mtime; codex: the
-# sqlite rows). The dead-slot scan behind `t resume` is built on this.
+# newest first, one path per line (claude: the project dir by mtime; codex: the sqlite
+# rows UNION the date-tree scan, deduped). The dead-slot scan behind `t resume` is
+# built on this.
 _dev_agent_transcripts_for_cwd() {
   setopt local_options null_glob bare_glob_qual
   local agent="$1" cwd="$2" row p
   if [[ $agent == codex ]]; then
+    local -A seen
     for row in ${(f)"$(_codex_threads_for_cwd "$cwd")"}; do
-      p=${${row#*$'\t'}%%$'\t'*}; [[ -f $p ]] && print -r -- "$p"
+      p=${${row#*$'\t'}%%$'\t'*}; [[ -f $p && -z ${seen[$p]:-} ]] && { seen[$p]=1; print -r -- "$p"; }
+    done
+    for p in ${(f)"$(_codex_rollout_scan "$cwd")"}; do
+      [[ -z ${seen[$p]:-} ]] && { seen[$p]=1; print -r -- "$p"; }
     done
     return 0
   fi
@@ -1169,7 +1214,7 @@ _dev_worktree_beam_sync() {
 # free slot. Shared code: both landing sides route through it (_dev_pull locally,
 # _tbeam_land over ssh), so it needs `dots` on the host like the rest of the beam family.
 _dev_beam_land_cwd() {
-  local cwd="$1" sid="${2:-}" ohost="${3:-}"
+  local cwd="$1" sid="${2:-}" ohost="${3:-}" agent="${4:-claude}"
   [[ -n $DEV_WORKTREE_ROOT && $cwd == ${DEV_WORKTREE_ROOT}/*/* ]] || { print -r -- "$cwd"; return 0 }
   local r repo slot; r=$(_dev_repo_of_dir "$cwd") || { print -r -- "$cwd"; return 0 }
   repo=${r%%$'\t'*}; slot=${r#*$'\t'}
@@ -1226,7 +1271,9 @@ _dev_beam_land_cwd() {
   # `git push` in the new slot would aim at the OLD slot's branch.
   git -C "$repodir" worktree add -q --no-track -b "$nbr" "$nwt" "origin/$br" 2>/dev/null
   [[ -e $nwt/.git ]] || { print -r -- "tbeam: couldn't create $nwt to reland into" >&2; return 1 }
-  if [[ -n $sid ]]; then
+  # claude only: a codex rollout is date-keyed, so there is nothing to relocate for a
+  # relanded slot (codex indexes it wherever it resumes)
+  if [[ -n $sid && $agent == claude ]]; then
     local pdir="$HOME/.claude/projects" encold="${cwd//[^A-Za-z0-9]/-}" encnew="${nwt//[^A-Za-z0-9]/-}" f
     mkdir -p "$pdir/$encnew"
     # -R: the sid's files include a DIRECTORY named exactly <sid> (tool-results etc.,
@@ -1715,16 +1762,20 @@ _t_paste() {
 # from a snapshot taken minutes ago. Every consumer keeps its original fork-based
 # path and falls back to it when the snapshot is empty (no ps, no tmux server), so
 # behaviour is identical — this is a cache, not a new source of truth.
-typeset -gA _DEV_PS_COMM _DEV_PS_PPID _DEV_PS_KIDS _DEV_PANE_PIDS _DEV_SESS_PID
+typeset -gA _DEV_PS_COMM _DEV_PS_PPID _DEV_PS_KIDS _DEV_PANE_PIDS _DEV_SESS_PID _DEV_PS_APP
 typeset -g _DEV_PS_AT=0
 _dev_ps_snapshot() {
   (( ${#_DEV_PS_COMM} )) && (( EPOCHREALTIME - _DEV_PS_AT < 3 )) && return 0
-  _DEV_PS_COMM=(); _DEV_PS_PPID=(); _DEV_PS_KIDS=(); _DEV_PANE_PIDS=(); _DEV_SESS_PID=()
+  _DEV_PS_COMM=(); _DEV_PS_PPID=(); _DEV_PS_KIDS=(); _DEV_PANE_PIDS=(); _DEV_SESS_PID=(); _DEV_PS_APP=()
   local pid ppid comm sname
   # comm can contain spaces (an .app bundle path), so it takes the rest of the line
   # and :t trims it to the basename — same normalization the old per-pid ps did.
+  # A binary living inside a GUI bundle is remembered as such: the ChatGPT app ships
+  # its own `codex` core (/Applications/ChatGPT.app/Contents/Resources/codex), which
+  # is not a terminal session and must not render as a foreground agent.
   while read -r pid ppid comm; do
     [[ $pid == <-> ]] || continue
+    [[ $comm == *.app/Contents/* ]] && _DEV_PS_APP[$pid]=1
     _DEV_PS_COMM[$pid]=${comm:t}
     _DEV_PS_PPID[$pid]=$ppid
     _DEV_PS_KIDS[$ppid]="${_DEV_PS_KIDS[$ppid]:-} $pid"
@@ -2138,6 +2189,7 @@ _dev_fg_rows() {
       up=${_DEV_PS_PPID[$up]:-}
     done
     for p in ${(k)_DEV_PS_COMM}; do
+      [[ -n ${_DEV_PS_APP[$p]:-} ]] && continue     # a GUI bundle's agent core, not a session
       _dev_agent_is_proc "${_DEV_PS_COMM[$p]}" && claudes+=($p)
     done
     claudes=(${(no)claudes})                # assoc keys are unordered; pid order is stable
@@ -2146,7 +2198,7 @@ _dev_fg_rows() {
       _dev_agent_is_proc "$(ps -o comm= -p $up 2>/dev/null)" && { me=$up; break; }
       up=$(ps -o ppid= -p $up 2>/dev/null | tr -d ' ')
     done
-    claudes=(${(f)"$(ps -Axo pid,comm 2>/dev/null | awk '{n=$2; sub(/.*\//,"",n)} n=="claude"||n=="codex"||n~/^codex-/{print $1}')"})
+    claudes=(${(f)"$(ps -Axo pid,comm 2>/dev/null | awk '$0 ~ /\.app\/Contents\// {next} {n=$2; sub(/.*\//,"",n)} n=="claude"||n=="codex"||n~/^codex-/{print $1}')"})
   fi
   local -A live
   local pid cwd repo k label sid title summary context agent
@@ -2734,7 +2786,9 @@ _dev_kill_one() {
     print
   fi
   local path; path=$(tmux display-message -p -t "$session" '#{session_path}' 2>/dev/null)
-  tmux kill-session -t "$session" 2>/dev/null && echo "Killed $session" || return 1
+  local _kerr
+  if _kerr=$(tmux kill-session -t "$session" 2>&1); then echo "Killed $session"
+  else echo "t kill: tmux kill-session $session failed${_kerr:+: $_kerr}" >&2; return 1; fi
   # A slot's dev server is detached from its tmux session and would outlive it,
   # serving the old code on the slot's port. Only a per-session worktree is swept
   # this way — a shared tree's processes belong to everyone.
@@ -2797,7 +2851,7 @@ _dev_kill_fg() {
   local idpart="${handle##*:}"
   local pid cwd repo sid label context title m tsess killed= matched=
   local -a tx
-  for pid in ${(f)"$(ps -Axo pid,comm 2>/dev/null | awk '{n=$2; sub(/.*\//,"",n)} n=="claude"||n=="codex"||n~/^codex-/{print $1}')"}; do
+  for pid in ${(f)"$(ps -Axo pid,comm 2>/dev/null | awk '$0 ~ /\.app\/Contents\// {next} {n=$2; sub(/.*\//,"",n)} n=="claude"||n=="codex"||n~/^codex-/{print $1}')"}; do
     [[ -n ${inslot[$pid]} || $pid == $me ]] && continue
     sid= cwd=
     [[ -r $reg/$pid ]] && IFS=$'\t' read -r sid cwd < "$reg/$pid"
@@ -3726,6 +3780,7 @@ _dev_pull() {
   local sid=${row%%$'\t'*}
   local cwd=${${row#*$'\t'}%%$'\t'*}
   local fslot=${${${row#*$'\t'}#*$'\t'}%%$'\t'*}
+  local agent=${${(ps:\t:)row}[7]:-claude}; _dev_agent_valid "$agent" || agent=claude   # field 7 (a 6-field host = claude)
   [[ -n $sid && $sid != - ]] || { echo "dev: $host/$fslot has no active conversation to pull" >&2; return 1; }
 
   echo "⟳ Pulling ${sid[1,8]}… ($cwd) from $host → here"
@@ -3749,13 +3804,13 @@ _dev_pull() {
 
   # Transcript first: the collision reland below copies this sid's files into the new
   # slot's project dir, so they must be on local disk before the landing is decided.
-  _tbeam_pull_transcript "$cwd" "$target" || return 1
+  _tbeam_pull_transcript "$cwd" "$target" "$agent" "$sid" || return 1
 
   # Where does it land? Usually the recorded worktree (same path on every host); when THIS
   # machine's same-numbered slot is another session's — live, dirty, or diverged — reland
   # into a fresh slot instead of trampling it (_dev_beam_land_cwd, which also moves the
   # transcript to the new slot's project dir).
-  local land; land=$(_dev_beam_land_cwd "$cwd" "$sid" "$host") || return 1
+  local land; land=$(_dev_beam_land_cwd "$cwd" "$sid" "$host" "$agent") || return 1
   if [[ $land == "$cwd" ]]; then
     # Worktree mode: $cwd is the origin's per-session worktree (same root on every host).
     # Materialize it locally from its branch on origin if absent, rather than hard-failing.
@@ -3783,7 +3838,7 @@ _dev_pull() {
     _term_title ""
     [[ -n $existing ]] && { echo "dev: already running locally in $existing — attaching."; tmux attach-session -t "$existing"; return; }
     echo "✓ Resuming ${sid[1,8]}… here"
-    ( cd "$cwd" && exec claude -r "$sid" )
+    if [[ $agent == codex ]]; then ( cd "$cwd" && exec codex resume "$sid" ); else ( cd "$cwd" && exec claude -r "$sid" ); fi
     return
   fi
 
@@ -3794,7 +3849,7 @@ _dev_pull() {
     read -r lrepo lslot < <(_dev_slot_for_cwd "$cwd")
     [[ -n $lrepo && -n $lslot ]] || { echo "dev: couldn't map $cwd to a dev slot" >&2; return 1; }
     session="dev-${lrepo}-${lslot}"
-    _dev_resume_session "$session" "$cwd" "$sid"
+    _dev_resume_session "$session" "$cwd" "$sid" "$agent"
   fi
   echo "✓ Landed here as $session"
   if [[ -t 1 && -z $CLAUDE_CODE_SESSION_ID ]]; then
@@ -4226,6 +4281,14 @@ _t_resume() {
         "${(@)_incs}" --exclude='*' \
         "$_tgt:$HOME/.claude/projects/" "$HOME/.claude/projects/" 2>/dev/null
       _prc=$?
+      # codex rollouts: the whole date tree (small, append-only files; union rule);
+      # rc 23 = no ~/.codex/sessions there. A pulled rollout shows in the scan via
+      # _codex_rollout_scan before codex has indexed it.
+      if (( _prc == 0 || _prc == 23 )); then
+        rsync -a --update --timeout=10 -e "ssh -o ConnectTimeout=3 -o BatchMode=yes" \
+          --include='*/' --include='rollout-*.jsonl' --include='rollout-*.origin' --exclude='*' \
+          "$_tgt:$HOME/.codex/sessions/" "${CODEX_HOME:-$HOME/.codex}/sessions/" 2>/dev/null
+      fi
       if (( _prc == 0 || _prc == 23 )); then
         echo "⟳ pulled ${_h}'s latest transcripts" >&2
         # Cache the host's short hostname (once) so the origin column below can
@@ -5485,7 +5548,19 @@ _t_pop() {
 # live, freshest copy, so it wins — but if the host somehow had a newer copy
 # (you'd worked there more recently) it's preserved rather than clobbered.
 _tbeam_sync_transcript() {
-  local cwd="$1" host="$2"
+  local cwd="$1" host="$2" agent="${3:-claude}" sid="${4:-}"
+  if [[ $agent == codex ]]; then
+    # One rollout (+ its .origin), sent with its path RELATIVE to ~/.codex (rsync -R
+    # and the `/./` anchor) so the far side keeps the YYYY/MM/DD layout codex scans;
+    # codex indexes it there on the first resume (verified on 0.154).
+    local tx; tx=$(_dev_agent_transcript codex "$sid") || { echo "tbeam: no rollout for ${sid[1,8]}…" >&2; return 1; }
+    local croot="${CODEX_HOME:-$HOME/.codex}" rel=${tx#*/.codex/}
+    [[ $rel != $tx ]] || rel=${tx#$croot/}
+    local -a files=( "$croot/./$rel" )
+    [[ -f ${tx%.jsonl}.origin ]] && files+=( "$croot/./${rel%.jsonl}.origin" )
+    rsync -azR --update -e ssh "${(@)files}" "$host:.codex/"
+    return
+  fi
   local enc="${cwd//[^A-Za-z0-9]/-}"             # /a/b → -a-b, Claude's dir scheme (/ AND . → -)
   local src="$HOME/.claude/projects/$enc/"
   [[ -d $src ]] || { echo "tbeam: no transcript dir for $cwd ($src)" >&2; return 1; }
@@ -5498,7 +5573,19 @@ _tbeam_sync_transcript() {
 # direction flips, so the freshest copy of each file survives whichever way the
 # beam flows.
 _tbeam_pull_transcript() {
-  local cwd="$1" host="$2"
+  local cwd="$1" host="$2" agent="${3:-claude}" sid="${4:-}"
+  if [[ $agent == codex ]]; then
+    # ask the host where the rollout lives (its hook cache / index), then pull it
+    # with the same relative-path rsync the send direction uses
+    local rtx; rtx=$(ssh -o BatchMode=yes "$host" "zsh -lic '_dev_agent_transcript codex ${(q)sid}'" 2>/dev/null | tail -1)
+    [[ $rtx == */rollout-*.jsonl ]] || { echo "tbeam: $host has no rollout for ${sid[1,8]}…" >&2; return 1; }
+    local rel=${rtx#*/.codex/}
+    mkdir -p "${CODEX_HOME:-$HOME/.codex}"
+    rsync -azR --update -e ssh "$host:.codex/./$rel" "$host:.codex/./${rel%.jsonl}.origin" \
+      "${CODEX_HOME:-$HOME/.codex}/" 2>/dev/null \
+      || rsync -azR --update -e ssh "$host:.codex/./$rel" "${CODEX_HOME:-$HOME/.codex}/"
+    return
+  fi
   local enc="${cwd//[^A-Za-z0-9]/-}"                # /a/b → -a-b, Claude's dir scheme (/ AND . → -)
   local dst="$HOME/.claude/projects/$enc/"
   mkdir -p "$dst"
@@ -5563,7 +5650,8 @@ _tbeam_land() {
   # dirty, or diverged: the collision case), _dev_beam_land_cwd relands into a fresh slot,
   # relocating the already-synced transcript with it (the sender ran _tbeam_sync_transcript
   # before invoking us, so the sid's files are on disk either way).
-  local land; land=$(_dev_beam_land_cwd "$TB_CWD" "$TB_SID") || return 1
+  local agent=${TB_AGENT:-claude}; _dev_agent_valid "$agent" || agent=claude
+  local land; land=$(_dev_beam_land_cwd "$TB_CWD" "$TB_SID" "" "$agent") || return 1
   if [[ $land == "$TB_CWD" ]]; then
     # Worktree mode: if TB_CWD does not exist here yet, materialize the slot's worktree
     # from its branch on origin (else fresh off main) before landing. Uncommitted edits
@@ -5577,14 +5665,14 @@ _tbeam_land() {
     _dev_worktree_beam_sync "$TB_CWD"
   fi
   cd "$land" 2>/dev/null || { echo "tbeam: $land not found on ${HOST:-this host}" >&2; return 1; }
-  if [[ "$TB_MODE" == fg ]]; then
-    exec claude -r "$TB_SID"                     # owns this ssh TTY; dies with it
+  if [[ "$TB_MODE" == fg ]]; then                # owns this ssh TTY; dies with it
+    if [[ $agent == codex ]]; then exec codex resume "$TB_SID"; else exec claude -r "$TB_SID"; fi
   fi
   local repo slot session
   read -r repo slot < <(_dev_slot_for_cwd "$land")
   [[ -n $repo && -n $slot ]] || { echo "tbeam: couldn't map $land to a dev slot" >&2; return 1; }
   session="dev-${repo}-${slot}"
-  _dev_resume_session "$session" "$land" "$TB_SID"
+  _dev_resume_session "$session" "$land" "$TB_SID" "$agent"
   if [[ -n $TB_ATTACH ]]; then
     exec tmux attach -t "$session"              # drop the ssh caller straight in
   fi
@@ -5733,7 +5821,8 @@ _t_beam() {
   # self_move = "the origin is THIS foreground claude" (true current-session
   # move): only then do we SIGTERM ourselves to complete the move. For any other
   # origin (a dev slot) we kill-session it instead — see the two blocks below.
-  local sid cwd self_move=
+  local sid cwd self_move= agent=claude self_sid
+  self_sid=$(_dev_self_sid)
   if [[ -n $repo_arg ]]; then
     local slot=$slot_arg
     if [[ -z $slot ]]; then                         # first existing slot for repo
@@ -5750,11 +5839,9 @@ _t_beam() {
     # origin slot would beam transcript X while the slot is actually running Y,
     # leaving the live slot un-killed and two owners on Y after the remote resumes.
     local dir; dir=$(tmux display-message -p -t "$session" '#{session_path}' 2>/dev/null)
+    agent=$(_dev_agent_of_session "$session")
     sid=$(_dev_session_sid "$session" "$dir")
-    if [[ -z $sid ]]; then                          # pre-hook fallback: newest transcript in the dir
-      local -a tx=( "$HOME/.claude/projects/${dir//[^A-Za-z0-9]/-}"/*.jsonl(Nom[1]) )
-      sid=${${tx[1]:t}%.jsonl}
-    fi
+    [[ -n $sid ]] || sid=$(_dev_agent_newest_sid "$agent" "$dir")   # pre-hook fallback: newest conversation in the dir
     [[ -n $sid ]] || { echo "tbeam: couldn't find a session id for $session" >&2; return 1; }
     # The session's REAL dir is its tmux session_path ($dir) — the per-session worktree for
     # a worktree repo, the dev clone for an opt-out one. Use it (not the canonical DEV_REPOS
@@ -5764,13 +5851,22 @@ _t_beam() {
   elif [[ -n $sid_arg ]]; then
     setopt local_options null_glob
     local -a tx=( "$HOME/.claude/projects"/*/"$sid_arg"*.jsonl )
-    (( ${#tx} ))      || { echo "tbeam: no local session matching '$sid_arg'" >&2; return 1; }
-    (( ${#tx} == 1 )) || { echo "tbeam: '$sid_arg' matches ${#tx} sessions — use a longer prefix" >&2; return 1; }
-    sid=${${tx[1]:t}%.jsonl}
-    cwd=$(_tbeam_transcript_cwd "$tx[1]")
+    local crow
+    if (( ${#tx} == 0 )) && crow=$(_codex_thread_lookup "$sid_arg") && [[ -n $crow ]]; then
+      # a codex thread id (exact — codex ids are not prefix-matched here): its cwd is
+      # the index's, which follows the last resume
+      agent=codex; sid=$sid_arg
+      cwd=${${crow#*$'\t'}#*$'\t'}; cwd=${cwd%%$'\t'*}
+    else
+      (( ${#tx} ))      || { echo "tbeam: no local session matching '$sid_arg'" >&2; return 1; }
+      (( ${#tx} == 1 )) || { echo "tbeam: '$sid_arg' matches ${#tx} sessions — use a longer prefix" >&2; return 1; }
+      sid=${${tx[1]:t}%.jsonl}
+      cwd=$(_tbeam_transcript_cwd "$tx[1]")
+    fi
     [[ -n $cwd ]] || { echo "tbeam: couldn't read the working dir for $sid" >&2; return 1; }
-  elif [[ -n $CLAUDE_CODE_SESSION_ID && -z $pick ]]; then
-    sid=$CLAUDE_CODE_SESSION_ID; cwd=$PWD          # current-session mode
+  elif [[ -n $self_sid && -z $pick ]]; then
+    sid=$self_sid; cwd=$PWD                         # current-session mode (claude or codex)
+    agent=$(_dev_self_agent); agent=${agent:-claude}
   else
     local row filter="$PWD"
     [[ -n $all ]] && filter=""                      # --all: every project
@@ -5779,8 +5875,8 @@ _t_beam() {
     sid=${row%%$'\t'*}
     cwd=${${row#*$'\t'}%%$'\t'*}
   fi
-  [[ $sid == "$CLAUDE_CODE_SESSION_ID" && -n $CLAUDE_CODE_SESSION_ID ]] && self_move=1
-  [[ -n $CLAUDE_CODE_SESSION_ID ]] && detach=1      # no TTY in Claude's Bash subprocess to ssh -t into
+  [[ $sid == "$self_sid" && -n $self_sid ]] && self_move=1
+  [[ -n $self_sid ]] && detach=1                    # no TTY in an agent's tool subprocess to ssh -t into
   # Resume-through-sync for the picker is handled on the FAR side: _tbeam_land materializes
   # a missing per-session worktree from its branch before resuming. Don't rebuild it here —
   # the send path only needs the cwd as a path string (for the transcript rsync + TB_CWD),
@@ -5837,24 +5933,24 @@ _t_beam() {
   if ! _dev_worktree_beam_push "$cwd" "$host"; then   # carry uncommitted worktree edits ahead of the move
     echo "⚠ couldn't fully commit/push $cwd — $host may resume with stale code (the edits stay here)" >&2
   fi
-  _tbeam_sync_transcript "$cwd" "$host" || return 1
+  _tbeam_sync_transcript "$cwd" "$host" "$agent" "$sid" || return 1
 
   # Foreground mode: resume straight in the ssh session (needs a real terminal).
   if [[ -n $fg ]]; then
     [[ -z $detach ]] || { echo "tbeam: -f needs a terminal; can't combine with -d / inside Claude." >&2; return 1; }
-    ssh -t "$host" "TB_CWD=${(q)cwd} TB_SID=${(q)sid} TB_MODE=fg zsh -lic _tbeam_land"
+    ssh -t "$host" "TB_CWD=${(q)cwd} TB_SID=${(q)sid} TB_AGENT=${(q)agent} TB_MODE=fg zsh -lic _tbeam_land"
     return
   fi
 
   # tmux mode + auto-attach: -t lets _tbeam_land exec us into the landed session.
   if [[ -z $detach ]]; then
-    ssh -t "$host" "TB_CWD=${(q)cwd} TB_SID=${(q)sid} TB_MODE=tmux TB_ATTACH=1 zsh -lic _tbeam_land"
+    ssh -t "$host" "TB_CWD=${(q)cwd} TB_SID=${(q)sid} TB_AGENT=${(q)agent} TB_MODE=tmux TB_ATTACH=1 zsh -lic _tbeam_land"
     return
   fi
 
   # tmux mode, detached: capture the landed session name, print an attach hint.
   local session
-  session=$(ssh "$host" "TB_CWD=${(q)cwd} TB_SID=${(q)sid} TB_MODE=tmux zsh -lic _tbeam_land" | tail -1)
+  session=$(ssh "$host" "TB_CWD=${(q)cwd} TB_SID=${(q)sid} TB_AGENT=${(q)agent} TB_MODE=tmux zsh -lic _tbeam_land" | tail -1)
   [[ -n $session ]] || { echo "tbeam: landing on $host failed." >&2; return 1; }
   echo "✓ Running on $host as $session"
   local rest=${session#dev-} repo slot

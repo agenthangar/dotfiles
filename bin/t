@@ -1634,7 +1634,7 @@ def cmd_setup(cfg, args):
 # clones + registers it there by hand — the manual sequence this verb replaces.
 
 NEW_OWNER = "agenthangar"
-_NEW_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$")
+_NEW_NAME = re.compile(r"^[A-Za-z0-9._][A-Za-z0-9._-]{0,99}$")
 _NEW_SLUG = re.compile(r"^(?:git@github\.com:|ssh://git@github\.com/|https://github\.com/)"
                        r"([^/\s]+)/([^/\s]+?)(?:\.git)?/?$")
 _NEW_STALE = "invalid choice: 'new-land'"
@@ -1644,12 +1644,13 @@ _NEW_AGAIN = "\0again"   # the "none of these" pick row; never a valid repo name
 
 def _new_validate_name(name):
     """GitHub repo-name rules (also the ~/code dir name): letters, digits, . _ -; no
-    leading - or .; at most 100 chars; not . / .. / *.git. → error text or None."""
+    leading -; at most 100 chars; not . / .. / *.git (a leading dot is legal —
+    an org's .github repo). → error text or None."""
     if not name:
         return "a repo name is required"
-    if not _NEW_NAME.match(name) or name.endswith(".git"):
+    if not _NEW_NAME.match(name) or name.endswith(".git") or set(name) == {"."}:
         return (f"'{name}' is not a valid repo name — letters, digits, '.', '_', '-' only; "
-                "no leading '-' or '.'; at most 100 chars")
+                "no leading '-'; at most 100 chars")
     return None
 
 
@@ -1670,24 +1671,38 @@ def _new_name_input(text):
     return ("prompt", text) if re.search(r"\s", text) else ("name", text)
 
 
-def _new_name_prompt(desc, taken):
-    """The `claude -p` brief for repo names from a description. Rules mirror
-    _new_validate_name plus the house style (lowercase, hyphens, short — it is a
-    ~/code dir, a DEV_REPOS key, and a tmux/worktree prefix), and `taken` keeps it
-    off the names already on this machine."""
+def _new_name_prompt(desc, taken, owners=()):
+    """The `claude -p` brief for repo names from a description. Nothing GitHub-specific
+    is spelled out here on purpose: it carries live DATA — the house style, the names
+    already on this machine (`taken`), and the owners the token can create under — and
+    one generic instruction: where GitHub itself gives a name special meaning, follow
+    that convention and say which owner the name is tied to. The model knows the
+    conventions (a Pages user site, an org's .github repo, …); we only have to tell
+    it the owners, which it cannot know."""
     avoid = ", ".join(sorted(taken)[:40])
+    owners = [o for o in owners if o]
+    who = (f"It will be created under one of these GitHub owners (user + orgs; default "
+           f"{owners[0]}): {', '.join(owners)}. " if owners else "")
     return (f"Suggest names for a new GitHub repo. What it is for:\n\"{desc}\"\n\n"
             f"Rules: lowercase letters, digits and hyphens only, 1-3 words joined by hyphens, "
             f"at most 24 chars, memorable and specific; no generic filler (app, tool, project). "
-            + (f"Do not suggest any of these, they are taken: {avoid}.\n" if avoid else "\n")
+            + who
+            + "Where GitHub itself gives a repo name special meaning — the name decides how the "
+              "repo behaves, is served, or is discovered — the name MUST follow that convention "
+              "exactly and takes precedence over the style rules above; put such names first and "
+              "set \"owner\" to the owner it must be created under. Otherwise omit \"owner\".\n"
+            + (f"Do not suggest any of these, they are taken: {avoid}.\n" if avoid else "")
             + f"Return ONLY a JSON array (no prose, no code fence) of {_NEW_NAME_MAX} objects, "
-              "best first, each {\"name\": \"<name>\", \"why\": \"<reason in 8 words or fewer>\"}.")
+              "best first, each {\"name\": \"<name>\", \"why\": \"<reason in 8 words or fewer>\", "
+              "\"owner\": \"<owner>\" (optional)}.")
 
 
-def _new_parse_names(text, taken=()):
-    """→ [(name, why)] from the model's reply: tolerate fences/prose around the
+def _new_parse_names(text, taken=(), owners=()):
+    """→ [(name, why, owner)] from the model's reply: tolerate fences/prose around the
     array, lowercase, validate through _new_validate_name, drop taken names and
-    duplicates, cap at _NEW_NAME_MAX. An unparseable reply is [] (the caller says so)."""
+    duplicates, cap at _NEW_NAME_MAX. `owner` is the owner the model says the name is
+    tied to (None unless it is one of `owners` — the list it was given). An
+    unparseable reply is [] (the caller says so)."""
     m = re.search(r"\[.*\]", text or "", re.S)
     if not m:
         return []
@@ -1695,16 +1710,37 @@ def _new_parse_names(text, taken=()):
         arr = json.loads(m.group(0))
     except ValueError:
         return []
+    known = {o.lower(): o for o in owners if o}
     out, seen = [], set(taken)
     for o in arr if isinstance(arr, list) else []:
-        name = str(o.get("name", "") if isinstance(o, dict) else o).strip().lower()
+        d = o if isinstance(o, dict) else {"name": o}
+        name = str(d.get("name", "")).strip().lower()
         if not name or name in seen or _new_validate_name(name):
             continue
         seen.add(name)
-        out.append((name, str(o.get("why", "") if isinstance(o, dict) else "").strip()))
+        out.append((name, str(d.get("why", "")).strip(),
+                    known.get(str(d.get("owner", "") or "").strip().lower())))
         if len(out) >= _NEW_NAME_MAX:
             break
     return out
+
+
+def _new_owner_default(tied, rows):
+    """The owner picker's opening cursor: the owner the picked suggestion is tied to
+    when it is among the rows, else row 0 (NEW_OWNER, which _new_owner_rows puts first)."""
+    for i, (v, _) in enumerate(rows):
+        if tied and v.lower() == tied.lower():
+            return i
+    return 0
+
+
+def _new_owner_warnings(name, owner, tied):
+    """A suggestion tied to an owner (a name GitHub gives special meaning under THAT
+    owner) created under another one is a repo that will not do what it is named for."""
+    if tied and (owner or "").lower() != tied.lower():
+        return [f"'{name}' was suggested as a name GitHub reserves for the owner '{tied}' — "
+                f"under '{owner}' it is just a repo called {name}"]
+    return []
 
 
 def _new_taken_names(repo_paths, code_entries):
@@ -2056,7 +2092,7 @@ def _new_sh_gh(slug):
     return _new_gh_repo_state(r.returncode, r.stdout, r.stderr)
 
 
-def _new_sh_suggest(desc, taken):
+def _new_sh_suggest(desc, taken, owners=()):
     """Ask Claude (`claude -p`, the t find precedent — the real binary, never the
     zsh wrapper) for repo names. → (rows, error): rows from _new_parse_names, or
     an error line when the CLI is missing, times out, or replies with no names."""
@@ -2065,14 +2101,14 @@ def _new_sh_suggest(desc, taken):
         return [], "claude CLI not found — type a name instead"
     try:
         p = subprocess.run([claude_bin, "-p", "--model", NEW_NAME_MODEL, "--output-format", "json"],
-                           input=_new_name_prompt(desc, taken), capture_output=True, text=True,
-                           timeout=90)
+                           input=_new_name_prompt(desc, taken, owners), capture_output=True,
+                           text=True, timeout=90)
         res = json.loads(p.stdout).get("result", "") if p.stdout.strip() else ""
     except subprocess.TimeoutExpired:
         return [], "claude took too long — type a name instead"
     except (OSError, ValueError) as e:
         return [], f"claude failed ({e}) — type a name instead"
-    rows = _new_parse_names(res, taken)
+    rows = _new_parse_names(res, taken, owners)
     if not rows:
         tail = (p.stderr or "").strip().splitlines()
         return [], "claude returned no usable names" + (f" ({tail[-1]})" if tail else "")
@@ -2157,7 +2193,8 @@ def _new_wizard(cfg, answers, ctx):
     ui.raw()
     result = None
     try:
-        name, desc = answers["name"], answers["prompt"]
+        name, desc, tied = answers["name"], answers["prompt"], None
+        owner_rows = None
         while not name:
             if desc is None:
                 n = ui.cooked_input("│  repo name (or describe it in a sentence for suggestions) → ")
@@ -2175,18 +2212,21 @@ def _new_wizard(cfg, answers, ctx):
             ui.done("describe", desc)
             # the head repaints in place under the ◇ line; pick() replaces it
             ui.repaint(ui.head("name", f"asking claude ({NEW_NAME_MODEL}) for names…"))
-            rows, err = ctx["suggest"](desc, ctx["taken"])
+            if owner_rows is None:
+                owner_rows = _new_owner_rows(*ctx["owners"](), NEW_OWNER)
+            rows, err = ctx["suggest"](desc, ctx["taken"], [v for v, _ in owner_rows])
             desc = None
             if err:
                 ui.commit([f"{rail}  {st.y}⚠ {err}{st.r}"])
                 continue
-            choices = [(n, f"{n}  {st.y}{why}{st.r}" if why else n) for n, why in rows]
+            choices = [(n, f"{n}  {st.y}{why}{st.r}" if why else n) for n, why, _ in rows]
             choices.append((_NEW_AGAIN, f"{st.y}none of these — type a name or describe it again{st.r}"))
             pick = ui.pick("name", choices)
             if pick is None:
                 return None
             if pick != _NEW_AGAIN:
                 name = pick
+                tied = next(o for n, _, o in rows if n == pick)
         answers["name"] = name
         ui.done("name", name)
         path, state = ctx["probe"](name)
@@ -2194,7 +2234,6 @@ def _new_wizard(cfg, answers, ctx):
         for w in _new_name_warnings(name):
             ui.commit([f"{rail}  {st.y}⚠ {w}{st.r}"])
         oslug = _new_repo_slug(state.get("origin_url")) if state.get("origin_url") else None
-        owner_rows = None
         while True:
             if oslug:
                 owner = oslug.split("/")[0]
@@ -2206,12 +2245,15 @@ def _new_wizard(cfg, answers, ctx):
                 if owner_rows is None:
                     owner_rows = _new_owner_rows(*ctx["owners"](), NEW_OWNER)
                 if owner_rows:
-                    owner = ui.pick("owner", owner_rows)
+                    owner = ui.pick("owner", owner_rows, default=_new_owner_default(tied, owner_rows))
                     if owner is None:
                         return None
                 else:
-                    owner = ui.cooked_input("│  github owner → ", NEW_OWNER, prefill=NEW_OWNER)
+                    o = tied or NEW_OWNER
+                    owner = ui.cooked_input("│  github owner → ", o, prefill=o)
                 ui.done("owner", owner)
+            for w in _new_owner_warnings(name, owner, tied):
+                ui.commit([f"{rail}  {st.y}⚠ {w}{st.r}"])
             slug = oslug or f"{owner}/{name}"
             gh = ctx["gh"](slug)
             if gh[0] == "present":
@@ -2283,7 +2325,7 @@ def _new_prompt_flow(cfg, answers, ctx):
     """Plain-prompt fallback (TERM=dumb, no raw mode): the same questions as
     _new_wizard over input(), then the same review gate. → (steps, answers) or None."""
     st = Style()
-    name, desc = answers["name"], answers["prompt"]
+    name, desc, tied = answers["name"], answers["prompt"], None
     while not name:
         if desc is None:
             n = _prompt("repo name (or describe it in a sentence for suggestions): ")
@@ -2299,18 +2341,19 @@ def _new_prompt_flow(cfg, answers, ctx):
                 break
             desc = text
         print(f"  asking claude ({NEW_NAME_MODEL}) for names…")
-        rows, err = ctx["suggest"](desc, ctx["taken"])
+        rows, err = ctx["suggest"](desc, ctx["taken"],
+                                   [v for v, _ in _new_owner_rows(*ctx["owners"](), NEW_OWNER)])
         desc = None
         if err:
             print(f"  {err}", file=sys.stderr)
             continue
-        for i, (n, why) in enumerate(rows, 1):
-            print(f"  {i}) {n}" + (f"  — {why}" if why else ""))
+        for i, (n, why, o) in enumerate(rows, 1):
+            print(f"  {i}) {n}" + (f"  — {why}" if why else "") + (f"  (under {o})" if o else ""))
         r = _prompt(f"  pick 1-{len(rows)}, or type a name / a new description: ")
         if r is None:
             return None
         if r.isdigit() and 1 <= int(r) <= len(rows):
-            name = rows[int(r) - 1][0]
+            name, _, tied = rows[int(r) - 1]
         elif r:
             kind, text = _new_name_input(r)
             if kind == "prompt":
@@ -2331,10 +2374,12 @@ def _new_prompt_flow(cfg, answers, ctx):
     else:
         rows = _new_owner_rows(*ctx["owners"](), NEW_OWNER)
         choices = ", ".join(v for v, _ in rows)
-        owner = _prompt(f"  github owner [{NEW_OWNER}]{' (' + choices + ')' if choices else ''}: ",
-                        NEW_OWNER)
+        dflt = rows[_new_owner_default(tied, rows)][0] if rows else (tied or NEW_OWNER)
+        owner = _prompt(f"  github owner [{dflt}]{' (' + choices + ')' if choices else ''}: ", dflt)
         if owner is None:
             return None
+    for w in _new_owner_warnings(name, owner, tied):
+        print(f"  ⚠ {w}", file=sys.stderr)
     slug = oslug or f"{owner}/{name}"
     gh = ctx["gh"](slug)
     if gh[0] == "present":
@@ -2487,13 +2532,18 @@ def cmd_new(cfg, args):
     if args.dry_run or args.yes or not tty_ok:
         if not answers["name"] and answers["prompt"]:
             # no wizard to pick from: the model's first suggestion is the name
-            rows, err = _new_sh_suggest(answers["prompt"], ctx["taken"])
+            rows, err = _new_sh_suggest(answers["prompt"], ctx["taken"],
+                                        [v for v, _ in _new_owner_rows(*_new_sh_owners(), NEW_OWNER)])
             if err:
                 print(f"t new: {err}", file=sys.stderr)
                 return 1
-            answers["name"] = rows[0][0]
+            answers["name"], _, tied = rows[0]
             print(f"t new: name {answers['name']} (from --prompt; also suggested: "
-                  f"{', '.join(n for n, _ in rows[1:]) or 'nothing else'})")
+                  f"{', '.join(n for n, _, _ in rows[1:]) or 'nothing else'})")
+            for w in _new_owner_warnings(answers["name"], answers["owner"] or NEW_OWNER, tied):
+                if answers["owner"]:
+                    print(f"t new: ⚠ {w}", file=sys.stderr)
+            answers["owner"] = answers["owner"] or tied
         if not answers["name"]:
             print("t new: a repo name (or --prompt <description>) is required without the "
                   "wizard (t new <name> …)", file=sys.stderr)

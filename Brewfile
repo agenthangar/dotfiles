@@ -12,3 +12,8 @@ brew "jq"    # prview()                       — parse gh's JSON output
 brew "tmux"  # t open / t pop / t paste / t read / pr-watch — the Claude Code dev-session workflow
 brew "fzf"   # t push / t open / t find       — fuzzy-pick a Claude session
 brew "glow"  # t plan                         — render Claude plan markdown in-terminal
+
+# The agent CLIs: `t install` is the cross-platform, interactive path (it also logs
+# in); the cask is here so a plain install.sh on a Mac lands codex too. claude and
+# cursor-agent ship as vendor install scripts, not casks — t install runs those.
+cask "codex" # t open --codex / t install     — OpenAI Codex CLI

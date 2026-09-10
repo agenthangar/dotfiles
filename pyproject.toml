@@ -50,6 +50,12 @@ exclude_lines = [
     "def _new_prompt_flow\\(",
     "def _new_resolve\\(",
     "def _new_walk\\(",
+    # bin/t `t install` subprocess / tty / ssh glue (the pure _install_* model is tested)
+    "def _install_probe\\(",
+    "def _install_relink\\(",
+    "def _install_walk\\(",
+    "def _install_wizard\\(",
+    "def _install_prompt_flow\\(",
     # bin/t mcp server glue (tmux/registry gathering, git, the stdio loop, claude mcp add)
     "def _live_rows\\(",
     "def _git_brief\\(",

@@ -5842,6 +5842,7 @@ help() {
     "Remote machines:${(kj: :)REMOTE_HOSTS}"
     "Git & PRs:prview"
     "Claude:t csync"
+    "Agents (claude · codex · cursor):cursor-beam"
     "Keep the Mac awake:nosleep sleep-manager"
   )
 
@@ -5850,6 +5851,7 @@ help() {
   local -A hints=(
     "Repo shortcuts (cd)" "+ add a repo: t setup (or DEV_REPOS[key]=~/code/repo in ~/.zshrc.local)"
     "Remote machines"     "+ add a host: t setup (or REMOTE_HOSTS[key]=user@host in ~/.zshrc.local)"
+    "Agents (claude · codex · cursor)" "+ install / log in an agent CLI: t install · per-verb support: t install --status"
   )
 
   # Palette — bold, UPPERCASE section headers (man-page / `gh` convention; bold is
@@ -5906,7 +5908,7 @@ alias h=help   # `h` is a shorthand for `help`
 # key for `on`), and slot/flags after. Pulls live from the ${(k)DEV_REPOS} /
 # ${(k)REMOTE_HOSTS} arrays so it stays current with ~/.zshrc.local.
 _t() {
-  local -a verbs=(open ls kill push pop resume beam read plan paste find on cursor setup new)
+  local -a verbs=(open ls kill push pop resume beam read plan paste find on cursor setup new install)
   if (( CURRENT == 2 )); then
     _describe -t verbs 't verb' verbs
     return
@@ -5934,6 +5936,9 @@ _t() {
     new)
       if (( CURRENT == 3 )) && [[ ${words[CURRENT]} != -* ]]; then _message 'repo name'
       else _values 'flag' -p --prompt --owner --public --private --alias --hosts --no-hosts -y --yes --dry-run -h --help; fi ;;
+    install)
+      if [[ ${words[CURRENT]} == -* ]]; then _values 'flag' --status --update --no-login --headless --hosts --no-hosts -y --yes --dry-run -h --help
+      else _values 'agent' claude codex cursor; fi ;;
   esac
 }
 _sleepmgr_cmd() { _arguments '1:command:(status disable enable help)' }

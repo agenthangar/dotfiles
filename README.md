@@ -19,6 +19,7 @@ shim in `.zshrc` for verbs that must run in your shell).
 | `t push` / `t pop` | Move a session between a foreground terminal and a detached tmux slot — one-live-owner guarantee |
 | `t beam <repo> [slot] --host <h>` | Teleport a running session to another machine; pull one back with `t open … --here` |
 | `t find <query>` | Semantic search across saved sessions ("which one was working on X?"), reranked by Claude |
+| `t install [agent…]` | Install and log in the agent CLIs — Claude Code, Codex, Cursor — on this machine and every remote host, `t setup`-style: one checklist with the present entries locked, the vendors' commands shown before anything runs ([details](#agents)) |
 | `t new [name\|--prompt TEXT]` | Wizard: create `~/code/<name>` + a GitHub repo (owner picked from your orgs; squash-only, auto-merge), register it here and clone + register it on every remote host. No name in mind? Describe it (a sentence at the name step, or `--prompt`) and Claude suggests names to pick from. Re-running resumes; on an existing repo it just finishes the wiring |
 | `t mcp` | The `sessions` MCP server Claude Code spawns, so any Claude session can answer "which session is/was working on X?" from every saved transcript and the live slots. `--install` registers it (`dots` does), `--call <tool> '<json>'` runs one tool by hand |
 
@@ -99,6 +100,43 @@ errors rather than guessing. It skips `brew bundle` for speed.
 
 Start a dotfiles session with `t open dotfiles`. Session history syncs separately,
 in the background, via `csync`.
+
+## Agents
+
+The session tooling was built around Claude Code, and now takes **three agent
+CLIs**: Claude Code (`claude`), OpenAI's Codex CLI (`codex`), and the Cursor CLI
+(`cursor-agent`). `t install` installs and logs in whichever are missing, here
+and on every `REMOTE_HOSTS` host, using each vendor's published installer
+(`brew install --cask codex` on a Mac, their `curl … | sh` scripts elsewhere) and
+each one's login command — device-code variants over ssh. It is a checklist like
+`t setup`: installed and logged-in entries are locked under a ✓, the rest are
+pre-marked, and the review screen shows the exact commands before `y` runs any.
+`t install --status` prints this machine's state; `t doctor` reports an agent that
+is installed but not logged in.
+
+Not every verb supports every agent yet. The matrix below is **generated from
+`bin/t`** (a test pins this block to it), so a verb cannot gain or lose agent
+support without the README saying so:
+
+```text
+  surface                                           claude                codex                        cursor
+  ------------------------------------------------  --------------------  ---------------------------  -------------------------------
+  t install (install · login · update)              ✓                     ✓                            ✓
+  dev slots: t open / ls / kill / read / paste      ✓                     planned                      ✗ no slot — t cursor ls
+  t push / t pop                                    ✓                     planned                      ✗ no slot
+  t resume (dead slots)                             ✓                     planned                      → t cursor resume
+  t beam / --from (move a session)                  ✓                     planned                      → t cursor [id] --host / --from
+  csync (iCloud union of transcripts)               ✓ projects + plans    planned                      ✓ cursor-chats
+  SessionStart stamps (registry · opened · origin)  ✓ settings.json hook  ✓ hooks.json + /hooks trust  ✗ no hook wired
+  t plan                                            ✓                     ✗ codex keeps no plan files  ✗
+  t find / t mcp (transcript search)                ✓                     planned                      ✗
+  t doctor agent row (version · login · hook)       ✓                     ✓                            ✓ version · login
+```
+
+Codex needs one manual step after install: its SessionStart hook (the same
+`claude-stamp-tmux` script, registered in `~/.codex/hooks.json` by `install.sh`/
+`dots`) must be trusted once under `/hooks` inside codex — Codex has no supported
+way for an installer to pre-trust a hook.
 
 ## The `help` command
 
@@ -187,8 +225,9 @@ goes up). The gate feeds the single required `CI` check like every other job.
 
 ## Install on a new machine
 
-**Requirements:** macOS · zsh · [Claude Code](https://claude.com/claude-code) ·
-[Homebrew](https://brew.sh) (for the `Brewfile` tools).
+**Requirements:** macOS · zsh · [Homebrew](https://brew.sh) (for the `Brewfile`
+tools). The agent CLIs ([Claude Code](https://claude.com/claude-code), Codex,
+Cursor) are installed by `t install` afterwards.
 
 `install.sh` is location-independent — clone the repo anywhere and the symlink
 *targets* follow:

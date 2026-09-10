@@ -203,11 +203,25 @@ nosleep() {
   trap '_nosleep_restore; return 130' INT TERM
 
   # A caffeinate -dimsu that outlived its shell (an old unconditional nosleep whose
-  # terminal closed; sleep-manager's is tracked by its pidfile) holds the Mac awake
-  # no matter what this run decides — two were found from days earlier. Say so.
-  local -a strays
+  # terminal closed) holds the Mac awake no matter what this run decides — two were
+  # found from days earlier, and a mere warning left a third running. Stop it: it
+  # is exactly the hold this run exists to end. sleep-manager's own caffeinate is
+  # the one deliberate persistent hold, so it is named, not killed.
+  local -a strays; local pid keep
+  keep=''; [[ -f /tmp/sleep-manager-caffeinate.pid ]] && keep=$(</tmp/sleep-manager-caffeinate.pid)
   strays=( ${(f)"$(ps -Axo pid=,ppid=,command= 2>/dev/null | awk '$2 == 1 && $3 ~ /caffeinate$/ && $4 == "-dimsu" {print $1}')"} )
-  (( ${#strays} )) && echo "nosleep: ⚠ orphaned caffeinate -dimsu still holding sleep off (pid ${(j:, :)strays}) — kill ${(j: :)strays} to let it go" >&2
+  for pid in "${strays[@]}"; do
+    [[ -n $pid ]] || continue
+    if [[ $pid == "$keep" ]]; then
+      echo "nosleep: sleep-manager's caffeinate (pid $pid) is holding sleep off too — \`sleep-manager enable\` releases it" >&2
+    elif kill "$pid" 2>/dev/null; then
+      echo "nosleep: stopped an orphaned caffeinate -dimsu (pid $pid) left by an earlier run"
+    fi
+  done
+  # nomonitor: the backgrounded caffeinate is a plain child, not a job — no "[2] 82804"
+  # notice on the terminal, and it stays parented to this shell, so it never reads
+  # as an orphan to the sweep above.
+  setopt localoptions nomonitor
   sudo pmset -a disablesleep 1 || return 1
   caffeinate -dimsu & _NOSLEEP_CAF=$!
   if (( forever )); then

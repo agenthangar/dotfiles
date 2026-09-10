@@ -966,12 +966,12 @@ _GH_HIVE = {"allow_auto_merge": True, "delete_branch_on_merge": False, "allow_sq
             "allow_merge_commit": True, "allow_rebase_merge": True, "private": True}
 
 
-@pytest.mark.parametrize("name", ["ok", "my-tool_1.2", "x.y", "A" * 100, "Mixed"])
+@pytest.mark.parametrize("name", ["ok", "my-tool_1.2", "x.y", "A" * 100, "Mixed", ".github", ".x"])
 def test_new_validate_name_accepts(t_mod, name):
     assert t_mod._new_validate_name(name) is None
 
 
-@pytest.mark.parametrize("name", ["", None, "a/b", "-x", ".x", "..", "x.git", "a b", "a" * 101, "ünï"])
+@pytest.mark.parametrize("name", ["", None, "a/b", "-x", ".", "..", "...", "x.git", "a b", "a" * 101, "ünï"])
 def test_new_validate_name_rejects(t_mod, name):
     assert t_mod._new_validate_name(name)
 
@@ -1079,34 +1079,17 @@ def test_new_name_input_one_token_is_a_name_anything_else_a_prompt(t_mod):
     assert t_mod._new_name_input("two\twords") == ("prompt", "two\twords")
 
 
-def test_new_name_prompt_carries_rules_and_taken(t_mod):
-    txt = t_mod._new_name_prompt("a cash-flow forecaster", {"cashfwd", "dotfiles"})
+def test_new_name_prompt_carries_data_not_rules(t_mod):
+    txt = t_mod._new_name_prompt("a cash-flow forecaster", {"cashfwd", "dotfiles"},
+                                 ["agenthangar", "chrisooob"])
     assert '"a cash-flow forecaster"' in txt
     assert "cashfwd, dotfiles" in txt
+    assert "default agenthangar): agenthangar, chrisooob" in txt
     assert "JSON array" in txt and str(t_mod._NEW_NAME_MAX) in txt
-    assert "taken" not in t_mod._new_name_prompt("x", set())
-    txt = t_mod._new_name_prompt("my github site", set(), ["agenthangar", "chrisooob"])
-    assert "<owner>.github.io" in txt and "agenthangar, chrisooob" in txt and "lead with agenthangar" in txt
-    assert "<owner>.github.io" in t_mod._new_name_prompt("x", set())   # the rule holds without owners
-
-
-def test_new_pages_owner_and_owner_default(t_mod):
-    assert t_mod._new_pages_owner("chrisobrien-ai.github.io") == "chrisobrien-ai"
-    assert t_mod._new_pages_owner("ChrisOoob.GitHub.IO") == "chrisooob"
-    assert t_mod._new_pages_owner("github.io") is None
-    assert t_mod._new_pages_owner("my-site") is None
-    assert t_mod._new_pages_owner("a.b.github.io") is None
-    rows = [("agenthangar", "agenthangar"), ("chrisooob", "chrisooob (you)")]
-    assert t_mod._new_owner_default("chrisooob.github.io", rows) == 1
-    assert t_mod._new_owner_default("elsewhere.github.io", rows) == 0
-    assert t_mod._new_owner_default("plain", rows) == 0
-
-
-def test_new_owner_warnings_only_on_pages_mismatch(t_mod):
-    assert t_mod._new_owner_warnings("plain", "agenthangar") == []
-    assert t_mod._new_owner_warnings("chrisooob.github.io", "ChrisOoob") == []
-    w = t_mod._new_owner_warnings("chrisooob.github.io", "agenthangar")
-    assert len(w) == 1 and "'chrisooob'" in w[0] and "'agenthangar'" in w[0]
+    # the conventions are the model's to know: no GitHub rule is spelled out
+    assert "github.io" not in txt and ".github" not in txt
+    bare = t_mod._new_name_prompt("x", set())
+    assert "taken" not in bare and "owners" not in bare
 
 
 def test_new_parse_names_tolerates_prose_validates_and_dedupes(t_mod):
@@ -1114,13 +1097,34 @@ def test_new_parse_names_tolerates_prose_validates_and_dedupes(t_mod):
              '{"name": "cashfwd", "why": "dup"}, {"name": "-bad", "why": "invalid"}, '
              '{"name": "taken-one"}, "bare-string", {"why": "no name"}]\n```')
     assert t_mod._new_parse_names(reply, taken={"taken-one"}) == [
-        ("cashfwd", "short"), ("bare-string", "")]
+        ("cashfwd", "short", None), ("bare-string", "", None)]
     assert t_mod._new_parse_names("no array here") == []
     assert t_mod._new_parse_names("[not json") == []
     assert t_mod._new_parse_names("[not json]") == []
     assert t_mod._new_parse_names("") == []
     many = json.dumps([{"name": f"n{i}"} for i in range(20)])
     assert len(t_mod._new_parse_names(many)) == t_mod._NEW_NAME_MAX
+
+
+def test_new_parse_names_keeps_only_known_tied_owners(t_mod):
+    reply = json.dumps([{"name": "chrisooob.github.io", "why": "pages", "owner": "ChrisOoob"},
+                        {"name": ".github", "why": "org health", "owner": "agenthangar"},
+                        {"name": "plain", "why": "", "owner": "someone-else"},
+                        {"name": "none", "why": ""}])
+    assert t_mod._new_parse_names(reply, owners=["agenthangar", "chrisooob"]) == [
+        ("chrisooob.github.io", "pages", "chrisooob"), (".github", "org health", "agenthangar"),
+        ("plain", "", None), ("none", "", None)]
+
+
+def test_new_owner_default_and_warnings_follow_the_tied_owner(t_mod):
+    rows = [("agenthangar", "agenthangar"), ("chrisooob", "chrisooob (you)")]
+    assert t_mod._new_owner_default("ChrisOoob", rows) == 1
+    assert t_mod._new_owner_default("elsewhere", rows) == 0
+    assert t_mod._new_owner_default(None, rows) == 0
+    assert t_mod._new_owner_warnings("plain", "agenthangar", None) == []
+    assert t_mod._new_owner_warnings("chrisooob.github.io", "ChrisOoob", "chrisooob") == []
+    w = t_mod._new_owner_warnings("chrisooob.github.io", "agenthangar", "chrisooob")
+    assert len(w) == 1 and "'chrisooob'" in w[0] and "'agenthangar'" in w[0]
 
 
 def test_new_taken_names_is_basenames_plus_code_entries(t_mod):

@@ -1085,6 +1085,28 @@ def test_new_name_prompt_carries_rules_and_taken(t_mod):
     assert "cashfwd, dotfiles" in txt
     assert "JSON array" in txt and str(t_mod._NEW_NAME_MAX) in txt
     assert "taken" not in t_mod._new_name_prompt("x", set())
+    txt = t_mod._new_name_prompt("my github site", set(), ["agenthangar", "chrisooob"])
+    assert "<owner>.github.io" in txt and "agenthangar, chrisooob" in txt and "lead with agenthangar" in txt
+    assert "<owner>.github.io" in t_mod._new_name_prompt("x", set())   # the rule holds without owners
+
+
+def test_new_pages_owner_and_owner_default(t_mod):
+    assert t_mod._new_pages_owner("chrisobrien-ai.github.io") == "chrisobrien-ai"
+    assert t_mod._new_pages_owner("ChrisOoob.GitHub.IO") == "chrisooob"
+    assert t_mod._new_pages_owner("github.io") is None
+    assert t_mod._new_pages_owner("my-site") is None
+    assert t_mod._new_pages_owner("a.b.github.io") is None
+    rows = [("agenthangar", "agenthangar"), ("chrisooob", "chrisooob (you)")]
+    assert t_mod._new_owner_default("chrisooob.github.io", rows) == 1
+    assert t_mod._new_owner_default("elsewhere.github.io", rows) == 0
+    assert t_mod._new_owner_default("plain", rows) == 0
+
+
+def test_new_owner_warnings_only_on_pages_mismatch(t_mod):
+    assert t_mod._new_owner_warnings("plain", "agenthangar") == []
+    assert t_mod._new_owner_warnings("chrisooob.github.io", "ChrisOoob") == []
+    w = t_mod._new_owner_warnings("chrisooob.github.io", "agenthangar")
+    assert len(w) == 1 and "'chrisooob'" in w[0] and "'agenthangar'" in w[0]
 
 
 def test_new_parse_names_tolerates_prose_validates_and_dedupes(t_mod):

@@ -259,6 +259,12 @@ link_all() {
     link "$LINK_SRC/bin/pr-watch"         "$HOME/bin/pr-watch"
     link "$LINK_SRC/claude/commands/tpush.md" "$HOME/.claude/commands/tpush.md"
     link "$LINK_SRC/claude/commands/tpop.md"  "$HOME/.claude/commands/tpop.md"
+    # Codex CLI's twins of /tpush and /tpop (custom prompts: ~/.codex/prompts/<name>.md
+    # → /name in the codex TUI). Linked unconditionally like everything here, which
+    # is why install_codex_hooks below gates on a REAL codex home (config/auth), not
+    # on the ~/.codex dir these links create.
+    link "$LINK_SRC/codex/prompts/tpush.md"  "$HOME/.codex/prompts/tpush.md"
+    link "$LINK_SRC/codex/prompts/tpop.md"   "$HOME/.codex/prompts/tpop.md"
     # `t todo` is retired: its /todo command file no longer exists, so the managed
     # link that pointed at it is removed rather than left dangling (a dangling link
     # here shows up in Claude's command list as a broken /todo).
@@ -415,8 +421,9 @@ install_claude_mcp_allow
 # reason: a plain `dots` must land it on every machine, and `t install codex` re-runs
 # this right after the binary appears. Add-only (an existing claude-stamp-tmux entry,
 # or a hand-edited file, is never touched), tmp + os.replace, silent unless it adds.
-# Gated on codex being present or ~/.codex existing, so a machine that never runs
-# codex never grows a hooks file. The command is a literal $HOME: Codex runs hook
+# Gated on codex being present or a REAL codex home (its config.toml / auth.json —
+# NOT the bare ~/.codex dir, which link_all's prompt links create on every machine),
+# so a box that never runs codex never grows a hooks file. The command is a literal $HOME: Codex runs hook
 # commands through a shell (its own examples use `~` and `$(git …)`).
 #
 # Trust is the one half install.sh cannot do: Codex requires a one-time review of a
@@ -425,7 +432,7 @@ install_claude_mcp_allow
 # argv is fixed here and `t doctor` reports a registered-but-never-fired hook.
 install_codex_hooks() {
     [[ -z "${DOTFILES_NO_CODEX_HOOKS:-}" ]] || return 0
-    command -v codex >/dev/null 2>&1 || [[ -d "$HOME/.codex" ]] || return 0
+    command -v codex >/dev/null 2>&1 || [[ -f "$HOME/.codex/config.toml" || -f "$HOME/.codex/auth.json" ]] || return 0
     command -v python3 >/dev/null 2>&1 || return 0
     # shellcheck disable=SC2016  # the literal $HOME is the point: Codex expands it at hook time
     python3 - "$HOME/.codex/hooks.json" '$HOME/bin/claude-stamp-tmux --agent codex' <<'PY'

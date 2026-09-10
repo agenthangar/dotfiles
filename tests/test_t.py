@@ -1095,6 +1095,7 @@ def test_new_parse_names_tolerates_prose_validates_and_dedupes(t_mod):
         ("cashfwd", "short"), ("bare-string", "")]
     assert t_mod._new_parse_names("no array here") == []
     assert t_mod._new_parse_names("[not json") == []
+    assert t_mod._new_parse_names("[not json]") == []
     assert t_mod._new_parse_names("") == []
     many = json.dumps([{"name": f"n{i}"} for i in range(20)])
     assert len(t_mod._new_parse_names(many)) == t_mod._NEW_NAME_MAX

@@ -259,7 +259,13 @@ link_all() {
     link "$LINK_SRC/bin/pr-watch"         "$HOME/bin/pr-watch"
     link "$LINK_SRC/claude/commands/tpush.md" "$HOME/.claude/commands/tpush.md"
     link "$LINK_SRC/claude/commands/tpop.md"  "$HOME/.claude/commands/tpop.md"
-    link "$LINK_SRC/claude/commands/todo.md"  "$HOME/.claude/commands/todo.md"
+    # `t todo` is retired: its /todo command file no longer exists, so the managed
+    # link that pointed at it is removed rather than left dangling (a dangling link
+    # here shows up in Claude's command list as a broken /todo).
+    if [[ -L "$HOME/.claude/commands/todo.md" ]]; then
+        rm -f "$HOME/.claude/commands/todo.md"
+        echo "Removed retired link: ~/.claude/commands/todo.md"
+    fi
     # ~/.ssh must exist and be 0700 before the snippet can land in it. The Include
     # rewrite that pairs with this link stays below, in the full-install section.
     mkdir -p "$HOME/.ssh"
@@ -269,25 +275,27 @@ link_all() {
 
 link_all
 
-# Claude Code statusline — the open-task count for the slot, always on screen.
+# Claude Code statusline — retired with `t todo`.
 #
 # This runs in the LINKS-ONLY path, above the exit below, so a plain `dots` applies
 # it: the README's contract is "you rarely need to run install.sh by hand — dots
 # reconciles", and a step only reachable by a manual full install breaks that (it is
 # how a released change lands on one machine and silently not on another). Safe here
-# for the same reasons link_all is: offline, idempotent, additive, and it never
-# deletes — unlike the brew/launchd/PII steps the exit exists to skip.
+# for the same reasons link_all is: offline, idempotent, and it touches exactly one
+# key that this script itself wrote — unlike the brew/launchd/PII steps the exit
+# exists to skip.
 #
-# Seeding statusLine into settings.json.example only helps a FRESH machine:
-# install_claude_settings never clobbers an existing settings.json (Claude writes to
-# it at runtime), so every box that already has one would never get the key. Hence
-# this targeted merge — it adds statusLine ONLY when absent, so a hand-set statusline
-# is always kept, and it rewrites via tmp + os.replace so a crash cannot truncate the
-# live settings file. Silent unless it actually changes something, because it runs on
-# every single `dots`.
-install_claude_statusline() {
+# `t todo` is retired, and with it the statusLine it seeded (`t todo --statusline`).
+# The seed lived in settings.json.example AND in this targeted merge (Claude writes to
+# the live settings.json at runtime, so the example only ever reached a fresh box) —
+# so the retirement needs the same two halves: the example no longer carries the key,
+# and this removes it from an existing settings.json, ONLY when the command is exactly
+# the one we seeded. A hand-set statusline is never touched. Same tmp + os.replace
+# write, and silent unless it actually changes something, because it runs on every
+# single `dots`.
+retire_claude_statusline() {
     local dst="$HOME/.claude/settings.json"
-    [[ -e "$dst" ]] || return 0          # nothing to merge into; the seed already has it
+    [[ -e "$dst" ]] || return 0
     command -v python3 >/dev/null 2>&1 || return 0
     python3 - "$dst" <<'PY'
 import json, os, sys
@@ -298,23 +306,24 @@ try:
         data = json.load(fh)
 except (OSError, ValueError):
     sys.exit(0)          # not ours to repair, and never block a relink over it
-if not isinstance(data, dict) or data.get("statusLine"):
-    sys.exit(0)          # already set (or hand-set) — silent no-op, this runs every dots
-# $HOME, not an expanded path: Claude runs these through a shell (the SessionStart
-# hook uses the same form), so the setting survives a moved home directory.
-data["statusLine"] = {"type": "command", "command": "$HOME/bin/t todo --statusline"}
+sl = data.get("statusLine") if isinstance(data, dict) else None
+if not (isinstance(sl, dict) and sl.get("type") == "command"
+        and sl.get("command", "").replace(os.path.expanduser("~"), "$HOME", 1)
+        == "$HOME/bin/t todo --statusline"):
+    sys.exit(0)          # absent, or hand-set — leave it alone
+del data["statusLine"]
 tmp = dst + ".tmp"
 with open(tmp, "w", encoding="utf-8") as fh:
     json.dump(data, fh, indent=2)
     fh.write("\n")
 os.replace(tmp, dst)
-print("Set statusLine in %s -> t todo --statusline (open task count for this slot)" % dst)
+print("Removed the retired `t todo --statusline` statusLine from %s" % dst)
 PY
 }
-install_claude_statusline
+retire_claude_statusline
 
 # The `sessions` MCP server (bin/t mcp) — "which session is working on what?" from
-# inside any Claude session. Same contract as the statusline seed above, and here in
+# inside any Claude session. Same contract as the statusline retirement above, and here in
 # the links-only path for the same reason: a step only a manual install reaches lands
 # on one machine and silently not on another. Add-only — an entry that exists (or was
 # hand-edited) is never touched; `claude mcp remove sessions -s user` plus
@@ -353,7 +362,7 @@ install_claude_mcp
 # Registering the server is only half of it: Claude Code prompts for EVERY MCP tool
 # call unless a permission rule covers it, and a prompt per lookup makes the server
 # useless mid-turn. This one is ours and read-only (four lookups over local
-# transcripts, tmux, and the todo store, spawned by `t mcp` from this checkout), so
+# transcripts and tmux, spawned by `t mcp` from this checkout), so
 # it is allowed by default. Blanket `mcp__sessions` rather than four per-tool rules,
 # so a tool added to `t mcp` later is covered the day it ships.
 #

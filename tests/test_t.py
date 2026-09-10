@@ -858,672 +858,7 @@ def test_doctor_findings_wheel_rule_is_narrow(t_mod):
     assert not fires(term_program=None)
 
 
-# ─── t todo — key resolution ───────────────────────────────────────────────────
-
-def _todo_cfg(t_mod, tmp_path, monkeypatch):
-    return _config_with(t_mod, tmp_path, monkeypatch,
-                        {"dotfiles": "/code/dotfiles", "ff": "/code/financial-forecast"},
-                        worktree_root="/wt")
-
-
-def test_todo_key_prefers_the_worktree_path(t_mod, tmp_path, monkeypatch):
-    cfg = _todo_cfg(t_mod, tmp_path, monkeypatch)
-    # The worktree path carries the slot, and it wins over a disagreeing tmux name —
-    # the path is where the code actually is.
-    assert t_mod._todo_key(cfg, "/wt/dotfiles/3") == "dotfiles-3"
-    assert t_mod._todo_key(cfg, "/wt/dotfiles/3", tmux_name="dev-ff-9") == "dotfiles-3"
-
-
-def test_todo_key_worktree_is_keyed_on_the_basename_not_the_alias(t_mod, tmp_path, monkeypatch):
-    cfg = _todo_cfg(t_mod, tmp_path, monkeypatch)
-    # Worktree dirs are $DEV_WORKTREE_ROOT/<repo basename>/<slot> — deliberately the
-    # basename, so the path is identical on every host — but the KEY uses the local
-    # alias, so `ff` (at ~/code/financial-forecast) lands as ff-2, not financial-forecast-2.
-    assert t_mod._todo_key(cfg, "/wt/financial-forecast/2") == "ff-2"
-
-
-def test_todo_key_falls_back_to_the_tmux_session_name(t_mod, tmp_path, monkeypatch):
-    cfg = _todo_cfg(t_mod, tmp_path, monkeypatch)
-    # Shared-tree (worktree opt-out) repo: the path has no slot, the session name does.
-    assert t_mod._todo_key(cfg, "/code/dotfiles", tmux_name="dev-dotfiles-2") == "dotfiles-2"
-    # …and it works from anywhere inside that slot's tmux session, repo dir or not.
-    assert t_mod._todo_key(cfg, "/tmp", tmux_name="dev-dotfiles-2") == "dotfiles-2"
-
-
-def test_todo_key_splits_the_tmux_name_on_the_last_dash(t_mod, tmp_path, monkeypatch):
-    cfg = _todo_cfg(t_mod, tmp_path, monkeypatch)
-    # Multi-dash alias must survive (the _dev_* last-dash rule).
-    assert t_mod._todo_key(cfg, "/tmp", tmux_name="dev-my-long-repo-7") == "my-long-repo-7"
-    # Not a dev slot, or no numeric slot → not a key.
-    assert t_mod._todo_key(cfg, "/tmp", tmux_name="scratchpad") == "scratch"
-    assert t_mod._todo_key(cfg, "/tmp", tmux_name="dev-dotfiles-main") == "scratch"
-    assert t_mod._todo_key(cfg, "/tmp", tmux_name="dev-4") == "scratch"
-
-
-def test_todo_key_repo_dir_without_a_slot(t_mod, tmp_path, monkeypatch):
-    cfg = _todo_cfg(t_mod, tmp_path, monkeypatch)
-    assert t_mod._todo_key(cfg, "/code/dotfiles") == "dotfiles"
-    assert t_mod._todo_key(cfg, "/code/dotfiles/bin") == "dotfiles"
-
-
-def test_todo_key_scratch_and_override(t_mod, tmp_path, monkeypatch):
-    cfg = _todo_cfg(t_mod, tmp_path, monkeypatch)
-    # Nowhere in particular still has somewhere to write, so a quick add never errors.
-    assert t_mod._todo_key(cfg, "/tmp") == "scratch"
-    # -s wins over everything.
-    assert t_mod._todo_key(cfg, "/wt/dotfiles/3", tmux_name="dev-ff-1",
-                           override="ff-9") == "ff-9"
-
-
-# ─── t todo — paths and persistence ────────────────────────────────────────────
-
-def test_todo_dir_honours_xdg_state_home(t_mod, monkeypatch):
-    monkeypatch.setenv("XDG_STATE_HOME", "/xdg/state")
-    assert t_mod._todo_dir() == "/xdg/state/t/todo"
-    assert t_mod._todo_path("dotfiles-1") == "/xdg/state/t/todo/dotfiles-1.json"
-
-
-def test_todo_dir_defaults_under_local_state(t_mod, monkeypatch):
-    monkeypatch.delenv("XDG_STATE_HOME", raising=False)
-    monkeypatch.setattr(t_mod, "HOME", "/home/me")
-    assert t_mod._todo_dir() == "/home/me/.local/state/t/todo"
-
-
-def test_todo_load_missing_file_is_an_empty_list(t_mod, tmp_path):
-    data = t_mod._todo_load(str(tmp_path / "nope.json"))
-    assert data == {"v": 1, "next_id": 1, "items": []}
-
-
-def test_todo_load_corrupt_file_is_an_empty_list(t_mod, tmp_path):
-    # A half-written file must not make the command unusable.
-    p = tmp_path / "x.json"
-    p.write_text('{"items": [{"id": 1, "te')
-    assert t_mod._todo_load(str(p))["items"] == []
-    p.write_text('["not", "a", "dict"]')
-    assert t_mod._todo_load(str(p))["items"] == []
-
-
-def test_todo_load_repairs_next_id(t_mod, tmp_path):
-    # A stale next_id (hand-edited, or a sync that kept the older scalar) must never
-    # hand out an id that is already taken.
-    p = tmp_path / "x.json"
-    p.write_text('{"v": 1, "next_id": 2, "items": ['
-                 '{"id": 1, "text": "a"}, {"id": 7, "text": "b"}]}')
-    assert t_mod._todo_load(str(p))["next_id"] == 8
-
-
-def test_todo_save_then_load_roundtrips(t_mod, tmp_path):
-    path = str(tmp_path / "deep" / "dotfiles-1.json")
-    data = {"v": 1, "next_id": 2,
-            "items": [{"id": 1, "text": "café ☕", "done": False,
-                       "added": 1, "done_at": None, "deleted": False}]}
-    t_mod._todo_save(path, data)          # creates the parent dir
-    assert t_mod._todo_load(path) == data
-    assert not os.path.exists(path + ".tmp")
-
-
-# ─── t todo — the mutation core ────────────────────────────────────────────────
-
-def _fresh(t_mod):
-    return dict(t_mod._TODO_EMPTY, items=[])
-
-
-def _add(t_mod, data, *texts):
-    for text in texts:
-        t_mod._todo_apply(data, "add", text.split(), now=100)
-    return data
-
-
-def test_todo_add_assigns_rising_ids(t_mod):
-    data = _fresh(t_mod)
-    msg, rc = t_mod._todo_apply(data, "add", ["rebase", "onto", "main"], now=100)
-    assert rc == 0 and "#1" in msg
-    t_mod._todo_apply(data, "add", ["second"], now=100)
-    assert [i["id"] for i in data["items"]] == [1, 2]
-    assert data["items"][0]["text"] == "rebase onto main"
-    assert data["next_id"] == 3
-
-
-def test_todo_add_needs_text(t_mod):
-    data = _fresh(t_mod)
-    msg, rc = t_mod._todo_apply(data, "add", ["   "], now=100)
-    assert rc == 2 and data["items"] == []
-
-
-def test_todo_done_hides_the_item(t_mod):
-    data = _add(t_mod, _fresh(t_mod), "one", "two")
-    msg, rc = t_mod._todo_apply(data, "done", ["1"], now=200)
-    assert rc == 0 and "#1" in msg
-    assert data["items"][0]["done"] and data["items"][0]["done_at"] == 200
-    assert [i["id"] for i in t_mod._todo_open(data)] == [2]
-
-
-def test_todo_reopen_is_internal_only(t_mod):
-    # `undone` was retired as a typed verb, but the bare-id picker still needs to
-    # un-tick — it goes through the underscore-prefixed action nobody types.
-    data = _add(t_mod, _fresh(t_mod), "one")
-    t_mod._todo_apply(data, "done", ["1"], now=200)
-    msg, rc = t_mod._todo_apply(data, "_reopen", ["1"], now=300)
-    assert rc == 0 and not data["items"][0]["done"]
-    assert data["items"][0]["done_at"] is None
-    assert t_mod._todo_apply(data, "_reopen", ["9"], now=300)[1] == 1
-    assert t_mod._todo_apply(data, "_reopen", [], now=300)[1] == 1
-
-
-def test_todo_accepts_several_ids_at_once(t_mod):
-    data = _add(t_mod, _fresh(t_mod), "one", "two", "three")
-    msg, rc = t_mod._todo_apply(data, "done", ["1", "3"], now=200)
-    assert rc == 0
-    assert [i["id"] for i in t_mod._todo_open(data)] == [2]
-
-
-def test_todo_unknown_id_reports_without_raising(t_mod):
-    data = _add(t_mod, _fresh(t_mod), "one")
-    msg, rc = t_mod._todo_apply(data, "done", ["9", "not-a-number"], now=200)
-    assert rc == 1
-    assert "9" in msg and "not-a-number" in msg
-    assert not data["items"][0]["done"]
-    # A partial hit still applies what it could, and still reports the miss.
-    msg, rc = t_mod._todo_apply(data, "done", ["1", "9"], now=200)
-    assert rc == 1 and data["items"][0]["done"]
-
-
-def test_todo_id_actions_need_an_id(t_mod):
-    data = _add(t_mod, _fresh(t_mod), "one")
-    for action in ("done", "undone", "rm"):
-        assert t_mod._todo_apply(data, action, [], now=200)[1] == 2
-
-
-def test_todo_rm_is_a_tombstone_not_a_delete(t_mod):
-    # csync's rsync has no --delete, so a physically dropped item comes back from
-    # iCloud. The item must survive in the file, flagged.
-    data = _add(t_mod, _fresh(t_mod), "one", "two")
-    t_mod._todo_apply(data, "rm", ["1"], now=200)
-    assert len(data["items"]) == 2
-    assert data["items"][0]["deleted"] and data["items"][0]["deleted_at"] == 200
-    assert [i["id"] for i in t_mod._todo_open(data)] == [2]
-    # …and a tombstoned item is gone for good: not listable, not addressable.
-    assert t_mod._todo_find(data, "1") is None
-    assert t_mod._todo_apply(data, "done", ["1"], now=300)[1] == 1
-    assert [i["id"] for i in t_mod._todo_visible(data, show_all=True)] == [2]
-
-
-def test_todo_unknown_action_is_one_line(t_mod):
-    data = _fresh(t_mod)
-    msg, rc = t_mod._todo_apply(data, "fix", ["the", "thing"], now=300)
-    assert rc == 2 and "\n" not in msg          # the add-hint second line is gone
-    assert "add, done, rm, mv, ls" in msg
-    assert data["items"] == []
-
-
-def test_todo_retired_verbs_explain_themselves(t_mod):
-    # Muscle memory from the week these existed should get a pointer, not a dead end.
-    for verb, needle in (("clear", "purge themselves"), ("edit", "add it again"),
-                         ("undone", "-a"), ("purge", "purge themselves"),
-                         ("reopen", "-a")):
-        msg, rc = t_mod._todo_apply(_fresh(t_mod), verb, [], now=300)
-        assert rc == 2 and "is gone" in msg and needle in msg
-
-
-# ─── t todo — flags after the action ──────────────────────────────────────────
-
-def _todo_args(t_mod, *argv):
-    """Parse `t todo <argv>` exactly as main() does, then hoist — argparse's REMAINDER
-    parks every token after the action in `rest`, flags included."""
-    return t_mod._todo_hoist_flags(t_mod.build_parser().parse_args(["todo", *argv]))
-
-
-def test_todo_hoists_flags_typed_after_the_action(t_mod):
-    # `t todo ls -A` used to parse as action=ls, rest=['-A'], all_slots=False — the flag
-    # sat unread and the view answered as a plain `t todo`: "-A can't see all slots".
-    a = _todo_args(t_mod, "ls", "-A")
-    assert a.all_slots and a.rest == []
-    a = _todo_args(t_mod, "ls", "-a")
-    assert a.all and not a.all_slots and a.rest == []
-    a = _todo_args(t_mod, "done", "3", "-s", "dotfiles-4")
-    assert a.slot == "dotfiles-4" and a.rest == ["3"]
-    a = _todo_args(t_mod, "rm", "--items", "2")
-    assert a.items == 2 and a.rest == []
-
-
-def test_todo_hoist_leaves_flag_free_args_alone(t_mod):
-    a = _todo_args(t_mod, "done", "3", "4")
-    assert a.rest == ["3", "4"] and not a.all and not a.all_slots and a.slot is None
-    a = _todo_args(t_mod, "-A")                      # the gh-style order still works
-    assert a.all_slots and a.action is None and a.rest == []
-
-
-def test_todo_add_hoists_only_a_leading_run_of_flags(t_mod):
-    # Flags before the text are flags…
-    a = _todo_args(t_mod, "add", "-s", "dot-3", "fix", "it")
-    assert a.slot == "dot-3" and a.rest == ["fix", "it"]
-    # …but the text is prose: a `-s` inside it is a word, not a list called `in`.
-    a = _todo_args(t_mod, "add", "handle", "-s", "in", "t", "setup")
-    assert a.slot is None and a.rest == ["handle", "-s", "in", "t", "setup"]
-    # A `-h` mid-text stays text (the mini parser has no help action).
-    a = _todo_args(t_mod, "add", "fix", "the", "-h", "flag")
-    assert a.rest == ["fix", "the", "-h", "flag"]
-
-
-def test_todo_add_keeps_unknown_leading_tokens_as_text(t_mod):
-    # A negative number is not a todo flag; it stays the first word.
-    a = _todo_args(t_mod, "add", "-3", "degrees")
-    assert a.rest == ["-3", "degrees"] and not a.all
-    # A quoted dash-shaped first word arrives as ONE space-bearing token; the hoist holds
-    # it back from argparse (whose short-option prefix match would read it as -A plus
-    # junk), so quoting is the documented escape hatch.
-    a = _todo_args(t_mod, "add", "-A literal")
-    assert a.rest == ["-A literal"] and not a.all_slots
-    a = _todo_args(t_mod, "add", "-A literal", "-s", "x")   # …and only a LEADING run hoists
-    assert a.rest == ["-A literal", "-s", "x"] and a.slot is None
-    a = _todo_args(t_mod, "done", "-A literal", "-a")        # ids: a real flag still hoists
-    assert a.all and not a.all_slots and a.rest == ["-A literal"]
-    # `--all-of-them` must not abbreviate to --all.
-    a = _todo_args(t_mod, "add", "--all-of-them", "now")
-    assert a.rest == ["--all-of-them", "now"] and not a.all
-
-
-def test_todo_hoist_honours_a_mid_text_double_dash(t_mod):
-    a = _todo_args(t_mod, "add", "-s", "x", "--", "-A", "literal")
-    assert a.slot == "x" and not a.all_slots and a.rest == ["-A", "literal"]
-    a = _todo_args(t_mod, "done", "3", "--", "-A")
-    assert not a.all_slots and a.rest == ["3", "-A"]
-
-
-# ─── t todo — rendering ────────────────────────────────────────────────────────
-
-def _body(lines):
-    """Drop the trailing blank + action footer every todo view now appends, so these
-    assertions stay about the items themselves."""
-    return lines[:-2] if len(lines) >= 2 and lines[-2] == "" else lines
-
-
-def _plain(t_mod):
-    """A colourless Style so assertions can match text, not escape codes."""
-    st = t_mod.Style()
-    for attr in ("g", "c", "y", "b", "r"):
-        setattr(st, attr, "")
-    return st
-
-
-def test_todo_render_lists_open_items(t_mod):
-    data = _add(t_mod, _fresh(t_mod), "one", "two")
-    t_mod._todo_apply(data, "done", ["1"], now=200)
-    lines = _body(t_mod._todo_render(data, "dotfiles-1", st=_plain(t_mod)))
-    assert lines[0] == "dotfiles-1 — 1 open"
-    assert [l.strip() for l in lines[1:]] == ["2  ◻ two"]
-
-
-def test_todo_render_all_flag_shows_done_and_a_tally(t_mod):
-    data = _add(t_mod, _fresh(t_mod), "one", "two")
-    t_mod._todo_apply(data, "done", ["1"], now=200)
-    lines = _body(t_mod._todo_render(data, "dotfiles-1", show_all=True, st=_plain(t_mod)))
-    assert lines[0] == "dotfiles-1 — 1 open · 1 done"
-    assert [l.strip() for l in lines[1:]] == ["1  ✓ one", "2  ◻ two"]
-
-
-def test_todo_render_always_ends_with_the_action_footer(t_mod):
-    # Bare `t todo` is the discovery surface: the verbs must be visible without -h.
-    for data in (_fresh(t_mod), _add(t_mod, _fresh(t_mod), "one")):
-        lines = t_mod._todo_render(data, "dotfiles-1", st=_plain(t_mod))
-        assert lines[-2] == ""
-        for verb in ("t todo add", "t todo done", "t todo <id>", "-A"):
-            assert verb in lines[-1]
-    empty = t_mod._todo_render(_fresh(t_mod), "dotfiles-1", st=_plain(t_mod))
-    assert empty[0] == "dotfiles-1 — nothing open"
-
-
-def test_todo_render_truncates_to_width(t_mod):
-    data = _add(t_mod, _fresh(t_mod), "x" * 200)
-    lines = _body(t_mod._todo_render(data, "k", width=40, st=_plain(t_mod)))
-    assert all(len(l) <= 40 for l in lines)
-    assert lines[1].endswith("…")
-
-
-def test_todo_render_all_groups_by_slot_and_skips_empty(t_mod):
-    a = _add(t_mod, _fresh(t_mod), "first", "second")
-    b = _add(t_mod, _fresh(t_mod), "other")
-    empty = _fresh(t_mod)
-    done_only = _add(t_mod, _fresh(t_mod), "finished")
-    t_mod._todo_apply(done_only, "done", ["1"], now=200)
-    lines = t_mod._todo_render_all(
-        [("dotfiles-1", a), ("ff-2", b), ("gone-3", empty), ("tidy-4", done_only)],
-        st=_plain(t_mod))
-    lines = _body(lines)
-    assert "dotfiles-1" in lines[0] and "first" in lines[0]
-    assert lines[1].strip().startswith("2")       # continuation row: no repeated key
-    assert "dotfiles-1" not in lines[1]
-    assert "ff-2" in lines[2] and "other" in lines[2]
-    # A slot with nothing open never takes a row.
-    assert not any("gone-3" in l or "tidy-4" in l for l in lines)
-
-
-def test_todo_render_all_says_so_when_everything_is_clear(t_mod):
-    lines = t_mod._todo_render_all([("a-1", _fresh(t_mod))], st=_plain(t_mod))
-    assert _body(lines) == ["nothing open in any slot"]
-
-
-# ─── t todo — a slot sees its repo-level list ──────────────────────────────────
-
-def test_todo_parent_resolves_a_slot_to_its_repo(t_mod, tmp_path, monkeypatch):
-    repos = _todo_cfg(t_mod, tmp_path, monkeypatch).repos
-    assert t_mod._todo_parent("dotfiles-3", repos) == "dotfiles"
-    assert t_mod._todo_parent("dotfiles", repos) is None      # already repo-level
-    assert t_mod._todo_parent("scratch", repos) is None
-    # The head must be a REAL alias and the tail numeric, or `financial-forecast`
-    # would read as slot "forecast" of a repo "financial".
-    assert t_mod._todo_parent("financial-forecast", repos) is None
-    assert t_mod._todo_parent("dotfiles-main", repos) is None
-
-
-def test_todo_shared_is_none_when_the_repo_list_is_empty(t_mod, tmp_path, monkeypatch):
-    # The common case: a slot with no shared notes pays one stat and renders as before.
-    cfg = _todo_cfg(t_mod, tmp_path, monkeypatch)
-    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
-    assert t_mod._todo_shared(cfg, "dotfiles-3") is None
-    assert t_mod._todo_shared(cfg, "dotfiles") is None        # already repo-level
-    t_mod._todo_save(t_mod._todo_path("dotfiles"), _add(t_mod, _fresh(t_mod), "hello"))
-    assert t_mod._todo_shared(cfg, "dotfiles-3")[0] == "dotfiles"
-
-
-def test_todo_render_marks_shared_items_with_a_diamond(t_mod, tmp_path, monkeypatch):
-    # ◇ not ◻, because ids are per-list and both sections can hold a #3 — which list
-    # an item lives in has to be readable at a glance.
-    own = _add(t_mod, _fresh(t_mod), "fix the thing")
-    shared = _add(t_mod, _fresh(t_mod), "hello")
-    out = "\n".join(t_mod._todo_render(own, "dotfiles-3", shared=("dotfiles", shared)))
-    assert "◻ fix the thing" in out and "◇ hello" in out
-    assert out.index("◻ fix the thing") < out.index("◇ hello")   # own work first
-    assert "dotfiles — 1 open" in out
-
-
-def test_todo_render_hides_a_shared_section_with_nothing_to_show(t_mod):
-    # No repo list, or one holding only ticked-off items, renders exactly as before.
-    own = _add(t_mod, _fresh(t_mod), "fix the thing")
-    plain = t_mod._todo_render(own, "dotfiles-3")
-    assert t_mod._todo_render(own, "dotfiles-3", shared=None) == plain
-    done = _add(t_mod, _fresh(t_mod), "hello")
-    t_mod._todo_apply(done, "done", ["1"], now=100)
-    assert t_mod._todo_render(own, "dotfiles-3", shared=("dotfiles", done)) == plain
-    # -a widens to it, since the item is still live and can be removed or re-filed.
-    assert "✓ hello" in "\n".join(
-        t_mod._todo_render(own, "dotfiles-3", show_all=True, shared=("dotfiles", done)))
-
-
-def test_todo_statusline_carries_the_repo_level_list(t_mod, tmp_path, monkeypatch):
-    # The bar was keyed strictly on the slot, so a note jotted at repo level — the
-    # cross-slot work — was invisible from every place you actually work.
-    cfg = _todo_cfg(t_mod, tmp_path, monkeypatch)
-    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
-    monkeypatch.setenv("NO_COLOR", "1")
-    _no_dev_server(t_mod, monkeypatch)
-    t_mod._todo_save(t_mod._todo_path("dotfiles-3"), _add(t_mod, _fresh(t_mod), "own"))
-    t_mod._todo_save(t_mod._todo_path("dotfiles"), _add(t_mod, _fresh(t_mod), "hello"))
-    pay = {"workspace": {"current_dir": "/wt/dotfiles/3"}}
-    # Two lines: the slot's own work, then the repo's under it, its │ aligned.
-    assert t_mod._todo_statusline(pay, cfg) == "dotfiles-3 │ ◻ own\ndotfiles   │ ◇ hello"
-    # A repo-level cwd is already the shared list; it must not double up.
-    assert t_mod._todo_statusline({"workspace": {"current_dir": "/code/dotfiles"}},
-                                  cfg) == "dotfiles │ ◻ hello"
-
-
-def test_todo_statusline_shared_only_slot_is_not_empty(t_mod, tmp_path, monkeypatch):
-    cfg = _todo_cfg(t_mod, tmp_path, monkeypatch)
-    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
-    monkeypatch.setenv("NO_COLOR", "1")
-    _no_dev_server(t_mod, monkeypatch)
-    t_mod._todo_save(t_mod._todo_path("dotfiles"), _add(t_mod, _fresh(t_mod), "hello"))
-    assert t_mod._todo_statusline({"workspace": {"current_dir": "/wt/dotfiles/3"}},
-                                  cfg) == "dotfiles-3 │ nothing open here\ndotfiles   │ ◇ hello"
-
-
-def test_todo_statusline_repo_line_packs_to_the_width_on_its_own(t_mod, tmp_path, monkeypatch):
-    cfg = _todo_cfg(t_mod, tmp_path, monkeypatch)
-    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
-    monkeypatch.setenv("NO_COLOR", "1")
-    _no_dev_server(t_mod, monkeypatch)
-    t_mod._todo_save(t_mod._todo_path("dotfiles-3"), _add(t_mod, _fresh(t_mod), "own"))
-    t_mod._todo_save(t_mod._todo_path("dotfiles"), _add(
-        t_mod, _fresh(t_mod), "keep forecast on aug 15", "make cc payments work", "third"))
-    pay = {"workspace": {"current_dir": "/wt/dotfiles/3"}}
-    one, two = t_mod._todo_statusline(pay, cfg, width=50).split("\n")
-    assert one == "dotfiles-3 │ ◻ own"
-    assert two.startswith("dotfiles   │ ◇ keep forecast on aug 15") and two.endswith("+2 more")
-    assert len(two) <= 50
-    assert one.index("│") == two.index("│")           # a two-row table, not two bars
-    # Too narrow to afford the alignment padding: the repo key sits flush instead.
-    one, two = t_mod._todo_statusline(pay, cfg, width=25).split("\n")
-    assert two.startswith("dotfiles │ ")
-
-
-def test_todo_statusline_repo_line_is_dim_and_the_slot_line_is_not(t_mod, tmp_path, monkeypatch):
-    cfg = _todo_cfg(t_mod, tmp_path, monkeypatch)
-    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
-    monkeypatch.delenv("NO_COLOR", raising=False)
-    _no_dev_server(t_mod, monkeypatch)
-    t_mod._todo_save(t_mod._todo_path("dotfiles-3"), _add(t_mod, _fresh(t_mod), "own"))
-    t_mod._todo_save(t_mod._todo_path("dotfiles"), _add(t_mod, _fresh(t_mod), "hello", "more"))
-    one, two = t_mod._todo_statusline({"workspace": {"current_dir": "/wt/dotfiles/3"}},
-                                      cfg, width=30).split("\n")
-    assert "\033[36m◻\033[0m own" in one                 # own work: cyan box, plain text
-    assert two.startswith("\033[2m") and "\033[36m" not in two   # repo line: dim throughout
-    assert two.endswith("\033[0m")                        # …and never bleeds into the footer
-    # a repo line with nothing left over still closes its dim
-    t_mod._todo_save(t_mod._todo_path("dotfiles"), _add(t_mod, _fresh(t_mod), "hello"))
-    two = t_mod._todo_statusline({"workspace": {"current_dir": "/wt/dotfiles/3"}},
-                                 cfg, width=40).split("\n")[1]
-    assert two.endswith("◇ hello\033[0m")
-
-
-def test_todo_key_tmux_step_files_by_the_canonical_alias(t_mod, tmp_path, monkeypatch):
-    # A `dev-dot-12` window and the .worktrees/dotfiles/12 path are one slot: the raw
-    # name keyed dot-12 while the path (and `t todo add dot 12 …`) keyed dotfiles-12.
-    cfg = _config_with(t_mod, tmp_path, monkeypatch,
-                       {"dot": "/code/dotfiles", "dotfiles": "/code/dotfiles"},
-                       worktree_root="/wt")
-    assert t_mod._todo_key(cfg, "/code/dotfiles", tmux_name="dev-dot-12") == "dotfiles-12"
-    assert t_mod._todo_key(cfg, "/wt/dotfiles/12", tmux_name="dev-dot-12") == "dotfiles-12"
-
-
-# ─── t todo — statusline ───────────────────────────────────────────────────────
-
-def _no_dev_server(t_mod, monkeypatch):
-    """Stub the port probe. Without it the bar depends on whatever happens to be
-    listening on the machine running the suite — slot 3 is :5203 to a real dev server
-    as readily as to nothing at all."""
-    monkeypatch.setattr(t_mod, "_port_is_live", lambda *a, **k: False)
-
-
-def _statusline(t_mod, tmp_path, monkeypatch, payload, key=None, texts=(),
-                items_n=1, width=80, live_ports=(), tmux_name=None):
-    cfg = _todo_cfg(t_mod, tmp_path, monkeypatch)
-    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
-    if key:
-        data = _add(t_mod, _fresh(t_mod), *texts)
-        t_mod._todo_save(t_mod._todo_path(key), data)
-    monkeypatch.setattr(t_mod, "_port_is_live", lambda p, *a, **k: p in live_ports)
-    monkeypatch.setattr(t_mod, "_has_dev_server", lambda cwd: True)  # the fake cwd has no files
-    monkeypatch.setenv("NO_COLOR", "1")   # assert on the layout, not the escapes
-    return t_mod._todo_statusline(payload, cfg, items_n, width, tmux_name)
-
-
-def test_todo_statusline_renders_slot_model_and_top_item(t_mod, tmp_path, monkeypatch):
-    line = _statusline(t_mod, tmp_path, monkeypatch,
-                       {"workspace": {"current_dir": "/wt/dotfiles/1"},
-                        "model": {"display_name": "Opus"}},
-                       key="dotfiles-1", texts=("rebase onto main", "second"))
-    assert line == "dotfiles-1 · Opus │ ◻ rebase onto main  ◻ second"
-
-
-def test_todo_statusline_prefers_workspace_over_cwd(t_mod, tmp_path, monkeypatch):
-    # They differ when Claude is started from a subdir; workspace.current_dir is
-    # the project root and is what the slot is keyed on.
-    line = _statusline(t_mod, tmp_path, monkeypatch,
-                       {"cwd": "/tmp", "workspace": {"current_dir": "/wt/financial-forecast/2"}})
-    assert line.startswith("ff-2")
-
-
-def test_todo_statusline_survives_a_bare_payload(t_mod, tmp_path, monkeypatch):
-    # A statusline that raises leaves the TUI with a permanently broken status bar,
-    # so every field has to be optional.
-    for payload in ({}, {"model": None, "workspace": "nonsense"}, []):
-        line = _statusline(t_mod, tmp_path, monkeypatch, payload)
-        assert line.endswith("│ nothing open")
-
-
-def test_todo_statusline_truncates_a_long_item(t_mod, tmp_path, monkeypatch):
-    # A single item longer than the bar fills it exactly and ellipses — it must never
-    # wrap, or the one-line contract breaks on the narrowest host.
-    for width in (40, 80, 120):
-        line = _statusline(t_mod, tmp_path, monkeypatch,
-                           {"workspace": {"current_dir": "/wt/dotfiles/1"}},
-                           key="dotfiles-1", texts=("y" * 400,), width=width)
-        assert line.endswith("…") and len(line) <= width and "\n" not in line
-
-
-def test_todo_statusline_caps_each_item(t_mod, tmp_path, monkeypatch):
-    # The width fit only ellipses an item that OVERFLOWS the bar, so on a wide
-    # terminal one 140-char task fit outright and hid every item behind it. Each
-    # item is capped independently of the width; the next one still shows.
-    long = "Accounts ledger (http://localhost:5217/#accounts) Aug 21: " + "x" * 90
-    line = _statusline(t_mod, tmp_path, monkeypatch,
-                       {"workspace": {"current_dir": "/wt/dotfiles/1"}},
-                       key="dotfiles-1", texts=(long, "second"), width=240)
-    first = line.split("◻ ")[1].rstrip()
-    assert first.endswith("…") and len(first) == t_mod._TODO_BAR_ITEM_MAX
-    assert first.startswith("Accounts ledger (http://localhost:5217/#accounts)")
-    assert line.endswith("◻ second") and len(line) <= 240
-
-
-def test_todo_statusline_colours_unconditionally(t_mod, tmp_path, monkeypatch):
-    # Style() gates on isatty and this stdout is always the pipe Claude Code reads,
-    # so the shared helper would render every bar plain. NO_COLOR still opts out.
-    monkeypatch.delenv("NO_COLOR", raising=False)
-    cfg = _todo_cfg(t_mod, tmp_path, monkeypatch)
-    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
-    _no_dev_server(t_mod, monkeypatch)
-    t_mod._todo_save(t_mod._todo_path("dotfiles-1"), _add(t_mod, _fresh(t_mod), "one"))
-    line = t_mod._todo_statusline({"workspace": {"current_dir": "/wt/dotfiles/1"}}, cfg)
-    assert line.startswith("\033[2m") and "\033[36m◻\033[0m one" in line
-
-
-def test_todo_statusline_falls_back_when_no_item_fits(t_mod, tmp_path, monkeypatch):
-    # Too narrow for even a truncated item: report the count rather than leave a
-    # dangling │ with nothing after it.
-    line = _statusline(t_mod, tmp_path, monkeypatch,
-                       {"workspace": {"current_dir": "/wt/dotfiles/1"}},
-                       key="dotfiles-1", texts=("one", "two"), width=26)
-    assert line == "dotfiles-1 │ 2 open"
-
-
-# ─── t todo — action aliases and cross-list move ───────────────────────────────
-
-def test_todo_action_aliases_resolve(t_mod):
-    # `t todo list` was a dead end; none of these collide with a canonical name.
-    assert t_mod._todo_canon("list") == "ls"
-    assert t_mod._todo_canon("delete") == "rm"
-    assert t_mod._todo_canon("x") == "done"
-    assert len(t_mod._TODO_ALIASES) == 4        # four, not thirteen
-    # "check" is deliberately NOT an alias — it reads as "show me" as much as "check
-    # off", so it stays an unknown action rather than surprising either way.
-    assert t_mod._todo_canon("check") == "check"
-    assert t_mod._todo_canon("move") == "mv"
-    # canonical names pass through, unknown words stay unknown (so the hint still fires)
-    assert t_mod._todo_canon("add") == "add"
-    assert t_mod._todo_canon("frobnicate") == "frobnicate"
-
-
-def test_todo_apply_accepts_an_alias(t_mod):
-    data = _add(t_mod, _fresh(t_mod), "one")
-    msg, rc = t_mod._todo_apply(data, "delete", ["1"], now=200)
-    assert rc == 0 and data["items"][0]["deleted"]
-
-
-def test_todo_move_across_lists(t_mod):
-    src = _add(t_mod, _fresh(t_mod), "one", "two")
-    dst = _add(t_mod, _fresh(t_mod), "already here")
-    msg, rc = t_mod._todo_move(src, dst, "1", "ff-3", now=200)
-    assert rc == 0 and "ff-3" in msg
-    # gone from the source, present in the destination, text intact
-    assert [i["id"] for i in t_mod._todo_open(src)] == [2]
-    assert [i["text"] for i in t_mod._todo_open(dst)] == ["already here", "one"]
-
-
-def test_todo_move_reids_in_the_destination(t_mod):
-    # ids are per-list, so the moved item takes the destination's next id, not its own
-    src = _add(t_mod, _fresh(t_mod), "a", "b", "c")
-    dst = _fresh(t_mod)
-    t_mod._todo_move(src, dst, "3", "ff-3", now=200)
-    assert [i["id"] for i in dst["items"]] == [1]
-    assert dst["next_id"] == 2
-
-
-def test_todo_move_tombstones_the_source_item(t_mod):
-    # same reason as rm: csync has no --delete, so the source file must carry the move
-    src = _add(t_mod, _fresh(t_mod), "one")
-    dst = _fresh(t_mod)
-    t_mod._todo_move(src, dst, "1", "ff-3", now=200)
-    assert len(src["items"]) == 1
-    assert src["items"][0]["deleted"] and src["items"][0]["deleted_at"] == 200
-    # …and the moved copy is NOT itself a tombstone
-    assert not dst["items"][0]["deleted"] and dst["items"][0]["deleted_at"] is None
-
-
-def test_todo_move_unknown_id(t_mod):
-    src = _add(t_mod, _fresh(t_mod), "one")
-    dst = _fresh(t_mod)
-    msg, rc = t_mod._todo_move(src, dst, "9", "ff-3", now=200)
-    assert rc == 1 and dst["items"] == [] and not src["items"][0]["deleted"]
-
-
-def test_todo_statusline_packs_items_into_the_width(t_mod, tmp_path, monkeypatch):
-    texts = ("rebase onto main", "fix the ledger rollover", "ask about the beam gap")
-    wide = _statusline(t_mod, tmp_path, monkeypatch,
-                       {"workspace": {"current_dir": "/wt/dotfiles/1"}},
-                       key="dotfiles-1", texts=texts, width=90)
-    narrow = _statusline(t_mod, tmp_path, monkeypatch,
-                         {"workspace": {"current_dir": "/wt/dotfiles/1"}},
-                         key="dotfiles-1", texts=texts, width=45)
-    assert "\n" not in wide and "\n" not in narrow      # one line, always
-    assert len(narrow) <= 45 and narrow.count("◻") < wide.count("◻")
-    assert wide.endswith("more") and "+" in wide         # the unshown remainder is counted
-
-
-def test_todo_statusline_multiline_lists_items(t_mod, tmp_path, monkeypatch):
-    out = _statusline(t_mod, tmp_path, monkeypatch,
-                      {"workspace": {"current_dir": "/wt/dotfiles/1"}},
-                      key="dotfiles-1", texts=("one", "two", "three"), items_n=2)
-    lines = out.split("\n")
-    assert lines[0].endswith("│ 3 open")
-    assert lines[1].strip() == "◻ 1 one" and lines[2].strip() == "◻ 2 two"
-    assert lines[3].strip() == "+1 more"
-
-
-def test_todo_statusline_multiline_without_a_remainder(t_mod, tmp_path, monkeypatch):
-    out = _statusline(t_mod, tmp_path, monkeypatch,
-                      {"workspace": {"current_dir": "/wt/dotfiles/1"}},
-                      key="dotfiles-1", texts=("one",), items_n=5)
-    assert out.split("\n") == ["dotfiles-1 │ 1 open", "  ◻ 1 one"]
-
-
-def test_todo_statusline_uses_the_tmux_slot_when_the_cwd_has_none(
-        t_mod, tmp_path, monkeypatch):
-    # A session run from a repo's PRIMARY checkout inside a dev-<repo>-<n> window: the
-    # path carries no slot, so without the tmux name the bar renders the repo-level
-    # list while `t todo add` files into the slot's — the items just never show up.
-    line = _statusline(t_mod, tmp_path, monkeypatch, {"cwd": "/code/dotfiles"},
-                       key="dotfiles-12", texts=("check the chart",),
-                       tmux_name="dev-dotfiles-12")
-    assert line.startswith("dotfiles-12 │ ◻ check the chart")
-
-
-def test_todo_statusline_empty_list_is_one_line_either_way(t_mod, tmp_path, monkeypatch):
-    for n in (1, 5):
-        out = _statusline(t_mod, tmp_path, monkeypatch, {}, items_n=n)
-        assert out == "scratch │ nothing open"
-
-
-# ─── t todo — the dev URL zone ─────────────────────────────────────────────────
+# ─── the dev URL a slot is testable at (_dev_url, the sessions MCP rows) ────────
 
 def _dev_url(t_mod, monkeypatch, key, cwd, live=()):
     monkeypatch.setattr(t_mod, "_port_is_live", lambda p, *a, **k: p in live)
@@ -1582,234 +917,6 @@ def test_dev_url_ignores_a_non_numeric_trailing_segment(t_mod, monkeypatch, tmp_
     assert _dev_url(t_mod, monkeypatch, "scratch", str(tmp_path), live=(5200,)) is None
 
 
-def test_todo_statusline_shows_the_live_url(t_mod, tmp_path, monkeypatch):
-    line = _statusline(t_mod, tmp_path, monkeypatch,
-                       {"workspace": {"current_dir": "/wt/dotfiles/1"},
-                        "model": {"display_name": "Opus"}},
-                       key="dotfiles-1", texts=("check the chart",), live_ports=(5201,))
-    assert line == "dotfiles-1 · Opus ● http://localhost:5201 │ ◻ check the chart"
-
-
-def test_todo_statusline_shows_the_url_with_an_empty_list(t_mod, tmp_path, monkeypatch):
-    # The URL is where you go, the list is what to do there — the first must not
-    # depend on the second.
-    line = _statusline(t_mod, tmp_path, monkeypatch,
-                       {"workspace": {"current_dir": "/wt/dotfiles/1"}},
-                       live_ports=(5201,))
-    assert line == "dotfiles-1 ● http://localhost:5201 │ nothing open"
-
-
-def test_todo_statusline_counts_the_url_against_the_width(t_mod, tmp_path, monkeypatch):
-    # The head grew by ~24 columns and the one-line contract is what holds the bar
-    # together, so the URL has to be measured, not just appended.
-    for width in (26, 40, 80, 120):
-        line = _statusline(t_mod, tmp_path, monkeypatch,
-                           {"workspace": {"current_dir": "/wt/dotfiles/1"}},
-                           key="dotfiles-1", texts=("y" * 400,), width=width,
-                           live_ports=(5201,))
-        assert len(line) <= width and "\n" not in line
-
-
-def test_todo_statusline_drops_the_url_on_a_narrow_bar(t_mod, tmp_path, monkeypatch):
-    # Head + URL alone is 34 columns; at 40 there is nothing left to say, so the
-    # tasks keep the bar and the URL steps aside.
-    def bar(width):
-        return _statusline(t_mod, tmp_path, monkeypatch,
-                           {"workspace": {"current_dir": "/wt/dotfiles/1"}},
-                           key="dotfiles-1", texts=("check the chart",), width=width,
-                           live_ports=(5201,))
-
-    assert "localhost:5201" in bar(80)
-    assert bar(40) == "dotfiles-1 │ ◻ check the chart"
-
-
-# ─── t todo — the slotless-add destination picker ──────────────────────────────
-
-def _todo_row(slot, summary=""):
-    return {"host": "local", "sid": "-", "cwd": "", "slot": slot,
-            "state": "", "context": "", "summary": summary}
-
-
-def test_todo_add_targets_repo_level_is_first(t_mod):
-    # fzf preselects line 1, so the current behaviour stays the default — the picker
-    # adds a choice, it must not take one away.
-    out = t_mod._todo_add_targets("ff", [_todo_row("ff-3", "budget work")], {}, set())
-    assert out[0][0] == "ff"
-    assert "no slot" in out[0][1]["summary"]
-
-
-def test_todo_add_targets_labels_live_slots_with_their_work(t_mod):
-    out = t_mod._todo_add_targets(
-        "ff", [_todo_row("ff-3", "budget amortization"), _todo_row("ff-15", "pwa banner")], {}, set())
-    assert [k for k, _ in out] == ["ff", "ff-3", "ff-15"]
-    assert "budget amortization" in out[1][1]["summary"] and "pwa banner" in out[2][1]["summary"]
-
-
-def test_todo_add_targets_unions_three_sources(t_mod):
-    # live session, worktree on disk, existing list — each alone is enough to offer
-    out = t_mod._todo_add_targets("ff", [_todo_row("ff-1", "live one")],
-                                  {"ff-2": 3, "other-9": 1}, {"4"})
-    assert [k for k, _ in out] == ["ff", "ff-1", "ff-2", "ff-4"]
-    assert "live one" in out[1][1]["summary"]
-    assert "3 open" in out[2][1]["summary"]
-    assert "worktree" in out[3][1]["summary"]
-
-
-def test_todo_add_targets_sorts_numerically(t_mod):
-    out = t_mod._todo_add_targets("ff", [], {}, {"2", "10", "1"})
-    assert [k for k, _ in out] == ["ff", "ff-1", "ff-2", "ff-10"]
-
-
-def test_todo_add_targets_ignores_other_repos_and_junk(t_mod):
-    out = t_mod._todo_add_targets(
-        "ff", [_todo_row("dotfiles-1", "x"), _todo_row("ff-abc", "y")],
-        {"scratch": 2, "ff": 1}, {"notaslot"})
-    assert [k for k, _ in out] == ["ff"]        # nothing else qualified
-
-
-def test_todo_add_targets_repo_only_when_no_slots_exist(t_mod):
-    # a single entry is the caller's signal to skip the picker entirely
-    assert len(t_mod._todo_add_targets("ff", [], {}, set())) == 1
-
-
-def test_todo_slot_arg_takes_a_leading_number_when_text_follows(t_mod):
-    # `t todo add 11 fix the ledger` files across slots without leaving the dir.
-    assert t_mod._todo_slot_arg(["11", "fix", "the", "ledger"]) == ("11", ["fix", "the", "ledger"])
-
-
-def test_todo_slot_arg_leaves_a_lone_number_as_text(t_mod):
-    # `t todo add 11` — a lone number is an item, not a destination for nothing. This is
-    # the case that filed "11" to scratch and read as if it had gone to slot 11.
-    assert t_mod._todo_slot_arg(["11"]) == (None, ["11"])
-    assert t_mod._todo_slot_arg([]) == (None, [])
-    assert t_mod._todo_slot_arg(None) == (None, [])
-
-
-def test_todo_slot_arg_quoting_is_the_escape_hatch(t_mod):
-    # `t todo add "3 more tests"` arrives as ONE token, so nothing is stripped — the way
-    # to keep text that really does start with a digit.
-    assert t_mod._todo_slot_arg(["3 more tests"]) == (None, ["3 more tests"])
-    # …and an unquoted one is read as a slot, which is the accepted collision.
-    assert t_mod._todo_slot_arg(["3", "more", "tests"]) == ("3", ["more", "tests"])
-
-
-def test_todo_slot_arg_ignores_a_non_numeric_head(t_mod):
-    assert t_mod._todo_slot_arg(["fix", "11"]) == (None, ["fix", "11"])
-    assert t_mod._todo_slot_arg(["v2", "bump"]) == (None, ["v2", "bump"])
-
-
-def test_todo_canon_aliases_one_per_repo_dir(t_mod, tmp_path, monkeypatch):
-    # dot + dotfiles name one tree; offering both would list the same slots twice.
-    cfg = _config_with(t_mod, tmp_path, monkeypatch,
-                       {"dot": "/code/dotfiles", "dotfiles": "/code/dotfiles",
-                        "ff": "/code/financial-forecast"})
-    assert t_mod._todo_canon_aliases(cfg) == ["dotfiles", "ff"]
-
-
-def test_todo_canon_aliases_falls_back_to_the_shortest_key(t_mod, tmp_path, monkeypatch):
-    # No key equals the basename → shortest wins, exactly as repo_of_dir chooses.
-    cfg = _config_with(t_mod, tmp_path, monkeypatch,
-                       {"ff": "/code/financial-forecast", "fcast": "/code/financial-forecast"})
-    assert t_mod._todo_canon_aliases(cfg) == ["ff"]
-
-
-def test_todo_add_targets_all_puts_scratch_first(t_mod):
-    # Enter keeps the old from-nowhere behaviour: the picker adds a choice, never takes one.
-    out = t_mod._todo_add_targets_all(["ff"], [_todo_row("ff-3", "budget work")], {}, {})
-    assert out[0][0] == "scratch"
-    assert [k for k, _ in out] == ["scratch", "ff", "ff-3"]
-
-
-def test_todo_add_targets_all_skips_repos_with_nowhere_to_file(t_mod):
-    # ff has a live slot, dotfiles has an existing list, quiet has neither.
-    out = t_mod._todo_add_targets_all(
-        ["dotfiles", "ff", "quiet"], [_todo_row("ff-3", "x")], {"dotfiles": 2}, {})
-    assert [k for k, _ in out] == ["scratch", "dotfiles", "ff", "ff-3"]
-
-
-def test_todo_add_targets_all_reads_worktrees_per_alias(t_mod):
-    out = t_mod._todo_add_targets_all(["ff"], [], {}, {"ff": {"4"}})
-    assert [k for k, _ in out] == ["scratch", "ff", "ff-4"]
-    assert "worktree" in out[2][1]["summary"]
-
-
-def test_todo_add_targets_all_alone_is_just_scratch(t_mod):
-    # A single entry is the caller's signal to skip the picker entirely.
-    assert len(t_mod._todo_add_targets_all([], [], {}, {})) == 1
-
-
-def test_todo_scoped_picks_out_one_repos_lists(t_mod):
-    entries = [("dotfiles", 1), ("dotfiles-1", 2), ("dotfiles-12", 3),
-               ("ff", 4), ("ff-3", 5), ("scratch", 6), ("dotfiles-main", 7)]
-    entries = [(k, v) for k, v in entries]
-    assert [k for k, _ in t_mod._todo_scoped(entries, "dotfiles")] == [
-        "dotfiles", "dotfiles-1", "dotfiles-12"]
-    # a non-numeric tail is a different repo's list, not a slot of this one
-    assert [k for k, _ in t_mod._todo_scoped(entries, "ff")] == ["ff", "ff-3"]
-    assert t_mod._todo_scoped(entries, "nothing") == []
-
-
-def test_todo_scoped_live_gate_keeps_repo_level_and_only_live_slots(t_mod):
-    # A list outlives its session by design; the repo view hides the dead ones.
-    entries = [("dotfiles", 1), ("dotfiles-1", 2), ("dotfiles-12", 3), ("ff-3", 5)]
-    assert [k for k, _ in t_mod._todo_scoped(entries, "dotfiles", {"12"})] == [
-        "dotfiles", "dotfiles-12"]
-    # the repo-level list is kept even when NO slot is live
-    assert [k for k, _ in t_mod._todo_scoped(entries, "dotfiles", set())] == ["dotfiles"]
-    # None = no gate (the -a path)
-    assert len(t_mod._todo_scoped(entries, "dotfiles", None)) == 3
-
-
-def test_todo_live_nums_resolves_sibling_aliases_through_the_repo_dir(t_mod):
-    repos = {"dotfiles": "/c/dotfiles", "dot": "/c/dotfiles", "ff": "/c/ff"}
-    rows = [{"slot": "dot-4"}, {"slot": "dotfiles-7"}, {"slot": "ff-3"},
-            {"slot": "dotfiles-main"}, {"slot": "nope-1"}]
-    assert t_mod._todo_live_nums(repos, "dotfiles", rows) == {"4", "7"}
-    assert t_mod._todo_live_nums(repos, "ff", rows) == {"3"}
-    assert t_mod._todo_live_nums(repos, "unknown", rows) == set()
-
-
-def test_todo_add_targets_live_row_beats_a_dead_one_for_the_same_slot(t_mod):
-    # A session rooted outside its worktree is a live row AND a dead-slot row; the
-    # picker must show the running one, whichever the scan printed first.
-    dead = dict(_todo_row("ff-3", "old chart · Aug 20 10:00"), state="dead", context="none")
-    live = dict(_todo_row("ff-3", "rebase the ledger"), state="detached", context="active")
-    for rows in ([dead, live], [live, dead]):
-        out = t_mod._todo_add_targets("ff", rows, {}, set())
-        assert [k for k, _ in out] == ["ff", "ff-3"]
-        assert out[1][1]["state"] == "detached" and "rebase" in out[1][1]["summary"]
-
-
-def test_todo_add_targets_counts_a_sibling_alias_session_under_the_canonical_key(t_mod):
-    amap = {"dot": "dotfiles", "dotfiles": "dotfiles", "ff": "ff"}
-    out = t_mod._todo_add_targets(
-        "dotfiles", [dict(_todo_row("dot-4", "shim fix"), state="attached")], {}, set(), amap)
-    assert [k for k, _ in out] == ["dotfiles", "dotfiles-4"]
-    assert out[1][1]["slot"] == "dotfiles-4" and "shim fix" in out[1][1]["summary"]
-
-
-def test_todo_add_targets_dead_row_keeps_what_t_resume_knows(t_mod):
-    dead = dict(_todo_row("ff-2", "budget rework · #88 merged · Aug 21 14:02"), state="dead")
-    out = t_mod._todo_add_targets("ff", [dead], {"ff-2": 2}, {"2"})
-    assert out[1][1]["summary"] == "budget rework · #88 merged · Aug 21 14:02 · 2 open"
-
-
-def test_todo_add_targets_names_a_live_row_with_no_summary(t_mod):
-    out = t_mod._todo_add_targets("ff", [dict(_todo_row("ff-1"), state="detached")], {}, set())
-    assert out[1][1]["summary"] == "(live)"
-
-
-def test_todo_target_labels_are_t_ls_rows_without_colour(t_mod):
-    targets = t_mod._todo_add_targets(
-        "ff", [dict(_todo_row("ff-3", "budget work"), state="attached", context="active"),
-               dict(_todo_row("ff-10", "old thing"), state="dead")], {}, set())
-    labels = t_mod._todo_target_labels(targets, width=80)
-    assert labels[0][0] == "ff"
-    assert labels[1][1].startswith("● ✓     ff-3  ") and "budget work" in labels[1][1]
-    assert labels[2][1].startswith("        ff-10 ") and "old thing" in labels[2][1]
-    assert "\x1b[" not in labels[1][1]
-
-
 # ─── the shared slot row (t ls + every slot picker) ─────────────────────────────
 
 def test_slot_line_marks_and_columns(t_mod):
@@ -1838,183 +945,6 @@ def test_slot_line_colours_only_through_the_style(t_mod):
 def test_parse_rows_carries_a_dead_slot_row(t_mod):
     rows = t_mod._parse_rows("abc\t/wt/ff/2\tff-2\tdead\tnone\told chart · Aug 21 14:02\n")
     assert rows[0]["state"] == "dead" and rows[0]["summary"].endswith("14:02")
-
-
-# ─── t todo add — the <repo> [slot] positionals ─────────────────────────────────
-
-def test_todo_dest_args_repo_and_slot(t_mod):
-    amap = {"ff": "ff", "dot": "dotfiles", "dotfiles": "dotfiles"}
-    # `t todo add ff 22 need to integrate` — the slot was named; no picker.
-    assert t_mod._todo_dest_args(["ff", "22", "need", "to", "integrate"], amap) == \
-        ("ff-22", ["need", "to", "integrate"])
-    # repo alone → the repo-level list
-    assert t_mod._todo_dest_args(["ff", "look", "at", "the", "ledger"], amap) == \
-        ("ff", ["look", "at", "the", "ledger"])
-    # a sibling alias files under the canonical key — ids are per-list
-    assert t_mod._todo_dest_args(["dot", "3", "fix"], amap) == ("dotfiles-3", ["fix"])
-
-
-def test_todo_dest_args_takes_a_destination_only_when_text_follows(t_mod):
-    amap = {"ff": "ff"}
-    assert t_mod._todo_dest_args(["ff", "22"], amap) == (None, ["ff", "22"])
-    assert t_mod._todo_dest_args(["ff"], amap) == (None, ["ff"])
-    assert t_mod._todo_dest_args([], amap) == (None, [])
-    assert t_mod._todo_dest_args(None, amap) == (None, [])
-
-
-def test_todo_dest_args_bare_slot_needs_the_cwd_repo(t_mod):
-    amap = {"ff": "ff"}
-    assert t_mod._todo_dest_args(["22", "fix", "it"], amap, "ff") == ("ff-22", ["fix", "it"])
-    assert t_mod._todo_dest_args(["22", "fix", "it"], amap, None) == (None, ["22", "fix", "it"])
-    # quoting: one token, nothing stripped; and a repo name mid-text is just text
-    assert t_mod._todo_dest_args(["ff 22 fix it"], amap, "ff") == (None, ["ff 22 fix it"])
-    assert t_mod._todo_dest_args(["fix", "ff", "22"], amap, "ff") == (None, ["fix", "ff", "22"])
-
-
-def test_todo_alias_map_resolves_every_key_to_its_canonical_alias(t_mod, tmp_path, monkeypatch):
-    cfg = _config_with(t_mod, tmp_path, monkeypatch,
-                       {"dot": "/code/dotfiles", "dotfiles": "/code/dotfiles",
-                        "ff": "/code/financial-forecast", "fcast": "/code/financial-forecast"})
-    assert t_mod._todo_alias_map(cfg) == {"dot": "dotfiles", "dotfiles": "dotfiles",
-                                          "ff": "ff", "fcast": "ff"}
-
-
-# ─── t todo — no-id action pickers ─────────────────────────────────────────────
-
-def _mixed(t_mod):
-    data = _add(t_mod, _fresh(t_mod), "one", "two", "three", "four")
-    t_mod._todo_apply(data, "done", ["2"], now=200)
-    t_mod._todo_apply(data, "rm", ["4"], now=200)
-    return data
-
-
-def test_todo_pick_candidates_done_offers_only_open(t_mod):
-    # marking a done item done again is a no-op, so it must not be offered
-    assert [i for i, _ in t_mod._todo_pick_candidates(_mixed(t_mod), "done")] == [1, 3]
-
-
-def test_todo_pick_candidates_undone_offers_only_finished(t_mod):
-    assert [i for i, _ in t_mod._todo_pick_candidates(_mixed(t_mod), "undone")] == [2]
-
-
-def test_todo_pick_candidates_rm_and_mv_offer_everything_live(t_mod):
-    # you may well want to remove or re-file something already ticked off
-    for action in ("rm", "mv", "edit"):
-        assert [i for i, _ in t_mod._todo_pick_candidates(_mixed(t_mod), action)] == [1, 2, 3]
-
-
-def test_todo_pick_candidates_never_offers_a_tombstone(t_mod):
-    for action in ("done", "undone", "rm", "mv", "edit"):
-        assert 4 not in [i for i, _ in t_mod._todo_pick_candidates(_mixed(t_mod), action)]
-
-
-def test_todo_pick_candidates_labels_carry_state_and_id(t_mod):
-    labels = dict((i, l) for i, l in t_mod._todo_pick_candidates(_mixed(t_mod), "rm"))
-    assert labels[1] == "1  ◻ one"
-    assert labels[2] == "2  ✓ two"
-
-
-def test_todo_pick_candidates_accepts_aliases(t_mod):
-    # the picker is reached via the canonical name, but be robust to either
-    assert (t_mod._todo_pick_candidates(_mixed(t_mod), "x")
-            == t_mod._todo_pick_candidates(_mixed(t_mod), "done"))
-
-
-def test_todo_pick_candidates_empty_list(t_mod):
-    assert t_mod._todo_pick_candidates(_fresh(t_mod), "done") == []
-
-
-# ─── t todo — expiry and the bare-id action set ────────────────────────────────
-
-def test_todo_purge_drops_only_stale_finished_items(t_mod):
-    data = _add(t_mod, _fresh(t_mod), "open", "just done", "long done", "long gone")
-    t_mod._todo_apply(data, "done", ["2"], now=1000)          # recent
-    t_mod._todo_apply(data, "done", ["3"], now=1000)
-    t_mod._todo_apply(data, "rm", ["4"], now=1000)
-    data["items"][2]["done_at"] = 1000 - 8 * 86400            # backdate
-    data["items"][3]["deleted_at"] = 1000 - 8 * 86400
-    dropped = t_mod._todo_purge(data, now=1000)
-    assert dropped == 2
-    assert [i["id"] for i in data["items"]] == [1, 2]         # open + recent survive
-
-
-def test_todo_purge_leaves_timestampless_rows_alone(t_mod):
-    # Rows written before expiry existed have no done_at and must not vanish on a
-    # technicality.
-    data = _add(t_mod, _fresh(t_mod), "one")
-    data["items"][0]["done"] = True
-    data["items"][0]["done_at"] = None
-    assert t_mod._todo_purge(data, now=10 ** 9) == 0
-    assert len(data["items"]) == 1
-
-
-def test_todo_purge_never_touches_open_items(t_mod):
-    data = _add(t_mod, _fresh(t_mod), "a", "b")
-    assert t_mod._todo_purge(data, now=10 ** 9) == 0
-
-
-def test_todo_save_expires_on_write(t_mod, tmp_path):
-    data = _add(t_mod, _fresh(t_mod), "one", "two")
-    t_mod._todo_apply(data, "done", ["1"], now=100)
-    data["items"][0]["done_at"] = 100 - 8 * 86400
-    path = str(tmp_path / "k.json")
-    t_mod._todo_save(path, data)
-    assert [i["id"] for i in t_mod._todo_load(path)["items"]] == [2]
-
-
-def test_todo_id_actions_offers_reopen_only_when_finished(t_mod):
-    data = _add(t_mod, _fresh(t_mod), "one")
-    item = data["items"][0]
-    assert [a for a, _ in t_mod._todo_id_actions(item)] == ["done", "rm", "mv"]
-    item["done"] = True
-    assert [a for a, _ in t_mod._todo_id_actions(item)] == ["_reopen", "rm", "mv"]
-
-
-# ─── t todo — actions widen to the same scope as the view ──────────────────────
-
-def _two_lists(t_mod):
-    a = _add(t_mod, _fresh(t_mod), "help")
-    b = _add(t_mod, _fresh(t_mod), "other slot thing")
-    return [("dotfiles-1", a), ("dotfiles-3", b)]
-
-
-def test_todo_scoped_candidates_label_the_slot_when_several(t_mod):
-    # The view widens to the repo, so the actions must too — otherwise you see an item
-    # you cannot touch, which is what `t todo rm` did from a repo dir.
-    got = t_mod._todo_scoped_candidates(_two_lists(t_mod), "rm")
-    assert [(k, i) for k, i, _ in got] == [("dotfiles-1", 1), ("dotfiles-3", 1)]
-    assert got[0][2].startswith("dotfiles-1")
-    assert got[1][2].startswith("dotfiles-3")
-
-
-def test_todo_scoped_candidates_drop_the_slot_column_for_one_list(t_mod):
-    entries = _two_lists(t_mod)[:1]
-    assert t_mod._todo_scoped_candidates(entries, "rm")[0][2] == "1  ◻ help"
-
-
-def test_todo_scoped_candidates_stay_action_aware(t_mod):
-    entries = _two_lists(t_mod)
-    t_mod._todo_apply(entries[0][1], "done", ["1"], now=200)
-    assert [k for k, _, _ in t_mod._todo_scoped_candidates(entries, "done")] == ["dotfiles-3"]
-
-
-def test_todo_locate_finds_an_id_across_lists(t_mod):
-    entries = _two_lists(t_mod)
-    assert [k for k, _ in t_mod._todo_locate(entries, "1")] == ["dotfiles-1", "dotfiles-3"]
-    assert t_mod._todo_locate(entries, "9") == []
-
-
-def test_todo_locate_is_unambiguous_when_only_one_list_has_it(t_mod):
-    entries = _two_lists(t_mod)
-    t_mod._todo_apply(entries[1][1], "add", ["second"], now=100)
-    hits = t_mod._todo_locate(entries, "2")
-    assert len(hits) == 1 and hits[0][0] == "dotfiles-3"
-
-
-def test_todo_locate_skips_tombstones(t_mod):
-    entries = _two_lists(t_mod)
-    t_mod._todo_apply(entries[0][1], "rm", ["1"], now=200)
-    assert [k for k, _ in t_mod._todo_locate(entries, "1")] == ["dotfiles-3"]
 
 
 # ─── t new: pure helpers (name/url/slug, gh state, alias check, plan, hosts) ────
@@ -2133,12 +1063,47 @@ def test_new_answers_from_flags(t_mod):
     a = t_mod._new_answers(_NS(name="x", owner=None, public=True, private=False, alias=None,
                                hosts="mini, openclaw", no_hosts=False))
     assert a == {"name": "x", "owner": None, "visibility": "public", "alias": None,
-                 "hosts": ["mini", "openclaw"]}
+                 "hosts": ["mini", "openclaw"], "prompt": None}
     a = t_mod._new_answers(_NS(name=None, owner="o", public=False, private=True, alias="k",
-                               hosts=None, no_hosts=True))
-    assert a == {"name": None, "owner": "o", "visibility": "private", "alias": "k", "hosts": []}
+                               hosts=None, no_hosts=True, prompt="  a cli for X  "))
+    assert a == {"name": None, "owner": "o", "visibility": "private", "alias": "k", "hosts": [],
+                 "prompt": "a cli for X"}
     assert t_mod._new_answers(_NS(name=None, owner=None, public=False, private=False, alias=None,
                                   hosts=None, no_hosts=False))["hosts"] is None
+
+
+def test_new_name_input_one_token_is_a_name_anything_else_a_prompt(t_mod):
+    assert t_mod._new_name_input("  cashfwd ") == ("name", "cashfwd")
+    assert t_mod._new_name_input("-bad") == ("name", "-bad")     # still validated as a name
+    assert t_mod._new_name_input("a cli that forecasts cash") == ("prompt", "a cli that forecasts cash")
+    assert t_mod._new_name_input("two\twords") == ("prompt", "two\twords")
+
+
+def test_new_name_prompt_carries_rules_and_taken(t_mod):
+    txt = t_mod._new_name_prompt("a cash-flow forecaster", {"cashfwd", "dotfiles"})
+    assert '"a cash-flow forecaster"' in txt
+    assert "cashfwd, dotfiles" in txt
+    assert "JSON array" in txt and str(t_mod._NEW_NAME_MAX) in txt
+    assert "taken" not in t_mod._new_name_prompt("x", set())
+
+
+def test_new_parse_names_tolerates_prose_validates_and_dedupes(t_mod):
+    reply = ('Here you go:\n```json\n[{"name": "CashFwd", "why": "short"}, '
+             '{"name": "cashfwd", "why": "dup"}, {"name": "-bad", "why": "invalid"}, '
+             '{"name": "taken-one"}, "bare-string", {"why": "no name"}]\n```')
+    assert t_mod._new_parse_names(reply, taken={"taken-one"}) == [
+        ("cashfwd", "short"), ("bare-string", "")]
+    assert t_mod._new_parse_names("no array here") == []
+    assert t_mod._new_parse_names("[not json") == []
+    assert t_mod._new_parse_names("[not json]") == []
+    assert t_mod._new_parse_names("") == []
+    many = json.dumps([{"name": f"n{i}"} for i in range(20)])
+    assert len(t_mod._new_parse_names(many)) == t_mod._NEW_NAME_MAX
+
+
+def test_new_taken_names_is_basenames_plus_code_entries(t_mod):
+    assert t_mod._new_taken_names(["/Users/x/code/dotfiles", "/Users/x/work/api/", ""],
+                                  ["api", "hive", ""]) == {"dotfiles", "api", "hive"}
 
 
 def test_new_state_summary(t_mod):
@@ -2339,59 +1304,6 @@ def test_port_is_live_sees_an_ipv6_only_listener(t_mod):
         srv.close()
     assert t_mod._port_is_live(port) is False
 
-
-def test_todo_repo_arg_takes_the_repo_positionally(t_mod):
-    repos = {"ff": "/code/financial-forecast", "dotfiles": "/code/dotfiles"}
-    # `t todo ff add keep forecast` — the case that failed with "unknown action 'ff'".
-    assert t_mod._todo_repo_arg("ff", ["add", "keep", "forecast"], repos) \
-        == ("ff", "add", ["keep", "forecast"])
-    # A bare repo views it; a repo + number is the slot, then the action.
-    assert t_mod._todo_repo_arg("ff", [], repos) == ("ff", None, [])
-    assert t_mod._todo_repo_arg("ff", ["3"], repos) == ("ff-3", None, [])
-    assert t_mod._todo_repo_arg("ff", ["3", "add", "x"], repos) == ("ff-3", "add", ["x"])
-    # An explicit <alias>-<n> key works too, like -s.
-    assert t_mod._todo_repo_arg("ff-3", ["done", "2"], repos) == ("ff-3", "done", ["2"])
-
-
-def test_todo_repo_arg_leaves_non_repos_alone(t_mod):
-    repos = {"ff": "/code/financial-forecast", "add": "/code/add"}
-    # Not a repo → untouched, including a slot-shaped key of an unknown repo.
-    assert t_mod._todo_repo_arg("done", ["2"], repos) == (None, "done", ["2"])
-    assert t_mod._todo_repo_arg("api-3", ["ls"], repos) == (None, "api-3", ["ls"])
-    assert t_mod._todo_repo_arg(None, [], repos) == (None, None, [])
-    assert t_mod._todo_repo_arg("7", [], repos) == (None, "7", [])
-    # An action name always wins over a repo that happens to share it.
-    assert t_mod._todo_repo_arg("add", ["x"], repos) == (None, "add", ["x"])
-    assert t_mod._todo_repo_arg("list", [], repos) == (None, "list", [])
-def test_todo_ls_target_number_is_a_slot_of_the_cwd_repo(t_mod):
-    # `t todo ls 17` from the repo dir — the bug: the number was dropped and the whole
-    # repo rendered, so there was no way to see one slot.
-    assert t_mod._todo_ls_target("ff", {"ff": "/x/ff"}, ["17"]) == ("ff-17", None)
-
-
-def test_todo_ls_target_resolves_from_inside_a_sibling_slot(t_mod):
-    # From slot 15's worktree the key is ff-15; a number still means "slot N of ff".
-    assert t_mod._todo_ls_target("ff-15", {"ff": "/x/ff"}, ["17"]) == ("ff-17", None)
-
-
-def test_todo_ls_target_no_args_keeps_the_key(t_mod):
-    assert t_mod._todo_ls_target("ff-15", {"ff": "/x/ff"}, []) == ("ff-15", None)
-    assert t_mod._todo_ls_target("ff", {"ff": "/x/ff"}, None) == ("ff", None)
-
-
-def test_todo_ls_target_non_number_is_a_key_verbatim(t_mod):
-    # The positional twin of -s.
-    assert t_mod._todo_ls_target("ff", {"ff": "/x/ff"}, ["dotfiles-3"]) == ("dotfiles-3", None)
-
-
-def test_todo_ls_target_number_needs_a_repo(t_mod):
-    key, err = t_mod._todo_ls_target("scratch", {"ff": "/x/ff"}, ["17"])
-    assert key is None and "<repo>-17" in err
-
-
-def test_todo_ls_target_takes_one_token(t_mod):
-    key, err = t_mod._todo_ls_target("ff", {"ff": "/x/ff"}, ["17", "18"])
-    assert key is None and "one slot" in err
 
 # ─── mcp: transcript extraction ────────────────────────────────────────────────
 
@@ -2642,7 +1554,7 @@ def test_session_row_reaped_worktree_and_defaults(t_mod, tmp_path, monkeypatch):
     assert row["state"] == "dead" and row["live"] is False and row["context"] is None
     assert row["ago"] == "2h ago" and row["title"] == "first ask"
     assert row["first_prompts"] == ["first ask", "later ask"] and row["last_prompts"] == []
-    assert row["todo_open"] == 0 and row["pr"] is None and row["this_session"] is False
+    assert row["pr"] is None and row["this_session"] is False
 
 
 def test_session_row_live_pr_origin_and_this(t_mod, tmp_path, monkeypatch):
@@ -2660,11 +1572,11 @@ def test_session_row_live_pr_origin_and_this(t_mod, tmp_path, monkeypatch):
                prompts=("a", "b", "c", "d", "e"), ct="Custom")
     live = {rec["sid"]: {"slot": "ff-17", "state": "attached", "context": "active", "cwd": str(wt)}}
     row = t_mod._session_row(cfg, rec, live, now=3000, cache_root=str(cache),
-                             this_sid=rec["sid"], todo_counts={"ff-17": 3}, local_host="here")
+                             this_sid=rec["sid"], local_host="here")
     assert row["live"] and row["state"] == "attached" and row["context"] == "active"
     assert row["worktree_exists"] and row["branch"] == "dev/x" and row["title"] == "Custom"
     assert row["pr"]["state"] == "open" and row["pr"]["number"] == 5
-    assert row["origin"] == "mini" and row["this_session"] and row["todo_open"] == 3
+    assert row["origin"] == "mini" and row["this_session"]
     assert row["first_prompts"] == ["a", "b", "c"] and row["last_prompts"] == ["c", "d", "e"]
     # the origin stamp of THIS host is not an origin
     (tmp_path / "s.origin").write_text("here")
@@ -2832,35 +1744,6 @@ def test_git_brief_absent_dir(t_mod, tmp_path):
     assert t_mod._git_brief(str(tmp_path / "nope")) is None
 
 
-def test_todo_rows(t_mod, tmp_path, monkeypatch):
-    cfg = _mcp_cfg(t_mod, tmp_path, monkeypatch)
-    entries = [
-        ("ff-15", {"items": [{"id": 1, "text": "open one", "added": 5},
-                             {"id": 2, "text": "done one", "done": True, "done_at": 9},
-                             {"id": 3, "text": "gone", "deleted": True}]}),
-        ("ff", {"items": [{"id": 1, "text": "repo-level"}]}),
-        ("dotfiles-1", {"items": [{"id": 1, "text": "dot task"}]}),
-        ("financial-forecast", {"items": [{"id": 1, "text": "not a slot"}]}),
-        ("empty-9", {"items": []}),
-        ("scratch", {"items": [{"id": 1, "text": "loose"}]}),
-    ]
-    live = [{"slot": "ff-15"}, {"slot": "dot-1"}]
-    rows = t_mod._todo_rows(entries, cfg, live)
-    by = {r["key"]: r for r in rows}
-    assert set(by) == {"ff-15", "ff", "dotfiles-1", "financial-forecast", "scratch"}
-    assert by["ff-15"]["repo"] == "ff" and by["ff-15"]["slot"] == "ff-15" and by["ff-15"]["live"]
-    assert [i["text"] for i in by["ff-15"]["open"]] == ["open one"] and by["ff-15"]["done"] == []
-    assert by["ff"]["slot"] is None and by["ff"]["live"] is False
-    assert by["dotfiles-1"]["live"]                                      # dev-dot-1 keys the same dir
-    assert by["financial-forecast"]["repo"] is None
-    rows = t_mod._todo_rows(entries, cfg, live, include_done=True, repo="ff")
-    assert {r["key"] for r in rows} == {"ff-15", "ff"}
-    assert [i["text"] for i in [r for r in rows if r["key"] == "ff-15"][0]["done"]] == ["done one"]
-    assert {r["key"] for r in t_mod._todo_rows(entries, cfg, live, repo="dot")} == {"dotfiles-1"}
-    with pytest.raises(ValueError):
-        t_mod._todo_rows(entries, cfg, live, repo="zzz")
-
-
 def test_slot_sort_key(t_mod):
     assert sorted(["ff-10", "ff-9", "dot-2", "ff:abcd"], key=t_mod._slot_sort_key) == \
         ["dot-2", "ff-9", "ff-10", "ff:abcd"]
@@ -2868,10 +1751,9 @@ def test_slot_sort_key(t_mod):
 
 # ─── mcp: the tools over a hand-built context ──────────────────────────────────
 
-def _ctx(t_mod, recs, live=None, idle=None, todo=None, now=10 ** 9, this_sid=None):
+def _ctx(t_mod, recs, live=None, idle=None, now=10 ** 9, this_sid=None):
     live = live or {}
-    return {"recs": recs, "live": live, "idle": idle or [], "todo": todo or [],
-            "todo_counts": {k: len(t_mod._todo_open(d)) for k, d in (todo or [])},
+    return {"recs": recs, "live": live, "idle": idle or [],
             "live_rows": [{"slot": v["slot"]} for v in live.values()] + [{"slot": i["slot"]} for i in idle or []],
             "now": now, "cache_root": None, "this_sid": this_sid}
 
@@ -2891,13 +1773,12 @@ def test_tool_list_live_idle_and_remote(t_mod, tmp_path, monkeypatch):
             "brandnew": {"slot": "ff-24", "cwd": "/wt/financial-forecast/24", "state": "detached",
                          "context": "active", "kind": "tmux"}}
     idle = [{"slot": "dot-2", "cwd": "/wt/dotfiles/2", "state": "detached", "context": "idle"}]
-    todo = [("ff-17", {"items": [{"id": 1, "text": "x"}]})]
-    ctx = _ctx(t_mod, recs, live, idle, todo, now, this_sid="ff170000")
+    ctx = _ctx(t_mod, recs, live, idle, now, this_sid="ff170000")
     out = t_mod._tool_list(cfg, ctx, {})
     assert out["count"] == 3
-    slots = [(r["slot"], r["title"], r["todo_open"]) for r in out["sessions"]]
-    assert slots == [("dot-2", "(no active conversation)", 0), ("ff-17", "accounts ledger", 1),
-                     ("ff-24", "(no transcript yet)", 0)]
+    slots = [(r["slot"], r["title"]) for r in out["sessions"]]
+    assert slots == [("dot-2", "(no active conversation)"), ("ff-17", "accounts ledger"),
+                     ("ff-24", "(no transcript yet)")]
     assert out["sessions"][1]["this_session"] and out["sessions"][1]["url"] is None
     assert [r["slot"] for r in t_mod._tool_list(cfg, ctx, {"repo": "dot"})["sessions"]] == ["dot-2"]
     with pytest.raises(ValueError):
@@ -2919,18 +1800,13 @@ def test_tool_detail_assembles_everything(t_mod, tmp_path, monkeypatch):
     recs[3]["plan"] = str(plan)
     recs[3]["last_asst"] = "left off here"
     recs[3]["prompts"] = [{"ts": 1, "text": "p%d" % i} for i in range(15)]
-    todo = [("ff-17", {"items": [{"id": 1, "text": "slot item"}]}),
-            ("ff", {"items": [{"id": 4, "text": "repo item", "done": True}]}),
-            ("ff-9", {"items": [{"id": 1, "text": "other slot"}]})]
-    ctx = _ctx(t_mod, recs, todo=todo, now=now)
+    ctx = _ctx(t_mod, recs, now=now)
     row = t_mod._tool_detail(cfg, ctx, {"session": "ff-17", "plan_lines": 1})
     assert row["sid"] == "ff170000" and row["plan_head"] == ["# plan"]
     assert row["last_assistant"] == "left off here" and row["git"] is None
     assert [p["text"] for p in row["first_prompts"]] == ["p0", "p1", "p2"]
     assert [p["text"] for p in row["last_prompts"]] == ["p%d" % i for i in range(5, 15)]
-    assert row["todos"] == {"ff-17": [{"id": 1, "text": "slot item", "done": False}],
-                            "ff": [{"id": 4, "text": "repo item", "done": True}]}
-    assert row["hints"][0] == "t resume ff 17" and row["hints"][1] == "t todo -s ff-17"
+    assert row["hints"][0] == "t resume ff 17"
     assert any("worktree is gone" in h for h in row["hints"])
     assert row["also_at"] == []
     live = {"ff170000": {"slot": "ff-17", "cwd": "/wt/financial-forecast/17", "state": "attached",
@@ -2939,14 +1815,6 @@ def test_tool_detail_assembles_everything(t_mod, tmp_path, monkeypatch):
     assert row["hints"][0] == "t open ff 17"
     with pytest.raises(ValueError):
         t_mod._tool_detail(cfg, ctx, {"session": "zzzz"})
-
-
-def test_tool_todos(t_mod, tmp_path, monkeypatch):
-    cfg, recs, now = _find_fixture(t_mod, tmp_path, monkeypatch)
-    todo = [("ff-17", {"items": [{"id": 1, "text": "x"}]})]
-    out = t_mod._tool_todos(cfg, _ctx(t_mod, recs, todo=todo, now=now), {})
-    assert out["count"] == 1 and out["lists"][0]["key"] == "ff-17"
-    assert t_mod._tool_todos(cfg, _ctx(t_mod, recs, now=now), {"repo": "dot"}) == {"count": 0, "lists": []}
 
 
 # ─── mcp: framing ──────────────────────────────────────────────────────────────
@@ -2971,7 +1839,7 @@ def test_mcp_handle_initialize_echoes_version_and_instructions(t_mod):
 def test_mcp_handle_misc_methods(t_mod):
     assert _handle(t_mod, {"id": 1, "method": "ping"})["result"] == {}
     tools = _handle(t_mod, {"id": 2, "method": "tools/list"})["result"]["tools"]
-    assert [t["name"] for t in tools] == ["find_sessions", "list_sessions", "session_detail", "list_todos"]
+    assert [t["name"] for t in tools] == ["find_sessions", "list_sessions", "session_detail"]
     assert all(set(t) == {"name", "description", "inputSchema"} for t in tools)
     assert _handle(t_mod, {"id": 3, "method": "prompts/list"})["result"] == {"prompts": []}
     assert _handle(t_mod, {"id": 4, "method": "resources/list"})["result"] == {"resources": []}
@@ -2984,9 +1852,9 @@ def test_mcp_handle_misc_methods(t_mod):
 
 def test_mcp_handle_tools_call(t_mod):
     r = _handle(t_mod, {"id": 7, "method": "tools/call",
-                        "params": {"name": "list_todos", "arguments": {"repo": "ff"}}})
+                        "params": {"name": "list_sessions", "arguments": {"repo": "ff"}}})
     assert r["result"]["isError"] is False
-    assert json.loads(r["result"]["content"][0]["text"]) == {"ok": "list_todos", "args": {"repo": "ff"}}
+    assert json.loads(r["result"]["content"][0]["text"]) == {"ok": "list_sessions", "args": {"repo": "ff"}}
     r = _handle(t_mod, {"id": 8, "method": "tools/call", "params": {"name": "nope"}})
     assert r["result"]["isError"] and "unknown tool: nope" in r["result"]["content"][0]["text"]
 
@@ -3029,7 +1897,7 @@ def test_mcp_allow_state(t_mod, tmp_path):
     assert t_mod._mcp_allow_state(str(p)) == "none"
     p.write_text(json.dumps({"permissions": {"allow": ["Bash(ls)", "mcp__sessions"]}}))
     assert t_mod._mcp_allow_state(str(p)) == "server"
-    p.write_text(json.dumps({"permissions": {"allow": ["mcp__sessions__list_todos"]}}))
+    p.write_text(json.dumps({"permissions": {"allow": ["mcp__sessions__session_detail"]}}))
     assert t_mod._mcp_allow_state(str(p)) == "tools"
     # a neighbouring server must not read as ours
     p.write_text(json.dumps({"permissions": {"allow": ["mcp__sessionsX"]}}))
@@ -3058,9 +1926,9 @@ def test_mcp_allow_write_is_add_only_and_idempotent(t_mod, tmp_path):
 def test_mcp_allow_write_never_widens_a_hand_narrowed_set(t_mod, tmp_path):
     # per-tool rules are a deliberate choice — never silently widened back out
     p = tmp_path / "settings.json"
-    p.write_text(json.dumps({"permissions": {"allow": ["mcp__sessions__list_todos"]}}))
+    p.write_text(json.dumps({"permissions": {"allow": ["mcp__sessions__session_detail"]}}))
     assert t_mod._mcp_allow_write(str(p)) is False
-    assert json.loads(p.read_text())["permissions"]["allow"] == ["mcp__sessions__list_todos"]
+    assert json.loads(p.read_text())["permissions"]["allow"] == ["mcp__sessions__session_detail"]
     # and an unreadable/foreign-shaped file is left exactly as found
     for junk in ("{bad", json.dumps([1, 2]), json.dumps({"permissions": {"allow": "all"}})):
         p.write_text(junk)
@@ -3144,3 +2012,49 @@ def test_page_window_always_shows_at_least_one_line(t_mod):
     # a single line taller than the whole window is still shown rather than nothing
     assert t_mod._page_window([9, 1], 0, 4) == (0, 1)
     assert t_mod._page_window([1, 9], 1, 4) == (1, 2)
+
+
+# ─── _ls_scope (t ls [repo] [-a]) ────────────────────────────────────────────────
+
+def test_ls_scope_explicit_repo_from_anywhere(t_mod, tmp_path, monkeypatch):
+    # `t ls dot -r` from ~ must scope to dot's dir — the alias, not the cwd, decides.
+    cfg = _config_with(t_mod, tmp_path, monkeypatch,
+                       {"dot": "/Users/me/code/dotfiles", "api": "/Users/me/code/api"},
+                       worktree_root="/Users/me/code/.worktrees")
+    scope, wt = t_mod._ls_scope(cfg, "dot", False, "/Users/me")
+    assert scope == "/Users/me/code/dotfiles"
+    assert wt == "/Users/me/code/.worktrees/dotfiles"
+
+
+def test_ls_scope_defaults_to_cwd_repo(t_mod, tmp_path, monkeypatch):
+    cfg = _config_with(t_mod, tmp_path, monkeypatch, {"api": "/Users/me/code/api"},
+                       worktree_root="/Users/me/wt")
+    assert t_mod._ls_scope(cfg, None, False, "/Users/me/code/api/src") == \
+        ("/Users/me/code/api", "/Users/me/wt/api")
+    assert t_mod._ls_scope(cfg, None, False, "/Users/me") == ("", "")
+
+
+def test_ls_scope_all_widens(t_mod, tmp_path, monkeypatch):
+    cfg = _config_with(t_mod, tmp_path, monkeypatch, {"api": "/Users/me/code/api"})
+    assert t_mod._ls_scope(cfg, None, True, "/Users/me/code/api") == ("", "")
+
+
+def test_ls_scope_unknown_repo_names_choices(t_mod, tmp_path, monkeypatch):
+    cfg = _config_with(t_mod, tmp_path, monkeypatch, {"api": "/x", "dot": "/y"})
+    with pytest.raises(ValueError) as e:
+        t_mod._ls_scope(cfg, "nope", False, "/")
+    assert "api, dot" in str(e.value)
+
+
+def test_ls_scope_repo_with_all_is_refused(t_mod, tmp_path, monkeypatch):
+    cfg = _config_with(t_mod, tmp_path, monkeypatch, {"api": "/x"})
+    with pytest.raises(ValueError):
+        t_mod._ls_scope(cfg, "api", True, "/")
+
+
+def test_ls_parser_accepts_optional_repo(t_mod):
+    p = t_mod.build_parser()
+    a = p.parse_args(["ls", "dot", "-r"])
+    assert (a.repo, a.remote, a.all) == ("dot", True, False)
+    a = p.parse_args(["ls", "-a"])
+    assert (a.repo, a.all) == (None, True)

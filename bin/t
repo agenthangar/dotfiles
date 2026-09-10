@@ -310,9 +310,35 @@ def _header(st, scope):
     return f"dev sessions   {st.g}●{st.r} attached · {st.c}✓{st.r} active context{note}"
 
 
-def cmd_ls(cfg, args):
-    scope = "" if args.all else cfg.repo_dir_for_cwd(os.getcwd())
+def _ls_scope(cfg, repo, all_repos, cwd):
+    """Resolve `t ls [repo] [-a]` to (scope, wt_scope): the canonical repo dir the
+    rows are filtered to (plus its worktree root), or ("", "") for every repo.
+
+    An explicit repo is the scope from ANY directory — `t ls dot -r` from ~ was the
+    ask, and every other slot verb already takes `<repo>` this way. Unknown alias →
+    ValueError naming the choices (never a silent fall-through to the cwd repo,
+    which would render the WRONG repo under a heading that looks right). Combined
+    with -a it is a contradiction and is refused rather than one flag quietly
+    winning."""
+    if repo:
+        if all_repos:
+            raise ValueError("t ls: a repo and --all are contradictory — pick one")
+        if repo not in cfg.repos:
+            raise ValueError("unknown repo %r — one of: %s"
+                             % (repo, ", ".join(sorted(cfg.repos)) or "(none registered)"))
+        scope = cfg.repos[repo]
+    else:
+        scope = "" if all_repos else cfg.repo_dir_for_cwd(cwd)
     wt_scope = os.path.join(cfg.worktree_root, os.path.basename(scope)) if scope else ""
+    return scope, wt_scope
+
+
+def cmd_ls(cfg, args):
+    try:
+        scope, wt_scope = _ls_scope(cfg, args.repo, args.all, os.getcwd())
+    except ValueError as e:
+        print(e, file=sys.stderr)
+        return 1
     st = Style()
     if args.remote:
         rows = _scope_filter(_parse_rows(zsh_capture("_dev_rows_all"), host_prefixed=True), scope, wt_scope)
@@ -339,7 +365,7 @@ def _slot_line(r, st, name_w, avail, host_w=None):
     slot picker draw their rows through this, so a slot reads the same wherever it is
     offered — the point of a shared view is that you never re-learn a slot's row.
     state attached → ●, detached → ○, anything else (a dead slot from
-    _dev_dead_slot_rows, a synthetic list row) → blank, and its summary carries the
+    _dev_dead_slot_rows) → blank, and its summary carries the
     story instead; context active → ✓. host_w adds the `t ls -r` HOST column. The
     Style is the only colour, so Style(tty=False) yields a label a picker can measure."""
     amark = {"attached": f"{st.g}●{st.r}", "detached": "○"}.get(r.get("state"), " ")
@@ -350,15 +376,6 @@ def _slot_line(r, st, name_w, avail, host_w=None):
         host = f"{cell:<{host_w}} "
     summary = _truncate(r.get("summary") or "", avail)
     return f"{amark} {cmark}     {host}{r['slot']:<{name_w}} {st.y}{summary}{st.r}"
-
-
-def _slot_rows(cfg, aliases):
-    """Every slot of these repos as row dicts, live AND dead, from ONE zsh: the live
-    rows exactly as `t ls` renders them (_dev_session_rows — every repo; the caller
-    filters), then _dev_dead_slot_rows for the named repos, whose rows carry what
-    `t resume` knows about a dead slot. Gathering only; the model is pure."""
-    snippet = "_dev_session_rows; _dev_dead_slot_rows " + " ".join(shlex.quote(a) for a in aliases)
-    return _parse_rows(zsh_capture(snippet))
 
 
 def _render_local(rows, scope, st, has_remote=False):
@@ -1025,94 +1042,6 @@ def _parse_host_entry(ent, used):
     return alias, target
 
 
-def _pick_inline(title, rows, multi=False):
-    """A one-list inline picker in the `t setup` style — stdlib only, drawn on a rail
-    and redrawn in place, so it never takes over the screen and the whole transaction
-    stays in normal scrollback.
-
-    Deliberately NOT fzf and not curses, the same call t setup documents: fzf is not on
-    every host, and both take the screen. It also replaced a `zsh -lic` session scan
-    that cost 5s and suspended the shell with SIGTTOU — an interactive shell fights the
-    foreground process for the terminal.
-
-    rows: [(value, label)]. Returns a list of values when multi, one value otherwise,
-    or None when it cannot run (no tty, raw mode unavailable) or the user cancels."""
-    import select
-    import termios
-    import tty
-
-    if not rows or not sys.stdin.isatty() or not sys.stdout.isatty():
-        return None
-    st, out, fd = Style(), sys.stdout, sys.stdin.fileno()
-    try:
-        old_attrs = termios.tcgetattr(fd)
-    except termios.error:
-        return None
-    height = max(5, shutil.get_terminal_size((80, 24)).lines - 6)
-    cur, marked, painted = 0, set(), [0]
-
-    def read_key():
-        ch = os.read(fd, 1).decode(errors="replace")
-        if ch == "\x1b":
-            r, _, _ = select.select([fd], [], [], 0.05)
-            if r:
-                seq = os.read(fd, 2).decode(errors="replace")
-                return {"[A": "up", "OA": "up", "[B": "down", "OB": "down"}.get(seq, "esc")
-            return "esc"
-        return {"\r": "enter", "\n": "enter", " ": "space",
-                "\x03": "abort", "\x04": "abort", "": "abort"}.get(ch, ch)
-
-    def paint():
-        lo = max(0, min(cur - height // 2, len(rows) - height)) if len(rows) > height else 0
-        hi = min(len(rows), lo + height)
-        lines = ["%s┌%s %s" % (st.y, st.r, title)]
-        if lo:
-            lines.append("%s│%s   … %d above" % (st.y, st.r, lo))
-        for n in range(lo, hi):
-            sel = "›" if n == cur else " "
-            box = ("✓ " if n in marked else "  ") if multi else ""
-            body = _truncate(rows[n][1], max(20, shutil.get_terminal_size((80, 24)).columns - 8))
-            paint_on = st.c if n == cur else ""
-            lines.append("%s│%s %s%s%s%s%s" % (st.y, st.r, paint_on, sel, box, body, st.r))
-        if hi < len(rows):
-            lines.append("%s│%s   … %d more" % (st.y, st.r, len(rows) - hi))
-        keys = "↑↓/jk move · space mark · enter pick · q cancel" if multi \
-            else "↑↓/jk move · enter pick · q cancel"
-        lines.append("%s└%s %s%s%s" % (st.y, st.r, st.y, keys, st.r))
-        if painted[0]:
-            out.write("\x1b[%dA\r\x1b[J" % painted[0])
-        out.write("\n".join(lines) + "\n")
-        out.flush()
-        # erase by screen ROWS next time: the title / keys line wraps on a phone
-        cols = shutil.get_terminal_size((80, 24)).columns
-        painted[0] = sum(_term_rows(ln, cols) for ln in lines)
-
-    try:
-        tty.setcbreak(fd)
-        out.write("\x1b[?25l")
-        while True:
-            paint()
-            k = read_key()
-            if k in ("up", "k"):
-                cur = (cur - 1) % len(rows)
-            elif k in ("down", "j"):
-                cur = (cur + 1) % len(rows)
-            elif k == "space" and multi:
-                marked.symmetric_difference_update({cur})
-                cur = min(cur + 1, len(rows) - 1)
-            elif k == "enter":
-                picked = sorted(marked) if multi and marked else [cur]
-                return [rows[i][0] for i in picked] if multi else rows[cur][0]
-            elif k in ("abort", "esc", "q"):
-                return None
-    finally:
-        termios.tcsetattr(fd, termios.TCSADRAIN, old_attrs)
-        out.write("\x1b[?25h")
-        if painted[0]:
-            out.write("\x1b[%dA\r\x1b[J" % painted[0])
-        out.flush()
-
-
 class _RailUI:
     """The inline-wizard primitives shared by `t setup` and `t new`: raw single-key
     reads, an input line with a readline-PREFILLED suggestion, and in-place repaint of
@@ -1120,7 +1049,8 @@ class _RailUI:
     steps above it stay in normal scrollback (the clack / `npm create` aesthetic).
     Constructing it off a tty (no line discipline to save) raises, which is the signal
     the callers use to fall back to plain prompts. stdlib only — deliberately neither
-    fzf nor curses, for the reasons _pick_inline documents."""
+    fzf nor curses: fzf is not on every host, and both take over the screen while
+    the wizard's transcript stays in normal scrollback."""
 
     def __init__(self):
         import termios
@@ -1233,7 +1163,7 @@ class _RailUI:
         """A list under a ◆ step, redrawn in place: ↑↓/jk move, space marks (multi),
         enter picks, q/esc/ctrl-c cancels → None. rows: [(value, text)]. `default` is
         the initial cursor row, `marked` the pre-marked rows (multi) — the two things
-        _pick_inline lacks, and what lets a wizard step open on its suggestion."""
+        that let a wizard step open on its suggestion."""
         st, rail = self.st, self.rail
         cur = max(0, min(default or 0, len(rows) - 1))
         marks = set(marked or ())
@@ -1709,6 +1639,7 @@ _NEW_SLUG = re.compile(r"^(?:git@github\.com:|ssh://git@github\.com/|https://git
                        r"([^/\s]+)/([^/\s]+?)(?:\.git)?/?$")
 _NEW_STALE = "invalid choice: 'new-land'"
 _NEW_SENTINEL = "new-land: "
+_NEW_AGAIN = "\0again"   # the "none of these" pick row; never a valid repo name
 
 
 def _new_validate_name(name):
@@ -1725,6 +1656,60 @@ def _new_validate_name(name):
 def _new_name_warnings(name):
     return (["GitHub compares names case-insensitively — lowercase is the convention"]
             if name != name.lower() else [])
+
+
+NEW_NAME_MODEL = "sonnet"
+_NEW_NAME_MAX = 6
+
+
+def _new_name_input(text):
+    """Classify what the name step was given: one token → ("name", token), a
+    description (any whitespace inside) → ("prompt", text). A name is validated by
+    the caller, so a single bad token still errors as a name, never becomes a prompt."""
+    text = text.strip()
+    return ("prompt", text) if re.search(r"\s", text) else ("name", text)
+
+
+def _new_name_prompt(desc, taken):
+    """The `claude -p` brief for repo names from a description. Rules mirror
+    _new_validate_name plus the house style (lowercase, hyphens, short — it is a
+    ~/code dir, a DEV_REPOS key, and a tmux/worktree prefix), and `taken` keeps it
+    off the names already on this machine."""
+    avoid = ", ".join(sorted(taken)[:40])
+    return (f"Suggest names for a new GitHub repo. What it is for:\n\"{desc}\"\n\n"
+            f"Rules: lowercase letters, digits and hyphens only, 1-3 words joined by hyphens, "
+            f"at most 24 chars, memorable and specific; no generic filler (app, tool, project). "
+            + (f"Do not suggest any of these, they are taken: {avoid}.\n" if avoid else "\n")
+            + f"Return ONLY a JSON array (no prose, no code fence) of {_NEW_NAME_MAX} objects, "
+              "best first, each {\"name\": \"<name>\", \"why\": \"<reason in 8 words or fewer>\"}.")
+
+
+def _new_parse_names(text, taken=()):
+    """→ [(name, why)] from the model's reply: tolerate fences/prose around the
+    array, lowercase, validate through _new_validate_name, drop taken names and
+    duplicates, cap at _NEW_NAME_MAX. An unparseable reply is [] (the caller says so)."""
+    m = re.search(r"\[.*\]", text or "", re.S)
+    if not m:
+        return []
+    try:
+        arr = json.loads(m.group(0))
+    except ValueError:
+        return []
+    out, seen = [], set(taken)
+    for o in arr if isinstance(arr, list) else []:
+        name = str(o.get("name", "") if isinstance(o, dict) else o).strip().lower()
+        if not name or name in seen or _new_validate_name(name):
+            continue
+        seen.add(name)
+        out.append((name, str(o.get("why", "") if isinstance(o, dict) else "").strip()))
+        if len(out) >= _NEW_NAME_MAX:
+            break
+    return out
+
+
+def _new_taken_names(repo_paths, code_entries):
+    """Names a suggestion must avoid: every DEV_REPOS basename + every ~/code entry."""
+    return {os.path.basename(p.rstrip("/")) for p in repo_paths if p} | {e for e in code_entries if e}
 
 
 def _new_path(name):
@@ -1831,7 +1816,8 @@ def _new_answers(args):
     elif getattr(args, "hosts", None):
         hosts = [h.strip() for h in args.hosts.split(",") if h.strip()]
     return {"name": getattr(args, "name", None) or None, "owner": getattr(args, "owner", None),
-            "visibility": vis, "alias": getattr(args, "alias", None), "hosts": hosts}
+            "visibility": vis, "alias": getattr(args, "alias", None), "hosts": hosts,
+            "prompt": (getattr(args, "prompt", None) or "").strip() or None}
 
 
 def _new_state_summary(state):
@@ -2070,6 +2056,29 @@ def _new_sh_gh(slug):
     return _new_gh_repo_state(r.returncode, r.stdout, r.stderr)
 
 
+def _new_sh_suggest(desc, taken):
+    """Ask Claude (`claude -p`, the t find precedent — the real binary, never the
+    zsh wrapper) for repo names. → (rows, error): rows from _new_parse_names, or
+    an error line when the CLI is missing, times out, or replies with no names."""
+    claude_bin = shutil.which("claude") or os.path.join(HOME, ".local", "bin", "claude")
+    if not os.path.exists(claude_bin):
+        return [], "claude CLI not found — type a name instead"
+    try:
+        p = subprocess.run([claude_bin, "-p", "--model", NEW_NAME_MODEL, "--output-format", "json"],
+                           input=_new_name_prompt(desc, taken), capture_output=True, text=True,
+                           timeout=90)
+        res = json.loads(p.stdout).get("result", "") if p.stdout.strip() else ""
+    except subprocess.TimeoutExpired:
+        return [], "claude took too long — type a name instead"
+    except (OSError, ValueError) as e:
+        return [], f"claude failed ({e}) — type a name instead"
+    rows = _new_parse_names(res, taken)
+    if not rows:
+        tail = (p.stderr or "").strip().splitlines()
+        return [], "claude returned no usable names" + (f" ({tail[-1]})" if tail else "")
+    return rows, None
+
+
 def _new_sh_owners():
     """(login, [orgs]) the gh token can create under; ([], None) without gh."""
     if not shutil.which("gh"):
@@ -2086,7 +2095,7 @@ def _new_sh_whence(alias):
     inside the raw-mode wizard, and an interactive zsh that inherits the tty makes
     itself the terminal's foreground process group on startup; when it exits the
     wizard's next read of the tty fails with EIO (or SIGTTIN) — the same family of bug
-    as the SIGTTOU suspension _todo_pick_target hit with a `zsh -lic` scan. Detached,
+    as the SIGTTOU suspension an undetached `zsh -lic` scan once caused. Detached,
     it has no controlling terminal to take. None on any failure (no zsh, timeout)."""
     try:
         r = subprocess.run(["zsh", "-lic", ZSH_PRELUDE + f"whence -w {shlex.quote(alias)}"],
@@ -2148,16 +2157,36 @@ def _new_wizard(cfg, answers, ctx):
     ui.raw()
     result = None
     try:
-        name = answers["name"]
+        name, desc = answers["name"], answers["prompt"]
         while not name:
-            n = ui.cooked_input("│  repo name → ")
-            if not n:
-                return None
-            err = _new_validate_name(n)
+            if desc is None:
+                n = ui.cooked_input("│  repo name (or describe it in a sentence for suggestions) → ")
+                if not n:
+                    return None
+                kind, text = _new_name_input(n)
+                if kind == "name":
+                    err = _new_validate_name(text)
+                    if err:
+                        ui.commit([f"{rail}  {st.y}⚠ {err}{st.r}"])
+                        continue
+                    name = text
+                    break
+                desc = text
+            ui.done("describe", desc)
+            # the head repaints in place under the ◇ line; pick() replaces it
+            ui.repaint(ui.head("name", f"asking claude ({NEW_NAME_MODEL}) for names…"))
+            rows, err = ctx["suggest"](desc, ctx["taken"])
+            desc = None
             if err:
                 ui.commit([f"{rail}  {st.y}⚠ {err}{st.r}"])
                 continue
-            name = n
+            choices = [(n, f"{n}  {st.y}{why}{st.r}" if why else n) for n, why in rows]
+            choices.append((_NEW_AGAIN, f"{st.y}none of these — type a name or describe it again{st.r}"))
+            pick = ui.pick("name", choices)
+            if pick is None:
+                return None
+            if pick != _NEW_AGAIN:
+                name = pick
         answers["name"] = name
         ui.done("name", name)
         path, state = ctx["probe"](name)
@@ -2254,16 +2283,42 @@ def _new_prompt_flow(cfg, answers, ctx):
     """Plain-prompt fallback (TERM=dumb, no raw mode): the same questions as
     _new_wizard over input(), then the same review gate. → (steps, answers) or None."""
     st = Style()
-    name = answers["name"]
+    name, desc = answers["name"], answers["prompt"]
     while not name:
-        n = _prompt("repo name: ")
-        if n is None:
-            return None
-        err = _new_validate_name(n)
+        if desc is None:
+            n = _prompt("repo name (or describe it in a sentence for suggestions): ")
+            if n is None:
+                return None
+            kind, text = _new_name_input(n)
+            if kind == "name":
+                err = _new_validate_name(text)
+                if err:
+                    print(f"  {err}", file=sys.stderr)
+                    continue
+                name = text
+                break
+            desc = text
+        print(f"  asking claude ({NEW_NAME_MODEL}) for names…")
+        rows, err = ctx["suggest"](desc, ctx["taken"])
+        desc = None
         if err:
             print(f"  {err}", file=sys.stderr)
             continue
-        name = n
+        for i, (n, why) in enumerate(rows, 1):
+            print(f"  {i}) {n}" + (f"  — {why}" if why else ""))
+        r = _prompt(f"  pick 1-{len(rows)}, or type a name / a new description: ")
+        if r is None:
+            return None
+        if r.isdigit() and 1 <= int(r) <= len(rows):
+            name = rows[int(r) - 1][0]
+        elif r:
+            kind, text = _new_name_input(r)
+            if kind == "prompt":
+                desc = text
+            elif _new_validate_name(text):
+                print(f"  {_new_validate_name(text)}", file=sys.stderr)
+            else:
+                name = text
     answers["name"] = name
     path, state = ctx["probe"](name)
     print(f"  path: {_tilde(path)} · {_new_state_summary(state)}")
@@ -2392,6 +2447,9 @@ def cmd_new(cfg, args):
     """See the section comment above. Flags pre-answer wizard steps; -y / --dry-run /
     no tty skip the wizard and take the defaults for the rest."""
     answers = _new_answers(args)
+    if answers["name"] and answers["prompt"]:
+        print("t new: give a name OR --prompt, not both", file=sys.stderr)
+        return 1
     if answers["name"]:
         err = _new_validate_name(answers["name"])
         if err:
@@ -2415,15 +2473,30 @@ def cmd_new(cfg, args):
         if slug not in gh_cache:
             gh_cache[slug] = _new_sh_gh(slug)
         return gh_cache[slug]
+    try:
+        code_entries = os.listdir(os.path.join(HOME, "code"))
+    except OSError:
+        code_entries = []
     ctx = {"probe": lambda n: (_new_path(n), _new_sh_state(_new_path(n))),
            "gh": gh_for, "owners": _new_sh_owners, "f_repos": f_repos,
-           "whence": lambda a: None if a in registered else _new_sh_whence(a)}
+           "whence": lambda a: None if a in registered else _new_sh_whence(a),
+           "suggest": _new_sh_suggest,
+           "taken": _new_taken_names(cfg.repos.values(), code_entries)}
     st = Style()
     tty_ok = sys.stdin.isatty() and sys.stdout.isatty()
     if args.dry_run or args.yes or not tty_ok:
+        if not answers["name"] and answers["prompt"]:
+            # no wizard to pick from: the model's first suggestion is the name
+            rows, err = _new_sh_suggest(answers["prompt"], ctx["taken"])
+            if err:
+                print(f"t new: {err}", file=sys.stderr)
+                return 1
+            answers["name"] = rows[0][0]
+            print(f"t new: name {answers['name']} (from --prompt; also suggested: "
+                  f"{', '.join(n for n, _ in rows[1:]) or 'nothing else'})")
         if not answers["name"]:
-            print("t new: a repo name is required without the wizard (t new <name> …)",
-                  file=sys.stderr)
+            print("t new: a repo name (or --prompt <description>) is required without the "
+                  "wizard (t new <name> …)", file=sys.stderr)
             return 1
         steps = _new_resolve(cfg, answers, ctx)
         errs = [s for s in steps if s["do"] == "error"]
@@ -3093,7 +3166,7 @@ def cmd_install(cfg, args):
 _AGENT_PARITY = [
     ("surface", "claude", "codex", "cursor"),
     ("t install (install · login · update)", "✓", "✓", "✓"),
-    ("dev slots: t open / ls / kill / read / paste / todo", "✓", "planned", "✗ no slot — t cursor ls"),
+    ("dev slots: t open / ls / kill / read / paste", "✓", "planned", "✗ no slot — t cursor ls"),
     ("t push / t pop", "✓", "planned", "✗ no slot"),
     ("t resume (dead slots)", "✓", "planned", "→ t cursor resume"),
     ("t beam / --from (move a session)", "✓", "planned", "→ t cursor [id] --host / --from"),
@@ -3495,711 +3568,32 @@ def cmd_doctor(cfg, args):
 
 
 
-# ─── todo — a per-slot task list ───────────────────────────────────────────────
+# ─── todo — retired ─────────────────────────────────────────────────────────────
 #
-# Keyed on the SLOT (<repo>-<slot>), not the Claude session id: a conversation's id
-# changes under you (compaction, /clear, a fresh `t resume`) while the work does not,
-# and the slot is the unit you actually hold in your head when several run at once.
-# Keying on <repo>-<slot> also survives a beam, since the worktree path and branch are
-# basename+slot on every host by design.
+# `t todo` (a per-slot task list with a /todo command, a statusline bar, a
+# list_todos MCP tool and a csync pair) was retired in September 2026. The verb
+# is answered in main() (no subparser — `t -h` does not list it) so an old habit,
+# alias, or a lagging statusline setting gets one quiet line instead of argparse's
+# "invalid choice". The lists it kept
+# under $XDG_STATE_HOME/t/todo/ are left on disk, untouched.
+
+_TODO_RETIRED_MSG = "t todo is retired — it was removed in September 2026."
+
+
+def cmd_todo(cfg, args):
+    if "--statusline" in (args.rest or []):
+        return 0          # a lagging ~/.claude/settings.json: render nothing, never an error
+    print(_TODO_RETIRED_MSG, file=sys.stderr)
+    return 1
+
+
+# ─── the dev URL a slot is testable at (the `sessions` MCP rows carry it) ─────────
 #
-# Removal is a TOMBSTONE, never an unlink. csync's sync_pair is `rsync --update` with
-# NO --delete (bin/csync), so a file removed here comes straight back from iCloud on
-# the next run — but a done/deleted FLAG rides inside the file, and the newest whole
-# file wins. Only `t todo clear` physically drops the flagged items. Same reason the
-# union caveat is real: two machines editing one slot's list between syncs lose a side.
-# That is the one-live-owner-per-slot invariant the rest of `t` already assumes.
-
-_TODO_EMPTY = {"v": 1, "next_id": 1, "items": []}
-
-
-def _todo_dir():
-    """State root, read at call time so tests (and $XDG_STATE_HOME) can redirect it."""
-    base = os.environ.get("XDG_STATE_HOME") or os.path.join(HOME, ".local", "state")
-    return os.path.join(base, "t", "todo")
-
-
-def _todo_path(key):
-    return os.path.join(_todo_dir(), key + ".json")
-
-
-def _todo_key(cfg, cwd, tmux_name=None, override=None):
-    """The list a given cwd belongs to. Ladder, most specific first:
-      1. an explicit -s override (or the `<repo> [slot]` positionals, which become one);
-      2. a per-session worktree — cfg.repo_of_dir gives (alias, slot) straight off the
-         path, which is the normal case since Claude's Bash tool runs in the worktree;
-      3. the tmux session name (dev-<repo>-<slot>) for a shared-tree / opt-out repo,
-         split on the LAST dash so a multi-dash alias resolves (the _dev_* rule);
-      4. a canonical repo dir with no slot → the repo's own list;
-      5. nothing → "scratch", so a quick add from anywhere never errors out.
-    Deliberately NOT _infer_repo: its newest-log tiebreak between sibling aliases (dot
-    vs dotfiles) can drift between calls, which would silently split one slot's list
-    across two files. repo_of_dir's basename-else-shortest choice is stable."""
-    if override:
-        return override
-    alias, slot = cfg.repo_of_dir(cwd)
-    if alias and slot:
-        return "%s-%s" % (alias, slot)
-    if tmux_name and tmux_name.startswith("dev-"):
-        repo, dash, num = tmux_name[4:].rpartition("-")
-        if dash and repo and num.isdigit():
-            # By the CANONICAL alias: a `dev-dot-3` window and the .worktrees/dotfiles/3
-            # path are one slot and must key ONE list (step 2 and `t todo add dot 3 …`
-            # both say dotfiles-3); the raw name split them across two files.
-            return "%s-%s" % (_todo_alias_map(cfg).get(repo, repo), num)
-    if alias:
-        return alias
-    return "scratch"
-
-
-def _todo_load(path):
-    """Read a list file. Missing, unreadable, or malformed all read as an EMPTY list
-    rather than an error: this is a convenience surface, and refusing to work because
-    half a JSON write survived would be worse than starting the list over."""
-    try:
-        with open(path, encoding="utf-8") as fh:
-            data = json.load(fh)
-    except (OSError, ValueError):
-        return dict(_TODO_EMPTY, items=[])
-    if not isinstance(data, dict) or not isinstance(data.get("items"), list):
-        return dict(_TODO_EMPTY, items=[])
-    items = [i for i in data["items"] if isinstance(i, dict) and "id" in i]
-    highest = max([i.get("id", 0) for i in items] or [0])
-    return {"v": data.get("v", 1),
-            "next_id": max(int(data.get("next_id", 1) or 1), highest + 1),
-            "items": items}
-
-
-_TODO_TTL = 7 * 86400
-
-
-def _todo_purge(data, now=None, ttl=_TODO_TTL):
-    """Physically drop finished items older than `ttl`. Returns the count dropped.
-
-    This replaced an explicit `clear` verb: a list you have to tidy is a list you stop
-    using. Tombstones still do their csync job while they live (rsync has no --delete,
-    so an unlinked item would come straight back) — they just expire on their own, and
-    the purged copy wins the union merge by being newer.
-
-    An item with no timestamp is LEFT ALONE: rows written before this existed have no
-    done_at, and must not vanish on a technicality."""
-    now = int(now if now is not None else time.time())
-    keep = []
-    for i in data["items"]:
-        if i.get("done") or i.get("deleted"):
-            stamp = i.get("done_at") or i.get("deleted_at")
-            if stamp and now - int(stamp) > ttl:
-                continue
-        keep.append(i)
-    dropped = len(data["items"]) - len(keep)
-    data["items"] = keep
-    return dropped
-
-
-def _todo_save(path, data):
-    """Write atomically (tmp + os.replace) so a crash mid-write can never leave a
-    truncated list where a good one was. Expiry rides on the write so that reading a
-    list never rewrites it."""
-    _todo_purge(data)
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    tmp = path + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as fh:
-        json.dump(data, fh, ensure_ascii=False, indent=1)
-        fh.write("\n")
-    os.replace(tmp, path)
-
-
-def _todo_open(data):
-    return [i for i in data["items"] if not i.get("done") and not i.get("deleted")]
-
-
-def _todo_visible(data, show_all=False):
-    live = [i for i in data["items"] if not i.get("deleted")]
-    return live if show_all else [i for i in live if not i.get("done")]
-
-
-def _todo_find(data, tok):
-    """Resolve an id token to a live (non-tombstoned) item, else None."""
-    if not str(tok).isdigit():
-        return None
-    n = int(tok)
-    for i in data["items"]:
-        if i.get("id") == n and not i.get("deleted"):
-            return i
-    return None
-
-
-_TODO_ACTIONS = ("add", "done", "rm", "mv", "ls")
-
-# Four spellings, not thirteen. Each is a word you would plausibly reach for first;
-# a longer table only made the "one of:" error longer without making anything findable.
-_TODO_ALIASES = {"list": "ls", "x": "done", "delete": "rm", "move": "mv"}
-
-# Verbs that existed for a few days and no longer do. Answering with the reason beats
-# "unknown action" — muscle memory from this week should get a pointer, not a dead end.
-_TODO_RETIRED = {
-    "clear": "finished items purge themselves now",
-    "purge": "finished items purge themselves now",
-    "edit": "remove it and add it again",
-    "undone": "t todo -a, then pick the item",
-    "reopen": "t todo -a, then pick the item",
-}
-
-
-def _todo_canon(action):
-    return _TODO_ALIASES.get(action, action)
-
-
-def _todo_options(p):
-    """The `t todo` flags. One table, two parsers: build_parser() puts them on the
-    subcommand, and _todo_hoist_flags() re-reads them out of `rest` — a second
-    hand-copied list would drift the moment a flag was added to one and not the other."""
-    p.add_argument("-a", "--all", action="store_true",
-                   help="show finished items too, and inactive slots from a repo dir")
-    p.add_argument("-A", "--all-slots", action="store_true",
-                   help="every slot's open items, grouped")
-    p.add_argument("-s", "--slot", metavar="KEY",
-                   help="target another list by key (e.g. dotfiles-3) instead of the cwd's")
-    # Working but off the everyday surface: the statusLine config and CLAUDE.md depend
-    # on these, nobody types them.
-    p.add_argument("--json", action="store_true", help=argparse.SUPPRESS)
-    p.add_argument("--statusline", action="store_true", help=argparse.SUPPRESS)
-    p.add_argument("-n", "--items", type=int, metavar="N", help=argparse.SUPPRESS)
-
-
-# Flags that take a value: when scanning `add` text for a leading run of flags, the
-# token after one of these is its argument, not the first word of the task.
-_TODO_VALUE_FLAGS = ("-s", "--slot", "-n", "--items")
-
-
-def _todo_flaggy(tok):
-    """A token the hoist lets argparse see as an option: dash-led and whitespace-free.
-    A quoted "-A literal" is ONE space-bearing token — argparse's short-option prefix
-    match runs BEFORE its "contains a space → positional" rule, so left to itself it
-    reads that as -A plus junk. Holding such tokens back makes quoting a real escape
-    hatch, whatever argparse version is installed."""
-    return tok.startswith("-") and len(tok) > 1 and not any(c.isspace() for c in tok)
-
-
-def _todo_hoist_flags(args):
-    """Lift the todo flags out of `rest`, where argparse's REMAINDER parks every token
-    that follows the action — flags included. `t todo ls -A` parsed as action=ls,
-    rest=['-A'], all_slots=False: the flag sat unread and the view answered as a plain
-    `t todo` would, which reads as "-A can't see all slots". Only flags BEFORE the
-    action were ever seen (`t todo -A ls`), a gh-style order nobody types.
-
-    For `add` only a LEADING run of flags is hoisted (`t todo add -s dot-3 fix it`),
-    because the text that follows is prose and a `-s` inside it is a word, not a flag
-    (`t todo add handle -s in t setup` must stay one task, not file "in t setup" into a
-    list called `in`). The other actions take ids, so a flag anywhere is a flag.
-    Quoting is still the escape hatch for a task whose FIRST word is dash-shaped."""
-    rest = list(args.rest or [])
-    if not any(_todo_flaggy(tok) for tok in rest):
-        return args
-    verbatim = []
-    # A `--` ends the flags. (One placed directly after the action never reaches us —
-    # argparse eats it as the REMAINDER delimiter — so for a task whose FIRST word is
-    # dash-shaped, quote it: `t todo add "-A literal"` is one space-bearing token, which
-    # argparse never reads as an option.)
-    if "--" in rest:
-        cut = rest.index("--")
-        rest, verbatim = rest[:cut], rest[cut + 1:]
-    p = argparse.ArgumentParser(add_help=False, allow_abbrev=False)
-    _todo_options(p)
-    if _todo_canon(args.action) == "add":
-        i = 0
-        while i < len(rest) and _todo_flaggy(rest[i]):
-            i += 2 if rest[i] in _TODO_VALUE_FLAGS else 1
-        head, tail = rest[:i], rest[i:]
-        found, extra = p.parse_known_args(head)
-        rest = extra + tail
-    else:
-        held = [tok for tok in rest if tok.startswith("-") and not _todo_flaggy(tok)]
-        found, rest = p.parse_known_args([tok for tok in rest if tok not in held])
-        rest += held
-    for name, val in vars(found).items():
-        if val not in (None, False):             # a flag that was actually given
-            setattr(args, name, val)
-    args.rest = rest + verbatim
-    return args
-
-
-def _todo_slot_arg(rest):
-    """Split a leading bare slot number off an `add` -> ("11", ["fix","it"]) for
-    `t todo add 11 fix the ledger`; (None, rest) when there is none.
-
-    A bare number is genuinely ambiguous here -- `t todo 11` already means item #11 --
-    so the slot reading is taken only when TEXT FOLLOWS. `t todo add 11` alone stays a
-    literal item, which is what a lone number nearly always is. The escape hatch for
-    text that really does start with a digit is quoting: `t todo add "3 more tests"`
-    arrives as ONE token, so rest[0] is not a digit and nothing is stripped.
-
-    Pure -- resolving the number against a repo is the caller's job, and without one
-    (an add from ~) there is nothing to resolve it against, so it stays text."""
-    rest = list(rest or [])
-    if len(rest) >= 2 and rest[0].isdigit():
-        return (rest[0], rest[1:])
-    return (None, rest)
-
-
-def _todo_dest_args(rest, aliases, alias=None):
-    """Split an explicit destination off an `add` → (key, text tokens), or (None, rest).
-
-    The `<repo> [slot]` positionals every slot verb takes, most explicit first:
-      t todo add ff 22 fix the ledger   → ff-22
-      t todo add ff fix the ledger      → ff             (the repo-level list)
-      t todo add 22 fix the ledger      → <cwd repo>-22  (a bare slot needs `alias`)
-    `aliases` maps every DEV_REPOS key to its canonical one, so `dot 3` and
-    `dotfiles 3` file into ONE list: ids are per-list and a slot's own key is the
-    canonical alias (repo_of_dir's choice), so a sibling-alias key would silently
-    split one slot's list across two files. A destination is taken only when TEXT
-    FOLLOWS — `t todo add ff 22` stays the item "ff 22", the way a lone number stays
-    an item (_todo_slot_arg's rule) — and quoting is the escape hatch for text that
-    really does start with a repo's name. Pure."""
-    rest = list(rest or [])
-    if rest and rest[0] in aliases:
-        repo = aliases[rest[0]]
-        if len(rest) >= 3 and rest[1].isdigit():
-            return ("%s-%s" % (repo, rest[1]), rest[2:])
-        if len(rest) >= 2 and not rest[1].isdigit():
-            return (repo, rest[1:])
-        return (None, rest)
-    slot, stripped = _todo_slot_arg(rest)
-    if slot and alias:
-        return ("%s-%s" % (alias, slot), stripped)
-    return (None, rest)
-
-
-def _todo_repo_arg(action, rest, repos):
-    """Split a leading `<repo> [slot]` off the positionals -> (key, action, rest), the
-    `t <verb> <repo> [slot]` grammar every other slot verb speaks: `t todo ff add x`
-    files into ff's repo-level list, `t todo ff 3 add x` into ff-3, `t todo ff` views
-    the repo, `t todo ff-3 done 2` names a list outright. (None, action, rest) when
-    the first token is not a repo -- an ACTION name always wins, so a repo aliased
-    `add` could never shadow the verb (it just needs -s).
-
-    A bare number right after the repo is read as a SLOT, never as an item: that is
-    the grammar's slot position, and an item wants an action anyway -- `t todo ff 3 4`
-    still reaches item #4 of ff-3 through the bare-id path.
-
-    Pure -- the caller turns the key into the -s override."""
-    rest = list(rest or [])
-    if not action or action in _TODO_ACTIONS or action in _TODO_ALIASES \
-            or action in _TODO_RETIRED:
-        return (None, action, rest)
-    key = None
-    if action in repos:
-        key = action
-        if rest and rest[0].isdigit():
-            key, rest = "%s-%s" % (action, rest[0]), rest[1:]
-    else:
-        alias, dash, num = action.rpartition("-")
-        if dash and num.isdigit() and alias in repos:
-            key = action
-    if key is None:
-        return (None, action, rest)
-    return (key, rest[0] if rest else None, rest[1:])
-
-
-def _todo_ls_target(key, repos, rest):
-    """Resolve `t todo ls <what>` to the list to show -> (key, None) or (None, error).
-
-    A bare number is the slot of the repo `key` resolves to -- the same reading `add`
-    gives a leading number (`t todo add 17 fix it`), so `t todo ls 17` from a repo dir
-    OR from inside a sibling's worktree shows slot 17 and nothing else. No repo to
-    resolve against (scratch, ~) is an error naming the full-key form, not a silent
-    fall-through to the widened view -- that was the bug: the number was ignored and
-    the whole repo rendered, which read as "can't ls only slot 17".
-
-    Anything else is a list key verbatim (`t todo ls dotfiles-3`), the positional twin
-    of -s. Only ONE token is taken: the view is one list, and extra words would be
-    silently dropped otherwise."""
-    rest = list(rest or [])
-    if not rest:
-        return (key, None)
-    if len(rest) > 1:
-        return (None, "one slot or list at a time -- t todo ls %s" % rest[0])
-    tok = rest[0]
-    if not tok.isdigit():
-        return (tok, None)
-    alias = key if key in repos else key.rpartition("-")[0]
-    if alias not in repos:
-        return (None, "no repo here to read slot %s against -- t todo ls <repo>-%s" % (tok, tok))
-    return ("%s-%s" % (alias, tok), None)
-
-
-def _todo_apply(data, action, rest, now=None):
-    """Mutate `data` in place for one action. Returns (message, rc). Never raises on
-    bad input — an unknown id is a message and rc 1, so a fat-fingered `t todo done 9`
-    reports instead of exploding."""
-    now = int(now if now is not None else time.time())
-    rest = list(rest or [])
-    action = _todo_canon(action)
-
-    if action == "add":
-        text = " ".join(rest).strip()
-        if not text:
-            return ("t todo add: needs some text — t todo add \"rebase onto main\"", 2)
-        item = {"id": data["next_id"], "text": text, "done": False,
-                "added": now, "done_at": None, "deleted": False}
-        data["items"].append(item)
-        data["next_id"] += 1
-        return ("✓ added #%d  %s" % (item["id"], text), 0)
-
-    if action == "_reopen":          # internal: the bare-id picker's un-tick
-        item = _todo_find(data, rest[0]) if rest else None
-        if not item:
-            return ("⚠ no such item: %s" % (rest[0] if rest else "?"), 1)
-        item["done"], item["done_at"] = False, None
-        return ("✓ reopened #%d  %s" % (item["id"], item["text"]), 0)
-
-    if action in ("done", "rm"):
-        if not rest:
-            return ("t todo %s: needs an id (t todo to list them)" % action, 2)
-        hit, missed = [], []
-        for tok in rest:
-            item = _todo_find(data, tok)
-            if not item:
-                missed.append(str(tok))
-                continue
-            if action == "done":
-                item["done"], item["done_at"] = True, now
-            else:
-                item["deleted"], item["deleted_at"] = True, now
-            hit.append(item)
-        verb = {"done": "done", "rm": "removed"}[action]
-        msg = []
-        if hit:
-            msg.append("✓ %s %s" % (verb, ", ".join("#%d" % i["id"] for i in hit)))
-        if missed:
-            msg.append("⚠ no such item: %s" % ", ".join(missed))
-        return ("\n".join(msg), 1 if missed else 0)
-
-    if action in _TODO_RETIRED:
-        return ("t todo: `%s` is gone — %s" % (action, _TODO_RETIRED[action]), 2)
-
-    return ("t todo: unknown action '%s' — one of: %s"
-            % (action, ", ".join(_TODO_ACTIONS)), 2)
-
-
-def _todo_move(src_data, dst_data, tok, dst_key, now=None):
-    """Move one item between two lists. Returns (message, rc); mutates both dicts.
-
-    The item is re-created in the destination with a fresh id (ids are per-list) and
-    TOMBSTONED in the source rather than spliced out — same reason as `rm`: csync has
-    no --delete, so the source file has to carry the fact of the move."""
-    now = int(now if now is not None else time.time())
-    item = _todo_find(src_data, tok)
-    if not item:
-        return ("⚠ no such item: %s" % tok, 1)
-    moved = dict(item, id=dst_data["next_id"], deleted=False, deleted_at=None)
-    dst_data["items"].append(moved)
-    dst_data["next_id"] += 1
-    item["deleted"], item["deleted_at"] = True, now
-    return ("✓ moved #%s → %s #%d  %s" % (tok, dst_key, moved["id"], moved["text"]), 0)
-
-
-def _todo_render(data, key, show_all=False, width=80, st=None, shared=None):
-    """The one-list view. Returns display lines (no trailing newlines).
-
-    `shared` is an optional (key, data) for the repo-level list this slot hangs off:
-    its items render as a dim second section marked ◇ rather than ◻, so which list an
-    item lives in is readable at a glance — which matters, because ids are per-list and
-    the two sections can both hold a #3."""
-    st = st or Style()
-    items = _todo_visible(data, show_all)
-    n_open = len(_todo_open(data))
-    # Footer of next actions, mirroring `t ls`. Bare `t todo` is the discovery surface —
-    # without it the verbs exist only in -h, which nobody runs before they need them.
-    n_done = len(items) - n_open if show_all else 0
-    tally = "nothing open" if not n_open else "%d open" % n_open
-    if n_done:
-        tally += " · %d done" % n_done
-    head = "%s%s%s %s— %s%s" % (st.b, key, st.r, st.y, tally, st.r)
-    foot = ['', "  %s%s%s" % (st.y, _TODO_FOOT, st.r)]
-
-    lines = [head] if items else [head, '  %s(nothing here yet)%s' % (st.y, st.r)]
-    if items:
-        idw = max(len(str(i["id"])) for i in items)
-        for i in items:
-            mark = "✓" if i.get("done") else "◻"
-            body = _truncate(i["text"], max(10, width - idw - 6))
-            if i.get("done"):
-                lines.append("  %s%*d  %s %s%s" % (st.y, idw, i["id"], mark, body, st.r))
-            else:
-                lines.append("  %s%*d%s  %s %s" % (st.c, idw, i["id"], st.r, mark, body))
-    return lines + _todo_shared_lines(shared, show_all, width, st) + foot
-
-
-def _todo_shared_lines(shared, show_all, width, st):
-    """The repo-level section appended to a slot's view. Empty when there is nothing
-    to show, so a slot with no shared notes renders exactly as it always did."""
-    if not shared:
-        return []
-    skey, sdata = shared
-    sitems = _todo_visible(sdata, show_all)
-    if not sitems:
-        return []
-    n = len(_todo_open(sdata))
-    out = ['', "  %s%s — %s%s" % (st.y, skey,
-                                  "nothing open" if not n else "%d open" % n, st.r)]
-    idw = max(len(str(i["id"])) for i in sitems)
-    for i in sitems:
-        body = _truncate(i["text"], max(10, width - idw - 6))
-        mark = "✓" if i.get("done") else "◇"
-        out.append("  %s%*d%s  %s %s%s%s"
-                   % (st.c, idw, i["id"], st.r, mark, st.y if i.get("done") else "",
-                      body, st.r if i.get("done") else ""))
-    return out
-
-
-def _todo_id_actions(item):
-    """Actions offered for one item → [(action, label)]. `reopen` appears only for a
-    finished item, and is how un-ticking survives the `undone` verb being removed."""
-    if item.get("done"):
-        return [("_reopen", "reopen"), ("rm", "remove"), ("mv", "move to another slot")]
-    return [("done", "tick off"), ("rm", "remove"), ("mv", "move to another slot")]
-
-
-def _todo_scoped_candidates(entries, action):
-    """Items to offer across several lists → [(key, id, label)].
-
-    The view widens to the repo when the cwd names no slot; the ACTIONS have to widen
-    with it, or you see an item you cannot touch — which is exactly what `t todo rm`
-    did from a repo dir: it offered the (empty) repo-level list while the view showed a
-    slot's item. The label carries the slot whenever more than one list is in play."""
-    show_key = len(entries) > 1
-    out = []
-    for key, data in entries:
-        for ident, label in _todo_pick_candidates(data, action):
-            out.append((key, ident, "%s%s" % ("%-12s " % key if show_key else "", label)))
-    return out
-
-
-def _todo_locate(entries, tok):
-    """Every live item with id `tok` across `entries` → [(key, item)]. Ids are per-list,
-    so a widened scope can genuinely match twice; the caller disambiguates rather than
-    guessing."""
-    return [(key, i) for key, data in entries for i in data["items"]
-            if not i.get("deleted") and str(i.get("id")) == str(tok)]
-
-
-def _todo_pick_candidates(data, action):
-    """Items a no-id `done`/`undone`/`rm`/`edit`/`mv` should offer → [(id, label)].
-
-    `done` offers only open items (marking a done item done again is a no-op), `undone`
-    only finished ones, and the rest offer everything still live — you may well want to
-    remove or re-file something already ticked off."""
-    action = _todo_canon(action)
-    if action == "undone":
-        items = [i for i in data["items"] if i.get("done") and not i.get("deleted")]
-    elif action == "done":
-        items = _todo_open(data)
-    else:
-        items = _todo_visible(data, show_all=True)
-    return [(i["id"], "%d  %s %s" % (i["id"], "✓" if i.get("done") else "◻", i["text"]))
-            for i in items]
-
-
-_TODO_FOOT = ('add: t todo add "…" · done: t todo done <id> · one item: t todo <id> '
-              '· one slot: t todo ls <n> · every slot: t todo -A')
-
-
-def _todo_parent(key, repos):
-    """The repo-level list a slot key belongs to → alias, or None for a repo-level key.
-
-    The counterpart to `_todo_scoped`, which widens a slotless view DOWN to the repo's
-    slots. Without this the widening was one-way: a note jotted at repo level — the
-    cross-slot stuff, which is exactly what wants to be visible everywhere — was
-    invisible from inside every slot, on the bar and in the view alike. The tail must
-    be numeric AND the head a real alias, so `financial-forecast` is a repo, not slot
-    `forecast` of repo `financial`."""
-    head, _, num = key.rpartition("-")
-    return head if num.isdigit() and head in repos else None
-
-
-def _todo_shared(cfg, key):
-    """A slot's repo-level list as a (key, data) pair, or None when there is nothing
-    there. Gated on live items so a slot with no shared notes pays only one stat and
-    renders exactly as it always did."""
-    parent = _todo_parent(key, cfg.repos)
-    if not parent:
-        return None
-    data = _todo_load(_todo_path(parent))
-    return (parent, data) if _todo_visible(data, show_all=True) else None
-
-
-def _todo_live_nums(repos, alias, live_slots):
-    """Slot NUMBERS of this repo's live tmux sessions, from `_todo_live_slots` rows.
-
-    Matched through the repo DIR, not the alias string: a session named `dev-dot-4`
-    keys the same tree as the `dotfiles-4` list (`_todo_key` files by the canonical
-    alias, whichever name the session was opened under), so a string compare would
-    report a live slot dead. Pure: the caller gathers."""
-    path = repos.get(alias)
-    out = set()
-    for r in live_slots:
-        head, _, num = r.get("slot", "").rpartition("-")
-        if num.isdigit() and path and repos.get(head) == path:
-            out.add(num)
-    return out
-
-
-def _todo_scoped(entries, alias, live_nums=None):
-    """This repo's lists — its repo-level one plus every <alias>-<slot>. A plain shell in
-    a repo dir names no slot, so showing only the (usually empty) repo-level list hides
-    the work sitting in that repo's slots, which is exactly what was being asked for.
-
-    `live_nums` (a set of slot numbers) keeps only ACTIVE slots — the repo-level list is
-    always kept, open or not. A list outlives its session on purpose (keyed on the slot,
-    not the conversation id), so without this gate every slot that ever held a task kept
-    showing up from the repo dir long after its session was gone. None = no gate."""
-    out = []
-    for key, data in entries:
-        head, _, num = key.rpartition("-")
-        if key == alias:
-            out.append((key, data))
-        elif head == alias and num.isdigit() and (live_nums is None or num in live_nums):
-            out.append((key, data))
-    return out
-
-
-def _synth_row(slot, summary):
-    """A row in _dev_session_rows' shape for something that is not a session — a
-    list-level destination, or a slot the scan did not return — so one renderer
-    (_slot_line) draws every row of a picker."""
-    return {"host": "local", "sid": "-", "cwd": "", "slot": slot,
-            "state": "", "context": "", "summary": summary}
-
-
-_LIVE_STATES = ("attached", "detached")
-
-
-def _todo_add_targets(alias, rows, list_keys, wt_slots, aliases=None):
-    """Ordered destinations for a slotless `t todo add` → [(key, row)], each row in
-    _dev_session_rows' shape so _slot_line draws it: the picker IS the `t ls` view,
-    with the dead slots `t resume` knows about underneath — one slot view everywhere.
-
-    Standing in a repo dir names no slot, and with 20+ live slots for one repo a guess
-    would be worse than asking. The repo-level list stays FIRST so it is the default
-    pick — the picker adds a choice, it does not take one away.
-
-    Slots are the union of three sources: a scan row (live — labelled with what it is
-    working on, the only label recognisable among twenty — or dead, with its last
-    conversation), a worktree on disk (the no-scan fallback, labelled "worktree"), and
-    an existing list ("N open" rides on the summary). A live row beats a dead one for
-    the same slot (a session rooted outside its worktree is both), and a sibling
-    alias's live session (`dot-4` when asked about dotfiles) counts through `aliases`,
-    keyed canonically. Pure: the caller gathers."""
-    aliases = aliases or {}
-    by_num = {}
-    for r in rows:
-        head, _, num = r.get("slot", "").rpartition("-")
-        if not num.isdigit() or (head != alias and aliases.get(head) != alias):
-            continue
-        prev = by_num.get(num)
-        if prev is None or (prev.get("state") not in _LIVE_STATES
-                            and r.get("state") in _LIVE_STATES):
-            by_num[num] = dict(r, slot="%s-%s" % (alias, num))
-    seen = set(by_num) | {s for s in wt_slots if s.isdigit()}
-    open_counts = {}
-    for key, n in list_keys.items():
-        head, _, num = key.rpartition("-")
-        if head == alias and num.isdigit():
-            seen.add(num)
-            open_counts[num] = n
-    out = [(alias, _synth_row(alias, "(no slot — the repo-level list)"))]
-    for num in sorted(seen, key=int):
-        row = by_num.get(num) or _synth_row(
-            "%s-%s" % (alias, num), "worktree" if num in wt_slots else "")
-        summary = (row.get("summary") or "").strip()
-        if not summary and row.get("state") in _LIVE_STATES:
-            summary = "(live)"
-        bits = [summary] if summary else []
-        if open_counts.get(num):
-            bits.append("%d open" % open_counts[num])
-        row["summary"] = " · ".join(bits) or "-"
-        out.append((row["slot"], row))
-    return out
-
-
-def _todo_target_labels(targets, width=80):
-    """Picker labels for [(key, row)] targets: each row drawn by _slot_line with a plain
-    Style, so the picker can measure and truncate what it shows — the `t ls` row,
-    minus colour. Width accounts for the picker's own `│ ›` rail."""
-    st = Style(tty=False)
-    name_w = max([7] + [len(r["slot"]) for _, r in targets])
-    avail = max(12, width - 8 - 8 - name_w - 1)
-    return [(key, _slot_line(r, st, name_w, avail)) for key, r in targets]
-
-
-def _todo_alias_map(cfg):
-    """Every DEV_REPOS key → the canonical alias for its dir. Sibling keys (dot +
-    dotfiles) name one tree, and repo_of_dir only ever resolves to one of them — the
-    key equal to the basename, else the shortest — so that is the key a slot's list
-    lives under, and the one every alias must resolve to."""
-    by_dir = {}
-    for key, path in (cfg.repos or {}).items():
-        by_dir.setdefault(os.path.realpath(path), []).append(key)
-    out = {}
-    for path, keys in by_dir.items():
-        base = os.path.basename(path)
-        canon = base if base in keys else min(keys, key=len)
-        for k in keys:
-            out[k] = canon
-    return out
-
-
-def _todo_canon_aliases(cfg):
-    """One alias per repo DIR, sorted — offering both `dot` and `dotfiles` would list
-    the same slots twice under two names. The canonical side of _todo_alias_map."""
-    return sorted(set(_todo_alias_map(cfg).values()))
-
-
-def _todo_add_targets_all(aliases, rows, list_keys, wt_slots, amap=None):
-    """Destinations for an add from NOWHERE -- no repo in the cwd -> [(key, row)].
-
-    "scratch" stays FIRST so Enter keeps the old fallback behaviour: the picker adds a
-    choice, it never takes one away. Then every repo that has somewhere to file -- a
-    live slot, a worktree, or an existing list. A repo with none of those is left out on
-    purpose: from nowhere the useful destinations are the ones that already exist, and
-    `-s <key>` still reaches any list by name. Pure: the caller gathers.
-
-    wt_slots is keyed by alias here (one repo per key), unlike the single-repo twin."""
-    out = [("scratch", _synth_row("scratch", "(no repo — the catch-all list)"))]
-    for alias in aliases:
-        targets = _todo_add_targets(alias, rows, list_keys, wt_slots.get(alias) or set(), amap)
-        if len(targets) == 1 and alias not in list_keys:
-            continue                     # no slots, no list -- nothing to file against
-        out.extend(targets)
-    return out
-
-
-def _todo_render_all(entries, width=80, st=None):
-    """The -A cross-slot view: every list with something open, grouped by key. This is
-    the actual answer to 'many things in parallel and I forget what I need to do'."""
-    st = st or Style()
-    live = [(k, _todo_open(d)) for k, d in entries]
-    live = [(k, items) for k, items in live if items]
-    if not live:
-        return ["%snothing open in any slot%s" % (st.y, st.r),
-                "", "  %s%s%s" % (st.y, _TODO_FOOT, st.r)]
-    kw = max(len(k) for k, _ in live)
-    lines = []
-    for key, items in live:
-        for n, i in enumerate(items):
-            label = key if n == 0 else ""
-            body = _truncate(i["text"], max(10, width - kw - 10))
-            lines.append("  %s%-*s%s  %s%2d%s  ◻ %s"
-                         % (st.b, kw, label, st.r, st.c, i["id"], st.r, body))
-    return lines + ["", "  %s%s%s" % (st.y, _TODO_FOOT, st.r)]
-
-
 # The dev server a slot's work is testable at. Mirrors financial-forecast's
 # scripts/dev-worktree.sh, which is the thing that actually binds the port:
 # .worktrees/<repo>/<N> → 5200+N, primary checkout → Vite's canonical 5173.
-# Re-derived here rather than shelled out to because the statusline renders many
-# times a second and that script costs a bash plus several lsof calls.
+# Re-derived here rather than shelled out to because the MCP rows render it often
+# and that script costs a bash plus several lsof calls.
 _DEV_PORT_BASE = 5200
 _DEV_PORT_PRIMARY = 5173
 
@@ -4252,501 +3646,6 @@ def _dev_url(key, cwd):
     return "http://localhost:%d" % port if _port_is_live(port) else None
 
 
-# A single item's share of the one-line bar. The bar is a reminder, not the list —
-# `t todo` shows the full text — and without a cap one 140-char task fits a wide
-# terminal outright and hides every item behind it (the width fit only ever
-# ellipses an item that OVERFLOWS the bar). Sized so a hand-off's usual lead-in,
-# a name plus the URL it is checked at, survives whole:
-#   "Accounts ledger (http://localhost:5217/#accounts) Aug 21…"
-_TODO_BAR_ITEM_MAX = 56
-
-
-# A single item's share of the one-line bar. The bar is a reminder, not the list —
-# `t todo` shows the full text — and without a cap one 140-char task fits a wide
-# terminal outright and hides every item behind it (the width fit only ever
-# ellipses an item that OVERFLOWS the bar). Sized so a hand-off's usual lead-in,
-# a name plus the URL it is checked at, survives whole:
-#   "Accounts ledger (http://localhost:5217/#accounts) Aug 21…"
-_TODO_BAR_ITEM_MAX = 56
-
-
-def _todo_statusline(payload, cfg, items_n=1, width=80, tmux_name=None):
-    """Claude Code's statusLine. The payload arrives as JSON on stdin;
-    workspace.current_dir is preferred over cwd (they differ when Claude is run from a
-    subdir of the project). Everything is optional — a statusline that raises leaves
-    the TUI with a permanently broken status bar, so every field degrades to nothing.
-
-    Layout is two zones split by │: a dim head (slot · model, plus ● and the URL the
-    slot is testable at when a dev server is live) and the tasks, each carrying its own
-    checkbox — so the box, not a separator, is what delimits an item.
-    The open COUNT is deliberately gone: the ◻s and the trailing +N already say how
-    many, and a bare number sitting next to a checkbox read as an item.
-
-    A slot's bar also carries its REPO-level list — the cross-slot notes live there,
-    and keying the bar strictly on the slot hid them from every place you actually
-    work — on a SECOND LINE, dim throughout, headed by the repo key with its │ aligned
-    under the first line's:
-        ff-22 · Fable 5 ● http://localhost:5222 │ ◻ integrate into ff 11
-        ff                                      │ ◇ keep forecast on aug 15  +2 more
-    The two used to share one line (◻ then ◇), and at 20+ live slots that read as one
-    undifferentiated run of tasks in which the slot's OWN work — the thing the bar is
-    for — was one glyph-shape away from the repo's. Now the hierarchy is structural:
-    line 1 is always mine, line 2 always the repo's, and a slot with no repo notes is
-    the single line it always was. Claude Code renders each printed line as its own
-    row (and sets $COLUMNS, which _columns() reads, so both lines fit the terminal).
-
-    Every item is capped at _TODO_BAR_ITEM_MAX before the width fit, so one long task
-    cannot take a line. items_n > 1 is the older -n form: a header plus one line per
-    item, own then shared.
-
-    Colour is emitted UNCONDITIONALLY (honouring NO_COLOR) — Style() gates on
-    isatty and stdout here is always the pipe Claude Code reads, so the shared helper
-    would render every bar plain.
-
-    tmux_name is gathered by the caller and passed in (the ladder stays pure). Without
-    it the bar renders a DIFFERENT list from the one `t todo add` files into whenever
-    the cwd carries no slot of its own — a session run from a repo's primary checkout
-    inside a dev-<repo>-<n> window is exactly that case, and the items silently never
-    appear."""
-    if not isinstance(payload, dict):
-        payload = {}
-    ws = payload.get("workspace") if isinstance(payload.get("workspace"), dict) else {}
-    cwd = ws.get("current_dir") or payload.get("cwd") or os.getcwd()
-    model = payload.get("model") if isinstance(payload.get("model"), dict) else {}
-    name = (model.get("display_name") or "").strip()
-    key = _todo_key(cfg, cwd, tmux_name)
-    own = [("◻", i["id"], i["text"]) for i in _todo_open(_todo_load(_todo_path(key)))]
-    parent = _todo_parent(key, cfg.repos)
-    shared = [("◇", i["id"], i["text"])
-              for i in _todo_open(_todo_load(_todo_path(parent)))] if parent else []
-    items = own + shared                   # the slot's own work first, shared notes after
-
-    dim, cyan, green, rst = ("", "", "", "") if os.environ.get("NO_COLOR") else \
-        ("\033[2m", "\033[36m", "\033[32m", "\033[0m")
-    head = " · ".join([key] + ([name] if name else []))
-    # A live dev URL rides in the head zone, but deliberately NOT dim — it is the one
-    # part of the bar you act on. Carried as (coloured, printable) so the one-line
-    # packer below keeps measuring real widths rather than escape sequences.
-    url = _dev_url(key, cwd)
-    # " ● " + url + " │ " is 6 columns of chrome, and an item needs ~12 to say anything.
-    # On a bar too narrow for both, the tasks win — they are the reason for the bar.
-    if url and len(head) + len(url) + 18 > width:
-        url = None
-    if url:
-        head_c = "%s%s%s %s●%s %s%s%s%s │ %s" % (dim, head, rst, green, rst,
-                                                 cyan, url, rst, dim, rst)
-        head_p = "%s ● %s │ " % (head, url)
-    else:
-        head_c, head_p = dim + head + " │ " + rst, head + " │ "
-    if not items:
-        return head_c + dim + "nothing open" + rst
-
-    if items_n > 1:
-        shown = items[:items_n]
-        iw = max(len(str(i)) for _, i, _ in shown)
-        out = [head_c + dim + "%d open" % len(items) + rst]
-        for g, ident, text in shown:
-            out.append("  %s %s%*d%s %s"
-                       % (cyan + g + rst, dim, iw, ident, rst,
-                          _truncate(text, max(10, width - 6 - iw))))
-        if len(items) > items_n:
-            out.append("  %s+%d more%s" % (dim, len(items) - items_n, rst))
-        return "\n".join(out)
-
-    if not shared:
-        return _todo_pack(head_c, head_p, own, width, cyan, dim, rst)
-    first = (_todo_pack(head_c, head_p, own, width, cyan, dim, rst) if own
-             else head_c + dim + "nothing open here" + rst)
-    # The repo line: its key padded so the │ sits under line 1's (a two-row table,
-    # not two bars), unless that padding would leave no room for an item to say
-    # anything (20 columns after the │ — less renders as a bare "N open").
-    pad = len(head_p) - 3
-    label = parent.ljust(pad) if pad + 3 + 20 <= width else parent
-    second = _todo_pack(dim + label + " │ ", label + " │ ", shared, width, "", dim, rst)
-    if rst and not second.endswith(rst):
-        second += rst
-    return first + "\n" + second
-
-
-def _todo_pack(head_c, head_p, items, width, gc, dim, rst):
-    """One bar line: after the head, as many items as `width` allows, each behind its
-    glyph, then "+N more". Fits against a limit that already reserves that tail, so
-    the assembled line can never exceed `width`; only the FIRST item is ever ellipsed
-    (a mid-list ellipsis reads noisier than a +N). head_c/head_p are the coloured and
-    printable heads — the packer measures the printable one. gc colours each glyph;
-    empty leaves the line's own colour alone, for the repo line that is dim
-    throughout."""
-    tail_room = len("  +%d more" % len(items)) if len(items) > 1 else 0
-    limit = width - tail_room
-    plain, line, shown = head_p, head_c, 0
-    for g, _, text in items:
-        text = _truncate(text, _TODO_BAR_ITEM_MAX)   # every item; the width fit below
-        sep = "  " if shown else ""                  # only ever ellipses the first
-        if len(plain) + len(sep) + 2 + len(text) > limit:
-            if shown:
-                break
-            avail = limit - len(plain) - 2
-            if avail < 10:
-                break
-            text = _truncate(text, avail)
-        plain += sep + g + " " + text
-        line += sep + (gc + g + rst if gc else g) + " " + text
-        shown += 1
-    if not shown:                          # a width too narrow for even one item
-        return head_c + dim + "%d open" % len(items) + rst
-    if shown < len(items):
-        line += "%s  +%d more%s" % (dim, len(items) - shown, rst)
-    return line
-
-
-def _todo_live_slots():
-    """Live dev slots by name, straight from tmux (8ms) — for the gates that run on
-    every view and behind the statusline, where a slot NUMBER is all that is asked.
-    The pickers use _slot_rows instead: the full `t ls` scan (~0.3s), which #90 pulled
-    out of here for "suspending the shell" — that was zsh_capture's child taking the
-    terminal (fixed there, see its note), not the scan; the 5s was the pre-batch
-    transcript reading, gone since _transcript_meta_batch."""
-    try:
-        r = subprocess.run(["tmux", "list-sessions", "-F", "#{session_name}"],
-                           stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
-    except OSError:
-        return []
-    return [{"slot": n[4:], "summary": ""} for n in r.stdout.split() if n.startswith("dev-")]
-
-
-def _todo_worktree_slots(cfg, alias):
-    """The slot dirs on disk for one repo: $DEV_WORKTREE_ROOT/<basename>/<slot>."""
-    root = os.path.join(cfg.worktree_root, os.path.basename(cfg.repos.get(alias, "")))
-    return {os.path.basename(p) for p in glob.glob(os.path.join(root, "*"))
-            if os.path.exists(os.path.join(p, ".git"))}
-
-
-def _todo_pick_target(cfg, alias):
-    """Ask which list a slotless add should go to. Returns a key, or None to stay put.
-
-    `alias` None means the cwd names no repo at all (an add from ~), so the choice
-    widens across every repo instead of not being offered: the old gate only fired from
-    a repo dir, which left the from-nowhere add silently filing to `scratch` with a ✓
-    line that never said so — the one write path that did not name its list."""
-    if not (sys.stdin.isatty() and sys.stdout.isatty()):
-        return None
-    list_keys = {os.path.basename(p)[:-5]: len(_todo_open(_todo_load(p)))
-                 for p in glob.glob(os.path.join(_todo_dir(), "*.json"))}
-    amap = _todo_alias_map(cfg)
-    aliases = [amap.get(alias, alias)] if alias else _todo_canon_aliases(cfg)
-    # The `t ls` scan plus the dead slots, in one zsh — the rows the picker shows are
-    # the rows `t ls` and `t resume` show, drawn by the same _slot_line.
-    rows = _slot_rows(cfg, aliases)
-    if alias:
-        targets = _todo_add_targets(aliases[0], rows, list_keys,
-                                    _todo_worktree_slots(cfg, aliases[0]), amap)
-    else:
-        targets = _todo_add_targets_all(
-            aliases, rows, list_keys,
-            {a: _todo_worktree_slots(cfg, a) for a in aliases}, amap)
-    if len(targets) == 1:
-        return None                      # nowhere to file but here — nothing to choose
-    legend = "   ● attached · ✓ active" if any(
-        r.get("state") in _LIVE_STATES for _, r in targets) else ""
-    return _pick_inline("add to which list?" + legend,
-                        _todo_target_labels(targets, _columns()))
-
-
-def _todo_pick_action(item):
-    """What to do with one item; None if it cannot pick (caller prints the hint)."""
-    return _pick_inline('#%d  %s' % (item["id"], _truncate(item["text"], 50)),
-                        _todo_id_actions(item))
-
-
-def _todo_pick_ids(entries, action, multi=True):
-    """Pick the items for a no-id action across `entries` → [(key, id)]. None = cannot or
-    would not pick (caller keeps its 'needs an id' error, so scripts are unchanged)."""
-    cands = _todo_scoped_candidates(entries, action)
-    if not cands:
-        return None
-    rows = [((key, ident), lbl) for key, ident, lbl in cands]
-    return _pick_inline("%s which?" % _todo_canon(action), rows, multi=multi) or None
-
-
-def _todo_all_entries():
-    """(key, data) for every list on disk, key-sorted."""
-    return [(os.path.basename(p)[:-5], _todo_load(p))
-            for p in sorted(glob.glob(os.path.join(_todo_dir(), "*.json")))]
-
-
-def _tmux_session_name():
-    """The tmux session this shell is in, or None. Gathering only — _todo_key takes it
-    as an argument so the ladder stays pure."""
-    if not os.environ.get("TMUX"):
-        return None
-    try:
-        out = subprocess.run(["tmux", "display-message", "-p", "#S"],
-                             capture_output=True, text=True)
-    except OSError:
-        return None
-    return out.stdout.strip() or None
-
-
-def cmd_todo(cfg, args):
-    # --statusline is a rendering-only path invoked by Claude Code many times a second;
-    # it must never raise and never write. The blanket except is deliberate.
-    if args.statusline:
-        payload = {}
-        try:
-            raw = "" if sys.stdin.isatty() else sys.stdin.read()
-            if raw.strip():
-                payload = json.loads(raw)
-        except Exception:
-            payload = {}   # unparseable stdin still gets a line, just without the model
-        try:
-            print(_todo_statusline(payload, cfg, args.items or 1, _columns(),
-                                   _tmux_session_name()))
-        except Exception:
-            print("")
-        return 0
-
-    # `t todo ff add …` / `t todo ff 3` — the `<repo> [slot]` positionals every other
-    # slot verb takes. They are sugar for -s: the key lands in args.slot and the real
-    # action shifts left, so nothing below has to know the list was named positionally.
-    target, action, rest = _todo_repo_arg(args.action, args.rest, cfg.repos)
-    if target:
-        # Canonical alias, as `t todo add dot 3 …` and the key ladder resolve it: one
-        # slot, one list (see _todo_alias_map). An explicit -s stays verbatim.
-        head, dash, num = target.rpartition("-")
-        amap = _todo_alias_map(cfg)
-        target = ("%s-%s" % (amap.get(head, head), num) if dash and num.isdigit()
-                  else amap.get(target, target))
-        if args.slot and args.slot != target:
-            print("t todo: -s %s and %s name different lists — drop one"
-                  % (args.slot, target), file=sys.stderr)
-            return 2
-        # Re-parse the shifted tail as `todo -s <key> …`: REMAINDER swallowed anything
-        # after the repo on the first pass, so `t todo ff -a` arrived with `-a` as the
-        # action. Flags already parsed ahead of the repo are kept; -h prints and exits.
-        tail = build_parser().parse_args(["todo", "-s", target]
-                                         + ([action] if action is not None else []) + rest)
-        for name in ("all", "all_slots", "json", "statusline", "items"):
-            setattr(args, name, getattr(args, name) or getattr(tail, name))
-        args.slot, args.action, args.rest = target, tail.action, tail.rest
-    # `t todo ls -A`: flags typed after the action live in rest. Deliberately AFTER the
-    # repo shift — the hoist's rule depends on the real action (`add` text is prose, ids
-    # are not), and the shift's re-parse parks after-action flags in rest all over again.
-    _todo_hoist_flags(args)
-
-    # `t todo add -h` must print help, not file an item called "-h". REMAINDER swallows
-    # flags after the action, so the t() shim's -h check and argparse both miss it.
-    # Only the FIRST token counts, so `t todo add fix the -h flag` still adds normally.
-    if args.action in ("-h", "--help") or (args.rest and args.rest[0] in ("-h", "--help")):
-        build_parser().parse_args(["todo", "--help"])   # prints, then SystemExit(0)
-
-    width = _columns()
-    st = Style()
-
-    if args.all_slots:
-        entries = _todo_all_entries()
-        for line in _todo_render_all(entries, width, st):
-            print(line)
-        return 0
-
-    key = _todo_key(cfg, os.getcwd(), _tmux_session_name(), args.slot)
-
-    def live_gate():
-        """Slot numbers the repo view is limited to: its live sessions, unless -a asked
-        for everything. None disables the gate."""
-        return None if args.all else _todo_live_nums(cfg.repos, key, _todo_live_slots())
-
-    def scope():
-        """Lists this invocation acts on, exactly the set the view shows: a slotless cwd
-        widens DOWN to the repo's slots, a slot widens UP to its repo-level list. The
-        actions have to track the view either way, or you see an item you cannot touch.
-        An EXPLICITLY named list (-s, or the repo/slot positionals) is exactly that
-        list: the ambiguous-id error says "name one with -s", and naming one has to
-        actually narrow, or the advice is a dead end."""
-        if args.slot:
-            return [(key, data)]
-        if key in cfg.repos:
-            found = _todo_scoped(_todo_all_entries(), key, live_gate())
-            if found:
-                return found
-        shared = _todo_shared(cfg, key)
-        return [(key, data), shared] if shared else [(key, data)]
-    # An `add` resolves its destination three ways, most explicit first: -s names a list
-    # outright; the `<repo> [slot]` positionals every slot verb takes name one from
-    # anywhere (`t todo add ff 22 fix the ledger`), and a leading bare slot number
-    # files ACROSS slots without leaving the dir (`t todo add 11 fix the ledger`);
-    # otherwise the list is ASKED for rather than guessed. The picker used to be gated
-    # on `key in cfg.repos`, so an add from ~ fell through to the `scratch` catch-all
-    # with no prompt — and since the ✓ line named no list either, `t todo add 11`
-    # looked like it had gone to a slot 11 that was never involved. Both halves are
-    # fixed here and at the ✓ print below.
-    if _todo_canon(args.action or "ls") == "add" and not args.slot:
-        amap = _todo_alias_map(cfg)
-        alias = amap.get(key if key in cfg.repos else key.rpartition("-")[0])
-        dest, stripped = _todo_dest_args(args.rest, amap, alias)
-        if dest:
-            key, args.rest = dest, stripped
-        elif " ".join(args.rest).strip():
-            # No repo to resolve a number against (or no number): ask. The leading token
-            # stays part of the text — a slot needs a repo, and the picker shows both.
-            key = _todo_pick_target(cfg, alias) or key
-    # `t todo ls 17` names a slot the way `add 17 …` does; `ls` used to drop its args on
-    # the floor and render the widened repo view, so there was no way to see ONE slot.
-    if _todo_canon(args.action or "ls") == "ls" and args.rest:
-        key, err = _todo_ls_target(key, cfg.repos, args.rest)
-        if err:
-            print("t todo ls: %s" % err, file=sys.stderr)
-            return 2
-    path = _todo_path(key)
-    data = _todo_load(path)
-    action = args.action or "ls"
-
-    if args.json:
-        json.dump({"key": key, "path": path, **data}, sys.stdout, ensure_ascii=False, indent=1)
-        sys.stdout.write("\n")
-        return 0
-
-    # A lone id is not an action, but it is obviously about one item — offer what can be
-    # done with it rather than rejecting it.
-    if action and action.isdigit() and not args.rest:
-        hits = _todo_locate(scope(), action)
-        if len(hits) > 1:
-            print("t todo: #%s is in %s — name one with -s"
-                  % (action, ", ".join(k for k, _ in hits)), file=sys.stderr)
-            return 2
-        key = hits[0][0] if hits else key
-        path = _todo_path(key)
-        data = dict(scope()).get(key, data) if hits else data
-        item = hits[0][1] if hits else None
-        picked = _todo_pick_action(item) if item else None
-        if picked == "mv":
-            dest = _todo_pick_target(cfg, key.rpartition("-")[0] if key not in cfg.repos else key)
-            if not dest or dest == key:
-                return 2
-            dst_data = _todo_load(_todo_path(dest))
-            msg, rc = _todo_move(data, dst_data, action, dest)
-            if rc == 0:
-                _todo_save(_todo_path(dest), dst_data)
-                _todo_save(path, data)
-            print(msg, file=sys.stderr if rc else sys.stdout)
-            return rc
-        if picked:
-            msg, rc = _todo_apply(data, picked, [action])
-            if rc != 2:
-                _todo_save(path, data)
-            print(msg, file=sys.stderr if rc else sys.stdout)
-            if rc:
-                return rc
-            for line in _todo_render(data, key, args.all, width, st,
-                                     _todo_shared(cfg, key)):
-                print(line)
-            return 0
-        if not item:
-            print("⚠ no such item: %s" % action, file=sys.stderr)
-            return 1
-        print("t todo: %s is an item, not an action. Try:  t todo done %s  ·  t todo rm %s"
-              % (action, action, action), file=sys.stderr)
-        return 2
-
-    if _todo_canon(action) == "mv":
-        rest = list(args.rest)
-        if not rest:                                   # which item?
-            rest = _todo_pick_ids(data, "mv", multi=False) or []
-        if len(rest) == 1:                             # …and where to?
-            alias = key.rpartition("-")[0] if key not in cfg.repos else key
-            picked = _todo_pick_target(cfg, alias) if alias in cfg.repos else None
-            if picked and picked != key:
-                rest.append(picked)
-        if len(rest) < 2:
-            print("t todo mv: needs an id and a destination — t todo mv 2 ff-3", file=sys.stderr)
-            return 2
-        tok, dst_key = rest[0], rest[1]
-        if dst_key == key:
-            print("t todo mv: #%s is already in %s" % (tok, key), file=sys.stderr)
-            return 2
-        dst_path = _todo_path(dst_key)
-        dst_data = _todo_load(dst_path)
-        msg, rc = _todo_move(data, dst_data, tok, dst_key)
-        if rc == 0:
-            _todo_save(dst_path, dst_data)
-            _todo_save(path, data)
-        print(msg, file=sys.stderr if rc else sys.stdout)
-        return rc
-
-    # A repo dir names no slot. Showing only the (usually empty) repo-level list hides
-    # the work sitting in that repo's slots, so a slotless view widens to the repo —
-    # to its LIVE slots only (-a widens to inactive ones too; the repo-level list is
-    # shown regardless).
-    if (_todo_canon(action) == "ls" and key in cfg.repos
-            and (_todo_open(data) or any(
-                _todo_open(d) for _, d in _todo_scoped(_todo_all_entries(), key,
-                                                       live_gate())))):
-        scoped = _todo_scoped(_todo_all_entries(), key, live_gate())
-        if len(scoped) > 1 or not _todo_open(data):
-            n = sum(len(_todo_open(d)) for _, d in scoped)
-            print("%s%s%s %s— %d open%s" % (st.b, key, st.r, st.y, n, st.r))
-            for line in _todo_render_all(scoped, width, st):
-                print(line)
-            return 0
-
-    if _todo_canon(action) != "ls":
-        rest, canon = list(args.rest), _todo_canon(action)
-        if canon in ("done", "rm"):
-            entries = scope()
-            by_list = {}
-            if rest:
-                for tok in rest:                       # explicit ids resolve in scope too
-                    hits = _todo_locate(entries, tok)
-                    if len(hits) > 1:
-                        print("t todo: #%s is in %s — name one with -s"
-                              % (tok, ", ".join(k for k, _ in hits)), file=sys.stderr)
-                        return 2
-                    if not hits:
-                        print("⚠ no such item: %s" % tok, file=sys.stderr)
-                        return 1
-                    by_list.setdefault(hits[0][0], []).append(tok)
-            else:
-                for k, ident in _todo_pick_ids(entries, canon) or []:
-                    by_list.setdefault(k, []).append(str(ident))
-            if not by_list:
-                print("t todo %s: needs an id (t todo to list them)" % canon, file=sys.stderr)
-                return 2
-            worst = 0
-            for k, toks in by_list.items():
-                d = dict(entries)[k] if k != key else data
-                msg, rc = _todo_apply(d, canon, toks)
-                if rc != 2:
-                    _todo_save(_todo_path(k), d)
-                print(msg, file=sys.stderr if rc else sys.stdout)
-                worst = max(worst, rc)
-            if worst:
-                return worst
-            # _todo_render_all only fits a view widened DOWN to sibling slots; a slot
-            # widened UP re-renders as itself, with the repo section under it.
-            for line in _todo_render_all(scope(), width, st) \
-                    if key in cfg.repos and len(entries) > 1 \
-                    else _todo_render(data, key, args.all, width, st,
-                                      _todo_shared(cfg, key)):
-                print(line)
-            return 0
-
-        msg, rc = _todo_apply(data, action, rest)
-        if rc != 2:
-            _todo_save(path, data)
-        if msg and canon == "add" and not rc:
-            # Always name the list. The destination comes from the cwd, a bare slot arg
-            # or a picker — none of which the ✓ line showed, so an add that landed
-            # somewhere unintended stayed invisible until you went looking for it.
-            msg = "%s   %s→ %s%s" % (msg, st.y, key, st.r)
-        if msg:
-            print(msg, file=sys.stderr if rc else sys.stdout)
-        if rc:
-            return rc
-        if canon == "add":
-            return 0
-
-    for line in _todo_render(data, key, args.all, width, st, _todo_shared(cfg, key)):
-        print(line)
-    return 0
 
 # ─── mcp — which session is working on what ───────────────────────────────────
 #
@@ -4765,7 +3664,7 @@ def cmd_todo(cfg, args):
 # plus ONE `tmux list-sessions` fork — the zsh _dev_session_rows scan costs 1-5 s and
 # its only extra signal (idle vs active by capture-pane) is not decision-relevant
 # here; only all_hosts=true pays for zsh_capture("_dev_rows_all"), because remote
-# liveness has no other source; (3) the `t todo` store via _todo_all_entries.
+# liveness has no other source.
 #
 # The CALLER judges. find_sessions returns keyword-scored candidates WITH the prompt
 # excerpts that matched, and the instructions tell the model to read them — the caller
@@ -5097,7 +3996,7 @@ def _local_host():
     return socket.gethostname().split(".")[0]
 
 
-def _session_row(cfg, rec, live_by_sid, now, cache_root=None, this_sid=None, todo_counts=None,
+def _session_row(cfg, rec, live_by_sid, now, cache_root=None, this_sid=None,
                  local_host=None):
     """The dict every tool returns per session. Pure given the record: the only I/O is
     an isdir on the worktree, a stat on the opened stamp, and reads of the two
@@ -5137,7 +4036,6 @@ def _session_row(cfg, rec, live_by_sid, now, cache_root=None, this_sid=None, tod
         "prompts_total": rec.get("n_prompts", 0),
         "first_prompts": [p["text"] for p in prompts[:3]],
         "last_prompts": [p["text"] for p in prompts[-3:]] if len(prompts) > 3 else [],
-        "todo_open": (todo_counts or {}).get(key, 0) if key else 0,
         "url": None,
         "this_session": bool(this_sid and sid == this_sid),
     }
@@ -5329,7 +4227,7 @@ def _repo_path(cfg, alias):
 
 
 def _find_sessions(recs, terms, live_by_sid, cfg, days=60, repo=None, limit=10, now=None,
-                   cache_root=None, this_sid=None, todo_counts=None):
+                   cache_root=None, this_sid=None):
     now = now or time.time()
     days = max(0, int(days or 0))
     limit = max(1, min(30, int(limit or 10)))
@@ -5350,7 +4248,7 @@ def _find_sessions(recs, terms, live_by_sid, cfg, days=60, repo=None, limit=10, 
         score = _kw_score(rec, terms)
         if not score:
             continue
-        row = _session_row(cfg, rec, live_by_sid, now, cache_root, this_sid, todo_counts)
+        row = _session_row(cfg, rec, live_by_sid, now, cache_root, this_sid)
         if cutoff and row["activity_epoch"] < cutoff:
             continue
         row["score"] = score
@@ -5371,7 +4269,7 @@ def _session_ref_resolve(ref, cfg, recs, live_by_sid):
     """A tool's `session` argument → its index record, or ValueError with a teaching
     message. Forms, most specific first: dev-<x> (stripped); <alias>-<n> / <alias> <n>
     with a real DEV_REPOS alias and a numeric tail (rpartition on the last dash —
-    _todo_parent's rule, so `financial-forecast-17` is a slot of financial-forecast)
+    so `financial-forecast-17` is a slot of financial-forecast)
     → the live session rooted at that slot's worktree, else the slot's newest real
     transcript; <alias>:<hex> or a bare hex prefix → a unique session id."""
     ref = (ref or "").strip()
@@ -5448,37 +4346,6 @@ def _plan_head_lines(path, n=40):
         return None
 
 
-def _todo_rows(entries, cfg, live_rows, include_done=False, repo=None):
-    """The `t todo` lists as tool rows: one per list with anything to show. `repo`
-    keeps only that repo's lists (sibling aliases compare by path, like
-    _todo_live_nums); `live` says whether the slot has a tmux session."""
-    want = None
-    if repo:
-        want = cfg.repos.get(repo)
-        if not want:
-            raise ValueError("unknown repo alias %r — one of: %s"
-                             % (repo, ", ".join(sorted(cfg.repos)) or "(none configured)"))
-    out = []
-    for key, data in entries:
-        parent = _todo_parent(key, cfg.repos)
-        alias = parent or (key if key in cfg.repos else None)
-        if want and cfg.repos.get(alias) != want:
-            continue
-        items = _todo_visible(data, show_all=include_done)
-        if not items:
-            continue
-        num = key.rpartition("-")[2] if parent else ""
-        out.append({
-            "key": key, "repo": alias, "slot": key if parent else None,
-            "live": bool(parent) and num in _todo_live_nums(cfg.repos, parent, live_rows),
-            "open": [{"id": i["id"], "text": i["text"], "added": _fmt_ts(i.get("added"))}
-                     for i in items if not i.get("done")],
-            "done": [{"id": i["id"], "text": i["text"], "done_at": _fmt_ts(i.get("done_at"))}
-                     for i in items if i.get("done")],
-        })
-    return out
-
-
 # ── the tools ──
 
 _MCP_SERVER_INFO = {"name": "sessions", "version": "1"}
@@ -5488,13 +4355,11 @@ _MCP_INSTRUCTIONS = (
     "claudes, and every saved transcript. Use these tools UNPROMPTED — the user will not "
     "name this server — whenever they ask which session/slot/worktree/branch is or was "
     "working on something ('which session had the accounts redesign?'), what a slot is "
-    "doing or where it left off, what is left to do (todo lists), or which PR a session "
-    "opened. find_sessions returns candidates WITH prompt excerpts: judge the match "
+    "doing or where it left off, or which PR a session opened. find_sessions returns candidates WITH prompt excerpts: judge the match "
     "yourself from the excerpts and titles, then session_detail for the winner. Slots are "
     "named <repo>-<n> (tmux session dev-<repo>-<n>, worktree ~/code/.worktrees/<basename>/"
     "<n>, branch dev/<basename>-<n>); a live one is attached with `t open <repo> <n>`, a "
-    "dead one revived with `t resume <repo> <n>`, its tasks with `t todo -s <repo>-<n>` — "
-    "tell the user those commands rather than running them. A result flagged "
+    "dead one revived with `t resume <repo> <n>` — tell the user those commands rather than running them. A result flagged "
     "this_session is the conversation you are in.")
 
 _MCP_TOOLS = [
@@ -5518,7 +4383,7 @@ _MCP_TOOLS = [
     {"name": "list_sessions",
      "description": (
          "The live Claude sessions right now: tmux dev slots (<repo>-<n>) and foreground "
-         "claudes, with title, branch, PR + state, open todo count, dev-server URL, and "
+         "claudes, with title, branch, PR + state, dev-server URL, and "
          "the last prompts. Use it for 'what is running', 'what is slot 17 doing', or to "
          "map a slot to its worktree/branch. all_hosts also asks the other machines "
          "(slow: several seconds)."),
@@ -5528,7 +4393,7 @@ _MCP_TOOLS = [
     {"name": "session_detail",
      "description": (
          "Everything about one session: title, cwd, worktree, branch, git log/status of "
-         "the worktree if it still exists, live state, PR + state, its todo lists, plan "
+         "the worktree if it still exists, live state, PR + state, plan "
          "file head, the first and last prompts, and the last assistant message (where it "
          "left off). `session` is a session id or unique prefix, or a slot like ff-17 / "
          "dot-6 (live slot → its session; dead slot → its newest transcript)."),
@@ -5536,30 +4401,20 @@ _MCP_TOOLS = [
          "session": {"type": "string"},
          "plan_lines": {"type": "integer", "default": 40}},
          "required": ["session"]}},
-    {"name": "list_todos",
-     "description": (
-         "The `t todo` task lists: every slot's open items (and recently finished), with "
-         "whether the slot is live. Use it for 'what is left to do on X' or 'which slot "
-         "has the task about Y'."),
-     "inputSchema": {"type": "object", "properties": {
-         "repo": {"type": "string", "description": "DEV_REPOS alias to restrict to"},
-         "include_done": {"type": "boolean", "default": False}}}},
 ]
 
 
 def _mcp_context(cfg, state):
     """Everything a tool call reads, gathered once per call (glue): the index (re-stat
     at most every _INDEX_REFRESH_S — a back-to-back pair of calls must not walk 600
-    files twice), liveness, the todo store."""
+    files twice) and liveness."""
     now = time.time()
     if state.get("recs") is None or now - state.get("at", 0) > _INDEX_REFRESH_S:
         state["recs"] = _index_dedupe(_index_all(_projects_dir(), _index_dir()))
         state["at"] = now
     tmux_rows, panes, parents, registry = _live_rows(_cache_root(), _projects_dir())
     live_by_sid, idle = _live_index(tmux_rows, panes, parents, registry, cfg)
-    entries = _todo_all_entries()
-    return {"recs": state["recs"], "live": live_by_sid, "idle": idle, "todo": entries,
-            "todo_counts": {k: len(_todo_open(d)) for k, d in entries},
+    return {"recs": state["recs"], "live": live_by_sid, "idle": idle,
             "live_rows": [{"slot": v["slot"]} for v in live_by_sid.values()]
                          + [{"slot": i["slot"]} for i in idle],
             "now": now, "cache_root": _cache_root(),
@@ -5572,8 +4427,7 @@ def _tool_find(cfg, ctx, args):
         raise ValueError("give me a few keywords — e.g. 'accounts page redesign'")
     return _find_sessions(ctx["recs"], terms, ctx["live"], cfg, days=args.get("days", 60),
                           repo=args.get("repo"), limit=args.get("limit", 10), now=ctx["now"],
-                          cache_root=ctx["cache_root"], this_sid=ctx["this_sid"],
-                          todo_counts=ctx["todo_counts"])
+                          cache_root=ctx["cache_root"], this_sid=ctx["this_sid"])
 
 
 def _tool_list(cfg, ctx, args):
@@ -5588,7 +4442,7 @@ def _tool_list(cfg, ctx, args):
         rec = by_sid.get(sid) or {"sid": sid, "cwd": info.get("cwd"), "prompts": [],
                                   "n_prompts": 0, "mtime": ctx["now"]}
         row = _session_row(cfg, rec, ctx["live"], ctx["now"], ctx["cache_root"],
-                           ctx["this_sid"], ctx["todo_counts"])
+                           ctx["this_sid"])
         if not by_sid.get(sid):
             row["title"] = "(no transcript yet)"
         rows.append(row)
@@ -5597,7 +4451,7 @@ def _tool_list(cfg, ctx, args):
         rows.append({"sid": "", "short": "", "title": "(no active conversation)",
                      "repo": alias, "slot": i["slot"], "cwd": i["cwd"], "live": True,
                      "state": i["state"], "context": "idle", "host": "local",
-                     "todo_open": ctx["todo_counts"].get(i["slot"], 0), "url": None,
+                     "url": None,
                      "this_session": False})
     for row in rows:
         if row.get("slot") and row.get("cwd"):
@@ -5629,8 +4483,7 @@ def _slot_sort_key(slot):
 
 def _tool_detail(cfg, ctx, args):
     rec = _session_ref_resolve(args.get("session", ""), cfg, ctx["recs"], ctx["live"])
-    row = _session_row(cfg, rec, ctx["live"], ctx["now"], ctx["cache_root"], ctx["this_sid"],
-                       ctx["todo_counts"])
+    row = _session_row(cfg, rec, ctx["live"], ctx["now"], ctx["cache_root"], ctx["this_sid"])
     prompts = rec.get("prompts") or []
     row["first_prompts"] = [{"at": _fmt_short(p.get("ts")), "text": p["text"]} for p in prompts[:3]]
     row["last_prompts"] = [{"at": _fmt_short(p.get("ts")), "text": p["text"]}
@@ -5641,20 +4494,10 @@ def _tool_detail(cfg, ctx, args):
         row["url"] = _dev_url(row["slot"], row["cwd"])
     row["git"] = _git_brief(row["worktree"] if row.get("worktree_exists") else row["cwd"])
     row["plan_head"] = _plan_head_lines(row["plan"], args.get("plan_lines", 40)) if row.get("plan") else None
-    key = _todo_key(cfg, row["cwd"] or "")
-    todos = {}
-    for k, data in ctx["todo"]:
-        if k == key or (k == _todo_parent(key, cfg.repos)):
-            items = _todo_visible(data, show_all=True)
-            if items:
-                todos[k] = [{"id": i["id"], "text": i["text"], "done": bool(i.get("done"))}
-                            for i in items]
-    row["todos"] = todos
     hints = []
     alias, slot = cfg.repo_of_dir(row["cwd"] or "") if row.get("cwd") else (None, None)
     if alias and slot:
         hints.append(("t open %s %s" if row["live"] else "t resume %s %s") % (alias, slot))
-        hints.append("t todo -s %s-%s" % (alias, slot))
         if not row["worktree_exists"]:
             hints.append("worktree is gone (swept after merge?) — t resume rebuilds it from branch %s"
                          % row["branch"])
@@ -5662,14 +4505,8 @@ def _tool_detail(cfg, ctx, args):
     return row
 
 
-def _tool_todos(cfg, ctx, args):
-    rows = _todo_rows(ctx["todo"], cfg, ctx["live_rows"], include_done=bool(args.get("include_done")),
-                      repo=args.get("repo"))
-    return {"count": len(rows), "lists": rows}
-
-
 _MCP_HANDLERS = {"find_sessions": _tool_find, "list_sessions": _tool_list,
-                 "session_detail": _tool_detail, "list_todos": _tool_todos}
+                 "session_detail": _tool_detail}
 
 
 def _mcp_call(cfg, state, name, args):
@@ -5778,7 +4615,7 @@ def _mcp_registered(claude_json):
 # Registration alone still leaves every tool call behind a permission prompt, and a
 # prompt per lookup makes the server useless mid-turn — the model asks "which slot had
 # X?" three times in a row and stalls three times. This server is ours and read-only
-# (four lookups over local transcripts, tmux, and the todo store, spawned by `t mcp`
+# (three lookups over local transcripts and tmux, spawned by `t mcp`
 # from this very checkout), so the allow rule is seeded BY DEFAULT: the blanket
 # server-wide form, so a tool added to `t mcp` later is covered the day it ships.
 # Deliberate consequence: a future WRITE-capable sessions tool would inherit the
@@ -5844,7 +4681,7 @@ def _mcp_install():
     """Register with Claude Code at user scope, via `claude mcp add` (Claude's own
     writer — never a hand edit of the stateful ~/.claude.json). The EXPANDED path:
     the stdio spawn does not go through a shell, so `$HOME/bin/t` would be exec'd
-    literally (the statusline command, by contrast, is run through one)."""
+    literally (the SessionStart hook command, by contrast, is run through one)."""
     cmd = ["claude", "mcp", "add", "sessions", "-s", "user", "--",
            os.path.join(HOME, "bin", "t"), "mcp"]
     settings = os.path.join(HOME, ".claude", "settings.json")
@@ -5929,7 +4766,6 @@ examples:
   t push                  send the current session to a background tmux slot
   t pop api 3             pull dev-api-3 back to this terminal
   t resume api 3          revive dev-api-3's last conversation after it was closed
-  t todo add "rebase"     add to this slot's task list (t todo -A: every slot)
   t cd ff 5               cd this shell into ff's slot-5 worktree (bare t cd: picker)
   t beam api --host mini  send a session to 'mini' and resume it there
   t find "auth refactor"  search saved sessions, then resume the pick
@@ -5963,9 +4799,11 @@ Run `t <verb> -h` for a verb's own flags.""")
     sp = sub.add_parser("ls", help="list dev sessions (attached + active context)",
         description="List live Claude dev sessions: whether each is attached, and whether it "
             "has an active conversation loaded (vs. parked on the startup splash). Scoped to the "
-            "repo your cwd is in by default; `-a` widens to every repo, and `-r` spans every "
+            "repo your cwd is in by default (`t ls <repo>` scopes to a named repo from anywhere); "
+            "`-a` widens to every repo, and `-r` spans every "
             "$REMOTE_HOSTS machine in one table with a HOST column. Read-only — attach with "
             "`t open`, move with `t beam`.")
+    sp.add_argument("repo", nargs="?", help="scope to this repo from any directory (default: the repo cwd is in)")
     sp.add_argument("-r", "--remote", action="store_true", help="span every $REMOTE_HOSTS host")
     sp.add_argument("-a", "--all", action="store_true", help="every repo (not just the current)")
 
@@ -6147,9 +4985,15 @@ Run `t <verb> -h` for a verb's own flags.""")
             "<name>); then a clone + registration on every REMOTE_HOSTS host over ssh. Every "
             "step is check-then-do, so re-running after a failure (gh down, a host unreachable) "
             "resumes where it stopped — and running it on an existing repo just finishes the "
-            "wiring. Flags pre-answer wizard steps; -y takes the defaults for the rest. Run it "
-            "from the shell — the t() shim reloads your config afterward.")
+            "wiring. No name in mind? Describe the repo (a sentence at the name step, or "
+            "--prompt TEXT) and Claude suggests names to pick from. Flags pre-answer wizard "
+            "steps; -y takes the defaults for the rest. Run it from the shell — the t() shim "
+            "reloads your config afterward.")
     sp.add_argument("name", nargs="?", help="repo name (GitHub rules: letters, digits, . _ -)")
+    sp.add_argument("-p", "--prompt", metavar="TEXT",
+                    help="describe the repo instead of naming it: Claude suggests names, the "
+                         "wizard offers them to pick (-y takes the first). In the wizard, "
+                         "typing a sentence at the name step does the same")
     sp.add_argument("--owner", metavar="OWNER", help=f"GitHub owner, user or org (default: {NEW_OWNER})")
     vg = sp.add_mutually_exclusive_group()
     vg.add_argument("--public", action="store_true", help="create it public")
@@ -6194,27 +5038,6 @@ Run `t <verb> -h` for a verb's own flags.""")
             "output'), and tool versions. Ends with findings + suggested fixes. Run it on "
             "another machine with `t on <host> t doctor`.")
 
-    sp = sub.add_parser("todo", help="a scratch task list scoped to this dev slot",
-        description="""t todo — tasks for the slot you are standing in
-
-Usage: t todo [repo [slot]] [action] [args]
-
-  (no action)        show this slot's tasks
-  <repo> [slot]      another list, positionally: t todo ff add …  ·  t todo ff 3
-  ls [slot|key]      show one slot's tasks (t todo ls 17; t todo ls dotfiles-3)
-  add [repo [slot]] <text…>   add a task — here, or to a named repo/slot
-  done [id…]         tick off      — no id: pick from a list
-  rm   [id…]         remove        — no id: pick from a list
-  mv   [id] [slot]   move to another slot's list
-  <id>               pick an action for one item
-
-Lists live in $XDG_STATE_HOME/t/todo/<slot>.json and ride csync to your other
-machines. Finished tasks leave the view at once and are dropped after a week.""",
-        formatter_class=argparse.RawDescriptionHelpFormatter)
-    sp.add_argument("action", nargs="?", help=argparse.SUPPRESS)
-    sp.add_argument("rest", nargs=argparse.REMAINDER, help=argparse.SUPPRESS)
-    _todo_options(sp)
-
     # machine-readable / internal (hidden-ish; still have -h)
     sub.add_parser("session-rows", help="machine-readable per-host scan (remote contract)",
         description="Internal/machine-readable: emit one tab-separated row per live dev slot on "
@@ -6238,8 +5061,8 @@ machines. Finished tasks leave the view at once and are dropped after a week."""
     mp = sub.add_parser("mcp", help="(internal) stdio MCP server: which session is working on what",
         description="Internal: the stdio MCP server Claude Code spawns, registered at user "
             "scope as `sessions` by install.sh (or `t mcp --install`). Exposes the live slots, "
-            "keyword search over every saved transcript's prompts, per-session detail, and the "
-            "todo lists, so any Claude session can answer \"which session was working on X?\". "
+            "keyword search over every saved transcript's prompts, and per-session detail, "
+            "so any Claude session can answer \"which session was working on X?\". "
             "Not for direct use except through the flags below.")
     mp.add_argument("--install", action="store_true",
                     help="register with Claude Code (user scope) if not already")
@@ -6258,7 +5081,7 @@ IMPLEMENTED = {
     "ls": cmd_ls, "session-rows": cmd_session_rows, "on": cmd_on, "read": cmd_read,
     "plan": cmd_plan, "paste": cmd_paste, "kill": cmd_kill, "setup": cmd_setup,
     "land": cmd_land, "kill-owner": cmd_kill_owner, "cursor": cmd_cursor,
-    "doctor": cmd_doctor, "todo": cmd_todo, "mcp": cmd_mcp, "new": cmd_new, "new-land": cmd_new_land,
+    "doctor": cmd_doctor, "mcp": cmd_mcp, "new": cmd_new, "new-land": cmd_new_land,
     "install": cmd_install,
 }
 
@@ -6270,6 +5093,11 @@ def main(argv):
     # own help. The subparser still exists so `t -h` lists the verb.
     if argv and argv[0] == "cursor":
         return cmd_cursor(Config(), argparse.Namespace(rest=argv[1:]))
+    # `todo` is retired and has NO subparser (so `t -h` does not list it); it is
+    # answered here for the same REMAINDER reason — a lagging statusline setting
+    # still runs `t todo --statusline`, and that must exit 0 with no output.
+    if argv and argv[0] == "todo":
+        return cmd_todo(Config(), argparse.Namespace(rest=argv[1:]))
     parser = build_parser()
     args = parser.parse_args(argv)
     if not args.verb:

@@ -163,19 +163,19 @@ prview() {
 #
 # Options:
 #   -f, --forever    hold sleep off until Ctrl-C, unconditionally (the old behaviour)
-#   --grace <secs>   how long a signal may be absent before nosleep lets go (default 300)
+#   --grace <secs>   how long a signal may be absent before nosleep lets go (default 900)
 #   --every <secs>   how often the two signals are re-checked (default 30)
 #
 # Blocks sleep via `pmset disablesleep 1` + a background caffeinate, then keeps
 # holding only while BOTH signals stay fresh: internet (an HTTPS exchange with
-# api.anthropic.com) and tokens burning (a live local claude whose transcript was
-# written recently). Once either has been missing for the grace window it restores
-# sleep and exits — so a Claude run that finishes, or a network that drops, lets
+# api.anthropic.com) and tokens burning (a local claude mid-turn — Claude Code runs
+# its own caffeinate while a request is in flight). Once either has been missing for
+# the grace window it restores sleep and exits — so a Claude run that finishes, or a network that drops, lets
 # the Mac sleep on its own instead of holding it awake until you remember Ctrl-C.
 # For a persistent, unconditional block use `sleep-manager disable` instead.
 nosleep() {
   [[ "$1" == -h || "$1" == --help ]] && { _help_for nosleep; return 0; }
-  local forever=0 grace=300 every=30
+  local forever=0 grace=900 every=30
   while (( $# )); do
     case $1 in
       -f|--forever) forever=1 ;;
@@ -202,6 +202,26 @@ nosleep() {
   trap '_nosleep_restore' EXIT
   trap '_nosleep_restore; return 130' INT TERM
 
+  # A caffeinate -dimsu that outlived its shell (an old unconditional nosleep whose
+  # terminal closed) holds the Mac awake no matter what this run decides — two were
+  # found from days earlier, and a mere warning left a third running. Stop it: it
+  # is exactly the hold this run exists to end. sleep-manager's own caffeinate is
+  # the one deliberate persistent hold, so it is named, not killed.
+  local -a strays; local pid keep
+  keep=''; [[ -f /tmp/sleep-manager-caffeinate.pid ]] && keep=$(</tmp/sleep-manager-caffeinate.pid)
+  strays=( ${(f)"$(ps -Axo pid=,ppid=,command= 2>/dev/null | awk '$2 == 1 && $3 ~ /caffeinate$/ && $4 == "-dimsu" {print $1}')"} )
+  for pid in "${strays[@]}"; do
+    [[ -n $pid ]] || continue
+    if [[ $pid == "$keep" ]]; then
+      echo "nosleep: sleep-manager's caffeinate (pid $pid) is holding sleep off too — \`sleep-manager enable\` releases it" >&2
+    elif kill "$pid" 2>/dev/null; then
+      echo "nosleep: stopped an orphaned caffeinate -dimsu (pid $pid) left by an earlier run"
+    fi
+  done
+  # nomonitor: the backgrounded caffeinate is a plain child, not a job — no "[2] 82804"
+  # notice on the terminal, and it stays parented to this shell, so it never reads
+  # as an orphan to the sweep above.
+  setopt localoptions nomonitor
   sudo pmset -a disablesleep 1 || return 1
   caffeinate -dimsu & _NOSLEEP_CAF=$!
   if (( forever )); then
@@ -222,7 +242,7 @@ nosleep() {
     busy_at=$(_nosleep_busy_at)
     oldest=$(( busy_at < online_at ? busy_at : online_at ))
     if (( now - oldest > grace )); then
-      (( busy_at < online_at )) && why="no claude has written a transcript in ${grace}s" || why="the network has been down for ${grace}s"
+      (( busy_at < online_at )) && why="no local claude has been mid-turn for ${grace}s" || why="the network has been down for ${grace}s"
       echo "nosleep: letting go — $why"
       _nosleep_restore
       return 0
@@ -238,26 +258,24 @@ nosleep() {
 # Any HTTP status counts (no -f): a 404 proves the network path; only DNS/connect/
 # TLS failures — the outages that actually stop tokens burning — return nonzero.
 _nosleep_online() { curl -s -o /dev/null --max-time 4 https://api.anthropic.com/ 2>/dev/null; }
-# _nosleep_busy_at — epoch of the newest transcript write by a LIVE local claude
-# (0 when none). Reads the claude-stamp-tmux pid registry (~/.cache/claude-sessions/
-# <pid> = "<sid>\t<cwd>") rather than scanning every transcript's mtime: csync's
-# rsync preserves mtimes, so a transcript another machine is writing looks freshly
-# written here too, and only a registered pid that is still alive ties a write to
-# THIS Mac. Subagent transcripts count — the main file can sit untouched for
-# minutes while a subagent works, and that is still tokens burning.
+# _nosleep_busy_at — now when a local claude is mid-turn, else 0. Claude Code itself
+# spawns `caffeinate -i -t 300` under the `claude` process for exactly as long as a
+# request is in flight (respawned per turn, self-expiring at 5 min), so "a caffeinate
+# whose parent is claude" IS tokens burning, read off one ps. This replaced a
+# transcript-mtime check that was wrong both ways on a real machine: csync's rsync
+# bulk-touches IDLE sessions' transcripts (five idle slots shared one mtime), and a
+# session mid-way through a long tool call had not written its transcript in 31 min.
 _nosleep_busy_at() {
-  local reg="${XDG_CACHE_HOME:-$HOME/.cache}/claude-sessions" f sid cwd tx best=0
-  local -a mt
-  for f in "$reg"/<->(N.); do
-    kill -0 "${f:t}" 2>/dev/null || continue
-    IFS=$'\t' read -r sid cwd < "$f" || continue
-    [[ -n $sid ]] || continue
-    for tx in ~/.claude/projects/*/"$sid".jsonl(N) ~/.claude/projects/*/"$sid"/subagents/*.jsonl(N); do
-      zstat -A mt +mtime "$tx" 2>/dev/null || continue
-      (( mt[1] > best )) && best=$mt[1]
-    done
+  local pid ppid comm; local -A pcomm; local -a caf
+  while read -r pid ppid comm; do
+    [[ $pid == <-> ]] || continue
+    pcomm[$pid]=${comm:t}
+    [[ ${comm:t} == caffeinate ]] && caf+=("$ppid")
+  done < <(ps -Axo pid=,ppid=,comm= 2>/dev/null)
+  for ppid in "${caf[@]}"; do
+    [[ ${pcomm[$ppid]:-} == claude ]] && { echo "$EPOCHSECONDS"; return 0; }
   done
-  echo "$best"
+  echo 0
 }
 
 # _dots_tmux_apply — push ~/.tmux.conf into an already-running tmux server. tmux
@@ -2280,95 +2298,6 @@ _dev_session_rows() {
   _dev_fg_rows
   # Dead last, and stdio-detached inside: stdout here IS the row stream (and is an
   # ssh pipe under `t ls -r`), so the refresh must not write a byte or hold it open.
-  _pr_state_flush
-}
-
-# _dev_dead_slot_rows <repo>… — the DEAD slots of these repos, in _dev_session_rows'
-# row format ("<sid>\t<worktree>\t<repo>-<n>\tdead\tnone\t<summary>"), so anything
-# that already renders live rows renders these with the same code. This is the
-# data half of the shared slot view (bin/t's _slot_line is the rendering half):
-# a picker that lists slots — `t todo add`'s destination list — shows a live slot
-# exactly as `t ls` does and a dead one with what `t resume` knows about it, instead
-# of a bare "worktree". A slot is dead when no live dev session is rooted at its
-# worktree (matched by PATH, never by name — alias drift) and no sibling-alias
-# session carries its name (that one is a live row already; listing it here too
-# would double it). summary = the slot's newest conversation title + its PR tag +
-# when it last ran, from the same _transcript_meta_batch cache `t resume` reads, so
-# a warm scan costs one python start. Recency = max(transcript mtime, opened stamp)
-# with ↻ when the stamp is newer, as in `t resume`; and like `t resume`, a
-# conversationless stub (open-then-exit: no title) is skipped — only the THREE most
-# recent transcripts per slot go to the batch, enough to get past a stub without
-# reading a busy slot's whole history on a cold cache. The slot set is discovered
-# (_dev_repo_slots), so a reaped slot with a saved conversation still lists — it is
-# still a place `t resume` can revive and a list can be filed against.
-_dev_dead_slot_rows() {
-  setopt local_options null_glob bare_glob_qual
-  local repo dir base n wt slot txf ep opf title when sid k s p re
-  local -a cand mpaths mrows mt
-  local -a slots                     # in discovery order, so the output is stable
-  local -A livepath livename meta_title meta_pr slot_wt slot_cands
-  local -a _PR_STALE; local -A _PR_SPAWNED; local REPLY mr mrest
-  local opdir="${XDG_CACHE_HOME:-$HOME/.cache}/claude-sessions/opened"
-  while IFS=$'\t' read -r s p; do
-    [[ $s == dev-* ]] || continue
-    livename[${s#dev-}]=1; [[ -n $p ]] && livepath[$p]=1
-  done < <(tmux list-sessions -F '#{session_name}'$'\t''#{session_path}' 2>/dev/null)
-  # Pass 1: find each dead slot's newest transcripts; collect them for ONE batch.
-  for repo in "$@"; do
-    dir=${DEV_REPOS[$repo]:-}; [[ -n $dir ]] || continue
-    base=${dir:t}
-    for n in ${(f)"$(_dev_repo_slots "$repo")"}; do
-      [[ $n == <-> ]] || continue
-      wt="$DEV_WORKTREE_ROOT/$base/$n"
-      [[ -n ${livepath[$wt]:-} ]] && continue
-      for k in ${(k)DEV_REPOS}; do
-        [[ ${DEV_REPOS[$k]} == $dir && -n ${livename[$k-$n]:-} ]] && continue 2
-      done
-      cand=()
-      for txf in "$HOME/.claude/projects/${wt//[^A-Za-z0-9]/-}"/*.jsonl; do
-        # zstat -A: no $(…) fork per file — a repo with 20 dead slots holds hundreds.
-        zstat -A mt +mtime "$txf" 2>/dev/null || continue
-        ep=$mt[1]; re=0
-        opf="$opdir/${${txf:t}%.jsonl}"
-        if [[ -f $opf ]] && zstat -A mt +mtime "$opf" 2>/dev/null && (( mt[1] > ep )); then
-          ep=$mt[1]; re=1
-        fi
-        cand+=("$ep"$'\t'"$re"$'\t'"$txf")
-      done
-      slot="$repo-$n"; slots+=("$slot"); slot_wt[$slot]=$wt
-      cand=(${(On)cand})                          # newest first, by the leading epoch
-      slot_cands[$slot]=${(pj:\n:)cand[1,3]}
-      for s in "${(@)cand[1,3]}"; do mpaths+=("${s##*$'\t'}"); done
-    done
-  done
-  (( $#slots )) || return 0
-  # Pass 2: one batched, cached metadata read (title + last PR URL) for all of them.
-  (( $#mpaths )) && mrows=("${(@f)$(_transcript_meta_batch "${(@)mpaths}")}")
-  for mr in "${(@)mrows}"; do
-    [[ -n $mr ]] || continue
-    mrest=${mr#*$'\t'}                      # peeled, not split: an empty title must
-    meta_title[${mr%%$'\t'*}]=${mrest%%$'\t'*}  # not collapse the column away
-    meta_pr[${mr%%$'\t'*}]=${mrest#*$'\t'}
-  done
-  # Pass 3: print, newest titled conversation per slot.
-  for slot in "${(@)slots}"; do
-    sid=-; title=
-    for s in "${(@f)slot_cands[$slot]}"; do
-      [[ -n $s ]] || continue
-      txf=${s##*$'\t'}
-      title=${meta_title[$txf]:-}
-      [[ -n $title ]] || continue           # conversationless stub — as `t resume` skips it
-      ep=${s%%$'\t'*}; re=${${s#*$'\t'}%%$'\t'*}
-      sid=${${txf:t}%.jsonl}
-      _pr_state_tag "${meta_pr[$txf]:-}"; title+=$REPLY
-      when=; (( ep )) && when=$(strftime '%b %d %H:%M' "$ep" 2>/dev/null)
-      [[ $re == 1 && -n $when ]] && when+=" ↻"
-      [[ -n $when ]] && title+=" · $when"
-      break
-    done
-    printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$sid" "$slot_wt[$slot]" "$slot" dead none \
-      "${title:-(no conversation)}"
-  done
   _pr_state_flush
 }
 
@@ -5957,7 +5886,8 @@ _t() {
     on)
       (( CURRENT == 3 )) && _values 'host' ${(k)REMOTE_HOSTS} || _normal ;;
     ls)
-      _values 'flag' -r --remote -a --all -h --help ;;
+      if (( CURRENT == 3 )) && [[ ${words[CURRENT]} != -* ]]; then _values 'repo' ${(k)DEV_REPOS}
+      else _values 'flag' -r --remote -a --all -h --help; fi ;;
     push)
       _values 'flag' -p --pick -a --all -h --help ;;
     find)
@@ -5967,7 +5897,7 @@ _t() {
       else _files -/; fi ;;   # scan-dir arguments
     new)
       if (( CURRENT == 3 )) && [[ ${words[CURRENT]} != -* ]]; then _message 'repo name'
-      else _values 'flag' --owner --public --private --alias --hosts --no-hosts -y --yes --dry-run -h --help; fi ;;
+      else _values 'flag' -p --prompt --owner --public --private --alias --hosts --no-hosts -y --yes --dry-run -h --help; fi ;;
     install)
       if [[ ${words[CURRENT]} == -* ]]; then _values 'flag' --status --update --no-login --headless --hosts --no-hosts -y --yes --dry-run -h --help
       else _values 'agent' claude codex cursor; fi ;;

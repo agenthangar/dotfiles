@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# csync — two-way sync of Claude Code sessions, plans, t todo lists, and Cursor
+# csync — two-way sync of Claude Code sessions, plans, and Cursor
 # CLI chats with iCloud.
 # One command, no direction: merges both ways (newest file wins, nothing
 # deleted) so every machine converges to the union of all sessions and plans.
@@ -67,12 +67,6 @@ sync_pair() {
 # tree closes that gap; csync converges plans the same union way as transcripts.
 sync_pair "$HOME/.claude/projects" "$icloud_base/claude-sessions" "sessions"
 sync_pair "$HOME/.claude/plans"    "$icloud_base/claude-plans"    "plans"
-
-# `t todo` lists — one JSON file per dev slot ($XDG_STATE_HOME/t/todo/<repo>-<slot>.json),
-# so a slot beamed to another machine keeps the tasks parked against it. Union-merge is
-# whole-file newest-wins, which is why `t todo rm` TOMBSTONES rather than unlinks: with
-# no --delete, a removed file would come straight back from iCloud on the next run.
-sync_pair "${XDG_STATE_HOME:-$HOME/.local/state}/t/todo" "$icloud_base/t-todos" "todos"
 
 # Cursor CLI (cursor-agent) chats: ~/.cursor/chats/<workspace-hash>/<chat-id>/.
 # Gated on either side already existing so machines that never ran cursor-agent

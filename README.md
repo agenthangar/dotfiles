@@ -19,10 +19,9 @@ shim in `.zshrc` for verbs that must run in your shell).
 | `t push` / `t pop` | Move a session between a foreground terminal and a detached tmux slot — one-live-owner guarantee |
 | `t beam <repo> [slot] --host <h>` | Teleport a running session to another machine; pull one back with `t open … --here` |
 | `t find <query>` | Semantic search across saved sessions ("which one was working on X?"), reranked by Claude |
-| `t todo [add\|done\|rm] …` | A task list scoped to the slot you are in — bare to list, `t todo <id>` to act on one, `-A` for every slot. Also `/todo` inside Claude, and the statusline |
 | `t install [agent…]` | Install and log in the agent CLIs — Claude Code, Codex, Cursor — on this machine and every remote host, `t setup`-style: one checklist with the present entries locked, the vendors' commands shown before anything runs ([details](#agents)) |
-| `t new [name]` | Wizard: create `~/code/<name>` + a GitHub repo (owner picked from your orgs; squash-only, auto-merge), register it here and clone + register it on every remote host. Re-running resumes; on an existing repo it just finishes the wiring |
-| `t mcp` | The `sessions` MCP server Claude Code spawns, so any Claude session can answer "which session is/was working on X?" from every saved transcript, the live slots, and the todo lists. `--install` registers it (`dots` does), `--call <tool> '<json>'` runs one tool by hand |
+| `t new [name\|--prompt TEXT]` | Wizard: create `~/code/<name>` + a GitHub repo (owner picked from your orgs; squash-only, auto-merge), register it here and clone + register it on every remote host. No name in mind? Describe it (a sentence at the name step, or `--prompt`) and Claude suggests names to pick from. Re-running resumes; on an existing repo it just finishes the wiring |
+| `t mcp` | The `sessions` MCP server Claude Code spawns, so any Claude session can answer "which session is/was working on X?" from every saved transcript and the live slots. `--install` registers it (`dots` does), `--call <tool> '<json>'` runs one tool by hand |
 
 Run `t -h` for the full verb list.
 
@@ -31,7 +30,7 @@ Run `t -h` for the full verb list.
 | Command | What it does |
 | --- | --- |
 | `dots [--dev]` | Sync the live checkout to `origin/main` HEAD and reload zsh; `--dev` makes the session worktree you are standing in live instead ([details](#keeping-machines-in-sync)) |
-| `csync` | Two-way sync of Claude session history, plans, and `t todo` lists across machines via iCloud Drive |
+| `csync` | Two-way sync of Claude session history and plans across machines via iCloud Drive |
 | `sleep-manager` | Block or restore macOS sleep (`status`, `disable`, `enable`) |
 | `pii-scan` | Keep personal data out of this public repo ([details](#pii-guard)) |
 | `help` / `h` | Auto-generated, grouped list of every command ([details](#the-help-command)) |
@@ -120,18 +119,18 @@ Not every verb supports every agent yet. The matrix below is **generated from
 support without the README saying so:
 
 ```text
-  surface                                              claude                codex                        cursor
-  ---------------------------------------------------  --------------------  ---------------------------  -------------------------------
-  t install (install · login · update)                 ✓                     ✓                            ✓
-  dev slots: t open / ls / kill / read / paste / todo  ✓                     planned                      ✗ no slot — t cursor ls
-  t push / t pop                                       ✓                     planned                      ✗ no slot
-  t resume (dead slots)                                ✓                     planned                      → t cursor resume
-  t beam / --from (move a session)                     ✓                     planned                      → t cursor [id] --host / --from
-  csync (iCloud union of transcripts)                  ✓ projects + plans    planned                      ✓ cursor-chats
-  SessionStart stamps (registry · opened · origin)     ✓ settings.json hook  ✓ hooks.json + /hooks trust  ✗ no hook wired
-  t plan                                               ✓                     ✗ codex keeps no plan files  ✗
-  t find / t mcp (transcript search)                   ✓                     planned                      ✗
-  t doctor agent row (version · login · hook)          ✓                     ✓                            ✓ version · login
+  surface                                           claude                codex                        cursor
+  ------------------------------------------------  --------------------  ---------------------------  -------------------------------
+  t install (install · login · update)              ✓                     ✓                            ✓
+  dev slots: t open / ls / kill / read / paste      ✓                     planned                      ✗ no slot — t cursor ls
+  t push / t pop                                    ✓                     planned                      ✗ no slot
+  t resume (dead slots)                             ✓                     planned                      → t cursor resume
+  t beam / --from (move a session)                  ✓                     planned                      → t cursor [id] --host / --from
+  csync (iCloud union of transcripts)               ✓ projects + plans    planned                      ✓ cursor-chats
+  SessionStart stamps (registry · opened · origin)  ✓ settings.json hook  ✓ hooks.json + /hooks trust  ✗ no hook wired
+  t plan                                            ✓                     ✗ codex keeps no plan files  ✗
+  t find / t mcp (transcript search)                ✓                     planned                      ✗
+  t doctor agent row (version · login · hook)       ✓                     ✓                            ✓ version · login
 ```
 
 Codex needs one manual step after install: its SessionStart hook (the same

@@ -52,7 +52,7 @@ def _seed_worktree(path):
         f = path / "bin" / b
         f.write_text("#!/bin/sh\n")
         f.chmod(0o755)
-    for c in ("tpush.md", "tpop.md", "todo.md"):
+    for c in ("tpush.md", "tpop.md"):
         (path / "claude" / "commands" / c).write_text("x\n")
     (path / "claude" / "settings.json.example").write_text("{}\n")
     (path / "ssh" / "dotfiles.conf").write_text("# ssh\n")

@@ -4,10 +4,6 @@
       { "hooks": [ { "type": "command", "command": "$HOME/bin/claude-stamp-tmux" } ] }
     ]
   },
-  "statusLine": {
-    "type": "command",
-    "command": "$HOME/bin/t todo --statusline"
-  },
   "permissions": {
     "allow": [ "mcp__sessions" ]
   }

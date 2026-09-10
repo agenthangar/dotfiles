@@ -1639,6 +1639,7 @@ _NEW_SLUG = re.compile(r"^(?:git@github\.com:|ssh://git@github\.com/|https://git
                        r"([^/\s]+)/([^/\s]+?)(?:\.git)?/?$")
 _NEW_STALE = "invalid choice: 'new-land'"
 _NEW_SENTINEL = "new-land: "
+_NEW_AGAIN = "\0again"   # the "none of these" pick row; never a valid repo name
 
 
 def _new_validate_name(name):
@@ -1655,6 +1656,60 @@ def _new_validate_name(name):
 def _new_name_warnings(name):
     return (["GitHub compares names case-insensitively — lowercase is the convention"]
             if name != name.lower() else [])
+
+
+NEW_NAME_MODEL = "sonnet"
+_NEW_NAME_MAX = 6
+
+
+def _new_name_input(text):
+    """Classify what the name step was given: one token → ("name", token), a
+    description (any whitespace inside) → ("prompt", text). A name is validated by
+    the caller, so a single bad token still errors as a name, never becomes a prompt."""
+    text = text.strip()
+    return ("prompt", text) if re.search(r"\s", text) else ("name", text)
+
+
+def _new_name_prompt(desc, taken):
+    """The `claude -p` brief for repo names from a description. Rules mirror
+    _new_validate_name plus the house style (lowercase, hyphens, short — it is a
+    ~/code dir, a DEV_REPOS key, and a tmux/worktree prefix), and `taken` keeps it
+    off the names already on this machine."""
+    avoid = ", ".join(sorted(taken)[:40])
+    return (f"Suggest names for a new GitHub repo. What it is for:\n\"{desc}\"\n\n"
+            f"Rules: lowercase letters, digits and hyphens only, 1-3 words joined by hyphens, "
+            f"at most 24 chars, memorable and specific; no generic filler (app, tool, project). "
+            + (f"Do not suggest any of these, they are taken: {avoid}.\n" if avoid else "\n")
+            + f"Return ONLY a JSON array (no prose, no code fence) of {_NEW_NAME_MAX} objects, "
+              "best first, each {\"name\": \"<name>\", \"why\": \"<reason in 8 words or fewer>\"}.")
+
+
+def _new_parse_names(text, taken=()):
+    """→ [(name, why)] from the model's reply: tolerate fences/prose around the
+    array, lowercase, validate through _new_validate_name, drop taken names and
+    duplicates, cap at _NEW_NAME_MAX. An unparseable reply is [] (the caller says so)."""
+    m = re.search(r"\[.*\]", text or "", re.S)
+    if not m:
+        return []
+    try:
+        arr = json.loads(m.group(0))
+    except ValueError:
+        return []
+    out, seen = [], set(taken)
+    for o in arr if isinstance(arr, list) else []:
+        name = str(o.get("name", "") if isinstance(o, dict) else o).strip().lower()
+        if not name or name in seen or _new_validate_name(name):
+            continue
+        seen.add(name)
+        out.append((name, str(o.get("why", "") if isinstance(o, dict) else "").strip()))
+        if len(out) >= _NEW_NAME_MAX:
+            break
+    return out
+
+
+def _new_taken_names(repo_paths, code_entries):
+    """Names a suggestion must avoid: every DEV_REPOS basename + every ~/code entry."""
+    return {os.path.basename(p.rstrip("/")) for p in repo_paths if p} | {e for e in code_entries if e}
 
 
 def _new_path(name):
@@ -1761,7 +1816,8 @@ def _new_answers(args):
     elif getattr(args, "hosts", None):
         hosts = [h.strip() for h in args.hosts.split(",") if h.strip()]
     return {"name": getattr(args, "name", None) or None, "owner": getattr(args, "owner", None),
-            "visibility": vis, "alias": getattr(args, "alias", None), "hosts": hosts}
+            "visibility": vis, "alias": getattr(args, "alias", None), "hosts": hosts,
+            "prompt": (getattr(args, "prompt", None) or "").strip() or None}
 
 
 def _new_state_summary(state):
@@ -2000,6 +2056,29 @@ def _new_sh_gh(slug):
     return _new_gh_repo_state(r.returncode, r.stdout, r.stderr)
 
 
+def _new_sh_suggest(desc, taken):
+    """Ask Claude (`claude -p`, the t find precedent — the real binary, never the
+    zsh wrapper) for repo names. → (rows, error): rows from _new_parse_names, or
+    an error line when the CLI is missing, times out, or replies with no names."""
+    claude_bin = shutil.which("claude") or os.path.join(HOME, ".local", "bin", "claude")
+    if not os.path.exists(claude_bin):
+        return [], "claude CLI not found — type a name instead"
+    try:
+        p = subprocess.run([claude_bin, "-p", "--model", NEW_NAME_MODEL, "--output-format", "json"],
+                           input=_new_name_prompt(desc, taken), capture_output=True, text=True,
+                           timeout=90)
+        res = json.loads(p.stdout).get("result", "") if p.stdout.strip() else ""
+    except subprocess.TimeoutExpired:
+        return [], "claude took too long — type a name instead"
+    except (OSError, ValueError) as e:
+        return [], f"claude failed ({e}) — type a name instead"
+    rows = _new_parse_names(res, taken)
+    if not rows:
+        tail = (p.stderr or "").strip().splitlines()
+        return [], "claude returned no usable names" + (f" ({tail[-1]})" if tail else "")
+    return rows, None
+
+
 def _new_sh_owners():
     """(login, [orgs]) the gh token can create under; ([], None) without gh."""
     if not shutil.which("gh"):
@@ -2078,16 +2157,36 @@ def _new_wizard(cfg, answers, ctx):
     ui.raw()
     result = None
     try:
-        name = answers["name"]
+        name, desc = answers["name"], answers["prompt"]
         while not name:
-            n = ui.cooked_input("│  repo name → ")
-            if not n:
-                return None
-            err = _new_validate_name(n)
+            if desc is None:
+                n = ui.cooked_input("│  repo name (or describe it in a sentence for suggestions) → ")
+                if not n:
+                    return None
+                kind, text = _new_name_input(n)
+                if kind == "name":
+                    err = _new_validate_name(text)
+                    if err:
+                        ui.commit([f"{rail}  {st.y}⚠ {err}{st.r}"])
+                        continue
+                    name = text
+                    break
+                desc = text
+            ui.done("describe", desc)
+            # the head repaints in place under the ◇ line; pick() replaces it
+            ui.repaint(ui.head("name", f"asking claude ({NEW_NAME_MODEL}) for names…"))
+            rows, err = ctx["suggest"](desc, ctx["taken"])
+            desc = None
             if err:
                 ui.commit([f"{rail}  {st.y}⚠ {err}{st.r}"])
                 continue
-            name = n
+            choices = [(n, f"{n}  {st.y}{why}{st.r}" if why else n) for n, why in rows]
+            choices.append((_NEW_AGAIN, f"{st.y}none of these — type a name or describe it again{st.r}"))
+            pick = ui.pick("name", choices)
+            if pick is None:
+                return None
+            if pick != _NEW_AGAIN:
+                name = pick
         answers["name"] = name
         ui.done("name", name)
         path, state = ctx["probe"](name)
@@ -2184,16 +2283,42 @@ def _new_prompt_flow(cfg, answers, ctx):
     """Plain-prompt fallback (TERM=dumb, no raw mode): the same questions as
     _new_wizard over input(), then the same review gate. → (steps, answers) or None."""
     st = Style()
-    name = answers["name"]
+    name, desc = answers["name"], answers["prompt"]
     while not name:
-        n = _prompt("repo name: ")
-        if n is None:
-            return None
-        err = _new_validate_name(n)
+        if desc is None:
+            n = _prompt("repo name (or describe it in a sentence for suggestions): ")
+            if n is None:
+                return None
+            kind, text = _new_name_input(n)
+            if kind == "name":
+                err = _new_validate_name(text)
+                if err:
+                    print(f"  {err}", file=sys.stderr)
+                    continue
+                name = text
+                break
+            desc = text
+        print(f"  asking claude ({NEW_NAME_MODEL}) for names…")
+        rows, err = ctx["suggest"](desc, ctx["taken"])
+        desc = None
         if err:
             print(f"  {err}", file=sys.stderr)
             continue
-        name = n
+        for i, (n, why) in enumerate(rows, 1):
+            print(f"  {i}) {n}" + (f"  — {why}" if why else ""))
+        r = _prompt(f"  pick 1-{len(rows)}, or type a name / a new description: ")
+        if r is None:
+            return None
+        if r.isdigit() and 1 <= int(r) <= len(rows):
+            name = rows[int(r) - 1][0]
+        elif r:
+            kind, text = _new_name_input(r)
+            if kind == "prompt":
+                desc = text
+            elif _new_validate_name(text):
+                print(f"  {_new_validate_name(text)}", file=sys.stderr)
+            else:
+                name = text
     answers["name"] = name
     path, state = ctx["probe"](name)
     print(f"  path: {_tilde(path)} · {_new_state_summary(state)}")
@@ -2322,6 +2447,9 @@ def cmd_new(cfg, args):
     """See the section comment above. Flags pre-answer wizard steps; -y / --dry-run /
     no tty skip the wizard and take the defaults for the rest."""
     answers = _new_answers(args)
+    if answers["name"] and answers["prompt"]:
+        print("t new: give a name OR --prompt, not both", file=sys.stderr)
+        return 1
     if answers["name"]:
         err = _new_validate_name(answers["name"])
         if err:
@@ -2345,15 +2473,30 @@ def cmd_new(cfg, args):
         if slug not in gh_cache:
             gh_cache[slug] = _new_sh_gh(slug)
         return gh_cache[slug]
+    try:
+        code_entries = os.listdir(os.path.join(HOME, "code"))
+    except OSError:
+        code_entries = []
     ctx = {"probe": lambda n: (_new_path(n), _new_sh_state(_new_path(n))),
            "gh": gh_for, "owners": _new_sh_owners, "f_repos": f_repos,
-           "whence": lambda a: None if a in registered else _new_sh_whence(a)}
+           "whence": lambda a: None if a in registered else _new_sh_whence(a),
+           "suggest": _new_sh_suggest,
+           "taken": _new_taken_names(cfg.repos.values(), code_entries)}
     st = Style()
     tty_ok = sys.stdin.isatty() and sys.stdout.isatty()
     if args.dry_run or args.yes or not tty_ok:
+        if not answers["name"] and answers["prompt"]:
+            # no wizard to pick from: the model's first suggestion is the name
+            rows, err = _new_sh_suggest(answers["prompt"], ctx["taken"])
+            if err:
+                print(f"t new: {err}", file=sys.stderr)
+                return 1
+            answers["name"] = rows[0][0]
+            print(f"t new: name {answers['name']} (from --prompt; also suggested: "
+                  f"{', '.join(n for n, _ in rows[1:]) or 'nothing else'})")
         if not answers["name"]:
-            print("t new: a repo name is required without the wizard (t new <name> …)",
-                  file=sys.stderr)
+            print("t new: a repo name (or --prompt <description>) is required without the "
+                  "wizard (t new <name> …)", file=sys.stderr)
             return 1
         steps = _new_resolve(cfg, answers, ctx)
         errs = [s for s in steps if s["do"] == "error"]
@@ -4039,7 +4182,7 @@ Run `t <verb> -h` for a verb's own flags.""")
         description="Revive a DEAD dev slot's conversation (`t open` on a dead slot "
             "deliberately starts fresh — this brings the chat back). Offers EVERY conversation "
             "saved in the slot's own per-session worktree (one global newest-first list by "
-            "session time — never grouped by repo; live rows on top; conversationless stubs "
+            "session time — never grouped by repo; live rows on top when shown; conversationless stubs "
             "skipped), rebuilding a reaped worktree from its branch first, then resumes the pick "
             "in a fresh dev slot and attaches. Names default to "
             "the cwd repo; outside any repo dir a bare `t resume` scans every worktree repo. "
@@ -4050,14 +4193,18 @@ Run `t <verb> -h` for a verb's own flags.""")
             "in NEW terminal tabs (Terminal.app/iTerm2; `t open` hints when tabs are "
             "impossible — ssh, unrecognized terminal, no Accessibility; --fg takes a single "
             "pick only). "
-            "LIVE slots appear as labeled rows — '● active' / '● on <host>' — and "
-            "picking one ATTACHES in place (locally or on its host) instead of resuming. "
+            "LIVE slots are hidden by default (a stderr count names them — `t open` is "
+            "the verb for a running slot); -l/--live lists them as labeled rows — "
+            "'● active' / '● on <host>' — and picking one ATTACHES in place (locally or on "
+            "its host) instead of resuming; naming a live slot explicitly always attaches. "
             "Worktree-per-session repos only (a shared tree's transcripts are "
             "ambiguous per-slot — use `t push -p` there).")
     sp.add_argument("repo", nargs="?", help="DEV_REPOS key; defaults to the repo your cwd is in")
     sp.add_argument("slot", nargs="?", help="slot number; a lone slot implies the cwd repo")
     sp.add_argument("-f", "--fg", action="store_true", help="resume inline in THIS terminal (no tmux slot)")
     sp.add_argument("-a", "--all", action="store_true", help="scan every worktree repo (the default outside a repo dir)")
+    sp.add_argument("-l", "--live", action="store_true",
+        help="also list LIVE slots (hidden by default) as '● active' / '● on <host>' rows that attach on pick")
     sp.add_argument("-r", "--remote", action="store_true",
         help="pull the latest transcripts from every $REMOTE_HOSTS host first (direct rsync; "
              "csync is periodic and needs a shell on the far side), then scan as usual")
@@ -4185,9 +4332,15 @@ Run `t <verb> -h` for a verb's own flags.""")
             "<name>); then a clone + registration on every REMOTE_HOSTS host over ssh. Every "
             "step is check-then-do, so re-running after a failure (gh down, a host unreachable) "
             "resumes where it stopped — and running it on an existing repo just finishes the "
-            "wiring. Flags pre-answer wizard steps; -y takes the defaults for the rest. Run it "
-            "from the shell — the t() shim reloads your config afterward.")
+            "wiring. No name in mind? Describe the repo (a sentence at the name step, or "
+            "--prompt TEXT) and Claude suggests names to pick from. Flags pre-answer wizard "
+            "steps; -y takes the defaults for the rest. Run it from the shell — the t() shim "
+            "reloads your config afterward.")
     sp.add_argument("name", nargs="?", help="repo name (GitHub rules: letters, digits, . _ -)")
+    sp.add_argument("-p", "--prompt", metavar="TEXT",
+                    help="describe the repo instead of naming it: Claude suggests names, the "
+                         "wizard offers them to pick (-y takes the first). In the wizard, "
+                         "typing a sentence at the name step does the same")
     sp.add_argument("--owner", metavar="OWNER", help=f"GitHub owner, user or org (default: {NEW_OWNER})")
     vg = sp.add_mutually_exclusive_group()
     vg.add_argument("--public", action="store_true", help="create it public")

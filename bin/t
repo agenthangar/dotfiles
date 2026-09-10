@@ -2520,6 +2520,630 @@ def cmd_pending(cfg, args):
     return 2
 
 
+# ─── install — install + log in the agent CLIs (claude · codex · cursor) ───────
+#
+# The onboarding step `t setup` never covered: the agent binaries themselves. Before
+# this, a fresh box (or a remote host) got Claude Code, Codex, and the Cursor CLI by
+# hand, each from a different vendor page, then logged into each — and which of the
+# three was missing on which host was nobody's business until `t open --codex` said
+# "command not found" there. Same shape as `t setup` because it is the same job:
+# probe what is already there, offer the rest on ONE list with the present entries
+# locked under a ✓, show the exact commands as a review, run them on y.
+#
+# _INSTALL_AGENTS is the single table every surface reads — the probe, the plan,
+# `t doctor`'s agent rows, and the parity matrix (_AGENT_PARITY, rendered into
+# `t -h`, `t install --status`, README, and `help`); add an agent there and the rest
+# follows. Install commands are the vendors' published one-liners, shown VERBATIM in
+# the review so nothing runs that the screen did not state — a curl-pipe-sh is
+# exactly the kind of command you want to read before it runs. Login steps are
+# INTERACTIVE (inherited stdio: they open a browser or print a device code), so the
+# walk runs them after the rail UI has restored the terminal; over ssh (or
+# --headless) the device-code variants are used, since the browser is not where you
+# are (the cursor-beam keychain precedent). Hosts run the same verb over `ssh -t`
+# with -y, so a device-code login there prompts through the TTY.
+
+INSTALL_AGENTS = ("claude", "codex", "cursor")
+
+_CURL_CLAUDE = "curl -fsSL https://claude.ai/install.sh | bash"
+_CURL_CODEX = "curl -fsSL https://chatgpt.com/codex/install.sh | sh"
+_CURL_CURSOR = "curl https://cursor.com/install -fsS | bash"
+
+_INSTALL_AGENTS = {
+    "claude": {
+        "label": "Claude Code", "bin": "claude",
+        "install": {"darwin": _CURL_CLAUDE, "linux": _CURL_CLAUDE},
+        "login": ["claude", "auth", "login"],
+        "login_headless": ["claude", "auth", "login"],
+        "status": ["claude", "auth", "status"],
+        "update": ["claude", "update"],
+        "note": None,
+    },
+    "codex": {
+        "label": "Codex CLI (OpenAI)", "bin": "codex",
+        # brew's cask on a Mac that has brew (updatable with brew upgrade --cask); the
+        # vendor script everywhere else — no Node dependency on the Linux node
+        "install": {"darwin": "brew install --cask codex", "darwin-nobrew": _CURL_CODEX,
+                    "linux": _CURL_CODEX},
+        "login": ["codex", "login"],
+        "login_headless": ["codex", "login", "--device-auth"],
+        "status": ["codex", "login", "status"],
+        "update": ["codex", "update"],
+        "note": ("then open codex once and accept the dotfiles SessionStart hook under "
+                 "/hooks — t doctor checks"),
+    },
+    "cursor": {
+        "label": "Cursor CLI (cursor-agent)", "bin": "cursor-agent",
+        "install": {"darwin": _CURL_CURSOR, "linux": _CURL_CURSOR},
+        "login": ["cursor-agent", "login"],
+        "login_headless": ["env", "NO_OPEN_BROWSER=1", "cursor-agent", "login"],
+        "status": ["cursor-agent", "status"],
+        "update": ["cursor-agent", "update"],
+        "note": None,
+    },
+}
+
+_INSTALL_STALE = "invalid choice: 'install'"
+
+
+def _install_cmd(agent, os_name, has_brew=True):
+    """(label, argv) for installing `agent` on this OS: the vendor one-liner run through
+    `sh -c`, with the label being the one-liner itself so the review shows exactly
+    what runs. macOS without brew falls to the script variant where one exists."""
+    table = _INSTALL_AGENTS[agent]["install"]
+    key = "darwin" if os_name == "darwin" else "linux"
+    if key == "darwin" and not has_brew and "darwin-nobrew" in table:
+        key = "darwin-nobrew"
+    line = table.get(key) or table["linux"]
+    return line, ["sh", "-c", line]
+
+
+def _install_login_cmd(agent, headless):
+    return _INSTALL_AGENTS[agent]["login_headless" if headless else "login"]
+
+
+def _install_headless(env, flag=False):
+    """Over ssh the browser is not where you are — use each agent's device-code
+    login. --headless forces it (a tmux pane whose ssh env was scrubbed)."""
+    return bool(flag or env.get("SSH_CONNECTION") or env.get("SSH_TTY"))
+
+
+def _install_version(out):
+    """The version token in a `<bin> --version` line ('2.1.267 (Claude Code)',
+    'codex-cli 0.153.4', '2026.02.13-41ac335') — the first digit-led token."""
+    if not out or not out.strip():
+        return None
+    m = re.search(r"\d[\w.\-]*", out.strip().splitlines()[0])
+    return m.group(0) if m else out.strip().splitlines()[0]
+
+
+def _install_status_ok(agent, rc, out):
+    """Is the agent logged in, from its status command? claude answers JSON
+    ({"loggedIn": true}); codex prints 'Logged in using ChatGPT'; cursor-agent prints
+    an animated 'Logged in (…)' — so it is a text match with the negatives excluded,
+    and anything unparseable reads as NOT logged in (the safe direction: an extra
+    login offer costs a keypress, a missed one costs a failed session)."""
+    text = _ANSI_RE.sub("", out or "")
+    if agent == "claude":
+        try:
+            data = json.loads(text)
+            return bool(isinstance(data, dict) and data.get("loggedIn"))
+        except ValueError:
+            return rc == 0 and bool(re.search(r'"loggedIn"\s*:\s*true', text))
+    if rc != 0:
+        return False
+    if re.search(r"not (logged in|authenticated|signed in)", text, re.I):
+        return False
+    return bool(re.search(r"logged in|login successful|signed in", text, re.I))
+
+
+def _install_probe(agents=INSTALL_AGENTS):
+    """{agent: {bin, version, logged_in}} for this machine: `--version` and the status
+    command per agent, ~0.3s in all. A binary only on the interactive PATH
+    (~/.local/bin) is found by its known home when `which` misses it."""
+    out = {}
+    for a in agents:
+        spec = _INSTALL_AGENTS[a]
+        exe = shutil.which(spec["bin"]) or os.path.join(HOME, ".local", "bin", spec["bin"])
+        if not os.path.exists(exe):
+            out[a] = {"bin": None, "version": None, "logged_in": None}
+            continue
+        r = _run([exe, "--version"], timeout=20)
+        ver = _install_version(r.stdout) if r.returncode == 0 else None
+        s = _run([exe] + spec["status"][1:], timeout=30)
+        out[a] = {"bin": exe, "version": ver or "?",
+                  "logged_in": _install_status_ok(a, s.returncode, s.stdout + s.stderr)}
+    return out
+
+
+def _install_items(probed, want, hosts, update=False, no_login=False):
+    """The checklist item model `t install` renders — pure and testable, the
+    _setup_items shape (header / spacer / locked / toggle rows in one list).
+    probed: _install_probe output; want: agents named on the command line (None =
+    pre-mark every missing / logged-out one); hosts: [(alias, target)]. An installed
+    agent is a locked ✓ row with its version, a logged-in one a locked ✓ under LOGIN,
+    so "why isn't X offered?" answers itself. Login rows for a not-yet-installed
+    agent follow its install mark (login needs the binary first)."""
+    def wanted(a):
+        return (a in want) if want is not None else True
+
+    items = [{"t": "header", "sec": "agents", "label": "AGENTS · install"}]
+    installed = []
+    for a in INSTALL_AGENTS:
+        p = probed.get(a) or {}
+        if p.get("version"):
+            installed.append(a)
+            items.append({"t": "locked", "sec": "agents", "alias": a,
+                          "value": f"{p['version']} · installed"})
+        else:
+            items.append({"t": "toggle", "sec": "agents", "kind": "install", "alias": a,
+                          "value": _INSTALL_AGENTS[a]["label"], "checked": wanted(a)})
+    items += [{"t": "spacer", "sec": "login"},
+              {"t": "header", "sec": "login", "label": "LOGIN"}]
+    for a in INSTALL_AGENTS:
+        p = probed.get(a) or {}
+        if p.get("logged_in"):
+            items.append({"t": "locked", "sec": "login", "alias": a, "value": "logged in"})
+        else:
+            items.append({"t": "toggle", "sec": "login", "kind": "login", "alias": a,
+                          "value": " ".join(_INSTALL_AGENTS[a]["login"]),
+                          "checked": wanted(a) and not no_login})
+    if installed:
+        items += [{"t": "spacer", "sec": "options"},
+                  {"t": "header", "sec": "options", "label": "OPTIONS"},
+                  {"t": "toggle", "sec": "options", "kind": "update",
+                   "alias": "update installed agents", "value": ", ".join(installed),
+                   "checked": bool(update)}]
+    if hosts:
+        items += [{"t": "spacer", "sec": "hosts"},
+                  {"t": "header", "sec": "hosts", "label": "HOSTS · then run t install there"}]
+        for alias, target in hosts:
+            items.append({"t": "toggle", "sec": "hosts", "kind": "host", "alias": alias,
+                          "value": target, "checked": True})
+    return items
+
+
+def _install_result(items):
+    """{install: [agents], login: [agents], update: bool, hosts: [aliases]} from the
+    checked toggles, agents in INSTALL_AGENTS order."""
+    sel = {"install": [], "login": [], "update": False, "hosts": []}
+    for it in items:
+        if it["t"] != "toggle" or not it["checked"]:
+            continue
+        if it["kind"] in ("install", "login"):
+            sel[it["kind"]].append(it["alias"])
+        elif it["kind"] == "update":
+            sel["update"] = True
+        elif it["kind"] == "host":
+            sel["hosts"].append(it["alias"])
+    return sel
+
+
+def _install_ssh_argv(target, agents, no_login=False, update=False):
+    """`ssh -t <target> "zsh -lic 't install <agents> -y --no-hosts …'"` — the two
+    quoting layers of _new_ssh_argv, but -t and NO BatchMode-style silencing of the
+    far side: the remote login step prompts (a device code) through this TTY."""
+    words = ["t", "install"] + list(agents) + ["-y", "--no-hosts"]
+    if no_login:
+        words.append("--no-login")
+    if update:
+        words.append("--update")
+    inner = " ".join(shlex.quote(w) for w in words)
+    return ["ssh", "-t", "-o", "ConnectTimeout=5", target, f"zsh -lic {shlex.quote(inner)}"]
+
+
+def _install_host_outcome(rc):
+    """Classify a host run by rc alone — its stdio was the TTY (login prompts), so
+    there is no stderr to read: 255/124 unreachable, 2 = argparse rejected the verb
+    (stale dotfiles there), 127 = no `t`, 0 ok, else failed."""
+    if rc in (255, 124):
+        return "unreachable"
+    if rc == 2:
+        return "stale"
+    if rc == 127:
+        return "missing"
+    return "ok" if rc == 0 else "failed"
+
+
+def _install_host_line(host, status):
+    return {
+        "ok": f"✓ {host}: done",
+        "unreachable": f"⚠ {host}: unreachable — re-run `t install --hosts {host}` later",
+        "stale": f"⚠ {host}: stale dotfiles (no `t install` there) — run `dots` on it, then re-run",
+        "missing": f"⚠ {host}: no `t` there — run install.sh on it, then re-run",
+    }.get(status, f"⚠ {host}: failed — see its output above")
+
+
+def _install_plan(sel, probed, os_name, has_brew, headless, hosts):
+    """sel (_install_result) + probed state → ordered check-then-do step records, the
+    `t new` record shape ({step, do: run|skip|error, label, cmd, warn, interactive}).
+    Per agent: install (skip when present), update (when asked and present), login
+    (skip when logged in; error when the binary is neither present nor selected —
+    login needs it first). Then one `host:<alias>` step per picked host. Because
+    every step re-checks the probed state, a re-run after a failed login renders the
+    done steps as `=` and offers only what is left."""
+    steps = []
+
+    def rec(step, do, label, cmd=None, **kw):
+        steps.append({"step": step, "do": do, "label": label, "cmd": cmd,
+                      "warn": None, "interactive": False, **kw})
+
+    for a in INSTALL_AGENTS:
+        p = probed.get(a) or {}
+        present = bool(p.get("version"))
+        if a in sel["install"]:
+            if present:
+                rec(f"install:{a}", "skip", f"{a} {p['version']} already installed")
+            else:
+                label, cmd = _install_cmd(a, os_name, has_brew)
+                rec(f"install:{a}", "run", label, cmd, warn=_INSTALL_AGENTS[a]["note"])
+        elif present and sel["update"]:
+            rec(f"update:{a}", "run", " ".join(_INSTALL_AGENTS[a]["update"]),
+                list(_INSTALL_AGENTS[a]["update"]))
+        if a in sel["login"]:
+            if p.get("logged_in"):
+                rec(f"login:{a}", "skip", f"{a} already logged in")
+            elif present or a in sel["install"]:
+                cmd = _install_login_cmd(a, headless)
+                rec(f"login:{a}", "run", " ".join(cmd), list(cmd), interactive=True)
+            else:
+                rec(f"login:{a}", "error",
+                    f"{a} login: not installed and not selected for install")
+    agents = [a for a in INSTALL_AGENTS if a in sel["install"] or a in sel["login"]]
+    for alias, target in hosts:
+        if alias not in sel["hosts"]:
+            continue
+        argv = _install_ssh_argv(target, agents or list(INSTALL_AGENTS),
+                                 no_login=not sel["login"], update=sel["update"])
+        rec(f"host:{alias}", "run", f"{alias}: t install {' '.join(agents) or 'everything'}",
+            argv, host=alias, interactive=True)
+    return steps
+
+
+def _install_render(steps, st):
+    """Review / dry-run lines: + run, = skip, ✗ error, ⚠ warn, → the hosts."""
+    lines, hosts = [], []
+    for s in steps:
+        if s["step"].startswith("host:"):
+            hosts.append(s["host"])
+            continue
+        if s["do"] == "run":
+            lines.append(f"{st.g}+{st.r} {s['label']}")
+        elif s["do"] == "skip":
+            lines.append(f"{st.y}= {s['label']}{st.r}")
+        else:
+            lines.append(f"{st.b}✗ {s['label']}{st.r}")
+        if s.get("warn"):
+            lines.append(f"{st.y}  ⚠ {s['warn']}{st.r}")
+    if hosts:
+        run = next((s for s in steps if s["step"].startswith("host:")), None)
+        what = run["label"].split(": ", 1)[1] if run else "t install"
+        lines.append(f"{st.c}→{st.r} then on {', '.join(hosts)}: {what} -y --no-hosts")
+    return lines
+
+
+def _install_relink():
+    """Re-run the live install.sh in links-only mode so a seed that keys on a binary
+    just installed (install_codex_hooks) lands now, not on the next dots. Same
+    capability guard as _dots_relink in .zshrc."""
+    live = os.path.dirname(os.path.realpath(os.path.join(HOME, ".zshrc")))
+    inst = os.path.join(live, "install.sh")
+    try:
+        with open(inst, encoding="utf-8", errors="ignore") as fh:
+            if "DOTFILES_LINKS_ONLY" not in fh.read():
+                return
+    except OSError:
+        return
+    r = subprocess.run([inst], env={**os.environ, "DOTFILES_LINKS_ONLY": "1"},
+                       stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                       stderr=subprocess.STDOUT, text=True)
+    if r.stdout.strip():
+        print(r.stdout.rstrip())
+
+
+def _install_walk(steps, close=False):
+    """Run the plan: `=` for a skip, ✓ per step. Interactive steps (logins, hosts)
+    inherit the TTY; an install that fails skips that agent's login (it would only
+    fail again). A codex install re-seeds the hooks file at once. Host outcomes never
+    change the rc; a failed local step does."""
+    st = Style()
+    failed, skipped_login, codex_landed = 0, set(), False
+    for s in steps:
+        if s["step"].startswith("host:"):
+            continue
+        kind, _, agent = s["step"].partition(":")
+        if s["do"] == "skip":
+            print(f"{st.y}= {s['label']}{st.r}")
+            continue
+        if s["do"] == "error" or (kind == "login" and agent in skipped_login):
+            print(f"{st.b}✗ {s['label']}{st.r}")
+            failed += s["do"] == "error"
+            continue
+        if s["interactive"]:
+            rc = subprocess.call(s["cmd"])
+        else:
+            r = _run(s["cmd"], timeout=900)
+            rc = r.returncode
+            if rc != 0:
+                tail = [ln.strip() for ln in (r.stderr or r.stdout or "").splitlines()
+                        if ln.strip()][-3:]
+                print(f"{st.b}✗ {s['label']}{st.r} — {' / '.join(tail) or f'rc {rc}'}")
+        if rc != 0:
+            failed += 1
+            if kind == "install":
+                skipped_login.add(agent)
+            if s["interactive"]:
+                print(f"{st.b}✗ {s['label']}{st.r} (rc {rc})")
+            continue
+        print(f"✓ {s['label']}")
+        if s.get("warn"):
+            print(f"{st.y}  ⚠ {s['warn']}{st.r}")
+        if kind == "install" and agent == "codex":
+            codex_landed = True
+    if codex_landed:
+        _install_relink()
+    for s in steps:
+        if s["step"].startswith("host:"):
+            print(f"{st.c}→{st.r} {s['label']}")
+            rc = subprocess.call(s["cmd"])
+            print(_install_host_line(s["host"], _install_host_outcome(rc)))
+    if close:
+        print(f"{st.y}└{st.r}  " + (f"{st.g}✓{st.r} done" if not failed
+                                    else f"{st.y}· {failed} step(s) failed — re-run to resume{st.r}"))
+    return 1 if failed else 0
+
+
+def _install_wizard(items, plan):
+    """The `t setup` TUI over the install items: ONE list (agents, login, options,
+    hosts) under a single cursor, present entries locked under a dim ✓; enter → the
+    diff-style review (y apply · n back · q quit), re-planned from the live marks
+    through `plan()`. Returns True on apply (items mutated in place), False on abort;
+    raises off a tty → _install_prompt_flow."""
+    ui = _RailUI()
+    st, out, rail, width = ui.st, ui.out, ui.rail, ui.width
+    HINTS = "space select · enter review · q quit"
+
+    def row_text(it, aw, cur):
+        val = _truncate(str(it["value"]), max(8, width - aw - 12))
+        if it["t"] == "locked":
+            return f"{rail}   {st.g}✓{st.r} {st.y}{it['alias']:<{aw}}  {val}{st.r}"
+        mark = f"{st.c}◼{st.r}" if it["checked"] else "◻"
+        pre = f"{st.c}▸{st.r}" if cur else " "
+        alias = f"{st.b}{it['alias']:<{aw}}{st.r}" if cur else f"{it['alias']:<{aw}}"
+        return f"{rail}  {pre}{mark} {alias}  {st.y}{val}{st.r}"
+
+    def select_screen(msg=""):
+        pos = 0
+        while True:
+            sel = _selectable(items)
+            pos = max(0, min(pos, len(sel) - 1))
+            cur = sel[pos] if sel else -1
+            aw = max([len(x["alias"]) for x in items if x["t"] in ("toggle", "locked")] + [1])
+            head = ui.head("pick what to install", msg or HINTS)
+            nh = len(head)
+            disp = [(h, None) for h in head]
+            for idx, it in enumerate(items):
+                if it["t"] == "spacer":
+                    disp.append((rail, None))
+                elif it["t"] == "header":
+                    disp.append((f"{rail}  {st.b}{it['label']}{st.r}", None))
+                else:
+                    disp.append((row_text(it, aw, idx == cur), idx))
+            body = max(6, ui.lines() - 2 - nh)
+            if len(disp) > body:
+                cur_line = next((n for n, d in enumerate(disp) if d[1] == cur), nh)
+                lo = max(nh, min(cur_line - body // 2, len(disp) - (body - nh)))
+                lines = [d[0] for d in disp[:nh]] + [d[0] for d in disp[lo:lo + body - nh]]
+                if lo > nh:
+                    lines[nh] = f"{rail}  {st.y}… {lo - nh} more above{st.r}"
+                if lo + body - nh < len(disp):
+                    lines[-1] = f"{rail}  {st.y}… {len(disp) - (lo + body - nh)} more below{st.r}"
+            else:
+                lines = [d[0] for d in disp]
+            ui.repaint(lines)
+            msg = ""
+            k = ui.read_key()
+            it = items[cur] if sel else None
+            if k in ("q", "esc", "abort"):
+                return False
+            if k == "enter":
+                return True
+            if it and k in ("up", "k"):
+                pos -= 1
+            elif it and k in ("down", "j"):
+                pos += 1
+            elif it and k == "space":
+                it["checked"] = not it["checked"]
+                pos += 1
+            else:
+                msg = f"⚠ no binding for that key — {HINTS}"
+
+    def review_screen(lines):
+        if not lines:
+            return "empty"
+        body = [f"{rail}  {ln}" for ln in lines]
+        k = ui.page("review — what will run", body,
+                    accept=("y", "n", "esc", "q", "abort"), keys="y apply · n back · q quit")
+        if k == "y":
+            ui.commit([f"{st.g}◇{st.r}  {st.b}running{st.r}"] + body)
+            return True
+        return False if k in ("n", "esc") else None
+
+    out.write(f"{st.y}┌{st.r}  {st.b}t install{st.r} {st.y}· agent CLIs — nothing runs until "
+              f"you confirm{st.r}\n{rail}\n")
+    ui.raw()
+    ok, msg = False, ""
+    try:
+        while True:
+            if not select_screen(msg):
+                break
+            r = review_screen(_install_render(plan(), st))
+            if r == "empty":
+                msg = "nothing selected — space marks ◼ what gets installed"
+                continue
+            if r:
+                ok = True
+                break
+            if r is None:
+                break
+            msg = ""
+    except KeyboardInterrupt:
+        ok = False
+    finally:
+        ui.restore()
+    if not ok:
+        out.write(f"{st.y}└{st.r} {st.y}· aborted — nothing run{st.r}\n")
+    return ok
+
+
+def _install_prompt_flow(items, plan):
+    """Plain-prompt fallback (TERM=dumb, no raw mode): one y/N per toggle over the
+    same item model, then the same review gate."""
+    st = Style()
+    for it in items:
+        if it["t"] == "header":
+            print(f"\n{st.b}{it['label']}{st.r}")
+        elif it["t"] == "locked":
+            print(f"  {st.y}✓ {it['alias']} — {it['value']}{st.r}")
+        elif it["t"] == "toggle":
+            it["checked"] = _confirm(f"  {it['alias']} ({it['value']})?")
+    lines = _install_render(plan(), st)
+    if not lines:
+        return False
+    print(f"\n{st.b}review{st.r} — what will run:\n")
+    for ln in lines:
+        print(f"  {ln}")
+    return _confirm("proceed?")
+
+
+def cmd_install(cfg, args):
+    """See the section comment above. Positional agents pre-mark rows; -y skips the
+    TUI and takes the marks as they stand; --status prints the probe + parity matrix
+    and stops; --dry-run (and no tty) prints the plan and stops."""
+    st = Style()
+    unknown = [a for a in args.agents if a not in INSTALL_AGENTS]
+    if unknown:
+        print(f"t install: unknown agent(s): {', '.join(unknown)} — one of "
+              f"{', '.join(INSTALL_AGENTS)}", file=sys.stderr)
+        return 2
+    probed = _install_probe()
+    if args.status:
+        for a in INSTALL_AGENTS:
+            p = probed[a]
+            state = ("missing" if not p["version"] else
+                     f"{p['version']} · {'logged in' if p['logged_in'] else 'NOT logged in'}")
+            print(f"  {a:<8} {state}")
+        print()
+        for ln in _agent_parity_render():
+            print(ln)
+        return 0
+    hosts, err = _new_pick_hosts(cfg.hosts, args.hosts, args.no_hosts)
+    if err:
+        print(f"t install: {err}", file=sys.stderr)
+        return 1
+    want = args.agents or None
+    items = _install_items(probed, want, hosts, update=args.update, no_login=args.no_login)
+    os_name = "darwin" if sys.platform == "darwin" else "linux"
+    has_brew, headless = bool(shutil.which("brew")), _install_headless(os.environ, args.headless)
+
+    def plan():   # the review re-plans from the live marks
+        return _install_plan(_install_result(items), probed, os_name, has_brew, headless, hosts)
+
+    interactive = sys.stdin.isatty() and sys.stdout.isatty()
+    if args.dry_run or args.yes or not interactive:
+        steps = plan()
+        lines = _install_render(steps, st)
+        if not lines:
+            print("nothing to do — every agent is installed and logged in")
+            return 0
+        if args.dry_run or not args.yes:
+            print("would run:" if args.dry_run else "t install would run:")
+            for ln in lines:
+                print(f"  {ln}")
+            if args.dry_run:
+                return 0
+            print("\nt install is interactive — run it from a terminal, or pass -y "
+                  "(or --dry-run)", file=sys.stderr)
+            return 1
+        return _install_walk(steps)
+    if not _selectable(items):
+        print("nothing to do — every agent is installed and logged in")
+        return 0
+    wizard_ran = True
+    try:
+        confirmed = _install_wizard(items, plan)
+    except Exception as e:
+        wizard_ran = False
+        print(f"(inline UI unavailable: {e} — falling back to prompts)", file=sys.stderr)
+        confirmed = _install_prompt_flow(items, plan)
+    if not confirmed:
+        if not wizard_ran:
+            print("t install: aborted — nothing run")
+        return 1
+    return _install_walk(plan(), close=wizard_ran)
+
+
+# ─── agent parity — one table, rendered everywhere it is documented ────────────
+#
+# Every `t` surface either supports all three agents or says which it does not, and
+# the saying is generated: this table renders into `t -h`, `t install --status`,
+# README's "Agents" section (pinned by test_readme_parity_matrix_matches_bin_t) and
+# `help`. Add a surface → add a row, or the README test fails. Cells: ✓ supported,
+# ✗ not (with why), → the verb that does it instead.
+
+_AGENT_PARITY = [
+    ("surface", "claude", "codex", "cursor"),
+    ("t install (install · login · update)", "✓", "✓", "✓"),
+    ("dev slots: t open / ls / kill / read / paste / todo", "✓", "planned", "✗ no slot — t cursor ls"),
+    ("t push / t pop", "✓", "planned", "✗ no slot"),
+    ("t resume (dead slots)", "✓", "planned", "→ t cursor resume"),
+    ("t beam / --from (move a session)", "✓", "planned", "→ t cursor [id] --host / --from"),
+    ("csync (iCloud union of transcripts)", "✓ projects + plans", "planned", "✓ cursor-chats"),
+    ("SessionStart stamps (registry · opened · origin)", "✓ settings.json hook",
+     "✓ hooks.json + /hooks trust", "✗ no hook wired"),
+    ("t plan", "✓", "✗ codex keeps no plan files", "✗"),
+    ("t find / t mcp (transcript search)", "✓", "planned", "✗"),
+    ("t doctor agent row (version · login · hook)", "✓", "✓", "✓ version · login"),
+]
+
+
+def _agent_parity_render():
+    """The matrix as aligned plain-text lines (no ANSI: it is embedded in README and
+    argparse's epilog verbatim)."""
+    widths = [max(len(r[i]) for r in _AGENT_PARITY) for i in range(4)]
+    lines = []
+    for n, row in enumerate(_AGENT_PARITY):
+        cells = [f"{c:<{widths[i]}}" for i, c in enumerate(row)]
+        lines.append("  " + "  ".join(cells).rstrip())
+        if n == 0:
+            lines.append("  " + "  ".join("-" * w for w in widths))
+    return lines
+
+
+def _codex_hook_state(path):
+    """~/.codex/hooks.json: "registered" when a SessionStart command runs
+    claude-stamp-tmux, "none" when the file is absent or has no such entry, None when
+    it is unreadable or foreign-shaped (not ours to judge — the twin of
+    _mcp_allow_state)."""
+    try:
+        with open(path, encoding="utf-8") as fh:
+            data = json.load(fh)
+    except OSError:
+        return "none"
+    except ValueError:
+        return None
+    hooks = data.get("hooks") if isinstance(data, dict) else None
+    groups = hooks.get("SessionStart") if isinstance(hooks, dict) else None
+    if groups is None:
+        return "none" if isinstance(hooks, (dict, type(None))) else None
+    if not isinstance(groups, list):
+        return None
+    for g in groups:
+        for h in (g.get("hooks") or []) if isinstance(g, dict) else []:
+            if isinstance(h, dict) and "claude-stamp-tmux" in str(h.get("command", "")):
+                return "registered"
+    return "none"
+
+
 # ─── doctor — read-only setup diagnostics ─────────────────────────────────────
 # Born from a real debugging session: "scroll wheel doesn't work" turned out to be
 # four stacked facts (stale live checkout, missing ~/.tmux.conf link, tmux server
@@ -2659,6 +3283,16 @@ def _doctor_findings(facts):
         out.append("⚠ no %s allow rule in ~/.claude/settings.json, so every sessions "
                    "lookup prompts — run t mcp --install (dots seeds it too)"
                    % _MCP_ALLOW_RULE)
+    for a, p in sorted((facts.get("agents") or {}).items()):
+        if p.get("version") and p.get("logged_in") is False:
+            out.append("⚠ %s is installed but not logged in — run t install %s" % (a, a))
+    if facts.get("codex_hook") == "none":
+        out.append("⚠ codex has no dotfiles SessionStart hook in ~/.codex/hooks.json — run "
+                   "dots (install.sh seeds it), then accept it under /hooks in codex")
+    elif (facts.get("codex_hook") == "registered" and facts.get("codex_used")
+          and not facts.get("codex_hook_fired")):
+        out.append("· the codex hook is registered but has never fired here — open codex, "
+                   "run /hooks and trust it (until then t ls cannot title a codex slot)")
     if not out:
         out.append("✓ nothing suspicious found")
     return out
@@ -2722,15 +3356,34 @@ def cmd_doctor(cfg, args):
         ("zsh", ["zsh", "--version"]), ("tmux", ["tmux", "-V"]),
         ("git", ["git", "--version"]), ("gh", ["gh", "--version"]),
         ("fzf", ["fzf", "--version"])]]
-    claude_bin = shutil.which("claude") or os.path.join(HOME, ".local", "bin", "claude")
-    vers.append("claude %s" % (ver(run([claude_bin, "--version"], timeout=15))
-                               if os.path.exists(claude_bin) else "missing"))
     print("  " + " · ".join(vers))
+
+    # the agent CLIs: installed? logged in? (codex: is its hook wired?) — t install fixes
+    section("Agents")
+    facts_agents = _install_probe()
+    for a in INSTALL_AGENTS:
+        p = facts_agents[a]
+        if not p["version"]:
+            print("  %-8s missing — t install %s" % (a, a))
+        else:
+            print("  %-8s %s · %s" % (a, p["version"], "logged in" if p["logged_in"]
+                                        else "NOT logged in — t install %s" % a))
+    codex_hook = codex_used = None
+    if facts_agents["codex"]["version"] or os.path.isdir(os.path.join(HOME, ".codex")):
+        codex_hook = _codex_hook_state(os.path.join(HOME, ".codex", "hooks.json"))
+        codex_used = os.path.isdir(os.path.join(HOME, ".codex", "sessions"))
+        fired = bool(glob.glob(os.path.join(_cache_root(), "rollouts", "*")))
+        print("  codex hook %s" % {"registered": "registered in ~/.codex/hooks.json%s"
+                                   % ("" if fired else " (never fired here — trust it under /hooks)"),
+                                   "none": "NOT registered — run dots (install.sh seeds it)",
+                                   None: "~/.codex/hooks.json unreadable"}[codex_hook])
 
     # dotfiles: which checkout is live, is it current, are the links in place
     section("Dotfiles")
     facts = {"in_tmux": bool(os.environ.get("TMUX")),
-             "term_program": os.environ.get("TERM_PROGRAM"), "tui": tui}
+             "term_program": os.environ.get("TERM_PROGRAM"), "tui": tui,
+             "agents": facts_agents, "codex_hook": codex_hook, "codex_used": codex_used,
+             "codex_hook_fired": bool(glob.glob(os.path.join(_cache_root(), "rollouts", "*")))}
     zrc = os.path.join(HOME, ".zshrc")
     live_src = None
     if os.path.islink(zrc):
@@ -5284,7 +5937,11 @@ examples:
                           ask the sessions MCP by hand (Claude calls it for you)
   t on mini ls            run a command on a remote host
   t setup                 onboard this machine: register ~/code repos + ssh hosts
+  t install               install + log in the agent CLIs (claude, codex, cursor) here and on every host
   t new tool-x            wizard: create ~/code/tool-x + github <owner>/tool-x, register it everywhere
+
+agents — what each verb supports per agent (t install --status adds this machine's state):
+""" + "\n".join(_agent_parity_render()) + """
 
 Run `t <verb> -h` for a verb's own flags.""")
     sub = p.add_subparsers(dest="verb", metavar="<verb>")
@@ -5505,6 +6162,29 @@ Run `t <verb> -h` for a verb's own flags.""")
                     help="no wizard, no review: the flags plus defaults, then run")
     sp.add_argument("--dry-run", action="store_true", help="print the steps it would run, change nothing")
 
+    sp = sub.add_parser("install", help="install + log in the agent CLIs (claude, codex, cursor)",
+        description="The `t setup`-style checklist for the agent binaries themselves: probes "
+            "which of Claude Code, Codex CLI and the Cursor CLI are installed and logged in "
+            "here, then offers the rest on ONE list — installed and logged-in entries locked "
+            "under a ✓, the missing ones pre-marked — with the vendors' install one-liners and "
+            "each agent's login command shown verbatim in a review before anything runs "
+            "(y runs, n goes back, q aborts). Logins are interactive (browser, or a device "
+            "code over ssh / --headless). Every REMOTE_HOSTS host is then offered the same "
+            "run over ssh -t. Re-running is safe: present entries are never re-offered.")
+    sp.add_argument("agents", nargs="*", metavar="agent",
+                    help=f"pre-mark only these ({', '.join(INSTALL_AGENTS)}); default: every missing one")
+    sp.add_argument("-y", "--yes", action="store_true", help="no list, no review: run the marks as they stand")
+    sp.add_argument("--no-login", action="store_true", help="install only, skip the login steps")
+    sp.add_argument("--update", action="store_true", help="also run each installed agent's updater")
+    sp.add_argument("--headless", action="store_true",
+                    help="use the device-code logins (automatic over ssh)")
+    hg = sp.add_mutually_exclusive_group()
+    hg.add_argument("--hosts", metavar="A,B", help="offer the run only on these REMOTE_HOSTS aliases")
+    hg.add_argument("--no-hosts", action="store_true", help="local only (default: every REMOTE_HOSTS host is offered)")
+    sp.add_argument("--dry-run", action="store_true", help="print what would run, change nothing")
+    sp.add_argument("--status", action="store_true",
+                    help="print each agent's install/login state and the per-agent support matrix")
+
     sub.add_parser("doctor", help="diagnose this machine's dotfiles/tmux/Claude setup",
         description="Read-only diagnostics for when the tooling misbehaves: which checkout the "
             "live $HOME symlinks point at and whether it is behind origin/main, whether every "
@@ -5579,6 +6259,7 @@ IMPLEMENTED = {
     "plan": cmd_plan, "paste": cmd_paste, "kill": cmd_kill, "setup": cmd_setup,
     "land": cmd_land, "kill-owner": cmd_kill_owner, "cursor": cmd_cursor,
     "doctor": cmd_doctor, "todo": cmd_todo, "mcp": cmd_mcp, "new": cmd_new, "new-land": cmd_new_land,
+    "install": cmd_install,
 }
 
 

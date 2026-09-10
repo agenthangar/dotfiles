@@ -399,6 +399,61 @@ PY
 }
 install_claude_mcp_allow
 
+# Codex CLI's twin of the SessionStart hook: the same bin/claude-stamp-tmux script
+# (agent-aware — `--agent codex`), registered in ~/.codex/hooks.json so a codex slot
+# gets the same registry / opened / origin / tmux stamps a claude slot gets. Same
+# contract as the statusline and MCP seeds above, in the links-only path for the same
+# reason: a plain `dots` must land it on every machine, and `t install codex` re-runs
+# this right after the binary appears. Add-only (an existing claude-stamp-tmux entry,
+# or a hand-edited file, is never touched), tmp + os.replace, silent unless it adds.
+# Gated on codex being present or ~/.codex existing, so a machine that never runs
+# codex never grows a hooks file. The command is a literal $HOME: Codex runs hook
+# commands through a shell (its own examples use `~` and `$(git …)`).
+#
+# Trust is the one half install.sh cannot do: Codex requires a one-time review of a
+# non-managed hook under /hooks inside the TUI (recorded against the command's hash
+# in ~/.codex/config.toml — no supported installer pre-trust exists), which is why the
+# argv is fixed here and `t doctor` reports a registered-but-never-fired hook.
+install_codex_hooks() {
+    [[ -z "${DOTFILES_NO_CODEX_HOOKS:-}" ]] || return 0
+    command -v codex >/dev/null 2>&1 || [[ -d "$HOME/.codex" ]] || return 0
+    command -v python3 >/dev/null 2>&1 || return 0
+    python3 - "$HOME/.codex/hooks.json" '$HOME/bin/claude-stamp-tmux --agent codex' <<'PY'
+import json, os, sys
+
+dst, cmd = sys.argv[1], sys.argv[2]
+try:
+    with open(dst, encoding="utf-8") as fh:
+        data = json.load(fh)
+except OSError:
+    data = {}             # no file yet: create it
+except ValueError:
+    sys.exit(0)           # not ours to repair, and never block a relink over it
+if not isinstance(data, dict):
+    sys.exit(0)
+hooks = data.setdefault("hooks", {})
+if not isinstance(hooks, dict):
+    sys.exit(0)
+groups = hooks.setdefault("SessionStart", [])
+if not isinstance(groups, list):
+    sys.exit(0)
+for g in groups:
+    for h in (g.get("hooks") or []) if isinstance(g, dict) else []:
+        if isinstance(h, dict) and "claude-stamp-tmux" in str(h.get("command", "")):
+            sys.exit(0)   # already wired (or hand-edited) — silent no-op, this runs every dots
+groups.append({"hooks": [{"type": "command", "command": cmd}]})
+os.makedirs(os.path.dirname(dst), exist_ok=True)
+tmp = dst + ".tmp"
+with open(tmp, "w", encoding="utf-8") as fh:
+    json.dump(data, fh, indent=2)
+    fh.write("\n")
+os.replace(tmp, dst)
+print("Registered the SessionStart hook in %s -> claude-stamp-tmux --agent codex" % dst)
+print("  (one-time: open codex and accept it under /hooks — Codex trusts hooks by hand)")
+PY
+}
+install_codex_hooks
+
 # Everything below is the FULL install. The links-only relink stops here, before the
 # tmux source-file, the ssh Include rewrite, the ~/.zshrc.local and settings.json
 # seeds, the global gitconfig/hooksPath writes, the PII denylist branch (which would
@@ -588,6 +643,7 @@ elif [[ "$(uname)" != "Darwin" ]]; then
     # `zsh -lic` contract) and degrades gracefully without the rest.
     echo "Linux host — install the shell deps with your package manager, e.g.:"
     echo "  sudo apt-get install -y zsh tmux fzf jq   (gh: https://cli.github.com)"
+    echo "The agent CLIs (claude, codex, cursor-agent) install + log in via: t install"
 else
     echo "Homebrew not found — skipping Brewfile. Install it from https://brew.sh,"
     echo "then re-run this script (or 'brew bundle') to get gh/jq/tmux/fzf/glow."

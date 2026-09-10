@@ -54,6 +54,9 @@ def _seed_worktree(path):
         f.chmod(0o755)
     for c in ("tpush.md", "tpop.md"):
         (path / "claude" / "commands" / c).write_text("x\n")
+    (path / "codex" / "prompts").mkdir(parents=True, exist_ok=True)
+    for c in ("tpush.md", "tpop.md"):
+        (path / "codex" / "prompts" / c).write_text("x\n")
     (path / "claude" / "settings.json.example").write_text("{}\n")
     (path / "ssh" / "dotfiles.conf").write_text("# ssh\n")
     # install.sh seds this into ~/Library/LaunchAgents; content is irrelevant.

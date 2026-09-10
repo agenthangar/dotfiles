@@ -55,9 +55,15 @@ def hooks_of(home):
     return json.loads((home / ".codex" / "hooks.json").read_text())
 
 
-def test_seeds_hooks_json_when_codex_dir_exists(box):
+def _codex_home(home):
+    """A REAL codex home: its config.toml (the gate), not just the dir link_all makes."""
+    (home / ".codex").mkdir(exist_ok=True)
+    (home / ".codex" / "config.toml").write_text("model = \"gpt-6\"\n")
+
+
+def test_seeds_hooks_json_when_codex_home_exists(box):
     co, home = box
-    (home / ".codex").mkdir()
+    _codex_home(home)
     r = relink(co, home)
     assert r.returncode == 0, r.stderr
     assert "Registered the SessionStart hook" in r.stdout
@@ -65,15 +71,18 @@ def test_seeds_hooks_json_when_codex_dir_exists(box):
     assert data == {"hooks": {"SessionStart": [{"hooks": [{"type": "command", "command": HOOK_CMD}]}]}}
 
 
-def test_no_codex_dir_no_file(box):
+def test_no_codex_home_no_hooks_file(box):
     co, home = box
-    assert relink(co, home).returncode == 0
-    assert not (home / ".codex").exists()
+    r = relink(co, home)
+    assert r.returncode == 0, r.stderr
+    # link_all creates ~/.codex/prompts on every machine; that alone must not seed hooks
+    assert (home / ".codex" / "prompts" / "tpush.md").is_symlink()
+    assert not (home / ".codex" / "hooks.json").exists()
 
 
 def test_second_run_is_a_silent_noop(box):
     co, home = box
-    (home / ".codex").mkdir()
+    _codex_home(home)
     relink(co, home)
     before = (home / ".codex" / "hooks.json").read_text()
     r = relink(co, home)
@@ -84,7 +93,7 @@ def test_second_run_is_a_silent_noop(box):
 
 def test_merges_into_an_existing_file_without_touching_other_hooks(box):
     co, home = box
-    (home / ".codex").mkdir()
+    _codex_home(home)
     existing = {"description": "mine", "hooks": {
         "Stop": [{"hooks": [{"type": "command", "command": "say done"}]}],
         "SessionStart": [{"matcher": "startup", "hooks": [{"type": "command", "command": "python3 notes.py"}]}],
@@ -100,7 +109,7 @@ def test_merges_into_an_existing_file_without_touching_other_hooks(box):
 
 def test_existing_stamp_entry_is_left_alone(box):
     co, home = box
-    (home / ".codex").mkdir()
+    _codex_home(home)
     mine = {"hooks": {"SessionStart": [{"hooks": [{"type": "command",
                                                     "command": "/opt/bin/claude-stamp-tmux --agent codex --quiet"}]}]}}
     (home / ".codex" / "hooks.json").write_text(json.dumps(mine))
@@ -111,7 +120,7 @@ def test_existing_stamp_entry_is_left_alone(box):
 
 def test_invalid_json_is_never_repaired(box):
     co, home = box
-    (home / ".codex").mkdir()
+    _codex_home(home)
     (home / ".codex" / "hooks.json").write_text("{ this is not json")
     r = relink(co, home)
     assert r.returncode == 0
@@ -120,6 +129,6 @@ def test_invalid_json_is_never_repaired(box):
 
 def test_opt_out_env(box):
     co, home = box
-    (home / ".codex").mkdir()
+    _codex_home(home)
     assert relink(co, home, DOTFILES_NO_CODEX_HOOKS="1").returncode == 0
     assert not (home / ".codex" / "hooks.json").exists()

@@ -3200,9 +3200,10 @@ _AGENT_PARITY = [
     ("t beam / --from (move a session)", "✓", "✓ (rollout + .origin)", "→ t cursor [id] --host / --from"),
     ("csync (iCloud union of transcripts)", "✓ projects + plans", "✓ codex-sessions", "✓ cursor-chats"),
     ("SessionStart stamps (registry · opened · origin)", "✓ settings.json hook",
-     "✓ hooks.json + /hooks trust", "✗ no hook wired"),
+     "✓ hooks.json (trust once at startup)", "✗ no hook wired"),
     ("t plan", "✓", "✗ codex keeps no plan files (says so)", "✗"),
-    ("t find / t mcp (transcript search)", "✓", "planned", "✗"),
+    ("/tpush · /tpop slash commands", "✓ ~/.claude/commands", "✓ ~/.codex/prompts", "✗"),
+    ("t find / t mcp (transcript search)", "✓", "✗ claude transcripts only", "✗"),
     ("t doctor agent row (version · login · hook)", "✓", "✓", "✓ version · login"),
 ]
 

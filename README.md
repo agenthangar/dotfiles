@@ -48,6 +48,7 @@ you point them there yourself with `dots --dev`.
 | `.zshrc` | `~/.zshrc` |
 | `bin/<script>` | `~/bin/<script>` |
 | `claude/commands/*.md` | `~/.claude/commands/*.md` |
+| `codex/prompts/*.md` | `~/.codex/prompts/*.md` (Codex's `/tpush`, `/tpop`) |
 
 `bin/` holds the utility scripts (added to PATH):
 
@@ -142,9 +143,10 @@ support without the README saying so:
   t resume (dead slots)                             ✓                     ✓ (its sqlite thread index)            → t cursor resume
   t beam / --from (move a session)                  ✓                     ✓ (rollout + .origin)                  → t cursor [id] --host / --from
   csync (iCloud union of transcripts)               ✓ projects + plans    ✓ codex-sessions                       ✓ cursor-chats
-  SessionStart stamps (registry · opened · origin)  ✓ settings.json hook  ✓ hooks.json + /hooks trust            ✗ no hook wired
+  SessionStart stamps (registry · opened · origin)  ✓ settings.json hook  ✓ hooks.json (trust once at startup)   ✗ no hook wired
   t plan                                            ✓                     ✗ codex keeps no plan files (says so)  ✗
-  t find / t mcp (transcript search)                ✓                     planned                                ✗
+  /tpush · /tpop slash commands                     ✓ ~/.claude/commands  ✓ ~/.codex/prompts                     ✗
+  t find / t mcp (transcript search)                ✓                     ✗ claude transcripts only              ✗
   t doctor agent row (version · login · hook)       ✓                     ✓                                      ✓ version · login
 ```
 

@@ -426,10 +426,10 @@ install_claude_mcp_allow
 # so a box that never runs codex never grows a hooks file. The command is a literal $HOME: Codex runs hook
 # commands through a shell (its own examples use `~` and `$(git …)`).
 #
-# Trust is the one half install.sh cannot do: Codex requires a one-time review of a
-# non-managed hook under /hooks inside the TUI (recorded against the command's hash
-# in ~/.codex/config.toml — no supported installer pre-trust exists), which is why the
-# argv is fixed here and `t doctor` reports a registered-but-never-fired hook.
+# Trust is the one half install.sh cannot do: Codex asks once, at its next startup
+# ("Hooks need review" → "Trust all and continue"), and records the decision against
+# the command's hash in ~/.codex/config.toml — no supported installer pre-trust exists
+# — which is why the argv is fixed here and `t doctor` reads that trust record.
 install_codex_hooks() {
     [[ -z "${DOTFILES_NO_CODEX_HOOKS:-}" ]] || return 0
     command -v codex >/dev/null 2>&1 || [[ -f "$HOME/.codex/config.toml" || -f "$HOME/.codex/auth.json" ]] || return 0
@@ -466,7 +466,7 @@ with open(tmp, "w", encoding="utf-8") as fh:
     fh.write("\n")
 os.replace(tmp, dst)
 print("Registered the SessionStart hook in %s -> claude-stamp-tmux --agent codex" % dst)
-print("  (one-time: open codex and accept it under /hooks — Codex trusts hooks by hand)")
+print("  (one-time: start codex and accept its hooks prompt, 'Trust all and continue')")
 PY
 }
 install_codex_hooks

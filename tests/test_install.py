@@ -178,7 +178,7 @@ def test_install_plan_codex_install_carries_the_hook_note_and_headless_login(t_m
     steps = t_mod._install_plan(sel, _probed(), "linux", False, True, [])
     inst, login = steps
     assert inst["do"] == "run" and "chatgpt.com/codex/install.sh" in inst["label"]
-    assert "/hooks" in inst["warn"]
+    assert "hooks prompt" in inst["warn"]
     assert login["cmd"] == ["codex", "login", "--device-auth"]
 
 
@@ -237,7 +237,7 @@ def test_install_render_marks_and_host_trailer(t_mod):
     lines = t_mod._install_render(steps, _St())
     assert lines[0] == "= claude already logged in"
     assert lines[1] == "+ brew install --cask codex"
-    assert lines[2].startswith("  ⚠ then open codex")
+    assert lines[2].startswith("  ⚠ then start codex")
     assert lines[3] == "+ codex login"
     assert lines[4].startswith("✗ cursor login: not installed")
     # the hosts get every agent named for install OR login: a login the local box did
@@ -311,12 +311,22 @@ def test_doctor_findings_missing_agent_is_not_a_finding(t_mod):
 def test_doctor_findings_codex_hook_states(t_mod):
     out = t_mod._doctor_findings({"codex_hook": "none"})
     assert any("no dotfiles SessionStart hook" in l and "run dots" in l for l in out)
-    out = t_mod._doctor_findings({"codex_hook": "registered", "codex_used": True,
-                                  "codex_hook_fired": False})
-    assert any("never fired" in l and "/hooks" in l for l in out)
-    # registered + never used yet → nothing to nag about; registered + fired → quiet
-    assert t_mod._doctor_findings({"codex_hook": "registered", "codex_used": False,
-                                   "codex_hook_fired": False}) == ["✓ nothing suspicious found"]
-    assert t_mod._doctor_findings({"codex_hook": "registered", "codex_used": True,
-                                   "codex_hook_fired": True}) == ["✓ nothing suspicious found"]
+    out = t_mod._doctor_findings({"codex_hook": "registered", "codex_hook_trusted": False})
+    assert any("not trusted yet" in l and "Trust all and continue" in l for l in out)
+    # trusted, or trust unknown (config unreadable) → quiet
+    assert t_mod._doctor_findings({"codex_hook": "registered", "codex_hook_trusted": True}) == ["✓ nothing suspicious found"]
+    assert t_mod._doctor_findings({"codex_hook": "registered", "codex_hook_trusted": None}) == ["✓ nothing suspicious found"]
     assert t_mod._doctor_findings({"codex_hook": None}) == ["✓ nothing suspicious found"]
+
+
+def test_codex_hook_trusted_reads_the_config_record(t_mod, tmp_path):
+    cfg = tmp_path / "config.toml"
+    assert t_mod._codex_hook_trusted(str(cfg)) is None                      # no file
+    cfg.write_text('model = "gpt-6"\n[hooks.state]\n')
+    assert t_mod._codex_hook_trusted(str(cfg)) is False                     # no record
+    cfg.write_text('[hooks.state]\n\n[hooks.state."/Users/me/.codex/hooks.json:session_start:0:0"]\n'
+                   'trusted_hash = "sha256:547e29d0"\n')
+    assert t_mod._codex_hook_trusted(str(cfg)) is True
+    # a trust record for some OTHER hook source is not ours
+    cfg.write_text('[hooks.state."/repo/.codex/config.toml:pre_tool_use:0:0"]\ntrusted_hash = "sha256:x"\n')
+    assert t_mod._codex_hook_trusted(str(cfg)) is False

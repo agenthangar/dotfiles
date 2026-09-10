@@ -118,25 +118,30 @@ A dev slot runs either agent: `t open <repo> --codex` starts Codex CLI in a fres
 slot (`--claude` forces Claude), `DEV_AGENT[repo]=codex` in `~/.zshrc.local` makes
 it a repo's default and `DEV_AGENT_DEFAULT` the global one. `t ls` marks a codex
 slot with `⬡` in its STATUS column and adds the glyph to the legend only when one
-is on screen, so a claude-only listing looks exactly as it always did.
+is on screen, so a claude-only listing looks exactly as it always did. A codex
+slot's title comes from its rollout (the same cached parser as Claude's
+transcripts), `t pop`/`t push` move it with `codex resume`, and `t resume` lists
+a dead codex slot's conversations from Codex's own thread index, marked `⬡` in
+the picker. Codex mints its thread id at the first prompt (there is no
+`--session-id`), so an untouched codex slot reads as idle until you type.
 
 Not every verb supports every agent yet. The matrix below is **generated from
 `bin/t`** (a test pins this block to it), so a verb cannot gain or lose agent
 support without the README saying so:
 
 ```text
-  surface                                           claude                codex                         cursor
-  ------------------------------------------------  --------------------  ----------------------------  -------------------------------
-  t install (install · login · update)              ✓                     ✓                             ✓
-  dev slots: t open / ls / kill / read / paste      ✓                     ✓ t open --codex · DEV_AGENT  ✗ no slot — t cursor ls
-  t push / t pop                                    ✓                     planned                       ✗ no slot
-  t resume (dead slots)                             ✓                     planned                       → t cursor resume
-  t beam / --from (move a session)                  ✓                     planned                       → t cursor [id] --host / --from
-  csync (iCloud union of transcripts)               ✓ projects + plans    planned                       ✓ cursor-chats
-  SessionStart stamps (registry · opened · origin)  ✓ settings.json hook  ✓ hooks.json + /hooks trust   ✗ no hook wired
-  t plan                                            ✓                     ✗ codex keeps no plan files   ✗
-  t find / t mcp (transcript search)                ✓                     planned                       ✗
-  t doctor agent row (version · login · hook)       ✓                     ✓                             ✓ version · login
+  surface                                           claude                codex                                  cursor
+  ------------------------------------------------  --------------------  -------------------------------------  -------------------------------
+  t install (install · login · update)              ✓                     ✓                                      ✓
+  dev slots: t open / ls / kill / read / paste      ✓                     ✓ t open --codex · DEV_AGENT           ✗ no slot — t cursor ls
+  t push / t pop                                    ✓                     ✓                                      ✗ no slot
+  t resume (dead slots)                             ✓                     ✓ (its sqlite thread index)            → t cursor resume
+  t beam / --from (move a session)                  ✓                     planned                                → t cursor [id] --host / --from
+  csync (iCloud union of transcripts)               ✓ projects + plans    planned                                ✓ cursor-chats
+  SessionStart stamps (registry · opened · origin)  ✓ settings.json hook  ✓ hooks.json + /hooks trust            ✗ no hook wired
+  t plan                                            ✓                     ✗ codex keeps no plan files (says so)  ✗
+  t find / t mcp (transcript search)                ✓                     planned                                ✗
+  t doctor agent row (version · login · hook)       ✓                     ✓                                      ✓ version · login
 ```
 
 Codex needs one manual step after install: its SessionStart hook (the same

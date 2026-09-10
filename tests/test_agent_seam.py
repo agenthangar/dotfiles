@@ -163,8 +163,12 @@ TMUX_LOG_STUB = r"""#!/bin/bash
 # log every call; answer the two reads the seam makes
 printf '%s\n' "$*" >> "$TMUX_LOG"
 case "$1" in
-  show-environment) [[ -n "${FAKE_DEV_AGENT:-}" && "$4" == DEV_AGENT ]] && echo "DEV_AGENT=$FAKE_DEV_AGENT" ;;
+  show-environment)
+    [[ -n "${FAKE_DEV_AGENT:-}" && "$4" == DEV_AGENT ]] && echo "DEV_AGENT=$FAKE_DEV_AGENT"
+    [[ -n "${FAKE_RESUME_ID:-}" && "$4" == CLAUDE_RESUME_ID ]] && echo "CLAUDE_RESUME_ID=$FAKE_RESUME_ID"
+    exit 0 ;;
   capture-pane)     [[ -n "${FAKE_PANE:-}" ]] && printf '%s\n' "$FAKE_PANE" ;;
+  has-session)      [[ -n "${FAKE_HAS_SESSION:-}" ]] || exit 1 ;;
   list-panes|list-sessions) : ;;
 esac
 exit 0
@@ -246,13 +250,14 @@ def test_zsh_agent_of_session_reads_the_stamp_when_no_process(zsh):
 
 
 def test_zsh_agent_at_welcome(zsh):
-    # claude: the Welcome back banner; codex: only with a configured splash regex
+    # claude: the Welcome back banner; codex: "no thread stamped yet" — codex mints its
+    # thread (and fires the hook) at the first prompt, and its banner stays on screen
+    # through a short exchange, so pane text would read a real conversation as idle
     assert zsh("_dev_agent_at_welcome claude s; echo rc=$?", FAKE_PANE="Welcome back!").stdout.strip() == "rc=0"
     assert zsh("_dev_agent_at_welcome claude s; echo rc=$?", FAKE_PANE="> fix the bug").stdout.strip() == "rc=1"
-    assert zsh("_dev_agent_at_welcome codex s; echo rc=$?", FAKE_PANE="OpenAI Codex").stdout.strip() == "rc=1"
-    r = zsh("_DEV_CODEX_SPLASH_RE='OpenAI Codex'; _dev_agent_at_welcome codex s; echo rc=$?",
-            FAKE_PANE="OpenAI Codex (v0.153)")
-    assert r.stdout.strip() == "rc=0"
+    assert zsh("_dev_agent_at_welcome codex s; echo rc=$?", FAKE_PANE="OpenAI Codex (v0.154.0)").stdout.strip() == "rc=0"
+    assert zsh("_dev_agent_at_welcome codex s; echo rc=$?", FAKE_RESUME_ID="thr_1",
+               FAKE_PANE="OpenAI Codex (v0.154.0)").stdout.strip() == "rc=1"
 
 
 def test_zsh_new_session_stamps_the_agent_and_launch_line(zsh):
@@ -290,3 +295,168 @@ def test_zsh_sync_config_emits_the_agent_keys(zsh):
     lines = r.stdout.splitlines()
     assert "DEV_AGENT[api]=codex" in lines
     assert "DEV_AGENT_DEFAULT=claude" in lines
+
+
+# ─── codex conversations: the thread store, the locators, titles, self-id, wrappers ──
+
+FIXTURE_ROLLOUT = REPO_ROOT / "tests" / "fixtures" / "codex_rollout.jsonl"
+SID = "01a089c2-53cf-7a41-bd9f-ae70d07c2de9"
+
+THREADS_DDL = """
+CREATE TABLE threads (id TEXT PRIMARY KEY, rollout_path TEXT NOT NULL, created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL, source TEXT NOT NULL, model_provider TEXT NOT NULL, cwd TEXT NOT NULL,
+  title TEXT NOT NULL, sandbox_policy TEXT NOT NULL, approval_mode TEXT NOT NULL,
+  archived INTEGER NOT NULL DEFAULT 0, first_user_message TEXT NOT NULL DEFAULT '', name TEXT);
+"""
+
+
+def _codex_home(zsh, threads):
+    """Materialise ~/.codex: a rollout per thread under sessions/YYYY/MM/DD plus a
+    state_5.sqlite built from the real `threads` DDL. threads: [(sid, cwd, title,
+    updated_at, archived, name)]. Returns {sid: rollout path}."""
+    import sqlite3
+    home = zsh.home
+    day = home / ".codex" / "sessions" / "2026" / "09" / "09"
+    day.mkdir(parents=True, exist_ok=True)
+    db = sqlite3.connect(str(home / ".codex" / "state_5.sqlite"))
+    db.executescript(THREADS_DDL)
+    paths = {}
+    for sid, cwd, title, upd, archived, name in threads:
+        p = day / f"rollout-2026-09-09T22-20-09-{sid}.jsonl"
+        p.write_text(FIXTURE_ROLLOUT.read_text().replace(SID, sid))
+        paths[sid] = p
+        db.execute("insert into threads values (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                   (sid, str(p), upd, upd, "cli", "openai", cwd, title, "ws", "on-request",
+                    archived, title, name))
+    db.commit()
+    db.close()
+    return paths
+
+
+def test_zsh_codex_threads_for_cwd_orders_and_filters(zsh):
+    wt = f"{zsh.home}/code/.worktrees/api/3"
+    paths = _codex_home(zsh, [
+        ("aaaaaaaa-0000-0000-0000-000000000001", wt, "older", 100, 0, None),
+        ("aaaaaaaa-0000-0000-0000-000000000002", wt, "newer", 200, 0, "renamed"),
+        ("aaaaaaaa-0000-0000-0000-000000000003", wt, "archived", 300, 1, None),
+        ("aaaaaaaa-0000-0000-0000-000000000004", f"{zsh.home}/elsewhere", "other", 400, 0, None),
+    ])
+    r = zsh(f"_codex_threads_for_cwd {wt}")
+    rows = [ln.split("\t") for ln in r.stdout.splitlines()]
+    assert [x[0][-1] for x in rows] == ["2", "1"]           # newest first, archived + other cwd out
+    assert rows[0][3] == "renamed"                            # /rename wins over the title
+    assert rows[0][1] == str(paths["aaaaaaaa-0000-0000-0000-000000000002"])
+    assert zsh("_codex_thread_lookup aaaaaaaa-0000-0000-0000-000000000004").stdout.count("\n") == 1
+    # every transcript for the cwd, newest first, as paths
+    r = zsh(f"_dev_agent_transcripts_for_cwd codex {wt}")
+    assert r.stdout.splitlines() == [str(paths["aaaaaaaa-0000-0000-0000-000000000002"]),
+                                     str(paths["aaaaaaaa-0000-0000-0000-000000000001"])]
+    assert zsh(f"_dev_agent_newest_sid codex {wt}").stdout.strip() == "aaaaaaaa-0000-0000-0000-000000000002"
+
+
+def test_zsh_codex_threads_missing_db_is_silent(zsh):
+    r = zsh("_codex_threads_for_cwd /nowhere; echo rc=$?")
+    assert r.stdout.strip() == "rc=0" and r.stderr == ""
+    (zsh.home / ".codex").mkdir()
+    (zsh.home / ".codex" / "state_5.sqlite").write_text("not a database")
+    r = zsh("_codex_threads_for_cwd /nowhere; echo rc=$?")
+    assert r.stdout.strip() == "rc=0" and r.stderr == ""
+
+
+def test_zsh_transcript_sid_and_agent(zsh):
+    r = zsh(f"_dev_transcript_sid /x/rollout-2026-09-09T22-20-09-{SID}.jsonl; "
+            "_dev_transcript_sid /x/abc-123.jsonl; "
+            f"_dev_transcript_agent /x/rollout-2026-09-09T22-20-09-{SID}.jsonl; _dev_transcript_agent /x/abc-123.jsonl")
+    assert r.stdout.splitlines() == [SID, "abc-123", "codex", "claude"]
+
+
+def test_zsh_agent_transcript_locator_ladder(zsh):
+    wt = f"{zsh.home}/code/.worktrees/api/3"
+    paths = _codex_home(zsh, [(SID, wt, "t", 100, 0, None)])
+    real = str(paths[SID])
+    # 1. the hook's rollouts/<sid> cache wins
+    cache = zsh.home / ".cache" / "claude-sessions" / "rollouts"
+    cache.mkdir(parents=True)
+    (cache / SID).write_text(real + "\n")
+    assert zsh(f"_dev_agent_transcript codex {SID}").stdout.strip() == real
+    # 2. a stale cache entry (file gone) falls through to sqlite
+    (cache / SID).write_text("/gone.jsonl\n")
+    assert zsh(f"_dev_agent_transcript codex {SID}").stdout.strip() == real
+    # 3. no cache, no row → the date-tree glob (a synced-in rollout)
+    (cache / SID).unlink()
+    (zsh.home / ".codex" / "state_5.sqlite").unlink()
+    assert zsh(f"_dev_agent_transcript codex {SID}").stdout.strip() == real
+    # unknown id → rc 1, nothing printed
+    r = zsh("_dev_agent_transcript codex ffffffff-0000-0000-0000-000000000000; echo rc=$?")
+    assert r.stdout.strip() == "rc=1"
+    # claude: cwd-keyed project dir, or any project dir without a cwd
+    proj = zsh.home / ".claude" / "projects" / re.sub(r"[^A-Za-z0-9]", "-", wt)
+    proj.mkdir(parents=True)
+    (proj / "sid-1.jsonl").write_text("{}\n")
+    assert zsh(f"_dev_agent_transcript claude sid-1 {wt}").stdout.strip() == str(proj / "sid-1.jsonl")
+    assert zsh("_dev_agent_transcript claude sid-1").stdout.strip() == str(proj / "sid-1.jsonl")
+    assert zsh(f"_dev_agent_transcript claude nope {wt}; echo rc=$?").stdout.strip() == "rc=1"
+    assert zsh("_dev_agent_transcript claude -; echo rc=$?").stdout.strip() == "rc=1"
+
+
+def test_zsh_meta_batch_titles_a_codex_rollout(zsh):
+    wt = f"{zsh.home}/code/.worktrees/api/3"
+    paths = _codex_home(zsh, [(SID, wt, "t", 100, 0, None)])
+    r = zsh(f"_transcript_meta_batch {paths[SID]}")
+    path, title, pr = r.stdout.rstrip("\n").split("\t")
+    assert path == str(paths[SID])
+    assert title == "Reply with exactly the word OK and nothing else."   # the <recommended_plugins> notice is skipped
+    assert pr == "github.com/acme/api/pull/42"
+    # cached: a second call answers from meta/ without re-reading (same output)
+    assert zsh(f"_transcript_title {paths[SID]}").stdout.strip() == title
+    # a claude transcript in the same batch still parses as claude
+    proj = zsh.home / ".claude" / "projects" / "x"
+    proj.mkdir(parents=True)
+    (proj / "c1.jsonl").write_text('{"type":"user","message":{"content":"fix the login bug"}}\n')
+    r = zsh(f"_transcript_meta_batch {proj / 'c1.jsonl'} {paths[SID]}")
+    assert [ln.split("\t")[1] for ln in r.stdout.splitlines()] == ["fix the login bug", title]
+
+
+def test_zsh_self_sid_and_agent(zsh, tmp_path):
+    # a plain shell: nothing
+    assert zsh("_dev_self_sid; echo rc=$?").stdout.strip() == "rc=1"
+    # inside claude: the env var
+    r = zsh("_dev_self_sid; _dev_self_agent", CLAUDE_CODE_SESSION_ID="cs-1")
+    assert r.stdout.splitlines() == ["cs-1", "claude"]
+    # inside codex: the registry entry keyed on the codex pid above this shell —
+    # the fake process table puts a codex under launchd and makes it OUR ancestor
+    # by claiming the zsh's own pid (the harness runs zsh -c, so $$ is that zsh)
+    reg = zsh.home / ".cache" / "claude-sessions"
+    reg.mkdir(parents=True, exist_ok=True)
+    (reg / "4242").write_text(f"{SID}\t{zsh.home}\n")
+    (tmp_path / "ps.txt").write_text("4242 1 codex\n")
+    r = zsh("pid=$$; print -r -- \"$pid 4242 zsh\" >> $FAKE_PS; _dev_self_sid; _dev_self_agent")
+    assert r.stdout.splitlines() == [SID, "codex"]
+
+
+def test_zsh_agent_wrap_spawns_the_recorded_agent(zsh, tmp_path):
+    # a stub `codex` that writes a SPAWN instruction into the sentinel, the way
+    # `t push` does from inside a session; the wrapper must resume it as codex
+    stub = tmp_path / "stubbin" / "codex"
+    stub.write_text('#!/bin/bash\nprintf "SPAWN\\tdev-api-3\\t%s\\t%s\\tcodex\\n" "$HOME/code/.worktrees/api/3" "thr_7" > "$CLAUDE_TPUSH_ATTACH"\n')
+    stub.chmod(0o755)
+    r = zsh("codex; echo rc=$?")
+    log = zsh.log.read_text().splitlines()
+    assert "send-keys -t dev-api-3 codex resume thr_7; exit Enter" in log
+    assert "set-environment -t dev-api-3 DEV_AGENT codex" in log
+    # a payload WITHOUT the agent field (an older t push) resumes as claude
+    stub.write_text('#!/bin/bash\nprintf "SPAWN\\tdev-api-4\\t%s\\t%s\\n" "$HOME/code/.worktrees/api/4" "sid-9" > "$CLAUDE_TPUSH_ATTACH"\n')
+    zsh.log.write_text("")
+    zsh("codex")
+    log = zsh.log.read_text().splitlines()
+    assert "send-keys -t dev-api-4 claude -r sid-9; exit Enter" in log
+
+
+def test_zsh_repo_slots_sees_codex_only_slots(zsh):
+    # a slot whose only trace is a codex thread recorded in its (swept) worktree path
+    wt_root = f"{zsh.home}/code/.worktrees/api"
+    _codex_home(zsh, [("aaaaaaaa-0000-0000-0000-000000000007", f"{wt_root}/7", "t", 100, 0, None),
+                      ("aaaaaaaa-0000-0000-0000-000000000008", f"{wt_root}/12/sub", "t", 100, 0, None),
+                      ("aaaaaaaa-0000-0000-0000-000000000009", f"{zsh.home}/code/api", "t", 100, 0, None)])
+    (zsh.home / "code" / "api").mkdir(parents=True)
+    assert zsh("_dev_repo_slots api").stdout.split() == ["7", "12"]

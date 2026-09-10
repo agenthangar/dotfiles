@@ -13,7 +13,7 @@ shim in `.zshrc` for verbs that must run in your shell).
 
 | Command | What it does |
 | --- | --- |
-| `t open <repo> [slot]` | Open or reattach a session in a per-repo detached tmux slot (`--new`, `--fg`, `--remote`, `--here`) |
+| `t open <repo> [slot]` | Open or reattach a session in a per-repo detached tmux slot (`--new`, `--fg`, `--remote`, `--here`; `--codex` runs OpenAI's Codex CLI in the slot instead of Claude — `DEV_AGENT[repo]=codex` makes that the repo's default) |
 | `t ls [-r] [-a]` | List live sessions, optionally across every machine (`-r`) and repo (`-a`) |
 | `t cd [repo] [slot]` | `cd` this shell into a slot's worktree (bare `t cd`: fzf pick across all worktrees) |
 | `t push` / `t pop` | Move a session between a foreground terminal and a detached tmux slot — one-live-owner guarantee |
@@ -114,23 +114,29 @@ pre-marked, and the review screen shows the exact commands before `y` runs any.
 `t install --status` prints this machine's state; `t doctor` reports an agent that
 is installed but not logged in.
 
+A dev slot runs either agent: `t open <repo> --codex` starts Codex CLI in a fresh
+slot (`--claude` forces Claude), `DEV_AGENT[repo]=codex` in `~/.zshrc.local` makes
+it a repo's default and `DEV_AGENT_DEFAULT` the global one. `t ls` marks a codex
+slot with `⬡` in its STATUS column and adds the glyph to the legend only when one
+is on screen, so a claude-only listing looks exactly as it always did.
+
 Not every verb supports every agent yet. The matrix below is **generated from
 `bin/t`** (a test pins this block to it), so a verb cannot gain or lose agent
 support without the README saying so:
 
 ```text
-  surface                                           claude                codex                        cursor
-  ------------------------------------------------  --------------------  ---------------------------  -------------------------------
-  t install (install · login · update)              ✓                     ✓                            ✓
-  dev slots: t open / ls / kill / read / paste      ✓                     planned                      ✗ no slot — t cursor ls
-  t push / t pop                                    ✓                     planned                      ✗ no slot
-  t resume (dead slots)                             ✓                     planned                      → t cursor resume
-  t beam / --from (move a session)                  ✓                     planned                      → t cursor [id] --host / --from
-  csync (iCloud union of transcripts)               ✓ projects + plans    planned                      ✓ cursor-chats
-  SessionStart stamps (registry · opened · origin)  ✓ settings.json hook  ✓ hooks.json + /hooks trust  ✗ no hook wired
-  t plan                                            ✓                     ✗ codex keeps no plan files  ✗
-  t find / t mcp (transcript search)                ✓                     planned                      ✗
-  t doctor agent row (version · login · hook)       ✓                     ✓                            ✓ version · login
+  surface                                           claude                codex                         cursor
+  ------------------------------------------------  --------------------  ----------------------------  -------------------------------
+  t install (install · login · update)              ✓                     ✓                             ✓
+  dev slots: t open / ls / kill / read / paste      ✓                     ✓ t open --codex · DEV_AGENT  ✗ no slot — t cursor ls
+  t push / t pop                                    ✓                     planned                       ✗ no slot
+  t resume (dead slots)                             ✓                     planned                       → t cursor resume
+  t beam / --from (move a session)                  ✓                     planned                       → t cursor [id] --host / --from
+  csync (iCloud union of transcripts)               ✓ projects + plans    planned                       ✓ cursor-chats
+  SessionStart stamps (registry · opened · origin)  ✓ settings.json hook  ✓ hooks.json + /hooks trust   ✗ no hook wired
+  t plan                                            ✓                     ✗ codex keeps no plan files   ✗
+  t find / t mcp (transcript search)                ✓                     planned                       ✗
+  t doctor agent row (version · login · hook)       ✓                     ✓                             ✓ version · login
 ```
 
 Codex needs one manual step after install: its SessionStart hook (the same

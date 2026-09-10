@@ -577,7 +577,7 @@ dots() {
 # are machine-specific, so they live in ~/.zshrc.local (not committed); this file
 # just declares the array and sources that override. See .zshrc.local.example.
 #   DEV_REPOS[api]="$HOME/code/my-api"
-typeset -gA DEV_REPOS DEV_BRANCHES REMOTE_HOSTS DEV_WORKTREE
+typeset -gA DEV_REPOS DEV_BRANCHES REMOTE_HOSTS DEV_WORKTREE DEV_AGENT
 [[ -f "$HOME/.zshrc.local" ]] && source "$HOME/.zshrc.local"
 
 # DEV_BRANCH — the global default branch `dev`/`_dev_new_session` check out (and
@@ -597,6 +597,12 @@ typeset -gA DEV_REPOS DEV_BRANCHES REMOTE_HOSTS DEV_WORKTREE
 : ${DEV_WORKTREE_ROOT:=$HOME/code/.worktrees}
 : ${DEV_WORKTREE_DEFAULT:=1}
 
+# DEV_AGENT — which agent CLI a dev slot runs: `claude` (Claude Code, the default) or
+# `codex` (OpenAI Codex CLI). DEV_AGENT_DEFAULT is the global choice, the DEV_AGENT assoc
+# array (keyed like DEV_BRANCHES) the per-repo one, and `t open … --codex` / `--claude`
+# override both for one slot. See the agent seam (_dev_agent_*) below.
+: ${DEV_AGENT_DEFAULT:=claude}
+
 # DEV_BRANCHES — per-repo branch overrides, keyed by the same alias as DEV_REPOS.
 # A repo with no entry falls back to $DEV_BRANCH; e.g. a repo whose workflow
 # commits straight to main wants DEV_BRANCHES[myrepo]=main. Set in
@@ -604,6 +610,93 @@ typeset -gA DEV_REPOS DEV_BRANCHES REMOTE_HOSTS DEV_WORKTREE
 # _dev_branch_for <repo> — branch `dev` uses for <repo>: its DEV_BRANCHES
 # override if set, else the global $DEV_BRANCH.
 _dev_branch_for() { print -r -- "${DEV_BRANCHES[$1]:-$DEV_BRANCH}" }
+
+# ─── Agent seam — which CLI occupies a slot: claude (default) or codex ───────────
+#
+# Everything the slot tooling knows about "the agent" goes through these; nothing
+# else compares a process name to `claude` or spells its launch line. claude keeps
+# its pre-assigned id (`claude --session-id`, see _dev_new_session); codex has NO
+# such flag, so a codex slot's id arrives only through the SessionStart hook
+# (bin/claude-stamp-tmux --agent codex → CLAUDE_RESUME_ID + the pid registry), which
+# is why the hook must be trusted once under /hooks in codex (t doctor says when it
+# never fired). The agent of a LIVE slot is read off its process (comm, ground truth)
+# and only then off the DEV_AGENT tmux stamp _dev_new_session/_dev_resume_session and
+# the hook set.
+# _dev_agent_valid <name> — the closed set (a typo in DEV_AGENT must not launch `$a`).
+_dev_agent_valid() { case "$1" in claude|codex) return 0 ;; *) return 1 ;; esac }
+# _dev_agent_for <repo> [override] — the agent a NEW slot of <repo> gets: the --codex /
+# --claude flag, else DEV_AGENT[repo], else DEV_AGENT_DEFAULT. Prints it; rc 1 + a
+# pointer at ~/.zshrc.local for anything outside the set.
+_dev_agent_for() {
+  local repo="$1" a="${2:-}"
+  [[ -n $a ]] || a=${DEV_AGENT[$repo]:-${DEV_AGENT_DEFAULT:-claude}}
+  _dev_agent_valid "$a" || {
+    print -u2 -r -- "t: unknown agent '$a' (claude or codex) — check DEV_AGENT[$repo] / DEV_AGENT_DEFAULT in ~/.zshrc.local"
+    return 1
+  }
+  print -r -- "$a"
+}
+# _dev_agent_is_proc <comm> — is this process name an agent CLI? The ONE match every
+# process walk uses (the npm-launched codex can present as a native `codex-<triple>`
+# child of `node`; brew's cask is a bare `codex`).
+_dev_agent_is_proc() { case "${1:t}" in claude|codex|codex-*) return 0 ;; *) return 1 ;; esac }
+# _dev_agent_of_comm <comm> — the agent name for a process name (empty if none).
+_dev_agent_of_comm() { case "${1:t}" in claude) print -r -- claude ;; codex|codex-*) print -r -- codex ;; esac }
+# _dev_agent_of_session <tmux-session> — which agent a slot runs: the comm of its live
+# agent process (zero extra forks under _dev_ps_snapshot), else the DEV_AGENT stamp,
+# else claude (every pre-seam slot).
+_dev_agent_of_session() {
+  local s="$1" pid a
+  if pid=$(_dev_session_claude_pid "$s") && [[ -n $pid ]]; then
+    a=${_DEV_PS_COMM[$pid]:-}
+    [[ -n $a ]] || a=$(ps -o comm= -p "$pid" 2>/dev/null)
+    a=$(_dev_agent_of_comm "$a")
+    [[ -n $a ]] && { print -r -- "$a"; return 0; }
+  fi
+  a=$(tmux show-environment -t "$s" DEV_AGENT 2>/dev/null | cut -d= -f2)
+  _dev_agent_valid "$a" || a=claude
+  print -r -- "$a"
+}
+# _dev_agent_check <agent> — the binary is here, or say how to get it.
+_dev_agent_check() {
+  command -v "$1" >/dev/null 2>&1 && return 0
+  print -u2 -r -- "t: '$1' is not installed here — run: t install $1"
+  return 1
+}
+# _dev_agent_new_cmd <agent> [sid] — the pane command for a FRESH slot.
+_dev_agent_new_cmd() {
+  case "$1" in codex) print -r -- "codex" ;; *) print -r -- "claude --session-id $2" ;; esac
+}
+# _dev_agent_resume_cmd <agent> <sid> — the pane command that resumes conversation <sid>.
+_dev_agent_resume_cmd() {
+  case "$1" in codex) print -r -- "codex resume $2" ;; *) print -r -- "claude -r $2" ;; esac
+}
+# _DEV_CODEX_SPLASH_RE — the pane text that marks a codex slot parked on its startup
+# screen with no conversation yet (claude's is 'Welcome back'). Empty = unknown → a live
+# codex reads as active, so `t kill` still confirms. Set it in ~/.zshrc.local once
+# captured from a fresh pane (tmux capture-pane -p).
+: ${_DEV_CODEX_SPLASH_RE:=}
+# _dev_agent_at_welcome <agent> <session> — idle-on-splash test per agent.
+_dev_agent_at_welcome() {
+  case "$1" in
+    codex) [[ -n $_DEV_CODEX_SPLASH_RE ]] && tmux capture-pane -t "$2" -p 2>/dev/null | grep -Eq -- "$_DEV_CODEX_SPLASH_RE" ;;
+    *)     _dev_session_at_welcome "$2" ;;
+  esac
+}
+# _dev_agent_pid_above — walk up from this shell to the nearest agent process (the
+# claude or codex whose tool shell we are running in) and print its pid; rc 1 on miss.
+# Capped at init. The generalised _tpush_claude_pid (kept below as an alias).
+_dev_agent_pid_above() {
+  local pid=$$ comm
+  while (( pid > 1 )); do
+    comm=$(ps -o comm= -p "$pid" 2>/dev/null) || return 1
+    _dev_agent_is_proc "$comm" && { print -r -- "$pid"; return 0; }
+    pid=$(ps -o ppid= -p "$pid" 2>/dev/null) || return 1
+    pid=${pid//[[:space:]]/}
+    [[ -n $pid ]] || return 1
+  done
+  return 1
+}
 
 # Worktree-per-session helpers. The path + branch are derived from the repo's BASENAME
 # (${DEV_REPOS[repo]:t}), not the alias, so they are identical on every host (a dir is
@@ -1086,6 +1179,8 @@ _t_sync_config() {
     for k in ${(k)DEV_BRANCHES}; do print -r -- "DEV_BRANCHES[$k]=${(q)DEV_BRANCHES[$k]}"; done
     for k in ${(k)REMOTE_HOSTS}; do print -r -- "REMOTE_HOSTS[$k]=${(q)REMOTE_HOSTS[$k]}"; done
     for k in ${(k)DEV_WORKTREE};  do print -r -- "DEV_WORKTREE[$k]=${(q)DEV_WORKTREE[$k]}"; done
+    for k in ${(k)DEV_AGENT};     do print -r -- "DEV_AGENT[$k]=${(q)DEV_AGENT[$k]}"; done
+    print -r -- "DEV_AGENT_DEFAULT=${(q)DEV_AGENT_DEFAULT}"
     print -r -- "DEV_BRANCH=${(q)DEV_BRANCH}"
     print -r -- "DEV_WORKTREE_ROOT=${(q)DEV_WORKTREE_ROOT}"
     print -r -- "DEV_WORKTREE_DEFAULT=${(q)DEV_WORKTREE_DEFAULT}"
@@ -1328,7 +1423,8 @@ _tpaste_claude_ready() {
   # actual prompt instead, swap in a `tmux capture-pane -p` string match.
   local cmd
   cmd=$(tmux display-message -p -t "$session" '#{pane_current_command}' 2>/dev/null)
-  [[ $cmd == node || $cmd == claude ]] && return 0
+  [[ $cmd == node ]] && return 0
+  _dev_agent_is_proc "$cmd" && return 0
   return 1
 }
 
@@ -1519,13 +1615,13 @@ _dev_session_has_claude() {
   _dev_ps_snapshot
   if _dev_snap_ok; then
     for pane_pid in ${=_DEV_PANE_PIDS[$s]:-}; do
-      [[ ${_DEV_PS_COMM[$pane_pid]:-} == claude ]] && return 0
+      _dev_agent_is_proc "${_DEV_PS_COMM[$pane_pid]:-}" && return 0
       for kid in ${=_DEV_PS_KIDS[$pane_pid]:-}; do
-        case ${_DEV_PS_COMM[$kid]:-} in (claude|node) return 0 ;; esac
+        case ${_DEV_PS_COMM[$kid]:-} in (claude|codex|codex-*|node) return 0 ;; esac
         stack=($kid)
         while (( $#stack )); do
           pid=$stack[1]; shift stack
-          [[ ${_DEV_PS_COMM[$pid]:-} == claude ]] && return 0
+          _dev_agent_is_proc "${_DEV_PS_COMM[$pid]:-}" && return 0
           stack+=(${=_DEV_PS_KIDS[$pid]:-})
         done
       done
@@ -1534,10 +1630,10 @@ _dev_session_has_claude() {
   fi
   for pane_pid in ${(f)"$(tmux list-panes -t "$s" -F '#{pane_pid}' 2>/dev/null)"}; do
     comm=$(ps -o comm= -p "$pane_pid" 2>/dev/null)
-    [[ "${comm:t}" == claude ]] && return 0
+    _dev_agent_is_proc "$comm" && return 0
     for kid in ${(f)"$(pgrep -P "$pane_pid" 2>/dev/null)"}; do
       comm=$(ps -o comm= -p "$kid" 2>/dev/null)
-      case "${comm:t}" in (claude|node) return 0 ;; esac
+      case "${comm:t}" in (claude|codex|codex-*|node) return 0 ;; esac
       _dev_pid_tree_has_claude "$kid" && return 0
     done
   done
@@ -1549,7 +1645,7 @@ _dev_session_has_claude() {
 _dev_pid_tree_has_claude() {
   local pid="$1" comm kid
   comm=$(ps -o comm= -p "$pid" 2>/dev/null)
-  [[ "${comm:t}" == claude ]] && return 0
+  _dev_agent_is_proc "$comm" && return 0
   for kid in ${(f)"$(pgrep -P "$pid" 2>/dev/null)"}; do
     _dev_pid_tree_has_claude "$kid" && return 0
   done
@@ -1587,7 +1683,7 @@ _dev_session_claude_pid() {
     stack=(${=_DEV_PANE_PIDS[$s]:-})
     while (( $#stack )); do
       pid=$stack[1]; shift stack
-      if [[ ${_DEV_PS_COMM[$pid]:-} == claude ]]; then
+      if _dev_agent_is_proc "${_DEV_PS_COMM[$pid]:-}"; then
         _DEV_SESS_PID[$s]=$pid; print -r -- "$pid"; return 0
       fi
       stack+=(${=_DEV_PS_KIDS[$pid]:-})
@@ -1597,7 +1693,7 @@ _dev_session_claude_pid() {
   fi
   for pane_pid in ${(f)"$(tmux list-panes -t "$s" -F '#{pane_pid}' 2>/dev/null)"}; do
     comm=$(ps -o comm= -p "$pane_pid" 2>/dev/null)
-    [[ "${comm:t}" == claude ]] && { print -r -- "$pane_pid"; return 0; }
+    _dev_agent_is_proc "$comm" && { print -r -- "$pane_pid"; return 0; }
     for kid in ${(f)"$(pgrep -P "$pane_pid" 2>/dev/null)"}; do
       found=$(_dev_pid_tree_claude_pid "$kid") && { print -r -- "$found"; return 0; }
     done
@@ -1609,7 +1705,7 @@ _dev_session_claude_pid() {
 _dev_pid_tree_claude_pid() {
   local pid="$1" comm kid found
   comm=$(ps -o comm= -p "$pid" 2>/dev/null)
-  [[ "${comm:t}" == claude ]] && { print -r -- "$pid"; return 0; }
+  _dev_agent_is_proc "$comm" && { print -r -- "$pid"; return 0; }
   for kid in ${(f)"$(pgrep -P "$pid" 2>/dev/null)"}; do
     found=$(_dev_pid_tree_claude_pid "$kid") && { print -r -- "$found"; return 0; }
   done
@@ -1852,25 +1948,26 @@ _dev_fg_rows() {
   local -a claudes
   if _dev_snap_ok; then                     # snapshot: no ps fork per ancestor level
     while [[ -n $up && $up != 1 ]]; do
-      [[ ${_DEV_PS_COMM[$up]:-} == claude ]] && { me=$up; break; }
+      _dev_agent_is_proc "${_DEV_PS_COMM[$up]:-}" && { me=$up; break; }
       up=${_DEV_PS_PPID[$up]:-}
     done
     for p in ${(k)_DEV_PS_COMM}; do
-      [[ ${_DEV_PS_COMM[$p]} == claude ]] && claudes+=($p)
+      _dev_agent_is_proc "${_DEV_PS_COMM[$p]}" && claudes+=($p)
     done
     claudes=(${(no)claudes})                # assoc keys are unordered; pid order is stable
   else
     while [[ -n $up && $up != 1 ]]; do
-      [[ "$(ps -o comm= -p $up 2>/dev/null)" == claude ]] && { me=$up; break; }
+      _dev_agent_is_proc "$(ps -o comm= -p $up 2>/dev/null)" && { me=$up; break; }
       up=$(ps -o ppid= -p $up 2>/dev/null | tr -d ' ')
     done
-    claudes=(${(f)"$(ps -Axo pid,comm 2>/dev/null | awk '{n=$2; sub(/.*\//,"",n)} n=="claude"{print $1}')"})
+    claudes=(${(f)"$(ps -Axo pid,comm 2>/dev/null | awk '{n=$2; sub(/.*\//,"",n)} n=="claude"||n=="codex"||n~/^codex-/{print $1}')"})
   fi
   local -A live
-  local pid cwd repo k label sid title summary context
+  local pid cwd repo k label sid title summary context agent
   for pid in ${(@)claudes}; do
     live[$pid]=1
     [[ -n ${inslot[$pid]} || $pid == $me ]] && continue
+    agent=$(_dev_agent_of_comm "${_DEV_PS_COMM[$pid]:-$(ps -o comm= -p $pid 2>/dev/null)}"); [[ -n $agent ]] || agent=claude
     sid= cwd=
     [[ -r $reg/$pid ]] && IFS=$'\t' read -r sid cwd < "$reg/$pid"
     [[ -n $cwd ]] || cwd=$(readlink "/proc/$pid/cwd" 2>/dev/null)   # Linux: no lsof needed
@@ -1882,16 +1979,18 @@ _dev_fg_rows() {
     # foreground row UNIQUE (two `dot` foreground claudes were both "dot:fg" before)
     # and is the handle `t open <id>` reattaches by. The colon marks an fg row (tmux
     # slots use "<repo>-<num>"). A pre-registry session (no id) falls back to ":fg".
-    if [[ -n $sid ]]; then
+    if [[ -n $sid && $agent == codex ]]; then
+      label="${repo}:${sid[1,8]}"; context=active; summary='(codex session)'
+    elif [[ -n $sid ]]; then
       label="${repo}:${sid[1,8]}"
       local -a tx=( "$HOME/.claude/projects"/*/"$sid".jsonl(N) )
       title=$([[ -n ${tx[1]} ]] && _transcript_title "${tx[1]}")
       if [[ -n $title ]]; then context=active; summary=$title
       else context=idle; summary='(idle — no conversation)'; fi
     else
-      label="${repo}:fg"; sid='-'; context=unknown; summary='(foreground claude)'
+      label="${repo}:fg"; sid='-'; context=unknown; summary="(foreground $agent)"
     fi
-    printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$sid" "$cwd" "$label" attached "$context" "$summary"
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$sid" "$cwd" "$label" attached "$context" "$summary" "$agent"
   done
   # prune registry entries whose pid is no longer a live claude (sessions that ended)
   local f bpid
@@ -2180,7 +2279,7 @@ _dev_list() {
     if [[ $state == attached ]]; then amark="${g}●${r0}"; else amark='○'; fi
     if ! _dev_session_has_claude "$s"; then
       cmark=' '; summary='(no active session)'
-    elif _dev_session_at_welcome "$s"; then
+    elif _dev_agent_at_welcome "$(_dev_agent_of_session "$s")" "$s"; then
       cmark=' '; summary='(idle — no conversation)'
     else
       cmark="${c}✓${r0}"
@@ -2192,8 +2291,8 @@ _dev_list() {
     printf '  %s %s     %-*s %s%s%s\n' "$amark" "$cmark" $name_w "$short" "$y" "$summary" "$r0"
   done <<< "$names"
   # foreground rows: always ● (you're in the terminal); ✓ when context is active
-  local fstate fcontext fsummary
-  while IFS=$'\t' read -r _fsid _fcwd _fslot fstate fcontext fsummary; do
+  local fstate fcontext fsummary _fagent
+  while IFS=$'\t' read -r _fsid _fcwd _fslot fstate fcontext fsummary _fagent; do
     [[ -n $_fslot ]] || continue
     [[ $fcontext == active ]] && cmark="${c}✓${r0}" || cmark=' '
     (( ${#fsummary} > avail )) && fsummary="${fsummary[1,avail-1]}…"
@@ -2227,11 +2326,12 @@ _dev_session_rows() {
   # every title at once rather than forking python3 per slot.
   local -a rows rowtx tpaths tx mrows f _PR_STALE
   local -A title_of pr_of _PR_SPAWNED
-  local s short sid psid dir state context summary i mr mrest REPLY
+  local s short sid psid dir state context summary agent i mr mrest REPLY
   _dev_ps_snapshot
   while IFS=$'\t' read -r s dir state; do
     [[ $s == dev-* && -n $dir ]] || continue
     short="${s#dev-}"
+    agent=$(_dev_agent_of_session "$s")
     # Authoritative id (registry-first, stamp validated against the slot's repo) —
     # not the raw CLAUDE_RESUME_ID stamp, which a reused slot can carry stale from a
     # prior (even cross-repo) occupant; this is the targeting id callers act on.
@@ -2244,17 +2344,19 @@ _dev_session_rows() {
     tx=()
     if ! _dev_session_has_claude "$s"; then
       context=none
-    elif _dev_session_at_welcome "$s"; then
+    elif _dev_agent_at_welcome "$agent" "$s"; then
       context=idle
     else
       context=active
       # A valid id always has its transcript under this slot's own project dir,
       # since the dir IS the conversation's cwd. Collect it for the batch; a slot
       # with no id (or no transcript) falls back to _dev_session_summary in pass 2,
-      # which owns the birthtime-matching heuristic for that case.
-      [[ $sid != - ]] && tx=( "$HOME/.claude/projects/${dir//[^A-Za-z0-9]/-}/$sid".jsonl(N) )
+      # which owns the birthtime-matching heuristic for that case. (claude only —
+      # a codex slot's rollout is not cwd-keyed; its title lands with the seam's
+      # transcript locator.)
+      [[ $sid != - && $agent == claude ]] && tx=( "$HOME/.claude/projects/${dir//[^A-Za-z0-9]/-}/$sid".jsonl(N) )
     fi
-    rows+=("$sid"$'\t'"$dir"$'\t'"$short"$'\t'"$state"$'\t'"$context")
+    rows+=("$sid"$'\t'"$dir"$'\t'"$short"$'\t'"$state"$'\t'"$context"$'\t'"$agent")
     if [[ -n ${tx[1]:-} ]]; then rowtx+=("${tx[1]}"); tpaths+=("${tx[1]}")
     else rowtx+=('-'); fi
   done < <(tmux list-sessions -F "#{session_name}"$'\t'"#{session_path}"$'\t'"#{?session_attached,attached,detached}" 2>/dev/null | sort)
@@ -2269,12 +2371,14 @@ _dev_session_rows() {
 
   for (( i = 1; i <= $#rows; i++ )); do
     f=("${(@ps:\t:)rows[$i]}")
-    sid=$f[1]; dir=$f[2]; short=$f[3]; state=$f[4]; context=$f[5]
+    sid=$f[1]; dir=$f[2]; short=$f[3]; state=$f[4]; context=$f[5]; agent=$f[6]
     case $context in
       none) summary='(no active session)' ;;
       idle) summary='(idle — no conversation)' ;;
       *)
-        if [[ ${rowtx[$i]} != - ]]; then
+        if [[ $agent == codex ]]; then
+          summary='(codex session)'
+        elif [[ ${rowtx[$i]} != - ]]; then
           summary=${title_of[${rowtx[$i]}]:-}
         else
           psid=$sid; [[ $psid == - ]] && psid=
@@ -2292,7 +2396,9 @@ _dev_session_rows() {
         if [[ ${rowtx[$i]} != - ]]; then _pr_state_tag "${pr_of[${rowtx[$i]}]:-}"; summary+=$REPLY; fi
         ;;
     esac
-    printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$sid" "$dir" "$short" "$state" "$context" "$summary"
+    # field 7 = agent (claude|codex): trailing, so every front-indexed consumer and a
+    # stale host's 6-field parser keep working (bin/t _parse_rows defaults it to claude)
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$sid" "$dir" "$short" "$state" "$context" "$summary" "$agent"
   done
   # plus any FOREGROUND (non-tmux) claudes on this machine, same row format.
   _dev_fg_rows
@@ -2386,8 +2492,8 @@ _dev_list_remote() {
   if [[ -t 1 ]]; then g=$'\e[32m'; c=$'\e[36m'; y=$'\e[2m'; b=$'\e[1m'; r0=$'\e[0m'; fi
   # widest HOST and SESSION cells so both columns line up (headers are the floor:
   # "HOST"=4, "SESSION"=7). HOST is its own column, SESSION stays the bare slot.
-  local host sid cwd slot state context summary host_w=4 name_w=7
-  while IFS=$'\t' read -r host sid cwd slot state context summary; do
+  local host sid cwd slot state context summary agent host_w=4 name_w=7
+  while IFS=$'\t' read -r host sid cwd slot state context summary agent; do
     # local rows render with a BLANK host cell (see below), so they never widen it.
     [[ $host != local ]] && (( ${#host} > host_w )) && host_w=${#host}
     (( ${#slot} > name_w )) && name_w=${#slot}
@@ -2399,7 +2505,7 @@ _dev_list_remote() {
   print -r -- ""
   printf '  %s%-8s%-*s %-*s %s%s\n' "$y" 'STATUS' $host_w 'HOST' $name_w 'SESSION' 'WORKING ON' "$r0"
   local amark cmark hostcell
-  while IFS=$'\t' read -r host sid cwd slot state context summary; do
+  while IFS=$'\t' read -r host sid cwd slot state context summary agent; do
     [[ $state == attached ]] && amark="${g}●${r0}" || amark='○'
     [[ $context == active ]] && cmark="${c}✓${r0}" || cmark=' '
     (( ${#summary} > avail )) && summary="${summary[1,avail-1]}…"
@@ -2493,13 +2599,13 @@ _dev_kill_fg() {
   done
   local me up=$$
   while [[ -n $up && $up != 1 ]]; do
-    [[ "$(ps -o comm= -p $up 2>/dev/null)" == claude ]] && { me=$up; break; }
+    _dev_agent_is_proc "$(ps -o comm= -p $up 2>/dev/null)" && { me=$up; break; }
     up=$(ps -o ppid= -p $up 2>/dev/null | tr -d ' ')
   done
   local idpart="${handle##*:}"
   local pid cwd repo sid label context title m tsess killed= matched=
   local -a tx
-  for pid in ${(f)"$(ps -Axo pid,comm 2>/dev/null | awk '{n=$2; sub(/.*\//,"",n)} n=="claude"{print $1}')"}; do
+  for pid in ${(f)"$(ps -Axo pid,comm 2>/dev/null | awk '{n=$2; sub(/.*\//,"",n)} n=="claude"||n=="codex"||n~/^codex-/{print $1}')"}; do
     [[ -n ${inslot[$pid]} || $pid == $me ]] && continue
     sid= cwd=
     [[ -r $reg/$pid ]] && IFS=$'\t' read -r sid cwd < "$reg/$pid"
@@ -2666,7 +2772,7 @@ _dev_kill() {
 # one. uuidgen is uppercase but Claude stores ids lowercase, so we lowercase to
 # keep the transcript filename glob (`<sid>.jsonl`) matching.
 _dev_new_session() {
-  local session="$1" dir="$2" branch="${3:-$DEV_BRANCH}" skip_prepare="${4:-}"
+  local session="$1" dir="$2" branch="${3:-$DEV_BRANCH}" skip_prepare="${4:-}" agent="${5:-claude}"
   local logfile="$HOME/.tmux-logs/${session}.log"
   local sid; sid="$(uuidgen | tr 'A-Z' 'a-z')"
   mkdir -p "$HOME/.tmux-logs"
@@ -2679,14 +2785,18 @@ _dev_new_session() {
   tmux new-session -d -s "$session" -c "$dir"
   tmux set-option -t "$session" window-size latest 2>/dev/null
   tmux pipe-pane -t "$session" -o "cat >> $logfile"
-  tmux set-environment -t "$session" CLAUDE_RESUME_ID "$sid"
+  # Which agent occupies the slot, for every later reader (_dev_agent_of_session). Only
+  # claude takes a pre-assigned id; a codex slot is stamped by its SessionStart hook once
+  # codex has minted one (there is no `codex --session-id`).
+  tmux set-environment -t "$session" DEV_AGENT "$agent"
+  [[ $agent == claude ]] && tmux set-environment -t "$session" CLAUDE_RESUME_ID "$sid"
   # `; exit` so quitting Claude closes the pane's shell and tears down the
   # (single-window) tmux session instead of leaving an idle prompt behind. Fires
   # on any exit (clean or crash); crash output survives in the pipe-pane logfile
   # (`t read`). `t pop` kill-sessions the slot itself, so the exit is moot there.
   local prep="_dev_repo_prepare ${(q)branch}; "
   [[ -n $skip_prepare ]] && prep=    # worktree mode: <dir> is already on its branch
-  tmux send-keys -t "$session" "${prep}claude --session-id $sid; exit" Enter
+  tmux send-keys -t "$session" "${prep}$(_dev_agent_new_cmd "$agent" "$sid"); exit" Enter
 }
 
 # _t_dev — the engine behind `t open`: open/reattach a Claude Code tmux session, local or on
@@ -2698,7 +2808,7 @@ _dev_new_session() {
 # is per-repo (DEV_BRANCHES[repo], else $DEV_BRANCH). User-facing help lives in bin/t
 # (`t open -h`); the t() shim routes -h there, so this helper takes none of its own.
 _t_dev() {
-  local no_tmux= force= remote= all= local_only=
+  local no_tmux= force= remote= all= local_only= agent_over=
   local -a pos
   local arg
   # -f/--fg = foreground/no-tmux EVERYWHERE (matches tbeam -f). The kill-confirm
@@ -2712,6 +2822,8 @@ _t_dev() {
       -r|--remote)       remote=1 ;;
       -l|--local|--here) local_only=1 ;;
       -a|--all)          all=1 ;;
+      --codex)           agent_over=codex ;;
+      --claude)          agent_over=claude ;;
       *)                 pos+=("$arg") ;;
     esac
   done
@@ -2893,6 +3005,13 @@ _t_dev() {
     # nothing live remotely either → fall through to the local path (fresh start)
   fi
 
+  # Which agent a FRESH slot gets: the --codex/--claude flag > DEV_AGENT[repo] >
+  # DEV_AGENT_DEFAULT (the seam above). Resolved here, after the repo is known and
+  # before any tmux work, so a missing binary fails with the `t install` pointer
+  # instead of a pane that dies on "command not found". A reattach ignores it.
+  local agent
+  agent=$(_dev_agent_for "$repo" "$agent_over") || return 1
+
   # -f/--fg (a.k.a. --no-tmux): run claude inline, no tmux. If a SPECIFIC slot is
   # named and it's live, foreground-RESUME that conversation (`claude -r`) — matching
   # what -f means in tbeam / `dev -r`; that's exactly `tpop`, so delegate to it (it
@@ -2919,10 +3038,11 @@ _t_dev() {
       if [[ -n $_wt ]]; then dir="$_wt"; skip_prepare=1
       else _dev_worktree_refuse "$repo" "$_wslot"; return 1; fi
     fi
-    echo "Starting claude in $dir (no tmux)"
+    _dev_agent_check "$agent" || return 1
+    echo "Starting $agent in $dir (no tmux)"
     cd "$dir" || return 1
     [[ -n $skip_prepare ]] || _dev_repo_prepare "$branch"
-    claude
+    "$agent"     # claude → the claude() wrapper (tpush sentinel); codex → the binary
     return
   fi
 
@@ -2982,7 +3102,12 @@ _t_dev() {
   mkdir -p "$logdir"
 
   if tmux has-session -t "$session" 2>/dev/null; then
-    echo "Reattaching $session"
+    local live_agent; live_agent=$(_dev_agent_of_session "$session")
+    if [[ -n $agent_over && $agent_over != $live_agent ]]; then
+      echo "Reattaching $session (it is live as $live_agent — --$agent_over applies to a fresh slot only)"
+    else
+      echo "Reattaching $session"
+    fi
     # resume logging if it stopped (e.g. after server restart)
     tmux pipe-pane -t "$session" -o "cat >> $logfile"
     tmux attach-session -t "$session"
@@ -2998,8 +3123,9 @@ _t_dev() {
       if [[ -n $_wt ]]; then dir="$_wt"; skip_prepare=1
       else _dev_worktree_refuse "$repo" "$slot"; return 1; fi
     fi
-    echo "Starting $session in $dir (logging to $logfile)"
-    _dev_new_session "$session" "$dir" "$branch" "$skip_prepare"
+    _dev_agent_check "$agent" || return 1
+    echo "Starting $session in $dir${agent:#claude:+ · $agent} (logging to $logfile)"
+    _dev_new_session "$session" "$dir" "$branch" "$skip_prepare" "$agent"
     tmux attach-session -t "$session"
   fi
 }
@@ -4759,7 +4885,7 @@ _claude_sessions_fzf() {
 # conversation (claude -r) rather than starting fresh on $DEV_BRANCH. Same name
 # + log path convention so dev/tread/tpaste treat it like any dev session.
 _dev_resume_session() {
-  local session="$1" dir="$2" sid="$3"
+  local session="$1" dir="$2" sid="$3" agent="${4:-claude}"
   local logfile="$HOME/.tmux-logs/${session}.log"
   mkdir -p "$HOME/.tmux-logs"
   # No fixed geometry / window-size latest: fit the active client so attaching from
@@ -4771,9 +4897,10 @@ _dev_resume_session() {
   # conversation back to the foreground (it also falls back to the dir's newest
   # transcript, but this is the precise signal when we know it).
   tmux set-environment -t "$session" CLAUDE_RESUME_ID "$sid"
+  tmux set-environment -t "$session" DEV_AGENT "$agent"
   # `; exit` so quitting Claude tears the session down rather than leaving an idle
   # shell (see _dev_new_session for the full rationale).
-  tmux send-keys -t "$session" "claude -r $sid; exit" Enter
+  tmux send-keys -t "$session" "$(_dev_agent_resume_cmd "$agent" "$sid"); exit" Enter
 }
 
 # _dev_slot_for_cwd <cwd> — map a transcript's working dir to a dev session slot.
@@ -4876,17 +5003,7 @@ claude() {
 # `claude` is the live foreground session. tpush signals it to exit so the user
 # doesn't have to type /exit — quitting hands control back to the claude() wrapper,
 # whose post-exit block resumes this session into tmux. Capped walk; stops at init.
-_tpush_claude_pid() {
-  local pid=$$ comm
-  while (( pid > 1 )); do
-    comm=$(ps -o comm= -p "$pid" 2>/dev/null) || return 1
-    [[ ${comm:t} == claude* ]] && { print -r -- "$pid"; return 0; }
-    pid=$(ps -o ppid= -p "$pid" 2>/dev/null) || return 1
-    pid=${pid//[[:space:]]/}
-    [[ -n $pid ]] || return 1
-  done
-  return 1
-}
+_tpush_claude_pid() { _dev_agent_pid_above }   # agent-agnostic now; the name stays for its callers
 
 # _t_push — the `t push` verb: push a Claude session into a detached background tmux slot.
 # Inside Claude (CLAUDE_CODE_SESSION_ID set) it grabs THIS session + $PWD; from a plain shell

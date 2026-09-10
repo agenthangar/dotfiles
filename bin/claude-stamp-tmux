@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# claude-stamp-tmux — SessionStart hook. Four jobs:
+# claude-stamp-tmux — SessionStart hook for Claude Code AND Codex CLI (see below). Four jobs:
 #   1. (in tmux) stamp this Claude session's id onto its tmux session as
 #      CLAUDE_RESUME_ID, so tplan/tpop/dev can target the *exact* session even when
 #      several slots share one project dir.
@@ -36,14 +36,32 @@
 # Wired via ~/.claude/settings.json (seeded from claude/settings.json.example) ->
 # hooks.SessionStart. session_id + cwd arrive in the hook's JSON payload on stdin;
 # we fall back to $CLAUDE_CODE_SESSION_ID / $PWD.
+#
+# Agent-aware (the same script serves Codex CLI, registered in ~/.codex/hooks.json as
+# `claude-stamp-tmux --agent codex` — Codex's SessionStart payload has the same
+# session_id / cwd keys plus transcript_path): the ancestry walk accepts claude OR
+# codex (the npm-launched codex can present as a native `codex-<triple>` under node,
+# which is why --agent exists as an override), and a codex session gets two extra
+# things — `rollouts/<sid>` = its transcript_path (rollouts are date-keyed under
+# ~/.codex/sessions, not cwd-keyed, so this is the only cheap sid → file link) and
+# its origin stamp NEXT TO that rollout (so it syncs with it), plus a DEV_AGENT tmux
+# stamp so the slot tooling knows what occupies the pane.
 set -uo pipefail
 
-IFS=$'\t' read -r sid cwd < <(python3 -c 'import sys, json
+agent_arg=""
+while (( $# )); do
+  case "$1" in
+    --agent) agent_arg="${2:-}"; shift 2 ;;
+    *) shift ;;
+  esac
+done
+
+IFS=$'\t' read -r sid cwd tx < <(python3 -c 'import sys, json
 try:
     d = json.load(sys.stdin)
-    print("\t".join([d.get("session_id","") or "", d.get("cwd","") or ""]))
+    print("\t".join([d.get("session_id","") or "", d.get("cwd","") or "", d.get("transcript_path","") or ""]))
 except Exception:
-    print("\t")' 2>/dev/null) || { sid=""; cwd=""; }
+    print("\t\t")' 2>/dev/null) || { sid=""; cwd=""; tx=""; }
 [[ -n $sid ]] || sid=${CLAUDE_CODE_SESSION_ID:-}
 [[ -n $sid ]] || exit 0
 [[ -n $cwd ]] || cwd=$PWD
@@ -58,15 +76,28 @@ mkdir -p "$reg/opened" 2>/dev/null && touch "$reg/opened/$sid" 2>/dev/null || tr
 # Registry: key by the LIVE claude pid (an ancestor of this hook), so `dev ls` can
 # look it up for a running foreground claude. Walk up from $PPID to the nearest
 # process named `claude`; record under it. (`dev ls` prunes dead-pid entries.)
-pid=$PPID comm="" n=0
+pid=$PPID comm="" agent="" n=0
 while [[ -n $pid && $pid != 1 && $n -lt 10 ]]; do
   comm=$(ps -o comm= -p "$pid" 2>/dev/null); comm=${comm##*/}
-  [[ $comm == claude ]] && break
+  case $comm in
+    claude)        agent=claude; break ;;
+    codex|codex-*) agent=codex;  break ;;
+  esac
   pid=$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' '); n=$((n+1))
 done
-if [[ $comm == claude && -n $pid ]]; then
+if [[ -n $agent && -n $pid ]]; then
   # shellcheck disable=SC2015  # best-effort write; the `|| true` is the intended catch-all
   mkdir -p "$reg" 2>/dev/null && printf '%s\t%s\n' "$sid" "$cwd" > "$reg/$pid" 2>/dev/null || true
+fi
+[[ -n $agent_arg ]] && agent=$agent_arg   # the registration knows best (npm launcher = node)
+[[ -n $agent ]] || agent=claude
+
+# Codex: remember where this session's rollout lives (sid → transcript_path). The
+# rollouts/ subdir is a sibling of opened/ for the same reason — the registry prune
+# globs plain files only, so it is never swept as a dead pid.
+if [[ $agent == codex && -n $tx ]]; then
+  # shellcheck disable=SC2015  # best-effort; never fail the hook
+  mkdir -p "$reg/rollouts" 2>/dev/null && printf '%s\n' "$tx" > "$reg/rollouts/$sid" 2>/dev/null || true
 fi
 
 # Origin stamp: record WHICH MACHINE this session (last) ran on, next to its
@@ -75,10 +106,18 @@ fi
 # hostname, so this file is the only provenance `t resume` has for its host
 # column. Resuming a synced conversation on another machine re-fires this hook
 # with the same sid and re-stamps it there — origin always means "last ran on".
-proj="$HOME/.claude/projects/$(printf '%s' "$cwd" | tr -c 'A-Za-z0-9' '-')"
-# shellcheck disable=SC2015  # best-effort; never fail the hook
-[[ -d $proj ]] && hostname -s > "$proj/$sid.origin" 2>/dev/null || true
+if [[ $agent == codex ]]; then
+  # next to the rollout itself (there is no per-cwd project dir for codex)
+  # shellcheck disable=SC2015  # best-effort; never fail the hook
+  [[ -n $tx && -d ${tx%/*} ]] && hostname -s > "${tx%.jsonl}.origin" 2>/dev/null || true
+else
+  proj="$HOME/.claude/projects/$(printf '%s' "$cwd" | tr -c 'A-Za-z0-9' '-')"
+  # shellcheck disable=SC2015  # best-effort; never fail the hook
+  [[ -d $proj ]] && hostname -s > "$proj/$sid.origin" 2>/dev/null || true
+fi
 
 # shellcheck disable=SC2015  # best-effort stamp; never fail the hook
 [[ -n ${TMUX:-} ]] && tmux set-environment CLAUDE_RESUME_ID "$sid" 2>/dev/null || true
+# shellcheck disable=SC2015
+[[ -n ${TMUX:-} ]] && tmux set-environment DEV_AGENT "$agent" 2>/dev/null || true
 exit 0

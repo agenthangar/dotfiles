@@ -54,10 +54,13 @@ def test_config_parses_arrays_and_scalars(t_mod, tmp_path, monkeypatch):
         "DEV_BRANCHES[api]=dev/api-main",
         "REMOTE_HOSTS[mini]=mini.local",
         "DEV_WORKTREE[api]=0",
+        "DEV_AGENT[api]=codex",
+        "DEV_AGENT_DEFAULT=claude",
         "DEV_BRANCH=dev/custom",
         "DEV_WORKTREE_ROOT=/home/me/wt",
         "DEV_WORKTREE_DEFAULT=1",
     ]))
+    assert cfg.agents == {"api": "codex"} and cfg.agent_default == "claude"
     assert cfg.repos == {"dotfiles": "/home/me/code/dotfiles", "api": "/home/me/code/my-api"}
     assert cfg.branches == {"api": "dev/api-main"}
     assert cfg.hosts == {"mini": "mini.local"}
@@ -222,7 +225,32 @@ def test_parse_rows_local(t_mod):
     text = "sid1\t/code/x\t2\tactive\t✓\tworking on y"
     rows = t_mod._parse_rows(text)
     assert rows == [dict(host="local", sid="sid1", cwd="/code/x", slot="2",
-                         state="active", context="✓", summary="working on y")]
+                         state="active", context="✓", summary="working on y", agent="claude")]
+
+
+def test_parse_rows_trailing_agent_field(t_mod):
+    # field 7 (8 host-prefixed) names the agent; absent or unknown → claude, so a host
+    # on older dotfiles that still emits six fields parses exactly as before
+    assert t_mod._parse_rows("s\t/c\t1\tattached\tactive\tsum\tcodex")[0]["agent"] == "codex"
+    assert t_mod._parse_rows("s\t/c\t1\tattached\tactive\tsum\tclaude")[0]["agent"] == "claude"
+    assert t_mod._parse_rows("s\t/c\t1\tattached\tactive\tsum\tgpt")[0]["agent"] == "claude"
+    assert t_mod._parse_rows("s\t/c\t1\tattached\tactive\tsum")[0]["agent"] == "claude"
+    r = t_mod._parse_rows("mini\ts\t/c\t1\tattached\tactive\tsum\tcodex", host_prefixed=True)[0]
+    assert r["host"] == "mini" and r["agent"] == "codex" and r["summary"] == "sum"
+
+
+def test_config_agent_for_precedence(t_mod, tmp_path, monkeypatch):
+    cfg = _write_config(t_mod, tmp_path, monkeypatch, "\n".join([
+        "DEV_REPOS[api]=/code/api", "DEV_REPOS[web]=/code/web",
+        "DEV_AGENT[api]=codex", "DEV_AGENT[web]=gpt5", "DEV_AGENT_DEFAULT=claude"]))
+    assert cfg.agent_for("api") == "codex"                 # per-repo
+    assert cfg.agent_for("api", "claude") == "claude"      # --claude beats a codex repo
+    assert cfg.agent_for("web") == "claude"                # a typo never launches
+    assert cfg.agent_for("other") == "claude"              # the default
+    assert cfg.agent_for("other", "codex") == "codex"      # --codex
+    cfg = _write_config(t_mod, tmp_path, monkeypatch, "DEV_AGENT_DEFAULT=codex\n")
+    assert cfg.agent_for("anything") == "codex"
+    assert cfg.agent_for("anything", "claude") == "claude"
 
 
 def test_parse_rows_host_prefixed(t_mod):
@@ -933,6 +961,25 @@ def test_slot_line_marks_and_columns(t_mod):
     # the t ls -r HOST column; a local row leaves it blank
     assert t_mod._slot_line(dict(row, host="mini"), st, 7, 20, host_w=4).startswith("        mini ff-3")
     assert t_mod._slot_line(dict(row, host="local"), st, 7, 20, host_w=4).startswith(" " * 13 + "ff-3")
+
+
+def test_slot_line_agent_glyph_keeps_the_status_width(t_mod):
+    st = t_mod.Style(tty=False)
+    row = {"host": "local", "slot": "ff-3", "state": "attached", "context": "active", "summary": "x"}
+    claude = t_mod._slot_line(dict(row, agent="claude"), st, 7, 20)
+    codex = t_mod._slot_line(dict(row, agent="codex"), st, 7, 20)
+    assert claude == "● ✓     ff-3    x"                 # unchanged for the default agent
+    assert codex == "● ✓ ⬡   ff-3    x"                 # third glyph, same 8-column budget
+    assert len(claude) == len(codex)
+    assert t_mod._slot_line(row, st, 7, 20) == claude   # no agent key at all = claude
+
+
+def test_header_agent_legend_only_when_a_codex_row_is_shown(t_mod):
+    st = t_mod.Style(tty=False)
+    assert "⬡" not in t_mod._header(st, "")
+    assert "⬡" not in t_mod._header(st, "", ["claude", "claude"])
+    h = t_mod._header(st, "/code/ff", ["claude", "codex"])
+    assert " · ⬡ codex" in h and "(repo: ff" in h
 
 
 def test_slot_line_colours_only_through_the_style(t_mod):

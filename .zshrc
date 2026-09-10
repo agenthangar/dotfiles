@@ -3788,9 +3788,13 @@ _pr_state_flush() {
 # transcripts from every $REMOTE_HOSTS host first (direct rsync — csync is periodic
 # and needs a prompt on the far side, so "resume what just died on the other
 # machine" cannot wait for it), then scans as usual. LIVE slots — local or on a
-# $REMOTE_HOSTS host — appear as labeled rows ("● active" / "● on <host>") whose pick
+# $REMOTE_HOSTS host — are HIDDEN from the scan by default (a stderr count names
+# them; `t open` is the verb for a running slot, and with a dozen live slots pinned
+# to the top the dead rows this verb exists for scrolled off a phone screen);
+# -l/--live shows them as labeled rows ("● active" / "● on <host>") whose pick
 # ATTACHES in place instead of resuming (one-live-owner: a second `claude -r` on a
-# live id diverges the transcript).
+# live id diverges the transcript). An explicit `t resume <repo> <slot>` on a live
+# slot always attaches — a direct ask, not a scan.
 # -f/--fg resumes inline in THIS terminal (t pop's landing) instead of a slot.
 # Dead rows carry the two shared picker signals (see _claude_session_rows and
 # claude-stamp-tmux jobs 3-4): recency/date = max(transcript mtime, last-opened
@@ -3802,13 +3806,14 @@ _pr_state_flush() {
 # User-facing help lives in bin/t (`t resume -h`); the t() shim routes -h there.
 _t_resume() {
   setopt local_options null_glob bare_glob_qual
-  local a no_tmux= all_flag= remote_flag= days=30 _expect_days=; local -a pos
+  local a no_tmux= all_flag= remote_flag= live_flag= days=30 _expect_days=; local -a pos
   for a in "$@"; do
     if [[ -n $_expect_days ]]; then days=$a; _expect_days=; continue; fi
     case "$a" in
       -f|--fg)     no_tmux=1 ;;
       -a|--all)    all_flag=1 ;;
       -r|--remote) remote_flag=1 ;;
+      -l|--live)   live_flag=1 ;;
       --days)      _expect_days=1 ;;
       --days=*)    days=${a#--days=} ;;
       -*)          echo "t resume: unknown flag: $a (t resume -h for flags)" >&2; return 1 ;;
@@ -3956,7 +3961,7 @@ _t_resume() {
   local -A meta_title meta_pr
   local _p _mr _mrest
   local n wt sid busy rhost _rdir _rbase _rhost _rn _ralias _rsum _ok _stale stale_path
-  local txf title when ep org orgf hf skipped=0
+  local txf title when ep org orgf hf skipped=0 hidden_live=0
   local reopened opf opep REPLY
   local _rwtr=${DEV_WORKTREE_ROOT:-}
   # The two picker signals shared with _claude_session_rows/tfind (see the
@@ -4011,9 +4016,12 @@ _t_resume() {
           _t_dev "$repo" "$n"
           return
         fi
-        # Scan: a live local slot is a labeled row (pick → attach). Sort key
-        # (field 1, stripped after the global sort below): a live session is
+        # Scan: a live local slot is HIDDEN by default (counted for the hint
+        # below — the list is "what can I revive", and live slots are `t open`'s
+        # business); -l/--live shows it as a labeled row (pick → attach). Sort
+        # key (field 1, stripped after the global sort below): a live session is
         # "now", so the max sentinel pins it above every dead transcript.
+        [[ -n $live_flag ]] || { (( hidden_live++ )); continue; }
         cands+=(9999999999$'\t'"$repo"$'\t'"$n"$'\t'-$'\t'"$wt"$'\t'"● active"$'\t'"${local_sum[${busy#dev-}]:-(live session)}"$'\t'here$'\t'-$'\t'-)
         continue
       fi
@@ -4025,6 +4033,7 @@ _t_resume() {
           _dev_remote_attach "$rhost"$'\t'"${remote_live_alias[$n]}"$'\t'"$n" ""
           return
         fi
+        [[ -n $live_flag ]] || { (( hidden_live++ )); continue; }
         cands+=(9999999999$'\t'"$repo"$'\t'"$n"$'\t'-$'\t'"$wt"$'\t'"● on $rhost"$'\t'"${remote_live_sum[$n]:-(live session)}"$'\t'"$rhost"$'\t'"${remote_live_alias[$n]}"$'\t'-)
         continue
       fi
@@ -4053,6 +4062,7 @@ _t_resume() {
           _t_dev "$repo" "$n"
           return
         fi
+        [[ -n $live_flag ]] || { (( hidden_live++ )); continue; }
         cands+=(9999999999$'\t'"$repo"$'\t'"$n"$'\t'-$'\t'"${stale_path:-$wt}"$'\t'"● active"$'\t'"${local_sum[${_stale#dev-}]:-(live session)}"$'\t'here$'\t'-$'\t'-)
         continue
       fi
@@ -4136,6 +4146,7 @@ _t_resume() {
   _pr_state_flush
 
   (( skipped )) && echo "(${skipped} older conversation(s) outside the last ${days}d hidden — t resume --days all shows them)" >&2
+  (( hidden_live )) && echo "(${hidden_live} live slot(s) hidden — t resume --live lists them; t open attaches one)" >&2
 
   # ONE global newest-first order by session time (the leading epoch field),
   # never grouped by repo — the loop above emits repo-by-repo, so without this

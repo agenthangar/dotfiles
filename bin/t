@@ -2669,8 +2669,8 @@ _INSTALL_AGENTS = {
         "login_headless": ["codex", "login", "--device-auth"],
         "status": ["codex", "login", "status"],
         "update": ["codex", "update"],
-        "note": ("then open codex once and accept the dotfiles SessionStart hook under "
-                 "/hooks — t doctor checks"),
+        "note": ("then start codex once and accept its hooks prompt ('Trust all and "
+                 "continue') — t doctor checks"),
     },
     "cursor": {
         "label": "Cursor CLI (cursor-agent)", "bin": "cursor-agent",
@@ -3221,6 +3221,21 @@ def _agent_parity_render():
     return lines
 
 
+_CODEX_TRUST_RE = re.compile(r'\[hooks\.state\."[^"\n]*hooks\.json:[^"\n]*"\]\s*\n\s*trusted_hash\s*=\s*"')
+
+
+def _codex_hook_trusted(config_toml):
+    """Has the user trusted the hooks.json hook? Codex records that decision — taken
+    once at its startup "Hooks need review" prompt — as `[hooks.state."<hooks.json>:
+    session_start:N:M"] trusted_hash = "sha256:…"` in ~/.codex/config.toml (verified
+    on 0.154). True / False; None when the file is unreadable."""
+    try:
+        with open(config_toml, encoding="utf-8") as fh:
+            return bool(_CODEX_TRUST_RE.search(fh.read()))
+    except OSError:
+        return None
+
+
 def _codex_hook_state(path):
     """~/.codex/hooks.json: "registered" when a SessionStart command runs
     claude-stamp-tmux, "none" when the file is absent or has no such entry, None when
@@ -3391,10 +3406,10 @@ def _doctor_findings(facts):
     if facts.get("codex_hook") == "none":
         out.append("⚠ codex has no dotfiles SessionStart hook in ~/.codex/hooks.json — run "
                    "dots (install.sh seeds it), then accept it under /hooks in codex")
-    elif (facts.get("codex_hook") == "registered" and facts.get("codex_used")
-          and not facts.get("codex_hook_fired")):
-        out.append("· the codex hook is registered but has never fired here — open codex, "
-                   "run /hooks and trust it (until then t ls cannot title a codex slot)")
+    elif facts.get("codex_hook") == "registered" and facts.get("codex_hook_trusted") is False:
+        out.append("· the codex hook is registered but not trusted yet — start codex once and "
+                   "pick 'Trust all and continue' at its hooks prompt (until then a codex slot "
+                   "has no id: t ls cannot title it and t pop/push cannot target it)")
     if not out:
         out.append("✓ nothing suspicious found")
     return out
@@ -3474,9 +3489,10 @@ def cmd_doctor(cfg, args):
     if facts_agents["codex"]["version"] or os.path.isdir(os.path.join(HOME, ".codex")):
         codex_hook = _codex_hook_state(os.path.join(HOME, ".codex", "hooks.json"))
         codex_used = os.path.isdir(os.path.join(HOME, ".codex", "sessions"))
-        fired = bool(glob.glob(os.path.join(_cache_root(), "rollouts", "*")))
-        print("  codex hook %s" % {"registered": "registered in ~/.codex/hooks.json%s"
-                                   % ("" if fired else " (never fired here — trust it under /hooks)"),
+        codex_trusted = _codex_hook_trusted(os.path.join(HOME, ".codex", "config.toml"))
+        print("  codex hook %s" % {"registered": "registered in ~/.codex/hooks.json · %s"
+                                   % ("trusted" if codex_trusted else
+                                      "NOT trusted yet — start codex once and accept its hooks prompt"),
                                    "none": "NOT registered — run dots (install.sh seeds it)",
                                    None: "~/.codex/hooks.json unreadable"}[codex_hook])
 
@@ -3485,7 +3501,7 @@ def cmd_doctor(cfg, args):
     facts = {"in_tmux": bool(os.environ.get("TMUX")),
              "term_program": os.environ.get("TERM_PROGRAM"), "tui": tui,
              "agents": facts_agents, "codex_hook": codex_hook, "codex_used": codex_used,
-             "codex_hook_fired": bool(glob.glob(os.path.join(_cache_root(), "rollouts", "*")))}
+             "codex_hook_trusted": codex_trusted}
     zrc = os.path.join(HOME, ".zshrc")
     live_src = None
     if os.path.islink(zrc):

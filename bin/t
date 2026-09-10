@@ -4871,7 +4871,7 @@ Run `t <verb> -h` for a verb's own flags.""")
         description="Revive a DEAD dev slot's conversation (`t open` on a dead slot "
             "deliberately starts fresh — this brings the chat back). Offers EVERY conversation "
             "saved in the slot's own per-session worktree (one global newest-first list by "
-            "session time — never grouped by repo; live rows on top; conversationless stubs "
+            "session time — never grouped by repo; live rows on top when shown; conversationless stubs "
             "skipped), rebuilding a reaped worktree from its branch first, then resumes the pick "
             "in a fresh dev slot and attaches. Names default to "
             "the cwd repo; outside any repo dir a bare `t resume` scans every worktree repo. "
@@ -4882,14 +4882,18 @@ Run `t <verb> -h` for a verb's own flags.""")
             "in NEW terminal tabs (Terminal.app/iTerm2; `t open` hints when tabs are "
             "impossible — ssh, unrecognized terminal, no Accessibility; --fg takes a single "
             "pick only). "
-            "LIVE slots appear as labeled rows — '● active' / '● on <host>' — and "
-            "picking one ATTACHES in place (locally or on its host) instead of resuming. "
+            "LIVE slots are hidden by default (a stderr count names them — `t open` is "
+            "the verb for a running slot); -l/--live lists them as labeled rows — "
+            "'● active' / '● on <host>' — and picking one ATTACHES in place (locally or on "
+            "its host) instead of resuming; naming a live slot explicitly always attaches. "
             "Worktree-per-session repos only (a shared tree's transcripts are "
             "ambiguous per-slot — use `t push -p` there).")
     sp.add_argument("repo", nargs="?", help="DEV_REPOS key; defaults to the repo your cwd is in")
     sp.add_argument("slot", nargs="?", help="slot number; a lone slot implies the cwd repo")
     sp.add_argument("-f", "--fg", action="store_true", help="resume inline in THIS terminal (no tmux slot)")
     sp.add_argument("-a", "--all", action="store_true", help="scan every worktree repo (the default outside a repo dir)")
+    sp.add_argument("-l", "--live", action="store_true",
+        help="also list LIVE slots (hidden by default) as '● active' / '● on <host>' rows that attach on pick")
     sp.add_argument("-r", "--remote", action="store_true",
         help="pull the latest transcripts from every $REMOTE_HOSTS host first (direct rsync; "
              "csync is periodic and needs a shell on the far side), then scan as usual")

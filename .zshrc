@@ -166,8 +166,11 @@ prview() {
 #   --grace <secs>   how long a signal may be absent before nosleep lets go (default 900)
 #   --every <secs>   how often the two signals are re-checked (default 30)
 #
-# Blocks sleep via `pmset disablesleep 1` + a background caffeinate, then keeps
-# holding only while BOTH signals stay fresh: internet (an HTTPS exchange with
+# Blocks SYSTEM sleep via `pmset disablesleep 1` + a background caffeinate, while
+# the display still dims and sleeps on its own schedule (that is what locks the Mac
+# at a desk), and LOCKS the screen the moment the lid closes — with sleep disabled a
+# closed lid no longer sleeps, so it no longer locks either. It keeps holding only
+# while BOTH signals stay fresh: internet (an HTTPS exchange with
 # api.anthropic.com) and tokens burning (a local claude mid-turn — Claude Code runs
 # its own caffeinate while a request is in flight). Once either has been missing for
 # the grace window it restores sleep and exits — so a Claude run that finishes, or a network that drops, lets
@@ -223,36 +226,60 @@ nosleep() {
   # as an orphan to the sweep above.
   setopt localoptions nomonitor
   sudo pmset -a disablesleep 1 || return 1
-  caffeinate -dimsu & _NOSLEEP_CAF=$!
-  if (( forever )); then
-    echo "nosleep: holding sleep off until Ctrl-C"
-    wait "$_NOSLEEP_CAF"
-    return 0
-  fi
+  # -ims, not -dimsu: -d would pin the display on and -u would wake it. System,
+  # idle and disk sleep are held; the display follows pmset displaysleep, and the
+  # screen-lock delay turns that display sleep into a lock.
+  caffeinate -ims & _NOSLEEP_CAF=$!
 
   # Each signal carries the epoch it was LAST seen at; nosleep lets go when the
   # OLDER of the two falls more than $grace behind now. One failed probe (a wifi
   # blip) therefore does nothing on its own, and there is no double window: a
-  # transcript last written at T can hold the Mac awake until exactly T+grace.
-  local now busy_at online_at=$EPOCHSECONDS oldest why
-  echo "nosleep: holding sleep off while a local claude is working and the network is up (grace ${grace}s, Ctrl-C to stop)"
+  # claude last mid-turn at T can hold the Mac awake until exactly T+grace.
+  # The loop ticks every 2s for the lid (a lock that lands 30s after the lid shut
+  # is no lock) and runs the two signal probes only every $every.
+  local now busy_at online_at=$EPOCHSECONDS oldest why checked_at=0 lid_was=0
+  if (( forever )); then
+    echo "nosleep: holding sleep off until Ctrl-C (lid close locks the screen)"
+  else
+    echo "nosleep: holding sleep off while a local claude is working and the network is up (grace ${grace}s, lid close locks, Ctrl-C to stop)"
+  fi
+  busy_at=$online_at
   while :; do
     now=$EPOCHSECONDS
-    _nosleep_online && online_at=$now
-    busy_at=$(_nosleep_busy_at)
-    oldest=$(( busy_at < online_at ? busy_at : online_at ))
-    if (( now - oldest > grace )); then
-      (( busy_at < online_at )) && why="no local claude has been mid-turn for ${grace}s" || why="the network has been down for ${grace}s"
-      echo "nosleep: letting go — $why"
-      _nosleep_restore
-      return 0
+    if _nosleep_lid_closed; then
+      (( lid_was )) || { _nosleep_lock; lid_was=1; }
+    else
+      lid_was=0
     fi
-    [[ -t 1 ]] && printf '\r\e[K  claude active %ds ago · network ok %ds ago' $(( now - busy_at )) $(( now - online_at ))
-    # Keep the sudo timestamp warm so the restore never blocks on a password prompt
-    # that nobody is at the keyboard to answer — the whole point is running unattended.
-    sudo -n -v 2>/dev/null
-    sleep "$every"
+    if (( ! forever && now - checked_at >= every )); then
+      checked_at=$now
+      _nosleep_online && online_at=$now
+      busy_at=$(_nosleep_busy_at)
+      oldest=$(( busy_at < online_at ? busy_at : online_at ))
+      if (( now - oldest > grace )); then
+        (( busy_at < online_at )) && why="no local claude has been mid-turn for ${grace}s" || why="the network has been down for ${grace}s"
+        echo "nosleep: letting go — $why"
+        _nosleep_restore
+        return 0
+      fi
+      [[ -t 1 ]] && printf '\r\e[K  claude active %ds ago · network ok %ds ago' $(( now - busy_at )) $(( now - online_at ))
+      # Keep the sudo timestamp warm so the restore never blocks on a password prompt
+      # that nobody is at the keyboard to answer — the whole point is running unattended.
+      sudo -n -v 2>/dev/null
+    fi
+    sleep 2
   done
+}
+# _nosleep_lid_closed — true while the lid is shut (AppleClamshellState, one ~10ms ioreg).
+_nosleep_lid_closed() { ioreg -r -k AppleClamshellState -d 4 2>/dev/null | grep -q '"AppleClamshellState" = Yes'; }
+# _nosleep_lock — lock the screen now. SACLockScreenImmediate is the call behind the
+# Apple-menu Lock Screen item: instant, and it needs no Accessibility grant (the
+# ctrl-cmd-q keystroke route does). It is a private framework, so a failure falls
+# back to sleeping the display, which the screen-lock delay turns into a lock.
+_nosleep_lock() {
+  python3 -c 'import ctypes; ctypes.CDLL("/System/Library/PrivateFrameworks/login.framework/login").SACLockScreenImmediate()' 2>/dev/null \
+    || pmset displaysleepnow 2>/dev/null
+  echo "nosleep: lid closed — screen locked"
 }
 # _nosleep_online — true when an HTTPS exchange with api.anthropic.com completes.
 # Any HTTP status counts (no -f): a 404 proves the network path; only DNS/connect/
@@ -3914,9 +3941,13 @@ _pr_state_flush() {
 # transcripts from every $REMOTE_HOSTS host first (direct rsync — csync is periodic
 # and needs a prompt on the far side, so "resume what just died on the other
 # machine" cannot wait for it), then scans as usual. LIVE slots — local or on a
-# $REMOTE_HOSTS host — appear as labeled rows ("● active" / "● on <host>") whose pick
+# $REMOTE_HOSTS host — are HIDDEN from the scan by default (a stderr count names
+# them; `t open` is the verb for a running slot, and with a dozen live slots pinned
+# to the top the dead rows this verb exists for scrolled off a phone screen);
+# -l/--live shows them as labeled rows ("● active" / "● on <host>") whose pick
 # ATTACHES in place instead of resuming (one-live-owner: a second `claude -r` on a
-# live id diverges the transcript).
+# live id diverges the transcript). An explicit `t resume <repo> <slot>` on a live
+# slot always attaches — a direct ask, not a scan.
 # -f/--fg resumes inline in THIS terminal (t pop's landing) instead of a slot.
 # Dead rows carry the two shared picker signals (see _claude_session_rows and
 # claude-stamp-tmux jobs 3-4): recency/date = max(transcript mtime, last-opened
@@ -3928,13 +3959,14 @@ _pr_state_flush() {
 # User-facing help lives in bin/t (`t resume -h`); the t() shim routes -h there.
 _t_resume() {
   setopt local_options null_glob bare_glob_qual
-  local a no_tmux= all_flag= remote_flag= days=30 _expect_days=; local -a pos
+  local a no_tmux= all_flag= remote_flag= live_flag= days=30 _expect_days=; local -a pos
   for a in "$@"; do
     if [[ -n $_expect_days ]]; then days=$a; _expect_days=; continue; fi
     case "$a" in
       -f|--fg)     no_tmux=1 ;;
       -a|--all)    all_flag=1 ;;
       -r|--remote) remote_flag=1 ;;
+      -l|--live)   live_flag=1 ;;
       --days)      _expect_days=1 ;;
       --days=*)    days=${a#--days=} ;;
       -*)          echo "t resume: unknown flag: $a (t resume -h for flags)" >&2; return 1 ;;
@@ -4082,7 +4114,7 @@ _t_resume() {
   local -A meta_title meta_pr
   local _p _mr _mrest
   local n wt sid busy rhost _rdir _rbase _rhost _rn _ralias _rsum _ok _stale stale_path
-  local txf title when ep org orgf hf skipped=0
+  local txf title when ep org orgf hf skipped=0 hidden_live=0
   local reopened opf opep REPLY
   local _rwtr=${DEV_WORKTREE_ROOT:-}
   # The two picker signals shared with _claude_session_rows/tfind (see the
@@ -4137,9 +4169,12 @@ _t_resume() {
           _t_dev "$repo" "$n"
           return
         fi
-        # Scan: a live local slot is a labeled row (pick → attach). Sort key
-        # (field 1, stripped after the global sort below): a live session is
+        # Scan: a live local slot is HIDDEN by default (counted for the hint
+        # below — the list is "what can I revive", and live slots are `t open`'s
+        # business); -l/--live shows it as a labeled row (pick → attach). Sort
+        # key (field 1, stripped after the global sort below): a live session is
         # "now", so the max sentinel pins it above every dead transcript.
+        [[ -n $live_flag ]] || { (( hidden_live++ )); continue; }
         cands+=(9999999999$'\t'"$repo"$'\t'"$n"$'\t'-$'\t'"$wt"$'\t'"● active"$'\t'"${local_sum[${busy#dev-}]:-(live session)}"$'\t'here$'\t'-$'\t'-)
         continue
       fi
@@ -4151,6 +4186,7 @@ _t_resume() {
           _dev_remote_attach "$rhost"$'\t'"${remote_live_alias[$n]}"$'\t'"$n" ""
           return
         fi
+        [[ -n $live_flag ]] || { (( hidden_live++ )); continue; }
         cands+=(9999999999$'\t'"$repo"$'\t'"$n"$'\t'-$'\t'"$wt"$'\t'"● on $rhost"$'\t'"${remote_live_sum[$n]:-(live session)}"$'\t'"$rhost"$'\t'"${remote_live_alias[$n]}"$'\t'-)
         continue
       fi
@@ -4179,6 +4215,7 @@ _t_resume() {
           _t_dev "$repo" "$n"
           return
         fi
+        [[ -n $live_flag ]] || { (( hidden_live++ )); continue; }
         cands+=(9999999999$'\t'"$repo"$'\t'"$n"$'\t'-$'\t'"${stale_path:-$wt}"$'\t'"● active"$'\t'"${local_sum[${_stale#dev-}]:-(live session)}"$'\t'here$'\t'-$'\t'-)
         continue
       fi
@@ -4262,6 +4299,7 @@ _t_resume() {
   _pr_state_flush
 
   (( skipped )) && echo "(${skipped} older conversation(s) outside the last ${days}d hidden — t resume --days all shows them)" >&2
+  (( hidden_live )) && echo "(${hidden_live} live slot(s) hidden — t resume --live lists them; t open attaches one)" >&2
 
   # ONE global newest-first order by session time (the leading epoch field),
   # never grouped by repo — the loop above emits repo-by-repo, so without this

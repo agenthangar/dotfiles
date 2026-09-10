@@ -163,7 +163,7 @@ prview() {
 #
 # Options:
 #   -f, --forever    hold sleep off until Ctrl-C, unconditionally (the old behaviour)
-#   --grace <secs>   how long a signal may be absent before nosleep lets go (default 300)
+#   --grace <secs>   how long a signal may be absent before nosleep lets go (default 900)
 #   --every <secs>   how often the two signals are re-checked (default 30)
 #
 # Blocks sleep via `pmset disablesleep 1` + a background caffeinate, then keeps
@@ -175,7 +175,7 @@ prview() {
 # For a persistent, unconditional block use `sleep-manager disable` instead.
 nosleep() {
   [[ "$1" == -h || "$1" == --help ]] && { _help_for nosleep; return 0; }
-  local forever=0 grace=300 every=30
+  local forever=0 grace=900 every=30
   while (( $# )); do
     case $1 in
       -f|--forever) forever=1 ;;

@@ -157,7 +157,7 @@ prview() {
   '
 }
 
-# nosleep — keep the Mac awake while Claude is working and the network is up
+# nosleep — keep the Mac awake while an agent CLI is working and the network is up
 #
 # Usage: nosleep [-f|--forever] [--grace <secs>] [--every <secs>]
 #
@@ -171,10 +171,13 @@ prview() {
 # at a desk), and LOCKS the screen the moment the lid closes — with sleep disabled a
 # closed lid no longer sleeps, so it no longer locks either. It keeps holding only
 # while BOTH signals stay fresh: internet (an HTTPS exchange with
-# api.anthropic.com) and tokens burning (a local claude mid-turn — Claude Code runs
-# its own caffeinate while a request is in flight). Once either has been missing for
-# the grace window it restores sleep and exits — so a Claude run that finishes, or a network that drops, lets
-# the Mac sleep on its own instead of holding it awake until you remember Ctrl-C.
+# api.anthropic.com) and tokens burning — a local claude, codex or cursor-agent
+# mid-turn (Claude Code runs its own caffeinate while a request is in flight; for
+# every agent, bytes moving on its sockets since the last check — the floor is
+# NOSLEEP_NET_BPS, 256 B/s, overridable in ~/.zshrc.local). Once either has been
+# missing for the grace window it restores sleep and exits — so a run that finishes,
+# or a network that drops, lets the Mac sleep on its own instead of holding it awake
+# until you remember Ctrl-C.
 # For a persistent, unconditional block use `sleep-manager disable` instead.
 nosleep() {
   [[ "$1" == -h || "$1" == --help ]] && { _help_for nosleep; return 0; }
@@ -196,7 +199,8 @@ nosleep() {
   # is GLOBAL on purpose: the EXIT trap fires after the function's locals are
   # unwound (verified — a local pid read as empty there, leaving caffeinate running
   # and the restore firing twice).
-  typeset -g _NOSLEEP_CAF='' _NOSLEEP_DONE=0
+  typeset -g _NOSLEEP_CAF='' _NOSLEEP_DONE=0 _NOSLEEP_WHO=''
+  _NOSLEEP_NET=()
   _nosleep_restore() {
     (( _NOSLEEP_DONE )) && return 0; _NOSLEEP_DONE=1
     [[ -n $_NOSLEEP_CAF ]] && kill "$_NOSLEEP_CAF" 2>/dev/null
@@ -233,15 +237,18 @@ nosleep() {
 
   # Each signal carries the epoch it was LAST seen at; nosleep lets go when the
   # OLDER of the two falls more than $grace behind now. One failed probe (a wifi
-  # blip) therefore does nothing on its own, and there is no double window: a
-  # claude last mid-turn at T can hold the Mac awake until exactly T+grace.
+  # blip, an agent between turns) therefore does nothing on its own, and there is
+  # no double window: an agent last mid-turn at T can hold the Mac awake until
+  # exactly T+grace. Both probes are LAST-SEEN updates — an idle answer leaves the
+  # epoch where it was (assigning the probe's 0 straight to busy_at made the first
+  # idle probe read as "idle for 55 years" and let go at once, grace unapplied).
   # The loop ticks every 2s for the lid (a lock that lands 30s after the lid shut
   # is no lock) and runs the two signal probes only every $every.
   local now busy_at online_at=$EPOCHSECONDS oldest why checked_at=0 lid_was=0
   if (( forever )); then
     echo "nosleep: holding sleep off until Ctrl-C (lid close locks the screen)"
   else
-    echo "nosleep: holding sleep off while a local claude is working and the network is up (grace ${grace}s, lid close locks, Ctrl-C to stop)"
+    echo "nosleep: holding sleep off while a local agent (claude · codex · cursor-agent) is working and the network is up (grace ${grace}s, lid close locks, Ctrl-C to stop)"
   fi
   busy_at=$online_at
   while :; do
@@ -254,15 +261,15 @@ nosleep() {
     if (( ! forever && now - checked_at >= every )); then
       checked_at=$now
       _nosleep_online && online_at=$now
-      busy_at=$(_nosleep_busy_at)
+      _nosleep_busy_at; (( REPLY )) && busy_at=$REPLY
       oldest=$(( busy_at < online_at ? busy_at : online_at ))
       if (( now - oldest > grace )); then
-        (( busy_at < online_at )) && why="no local claude has been mid-turn for ${grace}s" || why="the network has been down for ${grace}s"
+        (( busy_at < online_at )) && why="no local agent (claude · codex · cursor-agent) has been working for ${grace}s" || why="the network has been down for ${grace}s"
         echo "nosleep: letting go — $why"
         _nosleep_restore
         return 0
       fi
-      [[ -t 1 ]] && printf '\r\e[K  claude active %ds ago · network ok %ds ago' $(( now - busy_at )) $(( now - online_at ))
+      [[ -t 1 ]] && printf '\r\e[K  %s active %ds ago · network ok %ds ago' "${_NOSLEEP_WHO:-agent}" $(( now - busy_at )) $(( now - online_at ))
       # Keep the sudo timestamp warm so the restore never blocks on a password prompt
       # that nobody is at the keyboard to answer — the whole point is running unattended.
       sudo -n -v 2>/dev/null
@@ -285,24 +292,82 @@ _nosleep_lock() {
 # Any HTTP status counts (no -f): a 404 proves the network path; only DNS/connect/
 # TLS failures — the outages that actually stop tokens burning — return nonzero.
 _nosleep_online() { curl -s -o /dev/null --max-time 4 https://api.anthropic.com/ 2>/dev/null; }
-# _nosleep_busy_at — now when a local claude is mid-turn, else 0. Claude Code itself
-# spawns `caffeinate -i -t 300` under the `claude` process for exactly as long as a
-# request is in flight (respawned per turn, self-expiring at 5 min), so "a caffeinate
-# whose parent is claude" IS tokens burning, read off one ps. This replaced a
-# transcript-mtime check that was wrong both ways on a real machine: csync's rsync
-# bulk-touches IDLE sessions' transcripts (five idle slots shared one mtime), and a
-# session mid-way through a long tool call had not written its transcript in 31 min.
+# NOSLEEP_NET_BPS — bytes per second an agent CLI must move on its sockets (in + out)
+# between two probes to count as working. Idle keepalive chatter measured ~3 B/s for
+# a claude at its prompt and stays under ~60 B/s even for a codex holding eight
+# pooled HTTP/2 connections; a streaming turn is thousands. Override in ~/.zshrc.local.
+typeset -g NOSLEEP_NET_BPS=${NOSLEEP_NET_BPS:-256}
+# _nosleep_agent_of_comm <comm> — REPLY = the agent a process name belongs to (claude ·
+# codex · cursor), empty for anything else: the slot seam's _dev_agent_is_proc match
+# plus cursor-agent, which never occupies a slot but burns tokens all the same. (ps
+# reports argv[0], and cursor-agent's launcher `exec -a`s its own path — verified.)
+_nosleep_agent_of_comm() {
+  REPLY=''
+  if _dev_agent_is_proc "$1"; then
+    [[ ${1:t} == claude ]] && REPLY=claude || REPLY=codex
+  elif [[ ${1:t} == cursor-agent ]]; then
+    REPLY=cursor
+  fi
+}
+# _nosleep_busy_at — REPLY = now when a local agent CLI is working, else 0; _NOSLEEP_WHO
+# names the agents last seen at it (the status line). Two signals, either suffices:
+#   1. a `caffeinate` whose parent is `claude` — Claude Code spawns `caffeinate -i -t 300`
+#      under itself for exactly as long as a request is in flight (respawned per turn),
+#      so that child IS a turn in flight, read off one ps. Instant, no baseline; claude
+#      only — codex and cursor-agent spawn nothing of the kind.
+#   2. bytes moved on the agent's sockets since the previous probe: nettop's per-process
+#      cumulative in+out counters, delta ≥ NOSLEEP_NET_BPS × elapsed. The agent-agnostic
+#      reading of "tokens burning" — a request streams, keepalives do not. A pid's first
+#      sighting only records its baseline; the next probe decides.
+# Rejected on a live machine, both wrong the same way (an IDLE agent reads busy):
+#   - an ESTABLISHED :443 connection — idle agents keep pooled ones open (a codex at
+#     its prompt held eight, a claude two) and they outlive the turn indefinitely;
+#   - CPU time — an idle codex TUI burned 0.85 s in 47 s while a claude waiting on a
+#     tool burned 1.36 s: the separation is inside the noise.
+#   (And transcript mtime before both: csync bulk-touches IDLE transcripts, and a
+#   session mid-way through a long tool call had not written its transcript in 31 min.)
+# Returns through $REPLY, never stdout: a $(…) caller runs in a SUBSHELL, where the
+# baselines written to _NOSLEEP_NET would vanish and every probe would be a first
+# sighting (the _pr_state_tag lesson). `nettop -n` is load-bearing — with name
+# resolution a probe took 5.1 s, without it 40 ms — and a process with no socket
+# gets NO row, not a zero one. A GUI bundle's agent core (the ChatGPT app ships its
+# own codex) is skipped as _dev_ps_snapshot skips it: not a session you started, and
+# its background sync is not work.
+typeset -gA _NOSLEEP_NET
+typeset -g _NOSLEEP_WHO=''
 _nosleep_busy_at() {
-  local pid ppid comm; local -A pcomm; local -a caf
+  local pid ppid comm now=$EPOCHSECONDS; local -A pcomm agent; local -a caf args who
   while read -r pid ppid comm; do
     [[ $pid == <-> ]] || continue
     pcomm[$pid]=${comm:t}
     [[ ${comm:t} == caffeinate ]] && caf+=("$ppid")
+    [[ $comm == *.app/Contents/* ]] && continue
+    _nosleep_agent_of_comm "$comm"
+    [[ -n $REPLY ]] && { agent[$pid]=$REPLY; args+=(-p "$pid"); }
   done < <(ps -Axo pid=,ppid=,comm= 2>/dev/null)
   for ppid in "${caf[@]}"; do
-    [[ ${pcomm[$ppid]:-} == claude ]] && { echo "$EPOCHSECONDS"; return 0; }
+    [[ ${pcomm[$ppid]:-} == claude ]] && { who+=(claude); break; }
   done
-  echo 0
+  if (( ${#args} && $+commands[nettop] )); then
+    local name bin bout rest prev elapsed bytes
+    while IFS=, read -r name bin bout rest; do
+      pid=${name##*.}
+      [[ $pid == <-> && -n ${agent[$pid]:-} && $bin == <-> && $bout == <-> ]] || continue
+      bytes=$(( bin + bout ))
+      prev=${_NOSLEEP_NET[$pid]:-}
+      _NOSLEEP_NET[$pid]="$now $bytes"
+      [[ -n $prev ]] || continue                       # first sighting: baseline only
+      elapsed=$(( now - ${prev%% *} )); (( elapsed < 1 )) && elapsed=1
+      (( bytes - ${prev#* } >= NOSLEEP_NET_BPS * elapsed )) && who+=("${agent[$pid]}")
+    done < <(nettop -x -n -s 1 -L 1 -P "${args[@]}" -J bytes_in,bytes_out 2>/dev/null)
+  fi
+  # a pid that is no longer an agent (exited; the number may be reused) drops its baseline
+  for pid in "${(k)_NOSLEEP_NET[@]}"; do [[ -n ${agent[$pid]:-} ]] || unset "_NOSLEEP_NET[$pid]"; done
+  if (( ${#who} )); then
+    _NOSLEEP_WHO=${(j:, :)${(u)who}}; REPLY=$now
+  else
+    REPLY=0
+  fi
 }
 
 # _dots_tmux_apply — push ~/.tmux.conf into an already-running tmux server. tmux

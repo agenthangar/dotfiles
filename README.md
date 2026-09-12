@@ -135,19 +135,20 @@ Not every verb supports every agent yet. The matrix below is **generated from
 support without the README saying so:
 
 ```text
-  surface                                           claude                codex                                  cursor
-  ------------------------------------------------  --------------------  -------------------------------------  -------------------------------
-  t install (install · login · update)              ✓                     ✓                                      ✓
-  dev slots: t open / ls / kill / read / paste      ✓                     ✓ t open --codex · DEV_AGENT           ✗ no slot — t cursor ls
-  t push / t pop                                    ✓                     ✓                                      ✗ no slot
-  t resume (dead slots)                             ✓                     ✓ (its sqlite thread index)            → t cursor resume
-  t beam / --from (move a session)                  ✓                     ✓ (rollout + .origin)                  → t cursor [id] --host / --from
-  csync (iCloud union of transcripts)               ✓ projects + plans    ✓ codex-sessions                       ✓ cursor-chats
-  SessionStart stamps (registry · opened · origin)  ✓ settings.json hook  ✓ hooks.json (trust once at startup)   ✗ no hook wired
-  t plan                                            ✓                     ✗ codex keeps no plan files (says so)  ✗
-  /tpush · /tpop slash commands                     ✓ ~/.claude/commands  ✓ ~/.codex/prompts                     ✗
-  t find / t mcp (transcript search)                ✓                     ✗ claude transcripts only              ✗
-  t doctor agent row (version · login · hook)       ✓                     ✓                                      ✓ version · login
+  surface                                           claude                          codex                                  cursor
+  ------------------------------------------------  ------------------------------  -------------------------------------  -------------------------------
+  t install (install · login · update)              ✓                               ✓                                      ✓
+  dev slots: t open / ls / kill / read / paste      ✓                               ✓ t open --codex · DEV_AGENT           ✗ no slot — t cursor ls
+  t push / t pop                                    ✓                               ✓                                      ✗ no slot
+  t resume (dead slots)                             ✓                               ✓ (its sqlite thread index)            → t cursor resume
+  t beam / --from (move a session)                  ✓                               ✓ (rollout + .origin)                  → t cursor [id] --host / --from
+  csync (iCloud union of transcripts)               ✓ projects + plans              ✓ codex-sessions                       ✓ cursor-chats
+  SessionStart stamps (registry · opened · origin)  ✓ settings.json hook            ✓ hooks.json (trust once at startup)   ✗ no hook wired
+  t plan                                            ✓                               ✗ codex keeps no plan files (says so)  ✗
+  /tpush · /tpop slash commands                     ✓ ~/.claude/commands            ✓ ~/.codex/prompts                     ✗
+  t find / t mcp (transcript search)                ✓                               ✗ claude transcripts only              ✗
+  t doctor agent row (version · login · hook)       ✓                               ✓                                      ✓ version · login
+  nosleep (hold sleep while an agent works)         ✓ caffeinate child · net bytes  ✓ net bytes                            ✓ net bytes
 ```
 
 Codex needs one manual step after install: its SessionStart hook (the same

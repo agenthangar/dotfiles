@@ -6336,7 +6336,7 @@ _t() {
       else _files -/; fi ;;   # scan-dir arguments
     new)
       if (( CURRENT == 3 )) && [[ ${words[CURRENT]} != -* ]]; then _message 'repo name'
-      else _values 'flag' -p --prompt --owner --public --private --alias --hosts --no-hosts -y --yes --dry-run -h --help; fi ;;
+      else _values 'flag' --owner --public --private --alias --hosts --no-hosts -y --yes --dry-run -h --help; fi ;;
     install)
       if [[ ${words[CURRENT]} == -* ]]; then _values 'flag' --status --update --no-login --headless --hosts --no-hosts -y --yes --dry-run -h --help
       else _values 'agent' claude codex cursor; fi ;;

@@ -561,3 +561,95 @@ def test_csync_codex_pair_is_gated_on_either_side(tmp_path):
     assert _csync_run(home, log, {}).returncode == 0
     assert "codex-sessions" in log.read_text()
     assert (home / ".codex" / "sessions").is_dir()   # sync_pair mkdir -p's both sides
+
+
+# ─── nosleep's busy probe: agent-agnostic ──────────────────────────────────────
+
+PS_TABLE_STUB = r"""#!/bin/bash
+# ps -Axo pid=,ppid=,comm= → the whole fixture table ("pid ppid comm")
+[[ "$1" == -Axo ]] && { cat "$FAKE_PS"; exit 0; }
+exit 1
+"""
+
+NETTOP_STUB = r"""#!/bin/bash
+# log the argv (which pids nosleep asked about); answer cumulative per-process rows
+# from $FAKE_NETTOP after the header nettop prints
+printf '%s\n' "$*" >> "$NETTOP_LOG"
+echo ",bytes_in,bytes_out,"
+[[ -f "${FAKE_NETTOP:-}" ]] && cat "$FAKE_NETTOP"
+exit 0
+"""
+
+
+@pytest.fixture
+def nosleep(zsh, tmp_path):
+    """The zsh fixture with a ps stub answering the whole-table form the probe reads and
+    a nettop stub answering from $FAKE_NETTOP (cumulative per-process byte rows)."""
+    bins = tmp_path / "stubbin"
+    for name, body in (("ps", PS_TABLE_STUB), ("nettop", NETTOP_STUB)):
+        f = bins / name
+        f.write_text(body)
+        f.chmod(0o755)
+    table = tmp_path / "ps.txt"
+    table.write_text("1 0 launchd\n20 1 codex\n30 1 /Users/me/.local/bin/cursor-agent\n"
+                     "40 1 /Applications/ChatGPT.app/Contents/Resources/codex\n50 1 node\n60 1 zsh\n")
+    net = tmp_path / "nettop.txt"
+    log = tmp_path / "nettop.log"
+
+    def call(snippet, **extra):
+        return zsh(snippet, FAKE_NETTOP=str(net), NETTOP_LOG=str(log), **extra)
+
+    call.net, call.log, call.table = net, log, table
+    return call
+
+
+def test_zsh_nosleep_agent_of_comm(zsh):
+    # the slot seam's match (claude, codex, the npm codex-<triple>) plus cursor-agent —
+    # by basename, since ps reports argv[0] and cursor-agent's launcher execs its own path
+    r = zsh("for c in claude /usr/local/bin/claude codex codex-aarch64-apple-darwin cursor-agent "
+            "/Users/me/.local/bin/cursor-agent node zsh cursor; do _nosleep_agent_of_comm $c; echo \"$c=$REPLY\"; done")
+    assert r.stdout.split() == ["claude=claude", "/usr/local/bin/claude=claude", "codex=codex",
+                                "codex-aarch64-apple-darwin=codex", "cursor-agent=cursor",
+                                "/Users/me/.local/bin/cursor-agent=cursor", "node=", "zsh=", "cursor="]
+
+
+def test_zsh_nosleep_claude_caffeinate_is_busy_at_once(nosleep):
+    # Claude Code's own caffeinate child: instant, no baseline needed
+    nosleep.table.write_text("1 0 launchd\n10 1 claude\n11 10 caffeinate\n12 1 caffeinate\n")
+    r = nosleep('_nosleep_busy_at; echo "$REPLY $_NOSLEEP_WHO"')
+    when, who = r.stdout.split()
+    assert int(when) > 1_700_000_000 and who == "claude"
+    # a caffeinate parented to anything else (sleep-manager's, an orphan) is not a turn
+    nosleep.table.write_text("1 0 launchd\n10 1 claude\n12 1 caffeinate\n")
+    assert nosleep('_nosleep_busy_at; echo "$REPLY"').stdout.strip() == "0"
+
+
+def test_zsh_nosleep_bytes_moved_since_the_last_probe(nosleep):
+    nosleep.net.write_text("codex.20,1000,1000,\ncursor-agent.30,5000,100,\ncodex.40,900000,900000,\n")
+    # probe 1 baselines; probe 2 sees codex move 20 KB and cursor 50 B (keepalives);
+    # probe 3 sees nothing move; probe 4 runs after every agent has exited
+    r = nosleep(
+        '_nosleep_busy_at; echo "p1=$REPLY who=$_NOSLEEP_WHO"; '
+        "printf '%s\\n' 'codex.20,11000,11000,' 'cursor-agent.30,5040,110,' 'codex.40,5000000,5000000,' > $FAKE_NETTOP; "
+        '_nosleep_busy_at; echo "p2=$REPLY who=$_NOSLEEP_WHO"; '
+        '_nosleep_busy_at; echo "p3=$REPLY who=$_NOSLEEP_WHO keys=${(k)_NOSLEEP_NET}"; '
+        "echo '1 0 launchd' > $FAKE_PS; "
+        '_nosleep_busy_at; echo "p4=$REPLY keys=${(k)_NOSLEEP_NET}"')
+    p1, p2, p3, p4 = r.stdout.splitlines()
+    assert p1 == "p1=0 who="                                        # first sighting: baseline only
+    assert p2.startswith("p2=1") and p2.endswith(" who=codex")      # 20 KB in a probe = working; 50 B = not
+    assert p3.startswith("p3=0 who=codex keys=")                    # quiet; WHO keeps the last name (status line)
+    assert sorted(p3.split("keys=")[1].split()) == ["20", "30"]     # both CLI agents keep a baseline
+    assert p4 == "p4=0 keys="                                       # gone agents drop their baselines
+    # only CLI agents were asked about: not the ChatGPT app's bundled codex (40), not
+    # node/zsh — and never with name resolution (5 s a probe)
+    asked = nosleep.log.read_text().splitlines()[0]
+    assert "-p 20" in asked and "-p 30" in asked and "-p 40" not in asked and "-p 50" not in asked
+    assert "-n" in asked.split()
+
+
+def test_zsh_nosleep_net_floor_is_tunable(nosleep):
+    nosleep.net.write_text("codex.20,0,0,\n")
+    r = nosleep("_nosleep_busy_at; printf '%s\\n' 'codex.20,10000,10000,' > $FAKE_NETTOP; _nosleep_busy_at; echo $REPLY",
+                NOSLEEP_NET_BPS="100000")
+    assert r.stdout.strip() == "0"                                  # 20 KB is under a 100 KB/s floor

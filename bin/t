@@ -3205,6 +3205,7 @@ _AGENT_PARITY = [
     ("/tpush · /tpop slash commands", "✓ ~/.claude/commands", "✓ ~/.codex/prompts", "✗"),
     ("t find / t mcp (transcript search)", "✓", "✗ claude transcripts only", "✗"),
     ("t doctor agent row (version · login · hook)", "✓", "✓", "✓ version · login"),
+    ("nosleep (hold sleep while an agent works)", "✓ caffeinate child · net bytes", "✓ net bytes", "✓ net bytes"),
 ]
 
 

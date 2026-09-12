@@ -2850,15 +2850,18 @@ _dev_kill_one() {
       || { print; echo "Skipped $session."; return 1; }
     print
   fi
-  local path; path=$(tmux display-message -p -t "$session" '#{session_path}' 2>/dev/null)
+  # NOT `local path`: in zsh `path` is the array tied to $PATH, and a plain local
+  # keeps the tie but starts EMPTY — so every command below (the kill itself) was
+  # "command not found". Pinned by test_zshrc_never_declares_a_tied_special_….
+  local wt; wt=$(tmux display-message -p -t "$session" '#{session_path}' 2>/dev/null)
   local _kerr
   if _kerr=$(tmux kill-session -t "$session" 2>&1); then echo "Killed $session"
   else echo "t kill: tmux kill-session $session failed${_kerr:+: $_kerr}" >&2; return 1; fi
   # A slot's dev server is detached from its tmux session and would outlive it,
   # serving the old code on the slot's port. Only a per-session worktree is swept
   # this way — a shared tree's processes belong to everyone.
-  [[ -n $DEV_WORKTREE_ROOT && -n $path && $path == $DEV_WORKTREE_ROOT/* ]] \
-    && _dev_stop_rooted "$path"
+  [[ -n $DEV_WORKTREE_ROOT && -n $wt && $wt == $DEV_WORKTREE_ROOT/* ]] \
+    && _dev_stop_rooted "$wt"
   return 0
 }
 
@@ -5216,11 +5219,11 @@ PY
 _claude_sessions_fzf() {
   command -v fzf >/dev/null 2>&1 || { echo "fzf not installed (brew install fzf)" >&2; return 1; }
   local filter="${1:-}" query="${2:-}"
-  local prompt='resume claude (all) > '
-  [[ -n $filter ]] && prompt="resume claude (${filter:t}) > "
-  [[ -n $query  ]] && prompt="resume claude (search: $query) > "
+  local fzf_prompt='resume claude (all) > '   # not `prompt`: that local IS the shell's PS1
+  [[ -n $filter ]] && fzf_prompt="resume claude (${filter:t}) > "
+  [[ -n $query  ]] && fzf_prompt="resume claude (search: $query) > "
   _claude_session_rows "$filter" "$query" | fzf --delimiter=$'\t' --with-nth=3 --no-hscroll \
-        --prompt="$prompt" --height=60% --reverse
+        --prompt="$fzf_prompt" --height=60% --reverse
 }
 
 # _dev_resume_session <session> <dir> <session-id> — sibling of _dev_new_session:
@@ -6401,7 +6404,7 @@ _t() {
       else _files -/; fi ;;   # scan-dir arguments
     new)
       if (( CURRENT == 3 )) && [[ ${words[CURRENT]} != -* ]]; then _message 'repo name'
-      else _values 'flag' -p --prompt --owner --public --private --alias --hosts --no-hosts -y --yes --dry-run -h --help; fi ;;
+      else _values 'flag' --owner --public --private --alias --hosts --no-hosts -y --yes --dry-run -h --help; fi ;;
     install)
       if [[ ${words[CURRENT]} == -* ]]; then _values 'flag' --status --update --no-login --headless --hosts --no-hosts -y --yes --dry-run -h --help
       else _values 'agent' claude codex cursor; fi ;;

@@ -519,6 +519,46 @@ def test_zsh_beam_sync_transcript_ships_a_rollout_relative_to_codex_home(zsh, tm
     assert log.read_text().strip().endswith(f" me@mini:.claude/projects/{proj.name}/")
 
 
+# ─── t kill: _dev_kill_one under the stub tmux ─────────────────────────────────
+#
+# `t kill dotfiles 1` reached its confirm prompt and then reported
+# `_dev_kill_one:11: command not found: tmux`. The cause was a local named `path`:
+# in zsh `path` is the array TIED to $PATH, and a plain `local path` keeps the tie
+# while starting EMPTY — so every command after that line in the function, the
+# kill-session itself included, was "not found" (from 2026-08-22, #106, until the
+# codex PR stopped swallowing kill-session's stderr). The first test pins the kill
+# through the stub tmux; the second refuses any plain local named after a tied
+# special parameter anywhere in .zshrc, because the failure is invisible until a
+# command happens to run after the declaration.
+
+def test_zsh_kill_one_runs_tmux_kill_session(zsh):
+    # force=1 skips the confirm prompt (there is no TTY here); the stub logs argv
+    r = zsh("_dev_kill_one dev-api-3 1")
+    assert r.returncode == 0, r.stderr
+    assert "command not found" not in r.stderr
+    assert "Killed dev-api-3" in r.stdout
+    assert "kill-session -t dev-api-3" in zsh.log.read_text().splitlines()
+
+
+_ZSH_TIED_SPECIALS = {"path", "fpath", "cdpath", "manpath", "mailpath", "module_path", "prompt"}
+_ZSH_DECL_RE = re.compile(
+    r"^\s*(?:local|typeset|declare|integer|float|readonly)\b"
+    r"((?:\s+-[A-Za-z]+)*)"                              # flags
+    r"((?:\s+[A-Za-z_][A-Za-z0-9_]*(?:=\S*)?)*)")        # name[=value] …
+
+
+def test_zshrc_never_declares_a_tied_special_as_a_plain_local():
+    bad = []
+    for n, line in enumerate(ZSHRC.read_text().splitlines(), 1):
+        m = _ZSH_DECL_RE.match(line)
+        if not m or "g" in m.group(1) or "h" in m.group(1):   # typeset -g / -h are deliberate
+            continue
+        names = {tok.split("=", 1)[0] for tok in m.group(2).split()}
+        bad += [f".zshrc:{n}: local {name}" for name in sorted(names & _ZSH_TIED_SPECIALS)]
+    assert not bad, ("a plain local shadows a tied zsh special parameter (blanks $PATH & co. "
+                     "for the rest of the function):\n" + "\n".join(bad))
+
+
 CSYNC = REPO_ROOT / "bin" / "csync"
 
 

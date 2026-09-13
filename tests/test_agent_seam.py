@@ -665,31 +665,84 @@ def test_zsh_nosleep_claude_caffeinate_is_busy_at_once(nosleep):
 
 
 def test_zsh_nosleep_bytes_moved_since_the_last_probe(nosleep):
-    nosleep.net.write_text("codex.20,1000,1000,\ncursor-agent.30,5000,100,\ncodex.40,900000,900000,\n")
-    # probe 1 baselines; probe 2 sees codex move 20 KB and cursor 50 B (keepalives);
+    # nettop without -P: a "<name>.<pid>" row, then one row per open socket with its
+    # LIFETIME bytes (the process row's numbers are the sum over those sockets)
+    nosleep.net.write_text("codex.20,1000,1000,\ntcp4 10.0.0.2:1<->1.2.3.4:443,1000,1000,\n"
+                           "cursor-agent.30,5000,100,\ntcp4 10.0.0.2:2<->5.6.7.8:443,5000,100,\n"
+                           "codex.40,900000,900000,\ntcp4 10.0.0.2:3<->9.9.9.9:443,900000,900000,\n")
+    # probe 1 baselines; probe 2 sees codex move 60 KB and cursor 50 B (keepalives);
     # probe 3 sees nothing move; probe 4 runs after every agent has exited
     r = nosleep(
         '_nosleep_busy_at; echo "p1=$REPLY who=$_NOSLEEP_WHO"; '
-        "printf '%s\\n' 'codex.20,11000,11000,' 'cursor-agent.30,5040,110,' 'codex.40,5000000,5000000,' > $FAKE_NETTOP; "
+        "printf '%s\\n' 'codex.20,31000,31000,' 'tcp4 10.0.0.2:1<->1.2.3.4:443,31000,31000,' "
+        "'cursor-agent.30,5040,110,' 'tcp4 10.0.0.2:2<->5.6.7.8:443,5040,110,' "
+        "'codex.40,5000000,5000000,' 'tcp4 10.0.0.2:3<->9.9.9.9:443,5000000,5000000,' > $FAKE_NETTOP; "
         '_nosleep_busy_at; echo "p2=$REPLY who=$_NOSLEEP_WHO"; '
-        '_nosleep_busy_at; echo "p3=$REPLY who=$_NOSLEEP_WHO keys=${(k)_NOSLEEP_NET}"; '
+        '_nosleep_busy_at; echo "p3=$REPLY who=$_NOSLEEP_WHO pids=${(k)_NOSLEEP_NET_AT} socks=${#_NOSLEEP_NET}"; '
         "echo '1 0 launchd' > $FAKE_PS; "
-        '_nosleep_busy_at; echo "p4=$REPLY keys=${(k)_NOSLEEP_NET}"')
+        '_nosleep_busy_at; echo "p4=$REPLY pids=${(k)_NOSLEEP_NET_AT} socks=${#_NOSLEEP_NET}"')
     p1, p2, p3, p4 = r.stdout.splitlines()
-    assert p1 == "p1=0 who="                                        # first sighting: baseline only
-    assert p2.startswith("p2=1") and p2.endswith(" who=codex")      # 20 KB in a probe = working; 50 B = not
-    assert p3.startswith("p3=0 who=codex keys=")                    # quiet; WHO keeps the last name (status line)
-    assert sorted(p3.split("keys=")[1].split()) == ["20", "30"]     # both CLI agents keep a baseline
-    assert p4 == "p4=0 keys="                                       # gone agents drop their baselines
+    assert p1 == "p1=0 who="                                        # first sighting: baselines only
+    assert int(p2.split()[0][3:]) > 1_700_000_000 and p2.endswith(" who=codex")  # 60 KB in a probe = working; 50 B = not
+    assert p3.startswith("p3=0 who=codex pids=")                    # quiet; WHO keeps the last name (status line)
+    pids, socks = p3.split("pids=")[1].split(" socks=")
+    assert sorted(pids.split()) == ["20", "30"] and socks == "2"    # both CLI agents keep their baselines
+    assert p4 == "p4=0 pids= socks=0"                               # gone agents drop them
     # only CLI agents were asked about: not the ChatGPT app's bundled codex (40), not
-    # node/zsh — and never with name resolution (5 s a probe)
+    # node/zsh — never with name resolution (5 s a probe), and never collapsed with -P
+    # (the per-process total is not cumulative — see the next tests)
     asked = nosleep.log.read_text().splitlines()[0]
     assert "-p 20" in asked and "-p 30" in asked and "-p 40" not in asked and "-p 50" not in asked
-    assert "-n" in asked.split()
+    assert "-n" in asked.split() and "-P" not in asked.split()
+
+
+def test_zsh_nosleep_idle_bursts_stay_under_the_floor(nosleep):
+    # the idle patterns measured at the prompt (5 s samples over 150 s, 2026-09-13) —
+    # every one of them cleared the old 256 B/s × elapsed floor, which is how a nosleep
+    # reported "claude, codex active 0s ago" with both waiting for input. nettop names
+    # a claude by its binary, the version number, so its row is "2.1.270.<pid>".
+    nosleep.table.write_text("1 0 launchd\n10 1 claude\n20 1 codex\n")
+    nosleep.net.write_text("2.1.270.10,10283,8382,\ntcp6 [a]:1<->[b]:443,10283,8382,\n"
+                           "codex.20,89336,798974,\ntcp6 [c]:52251<->[d]:443,89336,798974,\n")
+    r = nosleep(
+        '_nosleep_busy_at; '
+        # claude: a 39 B keepalive plus its short-lived telemetry connection (~2.4 KB in /
+        # 3.1 KB out); codex: a ~15 KB post on its persistent socket plus a ~7 KB short
+        # connection — the most either was seen moving inside one window
+        "printf '%s\\n' '2.1.270.10,12792,11452,' 'tcp6 [a]:1<->[b]:443,10322,8382,' 'tcp6 [a]:2<->[e]:443,2470,3070,' "
+        "'codex.20,94779,815685,' 'tcp6 [c]:52251<->[d]:443,90798,812779,' 'tcp6 [c]:9<->[f]:443,3981,2906,' > $FAKE_NETTOP; "
+        '_nosleep_busy_at; echo "p2=$REPLY who=$_NOSLEEP_WHO"; '
+        # two minutes on, the same again (the short connections are gone, the posts
+        # repeat): the rate bound, 1 KiB/s × 120 s, is higher still
+        '_NOSLEEP_NET_AT[10]=$(( EPOCHSECONDS - 120 )); _NOSLEEP_NET_AT[20]=$(( EPOCHSECONDS - 120 )); '
+        "printf '%s\\n' '2.1.270.10,10361,8382,' 'tcp6 [a]:1<->[b]:443,10361,8382,' "
+        "'codex.20,92778,826584,' 'tcp6 [c]:52251<->[d]:443,92778,826584,' > $FAKE_NETTOP; "
+        '_nosleep_busy_at; echo "p3=$REPLY who=$_NOSLEEP_WHO socks=${#_NOSLEEP_NET}"')
+    assert r.stdout.splitlines() == ["p2=0 who=", "p3=0 who= socks=2"]   # the closed sockets dropped their baselines
+
+
+def test_zsh_nosleep_a_replaced_socket_does_not_hide_a_turn(nosleep):
+    # nettop's per-process total is a sum over the sockets open RIGHT NOW, so when a
+    # request's connection closes and the next request opens a fresh one the total
+    # DROPS — a process-level delta reads this busy turn as -600 KB. Per socket, the
+    # fresh connection's 200 KB is exactly what moved since the last probe.
+    nosleep.table.write_text("1 0 launchd\n20 1 codex\n")
+    nosleep.net.write_text("codex.20,300000,500000,\ntcp4 [a]:1<->[b]:443,300000,500000,\n")
+    r = nosleep('_nosleep_busy_at; '
+                "printf '%s\\n' 'codex.20,20000,180000,' 'tcp4 [a]:2<->[b]:443,20000,180000,' > $FAKE_NETTOP; "
+                '_nosleep_busy_at; echo "$REPLY $_NOSLEEP_WHO"')
+    when, who = r.stdout.split()
+    assert int(when) > 1_700_000_000 and who == "codex"
 
 
 def test_zsh_nosleep_net_floor_is_tunable(nosleep):
-    nosleep.net.write_text("codex.20,0,0,\n")
-    r = nosleep("_nosleep_busy_at; printf '%s\\n' 'codex.20,10000,10000,' > $FAKE_NETTOP; _nosleep_busy_at; echo $REPLY",
-                NOSLEEP_NET_BPS="100000")
-    assert r.stdout.strip() == "0"                                  # 20 KB is under a 100 KB/s floor
+    # each snippet rewrites the rows itself: the probes mutate $FAKE_NETTOP, so a call
+    # starting from the previous call's moved rows would see a zero delta
+    base = "printf '%s\\n' 'codex.20,0,0,' 'tcp4 [a]:1<->[b]:443,0,0,' > $FAKE_NETTOP; _nosleep_busy_at; "
+    move = "printf '%s\\n' 'codex.20,40000,40000,' 'tcp4 [a]:1<->[b]:443,40000,40000,' > $FAKE_NETTOP; _nosleep_busy_at; echo $REPLY"
+    assert nosleep(base + move).stdout.strip() != "0"                            # 80 KB in a probe clears the 48 KiB default
+    assert nosleep(base + move, NOSLEEP_NET_MIN="100000").stdout.strip() == "0"  # not a 100 KB one
+    # the rate bound: the same 80 KB after a 120 s gap is under 1 KiB/s × 120 s …
+    gap = base + "_NOSLEEP_NET_AT[20]=$(( EPOCHSECONDS - 120 )); " + move
+    assert nosleep(gap).stdout.strip() == "0"
+    assert nosleep(gap, NOSLEEP_NET_BPS="100").stdout.strip() != "0"             # … but over 100 B/s × 120 s

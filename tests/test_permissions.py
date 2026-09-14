@@ -286,8 +286,12 @@ def box(tmp_path):
 
 
 def relink(co, home, **extra):
+    # pytest-cov measures SUBPROCESSES too (its .pth hook fires on the COV_CORE_* env),
+    # and the sandbox's bin/t copy matches pyproject's `*/bin/t` include — so each box
+    # reported as a separate, mostly-uncovered 1500-statement file and CI's gate fell
+    # to 36%. The sandbox runs are exercising install.sh, not measuring bin/t.
     env = {
-        **os.environ,
+        **{k: v for k, v in os.environ.items() if not k.startswith("COV_CORE_")},
         "HOME": str(home),
         "DOTFILES_LINKS_ONLY": "1",
         "DOTFILES_NO_TMUX": "1",

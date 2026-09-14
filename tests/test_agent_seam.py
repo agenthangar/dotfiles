@@ -620,13 +620,21 @@ echo ",bytes_in,bytes_out,"
 exit 0
 """
 
+IOREG_STUB = r"""#!/bin/bash
+# ioreg -r -k AppleClamshellState … → the fixture's IOPMrootDomain property lines
+# ($FAKE_IOREG); nothing at all when there is no such file, like a Mac with no lid
+[[ -f "${FAKE_IOREG:-}" ]] && cat "$FAKE_IOREG"
+exit 0
+"""
+
 
 @pytest.fixture
 def nosleep(zsh, tmp_path):
-    """The zsh fixture with a ps stub answering the whole-table form the probe reads and
-    a nettop stub answering from $FAKE_NETTOP (cumulative per-process byte rows)."""
+    """The zsh fixture with a ps stub answering the whole-table form the probe reads, a
+    nettop stub answering from $FAKE_NETTOP (cumulative per-process byte rows) and an
+    ioreg stub answering the lid's IOPMrootDomain lines from $FAKE_IOREG."""
     bins = tmp_path / "stubbin"
-    for name, body in (("ps", PS_TABLE_STUB), ("nettop", NETTOP_STUB)):
+    for name, body in (("ps", PS_TABLE_STUB), ("nettop", NETTOP_STUB), ("ioreg", IOREG_STUB)):
         f = bins / name
         f.write_text(body)
         f.chmod(0o755)
@@ -635,11 +643,12 @@ def nosleep(zsh, tmp_path):
                      "40 1 /Applications/ChatGPT.app/Contents/Resources/codex\n50 1 node\n60 1 zsh\n")
     net = tmp_path / "nettop.txt"
     log = tmp_path / "nettop.log"
+    lid = tmp_path / "ioreg.txt"
 
     def call(snippet, **extra):
-        return zsh(snippet, FAKE_NETTOP=str(net), NETTOP_LOG=str(log), **extra)
+        return zsh(snippet, FAKE_NETTOP=str(net), NETTOP_LOG=str(log), FAKE_IOREG=str(lid), **extra)
 
-    call.net, call.log, call.table = net, log, table
+    call.net, call.log, call.table, call.lid = net, log, table, lid
     return call
 
 
@@ -746,3 +755,19 @@ def test_zsh_nosleep_net_floor_is_tunable(nosleep):
     gap = base + "_NOSLEEP_NET_AT[20]=$(( EPOCHSECONDS - 120 )); " + move
     assert nosleep(gap).stdout.strip() == "0"
     assert nosleep(gap, NOSLEEP_NET_BPS="100").stdout.strip() != "0"             # … but over 100 B/s × 120 s
+
+
+
+def test_zsh_nosleep_lid_closed_only_when_macos_would_sleep_on_it(nosleep):
+    # AppleClamshellCausesSleep is the kernel's own verdict (shouldSleepOnClamshellClosed:
+    # No while an external display on power drives the Mac) and it ignores pmset
+    # disablesleep — so a docked Mac never reads closed (the first version locked its
+    # external display the moment nosleep started), while a plain laptop under nosleep's
+    # own disablesleep still does
+    def closed(*props):
+        nosleep.lid.write_text("".join(f'      "{k}" = {v}\n' for k, v in props))
+        return nosleep("_nosleep_lid_closed; echo $?").stdout.strip() == "0"
+    assert closed(("AppleClamshellCausesSleep", "Yes"), ("AppleClamshellState", "Yes"))
+    assert not closed(("AppleClamshellCausesSleep", "No"), ("AppleClamshellState", "Yes"))   # clamshell mode
+    assert not closed(("AppleClamshellCausesSleep", "Yes"), ("AppleClamshellState", "No"))   # lid open
+    assert not closed()                                                                      # no lid at all

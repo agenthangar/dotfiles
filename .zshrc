@@ -6366,7 +6366,7 @@ help() {
   local -A hints=(
     "Repo shortcuts (cd)" "+ add a repo: t setup (or DEV_REPOS[key]=~/code/repo in ~/.zshrc.local)"
     "Remote machines"     "+ add a host: t setup (or REMOTE_HOSTS[key]=user@host in ~/.zshrc.local)"
-    "Agents (claude · codex · cursor)" "+ install / log in an agent CLI: t install · per-verb support: t install --status"
+    "Agents (claude · codex · cursor)" "+ install / log in an agent CLI: t install · per-verb support: t install --status · the shared allow list: t permissions"
   )
 
   # Palette — bold, UPPERCASE section headers (man-page / `gh` convention; bold is
@@ -6423,7 +6423,7 @@ alias h=help   # `h` is a shorthand for `help`
 # key for `on`), and slot/flags after. Pulls live from the ${(k)DEV_REPOS} /
 # ${(k)REMOTE_HOSTS} arrays so it stays current with ~/.zshrc.local.
 _t() {
-  local -a verbs=(open ls kill push pop resume beam read plan paste find on cursor setup new install)
+  local -a verbs=(open ls kill push pop resume beam read plan paste find on cursor setup new install permissions)
   if (( CURRENT == 2 )); then
     _describe -t verbs 't verb' verbs
     return

@@ -471,6 +471,32 @@ PY
 }
 install_codex_hooks
 
+# The tracked permission allow list (agents/permissions.allow + .retire) → every
+# installed agent's own config: ~/.claude/settings.json verbatim, codex's
+# ~/.codex/rules/dotfiles.rules and cursor's ~/.cursor/cli-config.json for the Bash
+# prefix rules. The parsing, translation and merge live in ONE place, bin/t — this
+# runs its `t permissions --apply`, `t permissions` is the by-hand twin and `t doctor`
+# prints the same report — so the installer and the diagnosis cannot drift. Here in
+# the links-only path like the seeds above, for the same reason: a rule allowed once
+# must land on every machine on its next `dots`. Add-and-retire: the merge appends
+# what is missing, removes what .retire names, and touches nothing else (hand-added
+# rules, deny lists, the rest of each file); silent unless something changed.
+#
+# bin/t is grep-guarded the way _dots_relink guards this script: the migration tests
+# seed a stub bin/t, and an older checkout's bin/t has no such verb — neither may fail
+# a relink. Runs from $LINK_SRC (the tree the links come from), so a session worktree's
+# ./install.sh applies the canonical list, not its own draft. DOTFILES_NO_PERMISSIONS=1
+# opts a machine out.
+install_agent_permissions() {
+    [[ -z "${DOTFILES_NO_PERMISSIONS:-}" ]] || return 0
+    [[ -f "$LINK_SRC/agents/permissions.allow" ]] || return 0
+    command -v python3 >/dev/null 2>&1 || return 0
+    grep -q 'def cmd_permissions' "$LINK_SRC/bin/t" 2>/dev/null || return 0
+    python3 "$LINK_SRC/bin/t" permissions --apply \
+        || echo "⚠ t permissions --apply failed (rc $?) — run it by hand" >&2
+}
+install_agent_permissions
+
 # Everything below is the FULL install. The links-only relink stops here, before the
 # tmux source-file, the ssh Include rewrite, the ~/.zshrc.local and settings.json
 # seeds, the global gitconfig/hooksPath writes, the PII denylist branch (which would
@@ -572,6 +598,9 @@ install_claude_settings() {
     echo "Created $dst from settings.json.example"
 }
 install_claude_settings
+# the settings.json just seeded gets the tracked allow list in this same run, not the
+# next dots (the links-only call above found no file to merge into on a fresh box)
+install_agent_permissions
 
 # Global git default — a pull reconciliation strategy so `git pull` never emits
 # the "divergent branches" hint and never silently merges or rebases. ff-only: a

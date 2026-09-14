@@ -169,7 +169,9 @@ prview() {
 # Blocks SYSTEM sleep via `pmset disablesleep 1` + a background caffeinate, while
 # the display still dims and sleeps on its own schedule (that is what locks the Mac
 # at a desk), and LOCKS the screen the moment the lid closes — with sleep disabled a
-# closed lid no longer sleeps, so it no longer locks either. It keeps holding only
+# closed lid no longer sleeps, so it no longer locks either (not when docked to an
+# external display: macOS never slept on that lid close, so there is no lock to
+# replace, and the closed lid is simply how the Mac sits). It keeps holding only
 # while BOTH signals stay fresh: internet (an HTTPS exchange with
 # api.anthropic.com) and tokens burning — a local claude, codex or cursor-agent
 # mid-turn (Claude Code runs its own caffeinate while a turn is in flight; for
@@ -285,8 +287,20 @@ nosleep() {
     sleep 2
   done
 }
-# _nosleep_lid_closed — true while the lid is shut (AppleClamshellState, one ~10ms ioreg).
-_nosleep_lid_closed() { ioreg -r -k AppleClamshellState -d 4 2>/dev/null | grep -q '"AppleClamshellState" = Yes'; }
+# _nosleep_lid_closed — true while the lid is shut AND macOS would sleep on that closure
+# (both keys sit on IOPMrootDomain: one ~10ms ioreg). AppleClamshellCausesSleep is the
+# kernel's own verdict — shouldSleepOnClamshellClosed(): no external display on power,
+# no clamshell-disable — and it does NOT consult `pmset disablesleep` (that flag lives
+# in the sleep-allowed gate, userDisabledAllSleep). So a docked Mac (lid shut, an
+# external display driving it) reads No and nosleep leaves it alone: macOS never slept
+# on that lid close, so there is no lock to replace — the first version locked the
+# external display the moment nosleep started. A plain laptop stays Yes under nosleep's
+# disablesleep, and the lock still lands.
+_nosleep_lid_closed() {
+  local out
+  out=$(ioreg -r -k AppleClamshellState -d 1 2>/dev/null) || return 1
+  [[ $out == *'"AppleClamshellState" = Yes'* && $out == *'"AppleClamshellCausesSleep" = Yes'* ]]
+}
 # _nosleep_lock — lock the screen now. SACLockScreenImmediate is the call behind the
 # Apple-menu Lock Screen item: instant, and it needs no Accessibility grant (the
 # ctrl-cmd-q keystroke route does). It is a private framework, so a failure falls

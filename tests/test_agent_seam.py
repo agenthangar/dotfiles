@@ -204,6 +204,53 @@ exit 0
 """
 
 
+# compinit's one-keystroke question when a dir on $fpath is group-writable. It is asked
+# ONLY on a tty (without one `read -q` hits EOF and compinit aborts, silently under the
+# `source … >/dev/null 2>&1`) — which is why the non-pty tests never met it and the pty
+# ones hung on it: GitHub's ubuntu runner ships such a dir. Answered `y`, what a person
+# types; the sandbox never uses completion.
+COMPINIT_PROMPT = b"Ignore insecure directories and continue [y] or abort compinit [n]? "
+
+
+def _run_under_pty(argv, env, timeout=60):
+    """Run argv under a pseudo-terminal — for the branches gated on `-t 0 && -t 1` (the
+    fzf pickers). stdout + stderr come back merged as .stdout; EOF once the child closes
+    its side (an empty read, or EIO on Linux). A compinit prompt is answered `y` once."""
+    master, slave = pty.openpty()
+    proc = subprocess.Popen(argv, env=env, stdin=slave, stdout=slave, stderr=slave, close_fds=True)
+    os.close(slave)
+    out, deadline, answered = bytearray(), time.monotonic() + timeout, False
+    while True:
+        ready, _, _ = select.select([master], [], [], max(0.0, deadline - time.monotonic()))
+        if not ready:
+            proc.kill()
+            break
+        try:
+            chunk = os.read(master, 65536)
+        except OSError:
+            break
+        if not chunk:
+            break
+        out += chunk
+        if not answered and out.rstrip().endswith(COMPINIT_PROMPT.rstrip()):
+            os.write(master, b"y")
+            answered = True
+    os.close(master)
+    return subprocess.CompletedProcess(argv, proc.wait(timeout=10), out.decode(errors="replace"), "")
+
+
+def test_run_under_pty_answers_the_compinit_prompt():
+    """The harness's own environment guard, driven against a real `read -q` prompt so it
+    is exercised on every OS, not only where a group-writable fpath dir happens to exist."""
+    prompt = COMPINIT_PROMPT.decode()
+    r = _run_under_pty(["zsh", "-c", f'if read -q "?{prompt}"; then echo continued; else echo aborted; fi; echo rc=$?'],
+                       {**os.environ, "TERM": "dumb"}, timeout=15)
+    assert "continued" in r.stdout and "aborted" not in r.stdout and "rc=0" in r.stdout, r.stdout
+    # and a command that never asks is untouched
+    r = _run_under_pty(["zsh", "-c", "echo plain; echo rc=$?"], {**os.environ, "TERM": "dumb"}, timeout=15)
+    assert "plain" in r.stdout and "rc=0" in r.stdout
+
+
 @pytest.fixture
 def zsh(tmp_path):
     """zsh_call(snippet, **env) → CompletedProcess of `source .zshrc; <snippet>` under a
@@ -232,27 +279,7 @@ def zsh(tmp_path):
         argv = ["zsh", "-c", f"source {ZSHRC} >/dev/null 2>&1; {snippet}"]
         if not _tty:
             return subprocess.run(argv, env=env, capture_output=True, text=True, timeout=60)
-        # Under a pseudo-terminal, for the branches gated on `-t 0 && -t 1` (the fzf
-        # pickers): stdout + stderr come back merged as .stdout, EOF once the child
-        # closes its side (an empty read, or EIO on Linux).
-        master, slave = pty.openpty()
-        proc = subprocess.Popen(argv, env=env, stdin=slave, stdout=slave, stderr=slave, close_fds=True)
-        os.close(slave)
-        out, deadline = bytearray(), time.monotonic() + 60
-        while True:
-            ready, _, _ = select.select([master], [], [], max(0.0, deadline - time.monotonic()))
-            if not ready:
-                proc.kill()
-                break
-            try:
-                chunk = os.read(master, 65536)
-            except OSError:
-                break
-            if not chunk:
-                break
-            out += chunk
-        os.close(master)
-        return subprocess.CompletedProcess(argv, proc.wait(timeout=10), out.decode(errors="replace"), "")
+        return _run_under_pty(argv, env)
 
     call.log = log
     call.home = home

@@ -11,9 +11,12 @@ bin/pr-watch in pyproject.toml, so these subprocess tests do not move the ratche
 import json
 import os
 import pathlib
+import pty
 import re
+import select
 import shutil
 import subprocess
+import time
 
 import pytest
 
@@ -159,6 +162,33 @@ ZSHRC = REPO_ROOT / ".zshrc"
 
 UUIDGEN_STUB = "#!/bin/bash\necho 0F0E0D0C-0B0A-0908-0706-050403020100\n"
 
+# A fake picker: it records what the real fzf would DISPLAY for every stdin row —
+# the --with-nth field, split on --delimiter (a positive index is 1-based, -1 the
+# last field, fzf's own rules) — then picks nothing (rc 1 = esc), or, with
+# $FZF_PICK set, the first row whose display contains it (the whole row on stdout,
+# rc 0 — what enter does).
+FZF_STUB = r"""#!/usr/bin/env python3
+import os, sys
+nth, delim = "1", "\t"
+for a in sys.argv[1:]:
+    if a.startswith("--with-nth="): nth = a[len("--with-nth="):]
+    elif a.startswith("--delimiter="): delim = a[len("--delimiter="):]
+i = int(nth)
+want = os.environ.get("FZF_PICK")
+for a in sys.argv[1:]:
+    if a.startswith("--header="):
+        with open(os.environ["FZF_LOG"] + ".header", "w") as hf: hf.write(a[len("--header="):])
+with open(os.environ["FZF_LOG"], "a") as log:
+    for line in sys.stdin.read().splitlines():
+        f = line.split(delim)
+        shown = f[i - 1] if i > 0 else f[i]
+        log.write(shown + "\n")
+        if want and want in shown:
+            print(line)
+            sys.exit(0)
+sys.exit(1)
+"""
+
 TMUX_LOG_STUB = r"""#!/bin/bash
 # log every call; answer the two reads the seam makes
 printf '%s\n' "$*" >> "$TMUX_LOG"
@@ -169,10 +199,59 @@ case "$1" in
     exit 0 ;;
   capture-pane)     [[ -n "${FAKE_PANE:-}" ]] && printf '%s\n' "$FAKE_PANE" ;;
   has-session)      [[ -n "${FAKE_HAS_SESSION:-}" ]] || exit 1 ;;
-  list-panes|list-sessions) : ;;
+  list-sessions)    [[ -n "${FAKE_SESSIONS:-}" ]] && printf '%s\n' $FAKE_SESSIONS ;;
+  display-message)  [[ -n "${FAKE_SESSION_PATH:-}" && "$*" == *session_path* ]] && echo "$FAKE_SESSION_PATH" ;;
+  list-panes)       : ;;
 esac
 exit 0
 """
+
+
+# compinit's one-keystroke question when a dir on $fpath is group-writable. It is asked
+# ONLY on a tty (without one `read -q` hits EOF and compinit aborts, silently under the
+# `source … >/dev/null 2>&1`) — which is why the non-pty tests never met it and the pty
+# ones hung on it: GitHub's ubuntu runner ships such a dir. Answered `y`, what a person
+# types; the sandbox never uses completion.
+COMPINIT_PROMPT = b"Ignore insecure directories and continue [y] or abort compinit [n]? "
+
+
+def _run_under_pty(argv, env, timeout=60):
+    """Run argv under a pseudo-terminal — for the branches gated on `-t 0 && -t 1` (the
+    fzf pickers). stdout + stderr come back merged as .stdout; EOF once the child closes
+    its side (an empty read, or EIO on Linux). A compinit prompt is answered `y` once."""
+    master, slave = pty.openpty()
+    proc = subprocess.Popen(argv, env=env, stdin=slave, stdout=slave, stderr=slave, close_fds=True)
+    os.close(slave)
+    out, deadline, answered = bytearray(), time.monotonic() + timeout, False
+    while True:
+        ready, _, _ = select.select([master], [], [], max(0.0, deadline - time.monotonic()))
+        if not ready:
+            proc.kill()
+            break
+        try:
+            chunk = os.read(master, 65536)
+        except OSError:
+            break
+        if not chunk:
+            break
+        out += chunk
+        if not answered and out.rstrip().endswith(COMPINIT_PROMPT.rstrip()):
+            os.write(master, b"y")
+            answered = True
+    os.close(master)
+    return subprocess.CompletedProcess(argv, proc.wait(timeout=10), out.decode(errors="replace"), "")
+
+
+def test_run_under_pty_answers_the_compinit_prompt():
+    """The harness's own environment guard, driven against a real `read -q` prompt so it
+    is exercised on every OS, not only where a group-writable fpath dir happens to exist."""
+    prompt = COMPINIT_PROMPT.decode()
+    r = _run_under_pty(["zsh", "-c", f'if read -q "?{prompt}"; then echo continued; else echo aborted; fi; echo rc=$?'],
+                       {**os.environ, "TERM": "dumb"}, timeout=15)
+    assert "continued" in r.stdout and "aborted" not in r.stdout and "rc=0" in r.stdout, r.stdout
+    # and a command that never asks is untouched
+    r = _run_under_pty(["zsh", "-c", "echo plain; echo rc=$?"], {**os.environ, "TERM": "dumb"}, timeout=15)
+    assert "plain" in r.stdout and "rc=0" in r.stdout
 
 
 @pytest.fixture
@@ -196,12 +275,14 @@ def zsh(tmp_path):
     (tmp_path / "ps.txt").write_text("1 0 launchd\n")
     log = tmp_path / "tmux.log"
 
-    def call(snippet, **extra):
+    def call(snippet, _tty=False, **extra):
         env = {"HOME": str(home), "XDG_CACHE_HOME": str(home / ".cache"),
                "PATH": f"{bins}:{os.environ.get('PATH', '')}", "TERM": "dumb",
                "TMUX_LOG": str(log), "FAKE_PS": str(tmp_path / "ps.txt"), **extra}
-        return subprocess.run(["zsh", "-c", f"source {ZSHRC} >/dev/null 2>&1; {snippet}"],
-                              env=env, capture_output=True, text=True, timeout=60)
+        argv = ["zsh", "-c", f"source {ZSHRC} >/dev/null 2>&1; {snippet}"]
+        if not _tty:
+            return subprocess.run(argv, env=env, capture_output=True, text=True, timeout=60)
+        return _run_under_pty(argv, env)
 
     call.log = log
     call.home = home
@@ -310,10 +391,20 @@ CREATE TABLE threads (id TEXT PRIMARY KEY, rollout_path TEXT NOT NULL, created_a
 """
 
 
-def _codex_home(zsh, threads):
+# what codex 0.154 records for a thread its parent spawned (index `source` column and
+# the rollout's session_meta.source alike); the parent's own source is the string 'cli'
+SUBAGENT_SOURCE = ('{"subagent":{"thread_spawn":{"parent_thread_id":"' + SID
+                   + '","depth":1,"agent_path":"/root/backend_audit","agent_nickname":"Newton","agent_role":null}}}')
+
+
+def _codex_home(zsh, threads, scan_cwd=False):
     """Materialise ~/.codex: a rollout per thread under sessions/YYYY/MM/DD plus a
     state_5.sqlite built from the real `threads` DDL. threads: [(sid, cwd, title,
-    updated_at, archived, name)]. Returns {sid: rollout path}."""
+    updated_at, archived, name[, source])] — source defaults to 'cli'; a subagent
+    spawn (SUBAGENT_SOURCE) is written into the index row AND the rollout's
+    session_meta the way codex 0.154 does. scan_cwd=True also stamps the thread's cwd
+    into its rollout's session_meta (the fixture carries a literal /Users/me path), so
+    _codex_rollout_scan sees it too. Returns {sid: rollout path}."""
     import sqlite3
     home = zsh.home
     day = home / ".codex" / "sessions" / "2026" / "09" / "09"
@@ -321,12 +412,19 @@ def _codex_home(zsh, threads):
     db = sqlite3.connect(str(home / ".codex" / "state_5.sqlite"))
     db.executescript(THREADS_DDL)
     paths = {}
-    for sid, cwd, title, upd, archived, name in threads:
+    for sid, cwd, title, upd, archived, name, *rest in threads:
+        source = rest[0] if rest else "cli"
         p = day / f"rollout-2026-09-09T22-20-09-{sid}.jsonl"
-        p.write_text(FIXTURE_ROLLOUT.read_text().replace(SID, sid))
+        text = FIXTURE_ROLLOUT.read_text().replace(SID, sid)
+        if scan_cwd:
+            text = text.replace("/Users/me/code/.worktrees/api/3", cwd)
+        if source != "cli":
+            assert text.count('"source": "cli"') == 1
+            text = text.replace('"source": "cli"', f'"source": {source}, "thread_source": "subagent"')
+        p.write_text(text)
         paths[sid] = p
         db.execute("insert into threads values (?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                   (sid, str(p), upd, upd, "cli", "openai", cwd, title, "ws", "on-request",
+                   (sid, str(p), upd, upd, source, "openai", cwd, title, "ws", "on-request",
                     archived, title, name))
     db.commit()
     db.close()
@@ -415,6 +513,30 @@ def test_zsh_meta_batch_titles_a_codex_rollout(zsh):
     (proj / "c1.jsonl").write_text('{"type":"user","message":{"content":"fix the login bug"}}\n')
     r = zsh(f"_transcript_meta_batch {proj / 'c1.jsonl'} {paths[SID]}")
     assert [ln.split("\t")[1] for ln in r.stdout.splitlines()] == ["fix the login bug", title]
+
+
+def test_zsh_codex_subagent_threads_are_not_conversations(zsh):
+    """A thread the parent spawned (`source` = a subagent JSON, empty title, the same
+    first prompt as the parent's brief) is codex's `<sid>/subagents/` — listed as a
+    conversation it repeated the parent's row once per helper (ff-35: four rows, one
+    thread). Both enumerators skip it; an exact-id lookup does not."""
+    wt = f"{zsh.home}/code/.worktrees/api/3"
+    sub = "aaaaaaaa-0000-0000-0000-00000000000b"
+    paths = _codex_home(zsh, [(SID, wt, "the parent", 100, 0, None),
+                              (sub, wt, "", 200, 0, None, SUBAGENT_SOURCE)], scan_cwd=True)
+    assert zsh(f"_codex_threads_for_cwd {wt}").stdout.splitlines()[0].startswith(SID)
+    assert sub not in zsh(f"_codex_threads_for_cwd {wt}").stdout
+    assert sub not in zsh(f"_codex_threads prefix {zsh.home}/code/.worktrees/api/").stdout
+    assert zsh(f"_codex_rollout_scan {wt}").stdout.splitlines() == [str(paths[SID])]
+    assert zsh(f"_dev_agent_transcripts_for_cwd codex {wt}").stdout.splitlines() == [str(paths[SID])]
+    assert zsh(f"_dev_repo_slots api").stdout.split() == ["3"]
+    assert sub in zsh(f"_codex_thread_lookup {sub}").stdout            # by id: still found
+    # a cache the OLD scan wrote (2-element entries, subagents listed) is re-read, not trusted
+    cache = zsh.home / ".cache" / "claude-sessions" / "rollout-cwd.json"
+    ino = paths[sub].stat().st_ino
+    cache.write_text(json.dumps({str(paths[sub]): [ino, wt], str(paths[SID]): [paths[SID].stat().st_ino, wt]}))
+    assert zsh(f"_codex_rollout_scan {wt}").stdout.splitlines() == [str(paths[SID])]
+    assert json.loads(cache.read_text())[str(paths[sub])] == [ino, wt, "sub"]
 
 
 def test_zsh_self_sid_and_agent(zsh, tmp_path):
@@ -620,13 +742,21 @@ echo ",bytes_in,bytes_out,"
 exit 0
 """
 
+IOREG_STUB = r"""#!/bin/bash
+# ioreg -r -k AppleClamshellState … → the fixture's IOPMrootDomain property lines
+# ($FAKE_IOREG); nothing at all when there is no such file, like a Mac with no lid
+[[ -f "${FAKE_IOREG:-}" ]] && cat "$FAKE_IOREG"
+exit 0
+"""
+
 
 @pytest.fixture
 def nosleep(zsh, tmp_path):
-    """The zsh fixture with a ps stub answering the whole-table form the probe reads and
-    a nettop stub answering from $FAKE_NETTOP (cumulative per-process byte rows)."""
+    """The zsh fixture with a ps stub answering the whole-table form the probe reads, a
+    nettop stub answering from $FAKE_NETTOP (cumulative per-process byte rows) and an
+    ioreg stub answering the lid's IOPMrootDomain lines from $FAKE_IOREG."""
     bins = tmp_path / "stubbin"
-    for name, body in (("ps", PS_TABLE_STUB), ("nettop", NETTOP_STUB)):
+    for name, body in (("ps", PS_TABLE_STUB), ("nettop", NETTOP_STUB), ("ioreg", IOREG_STUB)):
         f = bins / name
         f.write_text(body)
         f.chmod(0o755)
@@ -635,11 +765,12 @@ def nosleep(zsh, tmp_path):
                      "40 1 /Applications/ChatGPT.app/Contents/Resources/codex\n50 1 node\n60 1 zsh\n")
     net = tmp_path / "nettop.txt"
     log = tmp_path / "nettop.log"
+    lid = tmp_path / "ioreg.txt"
 
     def call(snippet, **extra):
-        return zsh(snippet, FAKE_NETTOP=str(net), NETTOP_LOG=str(log), **extra)
+        return zsh(snippet, FAKE_NETTOP=str(net), NETTOP_LOG=str(log), FAKE_IOREG=str(lid), **extra)
 
-    call.net, call.log, call.table = net, log, table
+    call.net, call.log, call.table, call.lid = net, log, table, lid
     return call
 
 
@@ -764,3 +895,87 @@ def test_zsh_nosleep_net_floor_is_tunable(nosleep):
     gap = base + "_NOSLEEP_NET_AT[20]=$(( EPOCHSECONDS - 120 )); " + move
     assert nosleep(gap).stdout.strip() == "0"
     assert nosleep(gap, NOSLEEP_NET_BPS="100").stdout.strip() != "0"             # … but over 100 B/s × 120 s
+
+
+
+def test_zsh_nosleep_lid_closed_only_when_macos_would_sleep_on_it(nosleep):
+    # AppleClamshellCausesSleep is the kernel's own verdict (shouldSleepOnClamshellClosed:
+    # No while an external display on power drives the Mac) and it ignores pmset
+    # disablesleep — so a docked Mac never reads closed (the first version locked its
+    # external display the moment nosleep started), while a plain laptop under nosleep's
+    # own disablesleep still does
+    def closed(*props):
+        nosleep.lid.write_text("".join(f'      "{k}" = {v}\n' for k, v in props))
+        return nosleep("_nosleep_lid_closed; echo $?").stdout.strip() == "0"
+    assert closed(("AppleClamshellCausesSleep", "Yes"), ("AppleClamshellState", "Yes"))
+    assert not closed(("AppleClamshellCausesSleep", "No"), ("AppleClamshellState", "Yes"))   # clamshell mode
+    assert not closed(("AppleClamshellCausesSleep", "Yes"), ("AppleClamshellState", "No"))   # lid open
+    assert not closed()                                                                      # no lid at all
+
+
+# ─── t resume: the picker renders the display column, for every agent ─────────────
+
+
+def test_zsh_resume_picker_shows_the_display_column_for_every_row(zsh, tmp_path):
+    """What fzf DISPLAYS for each `t resume` row is the padded display column — slot,
+    agent (the word: claude / codex), date, title — for a dead claude conversation, a
+    dead codex thread and a live slot alike. The column is the LAST tab field and the picker must
+    render it as such (--with-nth=-1): when the agent field landed as a 10th column, a
+    hard-coded --with-nth=10 showed every dead row as the bare word `claude` — and a
+    query matched nothing else — which is "t resume shows no session info"
+    (2026-09-14). Driven under a pty, because the fzf branch is gated on -t 0/1."""
+    for name, body in (("fzf", FZF_STUB), ("gh", "#!/bin/bash\nexit 1\n")):   # gh: no network for the PR tag
+        stub = tmp_path / "stubbin" / name
+        stub.write_text(body)
+        stub.chmod(0o755)
+    wt3 = f"{zsh.home}/code/.worktrees/api/3"
+    # slot 3: one claude conversation (its cwd-keyed project dir) + one codex thread
+    proj = zsh.home / ".claude" / "projects" / re.sub(r"[^A-Za-z0-9]", "-", wt3)
+    proj.mkdir(parents=True)
+    (proj / "c1.jsonl").write_text('{"type":"user","message":{"content":"fix the login bug"}}\n')
+    _codex_home(zsh, [(SID, wt3, "t", 100, 0, None),
+                      ("aaaaaaaa-0000-0000-0000-00000000000b", wt3, "", 200, 0, None, SUBAGENT_SOURCE)])
+    log = tmp_path / "fzf.log"
+    r = zsh("_t_resume api --live; echo rc=$?", _tty=True, FZF_LOG=str(log),
+            FAKE_SESSIONS="dev-api-4", FAKE_SESSION_PATH=f"{zsh.home}/code/.worktrees/api/4")
+    assert "rc=1" in r.stdout, r.stdout                        # esc in the picker → rc 1, nothing spawned
+    rows = log.read_text().splitlines()
+    assert len(rows) == 3, rows                                # the subagent thread adds no row
+    assert rows[0].split()[:4] == ["4", "claude", "●", "active"]   # the live slot pins to the top, agent named
+    dead = sorted(rows[1:])
+    assert dead[0].split()[:2] == ["3", "claude"] and dead[0].endswith("fix the login bug")
+    assert dead[1].split()[:2] == ["3", "codex"] and "Reply with exactly the word OK" in dead[1]
+    assert not any(row.strip() in ("claude", "codex", "-") for row in rows)   # never a bare field
+    # the padded layout: slot right-aligned in 2, then the agent column padded to the
+    # widest agent, then the 14-wide date cell
+    assert all(row.startswith(" 3  ") or row.startswith(" 4  ") for row in rows)
+    assert {row[4:10] for row in rows} == {"claude", "codex "}
+
+
+def test_zsh_resume_pick_revives_the_row_with_its_own_agent(zsh, tmp_path):
+    """A picked codex row revives through `codex resume <thread>`, a picked claude row
+    through `claude -r <sid>` — the agent rides in the row (field 10) and the sid is the
+    transcript's own (a rollout's trailing uuid; a claude file's basename)."""
+    for name, body in (("fzf", FZF_STUB), ("gh", "#!/bin/bash\nexit 1\n")):
+        stub = tmp_path / "stubbin" / name
+        stub.write_text(body)
+        stub.chmod(0o755)
+    wt3 = f"{zsh.home}/code/.worktrees/api/3"
+    pathlib.Path(wt3).mkdir(parents=True)                        # present → no rebuild (no git)
+    proj = zsh.home / ".claude" / "projects" / re.sub(r"[^A-Za-z0-9]", "-", wt3)
+    proj.mkdir(parents=True)
+    (proj / "c1.jsonl").write_text('{"type":"user","message":{"content":"fix the login bug"}}\n')
+    _codex_home(zsh, [(SID, wt3, "t", 100, 0, None)])
+    log = tmp_path / "fzf.log"
+    r = zsh("_t_resume api; echo rc=$?", _tty=True, FZF_LOG=str(log), FZF_PICK="word OK")
+    assert "rc=0" in r.stdout and f"Resuming {SID[:8]} in dev-api-3 ({wt3})" in r.stdout, r.stdout
+    tlog = zsh.log.read_text().splitlines()
+    assert f"send-keys -t dev-api-3 codex resume {SID}; exit Enter" in tlog
+    assert "set-environment -t dev-api-3 DEV_AGENT codex" in tlog
+    assert "attach-session -t dev-api-3" in tlog
+    zsh.log.write_text("")
+    r = zsh("_t_resume api 3; echo rc=$?", _tty=True, FZF_LOG=str(log), FZF_PICK="login bug")
+    assert "rc=0" in r.stdout, r.stdout
+    tlog = zsh.log.read_text().splitlines()
+    assert "send-keys -t dev-api-3 claude -r c1; exit Enter" in tlog
+    assert "set-environment -t dev-api-3 DEV_AGENT claude" in tlog

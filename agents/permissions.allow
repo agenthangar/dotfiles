@@ -1,0 +1,118 @@
+# agents/permissions.allow — the permission rules every machine's agents get.
+#
+# Claude Code's rule syntax (the superset), one rule per line, full-line # comments,
+# first wins on a duplicate. `dots` (install.sh → `t permissions --apply`) merges the
+# list into ~/.claude/settings.json verbatim, and translates every Bash PREFIX rule
+# (`Bash(<words>:*)`) into codex's ~/.codex/rules/dotfiles.rules and cursor's
+# ~/.cursor/cli-config.json; everything else (WebFetch, mcp__, Skill, WebSearch, an
+# exact `Bash(cmd)`) is claude-only. `t permissions --show` prints the translations.
+#
+# ENV ASSIGNMENTS — `Bash(*=* node *)`: Claude strips a leading `NAME=value` only for
+# its built-in safe list (NODE_ENV, CI, TZ …), so `DATABASE_URL=… node …` needs a rule
+# that spells the assignment out (`*=*` = any variable, any value; SPACE spelling only —
+# the `:*` form of such a rule is accepted by Claude and never matches, and the lint
+# refuses it). Cursor gets it as a whole-line glob. Codex CANNOT take it: its parser
+# hands a script with an assignment (or a redirect) to the rules as one opaque token —
+# and the prompt such a script raises is the sandbox blocking the network, so the same
+# `dots` turns the codex workspace-write sandbox's network on (add-only,
+# ~/.codex/config.toml `[sandbox_workspace_write] network_access = true`; set it false
+# by hand to keep the sandbox offline — a hand-set value is never flipped).
+#
+# ADD-AND-RETIRE: deleting a rule here leaves it on every machine that already has it
+# (the merge never removes what it does not know). To take a rule back, MOVE it to
+# permissions.retire. `mcp__sessions` is not here: install_claude_mcp_allow owns it.
+#
+# Harvested 2026-09-14 from the ff / cfp project settings.local.json files, the
+# global settings, codex's default.rules and cursor's cli-config.json — minus the
+# one-offs (`ps -p 55669`, a literal curl PUT), the machine paths (a
+# ~/Documents/Development tree that no longer exists), AND the project-specific rows
+# (a project's MCP tool names, its skills, the WebFetch domains it researched). This
+# repo is PUBLIC: it carries commands and generic tool rules only — no home paths, no
+# hosts, nothing that says what you work on. Pinned by test_shipped_lists_are_well_formed.
+
+# shells + interpreters — each one is "run anything"; promoted on purpose (2026-09-14)
+Bash(bash:*)
+Bash(python3:*)
+Bash(.venv/bin/python3:*)
+Bash(node:*)
+Bash(npx tsx:*)
+Bash(claude:*)
+Bash(curl:*)
+
+# git + github
+Bash(gh auth:*)
+Bash(gh pr:*)
+Bash(gh run:*)
+Bash(git add:*)
+Bash(git check-ignore:*)
+Bash(git checkout:*)
+Bash(git commit:*)
+Bash(git fetch:*)
+Bash(git fsck:*)
+Bash(git mv:*)
+Bash(git pull:*)
+Bash(git push:*)
+Bash(git rebase:*)
+Bash(git remote:*)
+Bash(git reset:*)
+Bash(git stash:*)
+Bash(git worktree:*)
+
+# node toolchain
+Bash(npm install:*)
+Bash(npm ls:*)
+Bash(npm run:*)
+Bash(npm start:*)
+Bash(npm test:*)
+Bash(npx playwright:*)
+Bash(npx tailwindcss:*)
+Bash(npx tsc:*)
+Bash(npx vite:*)
+Bash(npx vitest:*)
+
+# node toolchain with a leading env assignment (`DATABASE_URL=… node …`,
+# `TEST_PG_PORT=… npm run test:db`) — see ENV ASSIGNMENTS above; claude + cursor only,
+# and the reason codex's sandbox goes online (2026-09-14)
+Bash(*=* node *)
+Bash(*=* npx tsx *)
+Bash(*=* npm run *)
+Bash(*=* npm start *)
+Bash(*=* npm test *)
+Bash(*=* npx vitest *)
+Bash(*=* npx playwright *)
+
+# system + package managers + processes
+Bash(brew install:*)
+Bash(brew list:*)
+Bash(brew --prefix:*)
+Bash(pip3 install:*)
+Bash(launchctl:*)
+Bash(docker:*)
+Bash(psql:*)
+Bash(chmod:*)
+Bash(xattr:*)
+Bash(open:*)
+Bash(sleep:*)
+Bash(kill:*)
+Bash(ps:*)
+Bash(lsof:*)
+
+# read-only inspection
+Bash(ls:*)
+Bash(cat:*)
+Bash(echo:*)
+Bash(grep:*)
+Bash(rg:*)
+Bash(find:*)
+Bash(awk:*)
+Bash(jq:*)
+Bash(md5:*)
+Bash(xxd:*)
+Bash(diffstat:*)
+Bash(pdftotext:*)
+Bash(pdftoppm:*)
+
+# claude-only, generic tool rules (no project names, no fetch domains — see above)
+WebSearch
+DesignSync
+mcp__plugin_chrome-devtools-mcp_chrome-devtools__*

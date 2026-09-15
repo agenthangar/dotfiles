@@ -3062,6 +3062,9 @@ _AGENT_PARITY = [
     ("/tpush · /tpop slash commands", "✓ ~/.claude/commands", "✓ ~/.codex/prompts", "✗"),
     ("t find / t mcp (transcript search)", "✓", "✗ claude transcripts only", "✗"),
     ("t doctor agent row (version · login · hook)", "✓", "✓", "✓ version · login"),
+    ("permissions (agents/permissions.allow, synced by dots)", "✓ ~/.claude/settings.json",
+     "✓ ~/.codex/rules/dotfiles.rules (argv prefixes) · sandbox network on",
+     "✓ ~/.cursor/cli-config.json (argv + env prefixes)"),
     ("nosleep (hold sleep while an agent works)", "✓ caffeinate child · net bytes", "✓ net bytes", "✓ net bytes"),
 ]
 
@@ -3198,6 +3201,484 @@ def _parse_install_links(text):
     return [(m.group(1), m.group(2)) for m in _INSTALL_LINK_RE.finditer(text)]
 
 
+# ─── agent permissions — one tracked allow list, every agent's own config ──────
+#
+# agents/permissions.allow (+ .retire) is the permission allow list every machine's
+# agents get: Claude Code's rule syntax (the superset), one rule per line. `dots`
+# (install.sh → `t permissions --apply`, in the links-only path) merges it into each
+# installed agent's OWN config, so a rule allowed once is allowed everywhere and for
+# every agent — the per-project settings.local.json a worktree session's "always allow"
+# click lands in is reaped with the worktree, which is where rules went to die.
+#
+#   claude  ~/.claude/settings.json permissions.allow — the rules verbatim; add + retire
+#   codex   ~/.codex/rules/dotfiles.rules — every Bash PREFIX rule as a prefix_rule(…)
+#           (validated with `codex execpolicy check` on 0.154); the file is OURS,
+#           regenerated whole, so a hand rule belongs in default.rules. A rule with a
+#           leading env assignment is NOT translatable: codex's shell parser rejects an
+#           assignment (and a redirect) outright, so the policy sees the whole
+#           `zsh -lc <script>` as ONE token no prefix can cover — and the prompt such a
+#           script raises is the sandbox blocking the network, so --apply turns the
+#           workspace-write sandbox's network ON in ~/.codex/config.toml instead
+#           (_perm_codex_network_plan; add-only, a hand-set value is never flipped)
+#   cursor  ~/.cursor/cli-config.json permissions.allow — every Bash prefix rule as
+#           Shell(<words>): its matcher is startsWith("<words> ") (read off the
+#           2026.02 bundle — the Claude `:*` form does NOT prefix-match there); a rule
+#           with a leading assignment as the whole-line glob Shell(NAME=* <words> *),
+#           which its matchGlob (`*` → `.*` over the full command text) does take; add + retire
+#
+# Env assignments — `Bash(*=* node *)`, `Bash(DATABASE_URL=* node *)`: Claude strips a
+# leading assignment only for a fixed built-in safe list (NODE_ENV, CI, TZ, LANG …;
+# DATABASE_URL is not on it), so an allow rule must spell the assignment out, `*` for
+# any variable / any value. SPACE spelling only: verified on 2.1.271, both rules above
+# matched and ran `DATABASE_URL=probe node -e …` with no startup "wildcard before the
+# rest of the command" warning (a `Bash(git * main)` control did warn), while the `:*`
+# spellings `Bash(DATABASE_URL=* node:*)` and `Bash(*=* node:*)` were DENIED — so
+# _perm_lint refuses an env rule written with `:*`. Cursor takes the same rule as a
+# glob; codex cannot (above). In both matchers `*=*` is `.*=.*`, i.e. "an `=` somewhere
+# before the command" — as wide as it reads, under a list that allows bash outright.
+#
+# Add-and-retire: a rule deleted from .allow stays wherever it already landed (the
+# merge never removes what it does not know), so taking one back means MOVING it to
+# .retire. Only rules named in one of the two lists are ever touched — hand-added
+# rules, deny/ask lists and every other key survive. Same write contract as the other
+# seeds: tmp + os.replace (both agents own their file at runtime), silent unless
+# something changed, an unreadable or foreign-shaped file is left alone.
+
+_PERM_ALLOW = os.path.join("agents", "permissions.allow")
+_PERM_RETIRE = os.path.join("agents", "permissions.retire")
+_PERM_CODEX_RULES = os.path.join(".codex", "rules", "dotfiles.rules")
+_PERM_CODEX_CONFIG = os.path.join(".codex", "config.toml")
+_PERM_CODEX_NETWORK = "[sandbox_workspace_write]\nnetwork_access = true"
+_PERM_CODEX_HEADER = (
+    "# Managed by dotfiles: regenerated from agents/permissions.allow by `dots`\n"
+    "# (t permissions --apply). Hand edits here are overwritten — put yours in default.rules.\n")
+_PERM_AGENTS = ("claude", "codex", "cursor")
+_PERM_BASH_RE = re.compile(r"^Bash\((.*)\)$", re.S)
+# anything a shell would interpret: neither codex's argv prefix nor cursor's Shell()
+# can express it, and a rule carrying it stays claude-only rather than mistranslated
+_PERM_SHELL_META = set(";&|<>$`'\"(){}[]*?~\\\n\t")
+# a leading `NAME=value` on a prefix rule: the name is a variable or `*` (any variable),
+# the value `*` (any value — what such a rule is for) or a plain literal; a colon is out
+# because cursor splits its pattern on the first one, and anything a shell would
+# interpret is out as everywhere else
+_PERM_ENV_RE = re.compile(r"^(\*|[A-Za-z_][A-Za-z0-9_]*)=(\*|[A-Za-z0-9_./+-]*)$")
+
+
+def _perm_parse(text):
+    """The rules in a list file: one per line, full-line `#` comments and blank lines
+    dropped, duplicates collapsed (first wins), order kept — it is the order codex's
+    file and the JSON lists grow in."""
+    out = []
+    for raw in text.splitlines():
+        line = raw.strip()
+        if line and not line.startswith("#") and line not in out:
+            out.append(line)
+    return out
+
+
+def _perm_bash_rule(rule):
+    """A Claude `Bash(<words>:*)` (or `Bash(<words> *)`) prefix rule taken apart:
+    (env, argv) — env the leading `NAME=value` assignments as (name, value) pairs,
+    argv the command words. Codex's prefix_rule takes argv alone; cursor's Shell()
+    globs the whole line, so it can carry the assignments too. None for anything
+    else: a non-Bash rule, an exact-command rule (`Bash(xxd)` — a prefix would WIDEN
+    it), a prefix with shell syntax in it, an empty one, an assignment with no command
+    after it, or an env rule in the `:*` spelling — Claude 2.1.271 matched
+    `Bash(DATABASE_URL=* node *)` and `Bash(*=* node *)` but DENIED the same rules
+    written `…node:*`, so that spelling is refused rather than shipped as a dud
+    (_perm_lint names it)."""
+    m = _PERM_BASH_RE.match(rule)
+    if not m:
+        return None
+    body = m.group(1)
+    if not (body.endswith(":*") or body.endswith(" *")):
+        return None
+    parts = body[:-2].split()
+    env = []
+    while parts and "=" in parts[0]:
+        em = _PERM_ENV_RE.match(parts[0])
+        if not em:
+            return None
+        env.append((em.group(1), em.group(2)))
+        parts.pop(0)
+    if env and body.endswith(":*"):
+        return None
+    if not parts or any(c in _PERM_SHELL_META for w in parts for c in w):
+        return None
+    return env, parts
+
+
+def _perm_lint(rules):
+    """Rules the list must not carry, with the reason — today one shape: an env rule in
+    the `:*` spelling, which Claude accepts and never matches."""
+    out = []
+    for r in rules:
+        m = _PERM_BASH_RE.match(r)
+        if m and m.group(1).endswith(":*") and _perm_bash_rule(r) is None:
+            head = m.group(1)[:-2].split()
+            if head and _PERM_ENV_RE.match(head[0]):
+                out.append((r, "an env rule must use the space spelling — Claude never "
+                               "matches `NAME=* cmd:*`, write `Bash(%s *)`" % " ".join(head)))
+    return out
+
+
+def _perm_bash_prefix(rule):
+    """The argv prefix a rule allows, the shape codex's prefix_rule takes — None for a
+    rule that is not a prefix rule or that carries an env assignment (`PORT=3000 npm
+    start` is not an argv: codex's parser hands such a script to the rules as one
+    opaque token; see _perm_codex_network_plan for what codex gets instead)."""
+    parsed = _perm_bash_rule(rule)
+    if not parsed or parsed[0]:
+        return None
+    return parsed[1]
+
+
+def _perm_codex_rule(prefix):
+    # json.dumps == a Starlark string literal for the characters a prefix may carry
+    return 'prefix_rule(pattern=[%s], decision="allow")' % ", ".join(json.dumps(w) for w in prefix)
+
+
+def _perm_cursor_rule(prefix, env=()):
+    """cursor's entry: `Shell(<words>)` for a plain prefix (its matcher is
+    startsWith("<words> ")), and for a rule with assignments the whole-line glob
+    `Shell(NAME=* <words> *)` — cursor globs the full command text with `*` → `.*`, so
+    the assignment and its wildcard value ride along. Never the Claude `:*` form:
+    cursor splits its pattern on the first colon."""
+    head = " ".join("%s=%s" % kv for kv in env)
+    if not head:
+        return "Shell(%s)" % " ".join(prefix)
+    return "Shell(%s %s *)" % (head, " ".join(prefix))
+
+
+def _perm_translate(rules, agent):
+    """The rules `agent` gets from a list: claude every rule verbatim; codex the Bash
+    prefix rules without an assignment, as prefix_rule(…); cursor every Bash prefix
+    rule, assignments included, as a Shell() entry — deduped, so two Claude spellings
+    of one prefix collapse."""
+    if agent == "claude":
+        return list(rules)
+    out = []
+    for r in rules:
+        parsed = _perm_bash_rule(r)
+        if not parsed:
+            continue
+        env, argv = parsed
+        if agent == "codex":
+            if env:
+                continue
+            t = _perm_codex_rule(argv)
+        else:
+            t = _perm_cursor_rule(argv, env)
+        if t not in out:
+            out.append(t)
+    return out
+
+
+def _perm_codex_file(allow):
+    return _PERM_CODEX_HEADER + "".join(r + "\n" for r in _perm_translate(allow, "codex"))
+
+
+def _perm_conflicts(allow, retire):
+    """Rules in both lists — an authoring error nothing is applied over."""
+    drop = set(retire)
+    return [r for r in allow if r in drop]
+
+
+def _perm_list_plan(current, allow, retire):
+    """(new_list, added, removed): the allow rules not yet present appended in list
+    order, every occurrence of a retired rule dropped, everything else — hand-added
+    rules, non-string entries, their order — untouched."""
+    drop = set(retire)
+    kept = [r for r in current if not (isinstance(r, str) and r in drop)]
+    removed = [r for r in current if isinstance(r, str) and r in drop]
+    added = [r for r in allow if r not in kept]
+    return kept + added, added, removed
+
+
+def _perm_write(path, text):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = "%s.%d.tmp" % (path, os.getpid())
+    with open(tmp, "w", encoding="utf-8") as fh:
+        fh.write(text)
+    os.replace(tmp, path)
+
+
+def _perm_json_sync(path, allow, retire, apply=False):
+    """Sync one JSON permissions file — Claude's settings.json and cursor's
+    cli-config.json share the permissions.allow shape. Returns {"state", "add",
+    "retire"}: state "missing" (no file: install.sh's seed / the agent's first run
+    makes one, the next dots merges), None (unreadable or foreign-shaped: not ours to
+    repair), "synced", "pending" (changes waiting; apply=False) or "applied"."""
+    rep = {"state": None, "add": [], "retire": []}
+    try:
+        with open(path, encoding="utf-8") as fh:
+            data = json.load(fh)
+    except OSError:
+        rep["state"] = "missing"
+        return rep
+    except ValueError:
+        return rep
+    if not isinstance(data, dict):
+        return rep
+    perms = data.setdefault("permissions", {})
+    if not isinstance(perms, dict):
+        return rep
+    cur = perms.setdefault("allow", [])
+    if not isinstance(cur, list):
+        return rep
+    new, added, removed = _perm_list_plan(cur, allow, retire)
+    rep.update(add=added, retire=removed, state="synced")
+    if not added and not removed:
+        return rep
+    rep["state"] = "pending"
+    if apply:
+        perms["allow"] = new
+        _perm_write(path, json.dumps(data, indent=2) + "\n")
+        rep["state"] = "applied"
+    return rep
+
+
+def _perm_codex_sync(path, allow, apply=False):
+    """Sync the codex rules file we own: regenerated whole from the allow list, so a
+    retired rule is simply no longer generated. add/retire are the rule lines that
+    differ, for the report."""
+    want = _perm_codex_file(allow)
+    try:
+        with open(path, encoding="utf-8") as fh:
+            have = fh.read()
+    except OSError:
+        have = ""
+    have_rules, want_rules = _perm_parse(have), _perm_parse(want)
+    rep = {"state": "synced", "add": [r for r in want_rules if r not in have_rules],
+           "retire": [r for r in have_rules if r not in want_rules]}
+    if have == want:
+        return rep
+    rep["state"] = "pending"
+    if apply:
+        _perm_write(path, want)
+        rep["state"] = "applied"
+    return rep
+
+
+_PERM_TOML_HEADER = re.compile(r"^\s*\[")
+_PERM_CODEX_NET_HEADER = re.compile(r"^\s*\[\s*sandbox_workspace_write\s*\]\s*(#.*)?$")
+_PERM_CODEX_NET_KEY = re.compile(r"^\s*(sandbox_workspace_write\s*\.\s*)?network_access\s*=")
+_PERM_CODEX_NET_INLINE = re.compile(r"^\s*sandbox_workspace_write\s*=")
+
+
+def _perm_codex_network_plan(text):
+    """~/.codex/config.toml with `network_access = true` under
+    [sandbox_workspace_write], or None when nothing is to be done: the key is already
+    there in ANY form — true or false (a hand-set value is never flipped), under the
+    table, dotted, or in an inline table. Text surgery, add-only: the mini's python
+    has no TOML writer, and codex itself rewrites this file (trust levels, hook
+    state), so nothing but our one key is ever touched.
+
+    Why it exists: codex's policy engine cannot cover an env-prefixed or redirected
+    script — its parser rejects both, so the rules see the whole `zsh -lc <script>`
+    as ONE token — and the prompt such a command raises is the sandbox blocking the
+    network (a `DATABASE_URL=… node …vitest…` run asked with "The sandbox blocked its
+    loopback connection", 2026-09-14). With the sandbox online the model never
+    requests escalation, and an unmatched workspace-write command runs unasked."""
+    lines = text.split("\n")
+    if any(_PERM_CODEX_NET_KEY.match(l) or _PERM_CODEX_NET_INLINE.match(l) for l in lines):
+        return None
+    line = "network_access = true  # dotfiles: t permissions (set false to keep the sandbox offline)"
+    for i, l in enumerate(lines):
+        if _PERM_CODEX_NET_HEADER.match(l):
+            lines.insert(i + 1, line)
+            return "\n".join(lines)
+    if text and not text.endswith("\n"):
+        text += "\n"
+    return text + ("\n" if text else "") + "[sandbox_workspace_write]\n" + line + "\n"
+
+
+def _perm_toml_ok(text):
+    """True unless tomllib (3.11+) is here and rejects it — the mini's 3.9 cannot check."""
+    try:
+        import tomllib
+    except ImportError:
+        return True
+    try:
+        tomllib.loads(text)
+        return True
+    except tomllib.TOMLDecodeError:
+        return False
+
+
+def _perm_codex_network_sync(path, apply=False):
+    """The sandbox-network half of the codex report: {"state", "add"} — "synced" (the
+    key is present, whatever its value), "pending", "applied", or None (unreadable, or
+    the result would not parse — left alone). The add is one pseudo-line, so every
+    counter and status line treats it like a rule."""
+    rep = {"state": None, "add": []}
+    try:
+        with open(path, encoding="utf-8") as fh:
+            have = fh.read()
+    except FileNotFoundError:
+        have = ""
+    except (OSError, UnicodeDecodeError):
+        return rep
+    want = _perm_codex_network_plan(have)
+    if want is None:
+        rep["state"] = "synced"
+        return rep
+    if not _perm_toml_ok(want):
+        return rep
+    rep.update(state="pending", add=["config.toml: " + _PERM_CODEX_NETWORK.replace("\n", " ")])
+    if apply:
+        _perm_write(path, want)
+        rep["state"] = "applied"
+    return rep
+
+
+def _perm_targets(home, which=shutil.which):
+    """Which agents this machine syncs, with each one's file. codex is gated like its
+    hook seed (the binary, or a REAL codex home — not the bare ~/.codex link_all
+    makes); cursor on the config cursor-agent writes at its first run (never created
+    here: it carries the login); claude on its settings.json (install.sh seeds it)."""
+    t = {"claude": os.path.join(home, ".claude", "settings.json")}
+    if which("codex") or any(os.path.exists(os.path.join(home, ".codex", f))
+                             for f in ("config.toml", "auth.json")):
+        t["codex"] = os.path.join(home, _PERM_CODEX_RULES)
+    if os.path.exists(os.path.join(home, ".cursor", "cli-config.json")):
+        t["cursor"] = os.path.join(home, ".cursor", "cli-config.json")
+    return t
+
+
+def _perm_sync(home, allow, retire, apply=False, which=shutil.which):
+    """One report per agent — {agent: {"path", "state", "add", "retire"}}; an agent
+    not on this machine reports state "absent"."""
+    targets = _perm_targets(home, which)
+    out = {}
+    for agent in _PERM_AGENTS:
+        path = targets.get(agent)
+        if not path:
+            out[agent] = {"path": None, "state": "absent", "add": [], "retire": []}
+            continue
+        if agent == "codex":
+            rep = _perm_codex_sync(path, allow, apply)
+            net = _perm_codex_network_sync(os.path.join(home, _PERM_CODEX_CONFIG), apply)
+            rank = {"synced": 0, "applied": 1, "pending": 2}
+            rep["network"] = net["state"]
+            rep["add"] = rep["add"] + net["add"]
+            if rank.get(net["state"], -1) > rank[rep["state"]]:
+                rep["state"] = net["state"]
+        else:
+            rep = _perm_json_sync(path, _perm_translate(allow, agent),
+                                  _perm_translate(retire, agent), apply)
+        rep["path"] = path
+        out[agent] = rep
+    return out
+
+
+def _perm_root():
+    """The checkout that holds this bin/t — through the ~/bin/t symlink, the live one."""
+    return os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+
+
+def _perm_lists(root):
+    """(allow, retire) from a checkout; the retire file is optional."""
+    with open(os.path.join(root, _PERM_ALLOW), encoding="utf-8") as fh:
+        allow = _perm_parse(fh.read())
+    try:
+        with open(os.path.join(root, _PERM_RETIRE), encoding="utf-8") as fh:
+            retire = _perm_parse(fh.read())
+    except OSError:
+        retire = []
+    return allow, retire
+
+
+def _perm_short(agent, rep):
+    """`<agent> <state>` for t doctor's one-line summary."""
+    st = rep["state"]
+    if st == "absent":
+        return "%s not installed" % agent
+    if st == "missing":
+        return "%s no config yet" % agent
+    if st is None:
+        return "%s config unreadable" % agent
+    if st == "synced":
+        return "%s in sync" % agent
+    return "%s %d to add, %d to retire" % (agent, len(rep["add"]), len(rep["retire"]))
+
+
+def _perm_line(agent, rep):
+    """One status line per agent for `t permissions`."""
+    p = (rep.get("path") or "").replace(HOME, "~")
+    st = rep["state"]
+    if st == "absent":
+        return "%-7s not installed here" % agent
+    if st == "missing":
+        return "%-7s %s missing — install.sh seeds it, the next dots merges" % (agent, p)
+    if st is None:
+        return "%-7s %s unreadable or not the expected shape — left alone" % (agent, p)
+    tail = (" · ~/.codex/config.toml unreadable, sandbox network left alone"
+            if agent == "codex" and rep.get("network", "") is None else "")
+    if st == "synced":
+        return "%-7s %s in sync%s" % (agent, p, tail)
+    n = "%d to add, %d to retire" % (len(rep["add"]), len(rep["retire"]))
+    if st == "applied":
+        return "%-7s %s — applied: %s%s" % (agent, p, n, tail)
+    return "%-7s %s — %s: run dots, or t permissions --apply%s" % (agent, p, n, tail)
+
+
+def cmd_permissions(cfg, args):
+    root = _perm_root()
+    try:
+        allow, retire = _perm_lists(root)
+    except OSError as e:
+        print("t permissions: no %s in %s (%s)" % (_PERM_ALLOW, root, e), file=sys.stderr)
+        return 1
+    bad = _perm_conflicts(allow, retire)
+    if bad:
+        print("t permissions: in BOTH permissions.allow and permissions.retire — nothing "
+              "applied until one side wins: %s" % ", ".join(bad), file=sys.stderr)
+        return 2
+    lint = _perm_lint(allow + retire)
+    if lint:
+        for r, why in lint:
+            print("t permissions: %s — %s" % (r, why), file=sys.stderr)
+        print("t permissions: nothing applied until the list is fixed", file=sys.stderr)
+        return 2
+    if args.show:
+        for r in allow:
+            parsed = _perm_bash_rule(r)
+            print(r)
+            if not parsed:
+                print("    codex   — claude-only")
+                print("    cursor  — claude-only")
+                continue
+            env, argv = parsed
+            print("    codex   %s" % (_perm_codex_rule(argv) if not env else
+                                      "— not expressible (an env assignment is one opaque "
+                                      "token to codex's rules); its sandbox goes online instead"))
+            print("    cursor  %s" % _perm_cursor_rule(argv, env))
+        print("codex sandbox: %s → ~/.codex/config.toml when absent (never flips a hand-set value)"
+              % _PERM_CODEX_NETWORK.replace("\n", " "))
+        return 0
+    reps = _perm_sync(HOME, allow, retire, apply=args.apply)
+    if args.apply:
+        for agent in _PERM_AGENTS:
+            rep = reps[agent]
+            if rep["state"] != "applied":
+                continue
+            net = rep.get("network") == "applied"
+            added = len(rep["add"]) - (1 if net else 0)
+            if added or rep["retire"]:
+                print("permissions: %s — added %d, retired %d in %s"
+                      % (agent, added, len(rep["retire"]), rep["path"].replace(HOME, "~")))
+            if net:
+                print("permissions: codex — sandbox network on: %s in ~/.codex/config.toml"
+                      % _PERM_CODEX_NETWORK.replace("\n", " "))
+        return 0
+    print("permissions — %s: %d rule(s), %d retired → each installed agent's own config"
+          % (os.path.join(root, _PERM_ALLOW).replace(HOME, "~"), len(allow), len(retire)))
+    for agent in _PERM_AGENTS:
+        print("  " + _perm_line(agent, reps[agent]))
+    return 0
+
+
 def _doctor_findings(facts):
     """Pure diagnosis over the gathered facts → list of finding lines.
 
@@ -3268,6 +3749,13 @@ def _doctor_findings(facts):
         out.append("· the codex hook is registered but not trusted yet — start codex once and "
                    "pick 'Trust all and continue' at its hooks prompt (until then a codex slot "
                    "has no id: t ls cannot title it and t pop/push cannot target it)")
+    pend = [(a, r) for a, r in sorted((facts.get("perm_sync") or {}).items())
+            if r.get("state") == "pending"]
+    if pend:
+        out.append("⚠ agent permissions out of sync: %s — run dots (it applies "
+                   "agents/permissions.allow), or t permissions --apply"
+                   % ", ".join("%s (%d to add, %d to retire)" % (a, len(r["add"]), len(r["retire"]))
+                               for a, r in pend))
     if not out:
         out.append("✓ nothing suspicious found")
     return out
@@ -3353,13 +3841,22 @@ def cmd_doctor(cfg, args):
                                       "NOT trusted yet — start codex once and accept its hooks prompt"),
                                    "none": "NOT registered — run dots (install.sh seeds it)",
                                    None: "~/.codex/hooks.json unreadable"}[codex_hook])
+    # the tracked allow list vs each agent's own config — the same report `t permissions` prints
+    perm_sync = None
+    try:
+        allow, retire = _perm_lists(_perm_root())
+        perm_sync = _perm_sync(HOME, allow, retire)
+        print("  permissions %s (%d rules — t permissions)"
+              % (" · ".join(_perm_short(a, perm_sync[a]) for a in _PERM_AGENTS), len(allow)))
+    except OSError:
+        print("  permissions no agents/permissions.allow in the live checkout")
 
     # dotfiles: which checkout is live, is it current, are the links in place
     section("Dotfiles")
     facts = {"in_tmux": bool(os.environ.get("TMUX")),
              "term_program": os.environ.get("TERM_PROGRAM"), "tui": tui,
              "agents": facts_agents, "codex_hook": codex_hook, "codex_used": codex_used,
-             "codex_hook_trusted": codex_trusted}
+             "codex_hook_trusted": codex_trusted, "perm_sync": perm_sync}
     zrc = os.path.join(HOME, ".zshrc")
     live_src = None
     if os.path.islink(zrc):
@@ -4678,6 +5175,7 @@ examples:
   t on mini ls            run a command on a remote host
   t setup                 onboard this machine: register ~/code repos + ssh hosts
   t install               install + log in the agent CLIs (claude, codex, cursor) here and on every host
+  t permissions           is agents/permissions.allow applied to claude / codex / cursor here? (dots applies it)
   t new tool-x            wizard: create ~/code/tool-x + github <owner>/tool-x, register it everywhere
 
 agents — what each verb supports per agent (t install --status adds this machine's state):
@@ -4762,7 +5260,10 @@ Run `t <verb> -h` for a verb's own flags.""")
             "'● active' / '● on <host>' — and picking one ATTACHES in place (locally or on "
             "its host) instead of resuming; naming a live slot explicitly always attaches. "
             "Worktree-per-session repos only (a shared tree's transcripts are "
-            "ambiguous per-slot — use `t push -p` there).")
+            "ambiguous per-slot — use `t push -p` there). Agents: a claude conversation "
+            "and a codex thread are offered alike — every row names its agent in a column — "
+            "each revived by its own binary; a cursor chat has no dev slot — `t cursor ls` / "
+            "`t cursor resume <id>`.")
     sp.add_argument("repo", nargs="?", help="DEV_REPOS key; defaults to the repo your cwd is in")
     sp.add_argument("slot", nargs="?", help="slot number; a lone slot implies the cwd repo")
     sp.add_argument("-f", "--fg", action="store_true", help="resume inline in THIS terminal (no tmux slot)")
@@ -4934,6 +5435,22 @@ Run `t <verb> -h` for a verb's own flags.""")
     sp.add_argument("--status", action="store_true",
                     help="print each agent's install/login state and the per-agent support matrix")
 
+    sp = sub.add_parser("permissions", help="sync the tracked allow list into each agent's config (claude, codex, cursor)",
+        description="The permission allow list this repo tracks (agents/permissions.allow, "
+            "in Claude Code's rule syntax; agents/permissions.retire names the rules to take "
+            "back) against each installed agent's own config: ~/.claude/settings.json "
+            "verbatim, codex's ~/.codex/rules/dotfiles.rules and cursor's "
+            "~/.cursor/cli-config.json for the Bash prefix rules. Bare: report what is in "
+            "sync and what is waiting. `dots` runs --apply on every machine; this is the "
+            "by-hand twin. Add-and-retire: deleting a rule from the list changes nothing "
+            "anywhere — move it to permissions.retire. A rule with a leading NAME=* "
+            "assignment (`Bash(DATABASE_URL=* node:*)`) reaches claude and cursor; codex "
+            "cannot express one, so --apply turns its workspace-write sandbox's network on "
+            "in ~/.codex/config.toml instead — the prompt such a script raises is the "
+            "sandbox blocking the network.")
+    sp.add_argument("--apply", action="store_true", help="merge the adds and retires now (what dots does)")
+    sp.add_argument("--show", action="store_true", help="print every rule with its codex / cursor translation")
+
     sub.add_parser("doctor", help="diagnose this machine's dotfiles/tmux/Claude setup",
         description="Read-only diagnostics for when the tooling misbehaves: which checkout the "
             "live $HOME symlinks point at and whether it is behind origin/main, whether every "
@@ -4987,7 +5504,7 @@ IMPLEMENTED = {
     "plan": cmd_plan, "paste": cmd_paste, "kill": cmd_kill, "setup": cmd_setup,
     "land": cmd_land, "kill-owner": cmd_kill_owner, "cursor": cmd_cursor,
     "doctor": cmd_doctor, "mcp": cmd_mcp, "new": cmd_new, "new-land": cmd_new_land,
-    "install": cmd_install,
+    "install": cmd_install, "permissions": cmd_permissions,
 }
 
 

@@ -169,7 +169,9 @@ prview() {
 # Blocks SYSTEM sleep via `pmset disablesleep 1` + a background caffeinate, while
 # the display still dims and sleeps on its own schedule (that is what locks the Mac
 # at a desk), and LOCKS the screen the moment the lid closes — with sleep disabled a
-# closed lid no longer sleeps, so it no longer locks either. It keeps holding only
+# closed lid no longer sleeps, so it no longer locks either (not when docked to an
+# external display: macOS never slept on that lid close, so there is no lock to
+# replace, and the closed lid is simply how the Mac sits). It keeps holding only
 # while BOTH signals stay fresh: internet (an HTTPS exchange with
 # api.anthropic.com) and tokens burning — a local claude, codex or cursor-agent
 # mid-turn (Claude Code runs its own caffeinate while a turn is in flight; for
@@ -297,8 +299,20 @@ nosleep() {
     sleep 2
   done
 }
-# _nosleep_lid_closed — true while the lid is shut (AppleClamshellState, one ~10ms ioreg).
-_nosleep_lid_closed() { ioreg -r -k AppleClamshellState -d 4 2>/dev/null | grep -q '"AppleClamshellState" = Yes'; }
+# _nosleep_lid_closed — true while the lid is shut AND macOS would sleep on that closure
+# (both keys sit on IOPMrootDomain: one ~10ms ioreg). AppleClamshellCausesSleep is the
+# kernel's own verdict — shouldSleepOnClamshellClosed(): no external display on power,
+# no clamshell-disable — and it does NOT consult `pmset disablesleep` (that flag lives
+# in the sleep-allowed gate, userDisabledAllSleep). So a docked Mac (lid shut, an
+# external display driving it) reads No and nosleep leaves it alone: macOS never slept
+# on that lid close, so there is no lock to replace — the first version locked the
+# external display the moment nosleep started. A plain laptop stays Yes under nosleep's
+# disablesleep, and the lock still lands.
+_nosleep_lid_closed() {
+  local out
+  out=$(ioreg -r -k AppleClamshellState -d 1 2>/dev/null) || return 1
+  [[ $out == *'"AppleClamshellState" = Yes'* && $out == *'"AppleClamshellCausesSleep" = Yes'* ]]
+}
 # _nosleep_lock — lock the screen now. SACLockScreenImmediate is the call behind the
 # Apple-menu Lock Screen item: instant, and it needs no Accessibility grant (the
 # ctrl-cmd-q keystroke route does). It is a private framework, so a failure falls
@@ -880,10 +894,16 @@ try:
     c.execute('pragma busy_timeout=500')
     q = ("select id, rollout_path, cwd, coalesce(nullif(name,''), title, ''), updated_at "
          "from threads where archived=0 and ")
+    # A subagent thread (source = '{"subagent": {"thread_spawn": {"parent_thread_id": …}}}',
+    # title '') is a helper the parent spawned — codex's `<sid>/subagents/` — not a
+    # conversation: it copies the parent's brief as its first prompt, so listed as one it
+    # is the parent's row repeated once per helper (ff-35 showed four). An exact-id
+    # lookup stays unfiltered (a beam by id is deliberate).
+    sub = "instr(source, '\"subagent\"')=0 and "
     if mode == 'cwd':
-        rows = c.execute(q + "cwd=? order by updated_at desc", (arg,)).fetchall()
+        rows = c.execute(q + sub + "cwd=? order by updated_at desc", (arg,)).fetchall()
     elif mode == 'prefix':
-        rows = c.execute(q + "cwd like ? order by updated_at desc", (arg.replace('%', '') + '%',)).fetchall()
+        rows = c.execute(q + sub + "cwd like ? order by updated_at desc", (arg.replace('%', '') + '%',)).fetchall()
     else:
         rows = c.execute(q + "id=? order by updated_at desc", (arg,)).fetchall()
 except Exception:
@@ -950,15 +970,21 @@ for p in glob.glob(os.path.join(root, '*', '*', '*', 'rollout-*.jsonl')):
     try: st = os.stat(p)
     except OSError: continue
     k = known.get(p)
-    if not (isinstance(k, list) and len(k) == 2 and k[0] == st.st_ino):
-        cwd = ''
+    # entry = [inode, cwd, kind]; kind 'sub' marks a subagent thread's rollout (see
+    # _codex_threads) — a 2-element entry is from before that field and is re-read once
+    if not (isinstance(k, list) and len(k) == 3 and k[0] == st.st_ino):
+        cwd, kind = '', ''
         try:
             with open(p, 'rb') as fh: first = fh.readline(65536).decode('utf-8', 'replace')
             d = json.loads(first)
-            if d.get('type') == 'session_meta': cwd = (d.get('payload') or {}).get('cwd') or ''
+            if d.get('type') == 'session_meta':
+                pl = d.get('payload') or {}
+                cwd = pl.get('cwd') or ''
+                if pl.get('thread_source') == 'subagent' or isinstance(pl.get('source'), dict) and 'subagent' in pl['source']:
+                    kind = 'sub'
         except (OSError, ValueError, AttributeError): pass
-        known[p] = k = [st.st_ino, cwd]; changed = True
-    if k[1] == want: out.append((st.st_mtime, p))
+        known[p] = k = [st.st_ino, cwd, kind]; changed = True
+    if k[1] == want and not k[2]: out.append((st.st_mtime, p))
 if changed:
     try:
         os.makedirs(os.path.dirname(cache), exist_ok=True)
@@ -4454,10 +4480,10 @@ _t_resume() {
   fi
   remote_rows=$(print -r -- "$all_rows" | awk -F'\t' '$1 != "local"')
   # Local live titles, keyed by short session name (dev- prefix stripped).
-  local -A local_sum; local _lsn _lsum
-  while IFS=$'\t' read -r _lsn _lsum; do
-    [[ -n $_lsn ]] && local_sum[$_lsn]=$_lsum
-  done < <(print -r -- "$all_rows" | awk -F'\t' '$1 == "local" {print $4 "\t" $7}')
+  local -A local_sum local_agent; local _lsn _lsum _lag
+  while IFS=$'\t' read -r _lsn _lsum _lag; do
+    [[ -n $_lsn ]] && { local_sum[$_lsn]=$_lsum; local_agent[$_lsn]=${_lag:-claude}; }
+  done < <(print -r -- "$all_rows" | awk -F'\t' '$1 == "local" {print $4 "\t" $7 "\t" $8}')
 
   # Candidates: dead slots whose worktree project dir holds a transcript —
   # EVERY conversation in the slot, newest first, not just the newest .jsonl
@@ -4473,10 +4499,10 @@ _t_resume() {
   # does not redeclare, it PRINTS `x=value` (the `_ok=claw` junk-output bug).
   local -a cands slots tx
   local -a pending _mpaths _mrows _mf _PR_STALE
-  local -A remote_live_host remote_live_alias remote_live_sum
+  local -A remote_live_host remote_live_alias remote_live_sum remote_live_agent
   local -A meta_title meta_pr
   local _p _mr _mrest
-  local n wt sid busy rhost _rdir _rbase _rhost _rn _ralias _rsum _ok _stale stale_path agent _ag
+  local n wt sid busy rhost _rdir _rbase _rhost _rn _ralias _rsum _rag _ok _stale stale_path agent _ag
   local txf title when ep org orgf hf skipped=0 hidden_live=0
   local reopened opf opep REPLY
   local _rwtr=${DEV_WORKTREE_ROOT:-}
@@ -4499,16 +4525,16 @@ _t_resume() {
   done
   for repo in $repos; do
     _rdir=${DEV_REPOS[$repo]}; _rbase=${_rdir:t}
-    remote_live_host=(); remote_live_alias=(); remote_live_sum=()
+    remote_live_host=(); remote_live_alias=(); remote_live_sum=(); remote_live_agent=()
     if [[ -n $remote_rows ]]; then
-      while IFS=$'\t' read -r _rhost _rn _ralias _rsum; do
-        [[ -n $_rn ]] && { remote_live_host[$_rn]=$_rhost; remote_live_alias[$_rn]=$_ralias; remote_live_sum[$_rn]=$_rsum; }
+      while IFS=$'\t' read -r _rhost _rn _ralias _rsum _rag; do
+        [[ -n $_rn ]] && { remote_live_host[$_rn]=$_rhost; remote_live_alias[$_rn]=$_ralias; remote_live_sum[$_rn]=$_rsum; remote_live_agent[$_rn]=${_rag:-claude}; }
       done < <(print -r -- "$remote_rows" | awk -F'\t' -v d="$(_dev_homerel "$_rdir")" -v wtr="$(_dev_homerel "$_rwtr")" -v b="$_rbase" '
         { c=$3; sub(/^\/(Users|home)\/[^\/]+\//, "", c) }
         (c==d || (wtr != "" && b != "" && index(c, wtr "/" b "/") == 1)) {
           n = $4; sub(/^.*-/, "", n)
           r = $4; sub(/-[^-]+$/, "", r)
-          print $1 "\t" n "\t" r "\t" $7
+          print $1 "\t" n "\t" r "\t" $7 "\t" $8
         }')
     fi
     # Which slots to look at. NOT a fixed 1..20 range (which silently capped the
@@ -4538,7 +4564,7 @@ _t_resume() {
         # key (field 1, stripped after the global sort below): a live session is
         # "now", so the max sentinel pins it above every dead transcript.
         [[ -n $live_flag ]] || { (( hidden_live++ )); continue; }
-        cands+=(9999999999$'\t'"$repo"$'\t'"$n"$'\t'-$'\t'"$wt"$'\t'"● active"$'\t'"${local_sum[${busy#dev-}]:-(live session)}"$'\t'here$'\t'-$'\t'-)
+        cands+=(9999999999$'\t'"$repo"$'\t'"$n"$'\t'-$'\t'"$wt"$'\t'"● active"$'\t'"${local_sum[${busy#dev-}]:-(live session)}"$'\t'here$'\t'-$'\t'-$'\t'"${local_agent[${busy#dev-}]:-$(_dev_agent_of_session "$busy")}")
         continue
       fi
       # Remote-live: same treatment as local live (see the scan note above).
@@ -4550,7 +4576,7 @@ _t_resume() {
           return
         fi
         [[ -n $live_flag ]] || { (( hidden_live++ )); continue; }
-        cands+=(9999999999$'\t'"$repo"$'\t'"$n"$'\t'-$'\t'"$wt"$'\t'"● on $rhost"$'\t'"${remote_live_sum[$n]:-(live session)}"$'\t'"$rhost"$'\t'"${remote_live_alias[$n]}"$'\t'-)
+        cands+=(9999999999$'\t'"$repo"$'\t'"$n"$'\t'-$'\t'"$wt"$'\t'"● on $rhost"$'\t'"${remote_live_sum[$n]:-(live session)}"$'\t'"$rhost"$'\t'"${remote_live_alias[$n]}"$'\t'-$'\t'"${remote_live_agent[$n]:-claude}")
         continue
       fi
       # Name-only collision: a dev-<alias>-${n} tmux session (any alias keying
@@ -4579,7 +4605,7 @@ _t_resume() {
           return
         fi
         [[ -n $live_flag ]] || { (( hidden_live++ )); continue; }
-        cands+=(9999999999$'\t'"$repo"$'\t'"$n"$'\t'-$'\t'"${stale_path:-$wt}"$'\t'"● active"$'\t'"${local_sum[${_stale#dev-}]:-(live session)}"$'\t'here$'\t'-$'\t'-)
+        cands+=(9999999999$'\t'"$repo"$'\t'"$n"$'\t'-$'\t'"${stale_path:-$wt}"$'\t'"● active"$'\t'"${local_sum[${_stale#dev-}]:-(live session)}"$'\t'here$'\t'-$'\t'-$'\t'"${local_agent[${_stale#dev-}]:-$(_dev_agent_of_session "$_stale")}")
         continue
       fi
       # every conversation either agent recorded in this worktree: claude's project
@@ -4656,10 +4682,10 @@ _t_resume() {
       elif [[ -n ${host_alias[$org]:-} ]]; then org=${host_alias[$org]}
       fi
     fi
-    # a codex row is marked in its date cell (⬡ — the `t ls` glyph) so a picker with
-    # both agents says which binary each pick will run; field 4 is the real sid (the
-    # trailing uuid of a rollout filename), field 11 the agent for the spawn
-    _ag=$(_dev_transcript_agent "$txf"); [[ $_ag == codex ]] && when="⬡ $when"
+    # field 4 is the real sid (the trailing uuid of a rollout filename); the agent
+    # (field 11 here, 10 once the sort key is stripped) gets its own display column
+    # AND picks the binary a pick spawns
+    _ag=$(_dev_transcript_agent "$txf")
     cands+=("$ep"$'\t'"$repo"$'\t'"$n"$'\t'"$(_dev_transcript_sid "$txf")"$'\t'"$wt"$'\t'"$when"$'\t'"$title"$'\t'-$'\t'-$'\t'"${org[1,10]}"$'\t'"$_ag")
   done
   # ONE detached refresh for the whole scan, instead of a `gh pr view` child per
@@ -4694,20 +4720,31 @@ _t_resume() {
   fi
 
   # Picker rows: repo(1) slot(2) sid(3) wt(4) when(5) title(6) loc(7) alias(8)
-  # origin(9) — loc/alias are `-` for a dead (resumable) row, the `here`
+  # origin(9) agent(10) — loc/alias are `-` for a dead (resumable) row, the `here`
   # sentinel (displayed "● active") for a live local slot, or the host + remote
   # alias for a slot live on a $REMOTE_HOSTS
   # host (pick → attach in place, never a second owner); origin is the machine a
   # dead conversation LAST RAN on (`-`/empty = here or unstamped — live rows name
-  # their host in the ● label instead). One ALIGNED display column (10) is
+  # their host in the ● label instead); agent is the row's claude/codex — what a
+  # dead pick spawns, and what a live slot is running (from the live scan, else
+  # the session's own stamp). EVERY row carries all ten, sentinelled, so the
+  # positional reads below never slide. One ALIGNED display column (11) is
   # appended here — fzf renders raw \t fields at literal tab stops (nothing
-  # lines up), so both fzf (--with-nth=10) and the no-fzf listing show the same
-  # pre-padded gh-style row: [repo]  slot  [origin]  date|●-where  title. The
+  # lines up), so both fzf and the no-fzf listing show the same pre-padded
+  # gh-style row: [repo]  slot  agent  [origin]  date|●-where  title. The agent
+  # is a WORD column on every row (a ⬡ in the date cell was too easy to miss and
+  # needed a legend — "need to more clearly indicate which is claude, codex",
+  # 2026-09-14). fzf
+  # renders it as --with-nth=-1 — the LAST field, the same rule as the listing's
+  # `${c##*$'\t'}` — never a fixed index: when the agent field landed as column
+  # 10, a hard-coded --with-nth=10 showed every dead row as the word `claude`
+  # (and matched queries against nothing else) — "t resume shows no session
+  # info", 2026-09-14. The
   # origin column only appears when some row has one (a single-machine setup
   # never sees it); all-repos mode adds the repo column. Both pad to the widest
   # value in this candidate set.
   local pick c fprompt; local -a f
-  local rw=0 ow=0 i=1
+  local rw=0 ow=0 aw=0 i=1
   if [[ -n $all_mode ]]; then
     fprompt="resume (${days}d)> "
     for c in "${(@)cands}"; do f=("${(@ps:\t:)c}"); (( ${#f[1]} > rw )) && rw=${#f[1]}; done
@@ -4717,21 +4754,23 @@ _t_resume() {
   for c in "${(@)cands}"; do
     f=("${(@ps:\t:)c}")
     [[ ${f[9]:-} != - && -n ${f[9]:-} ]] && (( ${#f[9]} > ow )) && ow=${#f[9]}
+    (( ${#f[10]} > aw )) && aw=${#f[10]}
   done
   for c in "${(@)cands}"; do
     f=("${(@ps:\t:)c}")
     org=${f[9]:-}; [[ $org == - ]] && org=
+    agent=${f[10]:-claude}
     if [[ -n $all_mode ]]; then
       if (( ow )); then
-        cands[$i]+=$'\t'"$(printf '%-*s  %2s  %-*s  %-14s  %s' "$rw" "$f[1]" "$f[2]" "$ow" "$org" "$f[5]" "$f[6]")"
+        cands[$i]+=$'\t'"$(printf '%-*s  %2s  %-*s  %-*s  %-14s  %s' "$rw" "$f[1]" "$f[2]" "$aw" "$agent" "$ow" "$org" "$f[5]" "$f[6]")"
       else
-        cands[$i]+=$'\t'"$(printf '%-*s  %2s  %-14s  %s' "$rw" "$f[1]" "$f[2]" "$f[5]" "$f[6]")"
+        cands[$i]+=$'\t'"$(printf '%-*s  %2s  %-*s  %-14s  %s' "$rw" "$f[1]" "$f[2]" "$aw" "$agent" "$f[5]" "$f[6]")"
       fi
     else
       if (( ow )); then
-        cands[$i]+=$'\t'"$(printf '%2s  %-*s  %-14s  %s' "$f[2]" "$ow" "$org" "$f[5]" "$f[6]")"
+        cands[$i]+=$'\t'"$(printf '%2s  %-*s  %-*s  %-14s  %s' "$f[2]" "$aw" "$agent" "$ow" "$org" "$f[5]" "$f[6]")"
       else
-        cands[$i]+=$'\t'"$(printf '%2s  %-14s  %s' "$f[2]" "$f[5]" "$f[6]")"
+        cands[$i]+=$'\t'"$(printf '%2s  %-*s  %-14s  %s' "$f[2]" "$aw" "$agent" "$f[5]" "$f[6]")"
       fi
     fi
     (( i++ ))
@@ -4750,7 +4789,7 @@ _t_resume() {
     # query — acceptable because fzf's fuzzy match crosses word gaps ("fixbug"
     # still matches "fix bug").
     pick=$(print -rl -- "${(@)cands}" | fzf --multi --marker='✓' --bind 'space:toggle+down' \
-      --delimiter=$'\t' --with-nth=10 --no-hscroll \
+      --delimiter=$'\t' --with-nth=-1 --no-hscroll \
       --header='space marks ✓ — every mark revives, first attaches' --prompt="$fprompt") || return 1
     [[ -n $pick ]] || return 1
   elif [[ -n $slot ]]; then
@@ -6382,7 +6421,7 @@ help() {
   local -A hints=(
     "Repo shortcuts (cd)" "+ add a repo: t setup (or DEV_REPOS[key]=~/code/repo in ~/.zshrc.local)"
     "Remote machines"     "+ add a host: t setup (or REMOTE_HOSTS[key]=user@host in ~/.zshrc.local)"
-    "Agents (claude · codex · cursor)" "+ install / log in an agent CLI: t install · per-verb support: t install --status"
+    "Agents (claude · codex · cursor)" "+ install / log in an agent CLI: t install · per-verb support: t install --status · the shared allow list: t permissions"
   )
 
   # Palette — bold, UPPERCASE section headers (man-page / `gh` convention; bold is
@@ -6439,7 +6478,7 @@ alias h=help   # `h` is a shorthand for `help`
 # key for `on`), and slot/flags after. Pulls live from the ${(k)DEV_REPOS} /
 # ${(k)REMOTE_HOSTS} arrays so it stays current with ~/.zshrc.local.
 _t() {
-  local -a verbs=(open ls kill push pop resume beam read plan paste find on cursor setup new install)
+  local -a verbs=(open ls kill push pop resume beam read plan paste find on cursor setup new install permissions)
   if (( CURRENT == 2 )); then
     _describe -t verbs 't verb' verbs
     return

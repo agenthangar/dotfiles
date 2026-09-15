@@ -1,0 +1,9 @@
+# agents/permissions.retire — rules `dots` REMOVES from every agent's config: the other
+# half of add-and-retire. A rule dropped from permissions.allow lives on wherever it
+# already landed, so taking one back means moving it here. Same syntax as .allow; a
+# rule in BOTH lists is an error — `t permissions` refuses to apply anything until one
+# side wins. A retired rule is removed from ~/.claude/settings.json and cursor's
+# cli-config.json (every occurrence) and simply stops being generated for codex.
+
+# subsumed by Bash(launchctl:*) in permissions.allow (2026-09-14)
+Bash(launchctl kickstart:*)

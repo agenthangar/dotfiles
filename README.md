@@ -135,26 +135,53 @@ Not every verb supports every agent yet. The matrix below is **generated from
 support without the README saying so:
 
 ```text
-  surface                                           claude                          codex                                  cursor
-  ------------------------------------------------  ------------------------------  -------------------------------------  -------------------------------
-  t install (install · login · update)              ✓                               ✓                                      ✓
-  dev slots: t open / ls / kill / read / paste      ✓                               ✓ t open --codex · DEV_AGENT           ✗ no slot — t cursor ls
-  t push / t pop                                    ✓                               ✓                                      ✗ no slot
-  t resume (dead slots)                             ✓                               ✓ (its sqlite thread index)            → t cursor resume
-  t beam / --from (move a session)                  ✓                               ✓ (rollout + .origin)                  → t cursor [id] --host / --from
-  csync (iCloud union of transcripts)               ✓ projects + plans              ✓ codex-sessions                       ✓ cursor-chats
-  SessionStart stamps (registry · opened · origin)  ✓ settings.json hook            ✓ hooks.json (trust once at startup)   ✗ no hook wired
-  t plan                                            ✓                               ✗ codex keeps no plan files (says so)  ✗
-  /tpush · /tpop slash commands                     ✓ ~/.claude/commands            ✓ ~/.codex/prompts                     ✗
-  t find / t mcp (transcript search)                ✓                               ✗ claude transcripts only              ✗
-  t doctor agent row (version · login · hook)       ✓                               ✓                                      ✓ version · login
-  nosleep (hold sleep while an agent works)         ✓ caffeinate child · net bytes  ✓ net bytes                            ✓ net bytes
+  surface                                                 claude                          codex                                                                 cursor
+  ------------------------------------------------------  ------------------------------  --------------------------------------------------------------------  -------------------------------------------------
+  t install (install · login · update)                    ✓                               ✓                                                                     ✓
+  dev slots: t open / ls / kill / read / paste            ✓                               ✓ t open --codex · DEV_AGENT                                          ✗ no slot — t cursor ls
+  t push / t pop                                          ✓                               ✓                                                                     ✗ no slot
+  t resume (dead slots)                                   ✓                               ✓ (its sqlite thread index)                                           → t cursor resume
+  t beam / --from (move a session)                        ✓                               ✓ (rollout + .origin)                                                 → t cursor [id] --host / --from
+  csync (iCloud union of transcripts)                     ✓ projects + plans              ✓ codex-sessions                                                      ✓ cursor-chats
+  SessionStart stamps (registry · opened · origin)        ✓ settings.json hook            ✓ hooks.json (trust once at startup)                                  ✗ no hook wired
+  t plan                                                  ✓                               ✗ codex keeps no plan files (says so)                                 ✗
+  /tpush · /tpop slash commands                           ✓ ~/.claude/commands            ✓ ~/.codex/prompts                                                    ✗
+  t find / t mcp (transcript search)                      ✓                               ✗ claude transcripts only                                             ✗
+  t doctor agent row (version · login · hook)             ✓                               ✓                                                                     ✓ version · login
+  permissions (agents/permissions.allow, synced by dots)  ✓ ~/.claude/settings.json       ✓ ~/.codex/rules/dotfiles.rules (argv prefixes) · sandbox network on  ✓ ~/.cursor/cli-config.json (argv + env prefixes)
+  nosleep (hold sleep while an agent works)               ✓ caffeinate child · net bytes  ✓ net bytes                                                           ✓ net bytes
 ```
 
 Codex needs one manual step after install: its SessionStart hook (the same
 `claude-stamp-tmux` script, registered in `~/.codex/hooks.json` by `install.sh`/
 `dots`) must be trusted once under `/hooks` inside codex — Codex has no supported
 way for an installer to pre-trust a hook.
+
+**Permissions travel too.** `agents/permissions.allow` is the allow list every
+machine's agents get — Claude Code's rule syntax, one rule per line — and `dots`
+(`install.sh` → `t permissions --apply`) merges it into each installed agent's
+own config: `~/.claude/settings.json` verbatim, and every `Bash(<words>:*)` prefix
+rule as a `prefix_rule` in `~/.codex/rules/dotfiles.rules` and a `Shell(<words>)`
+in `~/.cursor/cli-config.json` (the rest — WebFetch, MCP tools, skills — is
+Claude-only). A rule with a leading env assignment — `Bash(*=* node *)`, needed
+because Claude strips a leading `NAME=value` only for its built-in safe list, so
+`DATABASE_URL=… node …` matches nothing else; space spelling only, the `:*` form
+of such a rule is accepted by Claude and never matches — reaches Claude and, as a
+whole-line glob, cursor. Codex cannot take it: its parser hands a script with an
+assignment (or a redirect) to the rules as one opaque token, and the prompt such a
+script raises is the sandbox blocking the network, so the same `dots` turns the
+codex workspace-write sandbox's network on (`[sandbox_workspace_write]
+network_access = true` in `~/.codex/config.toml`, add-only — set it false by hand
+to keep the sandbox offline). It is **add-and-retire**: deleting a rule from the list changes
+nothing anywhere; moving it to `agents/permissions.retire` removes it everywhere
+on the next `dots`. Hand-added rules, deny lists and the rest of each file are
+never touched. `t permissions` reports what is in sync and what is waiting,
+`t permissions --show` prints each rule's translations, `t doctor` carries the
+same line, and `DOTFILES_NO_PERMISSIONS=1` opts a machine out. The shipped list
+is deliberately broad — it allows `bash`, `python3`, `node`, `curl` and `claude`
+outright — so read it before running `install.sh` on a machine that is not yours.
+It carries commands and generic tool rules only: a project's MCP tool names, its
+skills and the domains it fetched say what you work on, and this repo is public.
 
 ## The `help` command
 
@@ -173,8 +200,10 @@ hint. Output is self-contained — plain ANSI, colored only on a terminal.
 ## Claude plugins & MCP
 
 Claude settings install as a **real copy**, never clobbering an existing
-`~/.claude/settings.json`. The seed is **`settings.json.example`** — conservative:
-only the session-stamping hook the tmux tooling needs; you approve Bash yourself.
+`~/.claude/settings.json`. The seed is **`settings.json.example`** — minimal: the
+session-stamping hook the tmux tooling needs and the `mcp__sessions` allow rule.
+The tracked allow list (`agents/permissions.allow`, see [Agents](#agents)) is
+merged into it by the same install and by every `dots`.
 
 The live file is **per-machine and untracked by design**: Claude Code writes to
 it at runtime (`/model` saves your default model, "always allow" appends

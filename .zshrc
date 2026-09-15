@@ -263,6 +263,18 @@ nosleep() {
     fi
     if (( ! forever && now - checked_at >= every )); then
       checked_at=$now
+      if ! _nosleep_pmset_held; then
+        # Cleared under us — another nosleep's exit resets it for everyone (its restore
+        # is global, and the survivor's caffeinate still holds IDLE sleep off, so nothing
+        # looks wrong until the lid closes and the Mac sleeps). Re-arm rather than fight
+        # over exits: while this run lives, the flag is its invariant.
+        [[ -t 1 ]] && printf '\r\e[K'
+        if sudo -n pmset -a disablesleep 1 2>/dev/null; then
+          echo "nosleep: the sleep-disable flag was reset under this run (another nosleep exiting?) — re-armed"
+        else
+          echo "nosleep: the sleep-disable flag was reset under this run and sudo could not re-arm it — a closed lid would sleep the Mac" >&2
+        fi
+      fi
       _nosleep_online && online_at=$now
       _nosleep_busy_at; (( REPLY )) && busy_at=$REPLY
       oldest=$(( busy_at < online_at ? busy_at : online_at ))
@@ -311,6 +323,10 @@ _nosleep_lock() {
   [[ -t 1 ]] && printf '\r\e[K'                      # nosleep's status line leaves no newline
   echo "nosleep: lid closed — screen locked"
 }
+# _nosleep_pmset_held — true while pmset's disablesleep flag is set (one ~10 ms read).
+# The flag is what keeps a CLOSED lid from sleeping the Mac; caffeinate alone holds
+# only idle sleep. It is global state that any nosleep's restore clears.
+_nosleep_pmset_held() { pmset -g 2>/dev/null | grep -qE '^ *SleepDisabled[[:space:]]+1'; }
 # _nosleep_online — true when an HTTPS exchange with api.anthropic.com completes.
 # Any HTTP status counts (no -f): a 404 proves the network path; only DNS/connect/
 # TLS failures — the outages that actually stop tokens burning — return nonzero.

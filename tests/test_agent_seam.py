@@ -798,6 +798,24 @@ def test_zsh_nosleep_agent_of_comm(zsh):
                                 "/Users/me/.local/bin/cursor-agent=cursor", "node=", "zsh=", "cursor="]
 
 
+PMSET_STUB = r"""#!/bin/bash
+# pmset -g → the settings dump, with the flag from $FAKE_SLEEP_DISABLED
+[[ "$1" == -g ]] && { printf ' SleepDisabled\t\t%s\n sleep                10\n' "${FAKE_SLEEP_DISABLED:-0}"; exit 0; }
+exit 1
+"""
+
+
+def test_zsh_nosleep_pmset_held_reads_the_flag(zsh, tmp_path):
+    # the lid-close protection is pmset's global disablesleep flag, which any nosleep's
+    # exit clears for every other run — the loop re-arms it when a probe reads 0
+    stub = tmp_path / "stubbin" / "pmset"
+    stub.write_text(PMSET_STUB)
+    stub.chmod(0o755)
+    assert zsh("_nosleep_pmset_held; echo rc=$?", FAKE_SLEEP_DISABLED="1").stdout.strip() == "rc=0"
+    assert zsh("_nosleep_pmset_held; echo rc=$?", FAKE_SLEEP_DISABLED="0").stdout.strip() == "rc=1"
+    assert "_nosleep_pmset_held" in open(ZSHRC).read().split("checked_at=$now", 1)[1].split("_nosleep_online", 1)[0]
+
+
 def test_zsh_nosleep_claude_caffeinate_is_busy_at_once(nosleep):
     # Claude Code's own caffeinate child: instant, no baseline needed
     nosleep.table.write_text("1 0 launchd\n10 1 claude\n11 10 caffeinate\n12 1 caffeinate\n")

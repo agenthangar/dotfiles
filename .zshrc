@@ -4536,7 +4536,7 @@ _t_resume() {
         # key (field 1, stripped after the global sort below): a live session is
         # "now", so the max sentinel pins it above every dead transcript.
         [[ -n $live_flag ]] || { (( hidden_live++ )); continue; }
-        cands+=(9999999999$'\t'"$repo"$'\t'"$n"$'\t'-$'\t'"$wt"$'\t'"● active"$'\t'"${local_sum[${busy#dev-}]:-(live session)}"$'\t'here$'\t'-$'\t'-)
+        cands+=(9999999999$'\t'"$repo"$'\t'"$n"$'\t'-$'\t'"$wt"$'\t'"● active"$'\t'"${local_sum[${busy#dev-}]:-(live session)}"$'\t'here$'\t'-$'\t'-$'\t'-)
         continue
       fi
       # Remote-live: same treatment as local live (see the scan note above).
@@ -4548,7 +4548,7 @@ _t_resume() {
           return
         fi
         [[ -n $live_flag ]] || { (( hidden_live++ )); continue; }
-        cands+=(9999999999$'\t'"$repo"$'\t'"$n"$'\t'-$'\t'"$wt"$'\t'"● on $rhost"$'\t'"${remote_live_sum[$n]:-(live session)}"$'\t'"$rhost"$'\t'"${remote_live_alias[$n]}"$'\t'-)
+        cands+=(9999999999$'\t'"$repo"$'\t'"$n"$'\t'-$'\t'"$wt"$'\t'"● on $rhost"$'\t'"${remote_live_sum[$n]:-(live session)}"$'\t'"$rhost"$'\t'"${remote_live_alias[$n]}"$'\t'-$'\t'-)
         continue
       fi
       # Name-only collision: a dev-<alias>-${n} tmux session (any alias keying
@@ -4577,7 +4577,7 @@ _t_resume() {
           return
         fi
         [[ -n $live_flag ]] || { (( hidden_live++ )); continue; }
-        cands+=(9999999999$'\t'"$repo"$'\t'"$n"$'\t'-$'\t'"${stale_path:-$wt}"$'\t'"● active"$'\t'"${local_sum[${_stale#dev-}]:-(live session)}"$'\t'here$'\t'-$'\t'-)
+        cands+=(9999999999$'\t'"$repo"$'\t'"$n"$'\t'-$'\t'"${stale_path:-$wt}"$'\t'"● active"$'\t'"${local_sum[${_stale#dev-}]:-(live session)}"$'\t'here$'\t'-$'\t'-$'\t'-)
         continue
       fi
       # every conversation either agent recorded in this worktree: claude's project
@@ -4692,15 +4692,22 @@ _t_resume() {
   fi
 
   # Picker rows: repo(1) slot(2) sid(3) wt(4) when(5) title(6) loc(7) alias(8)
-  # origin(9) — loc/alias are `-` for a dead (resumable) row, the `here`
+  # origin(9) agent(10) — loc/alias are `-` for a dead (resumable) row, the `here`
   # sentinel (displayed "● active") for a live local slot, or the host + remote
   # alias for a slot live on a $REMOTE_HOSTS
   # host (pick → attach in place, never a second owner); origin is the machine a
   # dead conversation LAST RAN on (`-`/empty = here or unstamped — live rows name
-  # their host in the ● label instead). One ALIGNED display column (10) is
-  # appended here — fzf renders raw \t fields at literal tab stops (nothing
-  # lines up), so both fzf (--with-nth=10) and the no-fzf listing show the same
-  # pre-padded gh-style row: [repo]  slot  [origin]  date|●-where  title. The
+  # their host in the ● label instead); agent is what a dead pick spawns (`-` on
+  # a live row — it attaches, nothing is spawned). EVERY row carries all ten,
+  # sentinelled, so the positional reads below never slide. One ALIGNED display
+  # column (11) is appended here — fzf renders raw \t fields at literal tab
+  # stops (nothing lines up), so both fzf and the no-fzf listing show the same
+  # pre-padded gh-style row: [repo]  slot  [origin]  date|●-where  title. fzf
+  # renders it as --with-nth=-1 — the LAST field, the same rule as the listing's
+  # `${c##*$'\t'}` — never a fixed index: when the agent field landed as column
+  # 10, a hard-coded --with-nth=10 showed every dead row as the word `claude`
+  # (and matched queries against nothing else) — "t resume shows no session
+  # info", 2026-09-14. The
   # origin column only appears when some row has one (a single-machine setup
   # never sees it); all-repos mode adds the repo column. Both pad to the widest
   # value in this candidate set.
@@ -4748,7 +4755,7 @@ _t_resume() {
     # query — acceptable because fzf's fuzzy match crosses word gaps ("fixbug"
     # still matches "fix bug").
     pick=$(print -rl -- "${(@)cands}" | fzf --multi --marker='✓' --bind 'space:toggle+down' \
-      --delimiter=$'\t' --with-nth=10 --no-hscroll \
+      --delimiter=$'\t' --with-nth=-1 --no-hscroll \
       --header='space marks ✓ — every mark revives, first attaches' --prompt="$fprompt") || return 1
     [[ -n $pick ]] || return 1
   elif [[ -n $slot ]]; then

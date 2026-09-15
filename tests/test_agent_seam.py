@@ -11,9 +11,12 @@ bin/pr-watch in pyproject.toml, so these subprocess tests do not move the ratche
 import json
 import os
 import pathlib
+import pty
 import re
+import select
 import shutil
 import subprocess
+import time
 
 import pytest
 
@@ -159,6 +162,30 @@ ZSHRC = REPO_ROOT / ".zshrc"
 
 UUIDGEN_STUB = "#!/bin/bash\necho 0F0E0D0C-0B0A-0908-0706-050403020100\n"
 
+# A fake picker: it records what the real fzf would DISPLAY for every stdin row —
+# the --with-nth field, split on --delimiter (a positive index is 1-based, -1 the
+# last field, fzf's own rules) — then picks nothing (rc 1 = esc), or, with
+# $FZF_PICK set, the first row whose display contains it (the whole row on stdout,
+# rc 0 — what enter does).
+FZF_STUB = r"""#!/usr/bin/env python3
+import os, sys
+nth, delim = "1", "\t"
+for a in sys.argv[1:]:
+    if a.startswith("--with-nth="): nth = a[len("--with-nth="):]
+    elif a.startswith("--delimiter="): delim = a[len("--delimiter="):]
+i = int(nth)
+want = os.environ.get("FZF_PICK")
+with open(os.environ["FZF_LOG"], "a") as log:
+    for line in sys.stdin.read().splitlines():
+        f = line.split(delim)
+        shown = f[i - 1] if i > 0 else f[i]
+        log.write(shown + "\n")
+        if want and want in shown:
+            print(line)
+            sys.exit(0)
+sys.exit(1)
+"""
+
 TMUX_LOG_STUB = r"""#!/bin/bash
 # log every call; answer the two reads the seam makes
 printf '%s\n' "$*" >> "$TMUX_LOG"
@@ -169,10 +196,59 @@ case "$1" in
     exit 0 ;;
   capture-pane)     [[ -n "${FAKE_PANE:-}" ]] && printf '%s\n' "$FAKE_PANE" ;;
   has-session)      [[ -n "${FAKE_HAS_SESSION:-}" ]] || exit 1 ;;
-  list-panes|list-sessions) : ;;
+  list-sessions)    [[ -n "${FAKE_SESSIONS:-}" ]] && printf '%s\n' $FAKE_SESSIONS ;;
+  display-message)  [[ -n "${FAKE_SESSION_PATH:-}" && "$*" == *session_path* ]] && echo "$FAKE_SESSION_PATH" ;;
+  list-panes)       : ;;
 esac
 exit 0
 """
+
+
+# compinit's one-keystroke question when a dir on $fpath is group-writable. It is asked
+# ONLY on a tty (without one `read -q` hits EOF and compinit aborts, silently under the
+# `source … >/dev/null 2>&1`) — which is why the non-pty tests never met it and the pty
+# ones hung on it: GitHub's ubuntu runner ships such a dir. Answered `y`, what a person
+# types; the sandbox never uses completion.
+COMPINIT_PROMPT = b"Ignore insecure directories and continue [y] or abort compinit [n]? "
+
+
+def _run_under_pty(argv, env, timeout=60):
+    """Run argv under a pseudo-terminal — for the branches gated on `-t 0 && -t 1` (the
+    fzf pickers). stdout + stderr come back merged as .stdout; EOF once the child closes
+    its side (an empty read, or EIO on Linux). A compinit prompt is answered `y` once."""
+    master, slave = pty.openpty()
+    proc = subprocess.Popen(argv, env=env, stdin=slave, stdout=slave, stderr=slave, close_fds=True)
+    os.close(slave)
+    out, deadline, answered = bytearray(), time.monotonic() + timeout, False
+    while True:
+        ready, _, _ = select.select([master], [], [], max(0.0, deadline - time.monotonic()))
+        if not ready:
+            proc.kill()
+            break
+        try:
+            chunk = os.read(master, 65536)
+        except OSError:
+            break
+        if not chunk:
+            break
+        out += chunk
+        if not answered and out.rstrip().endswith(COMPINIT_PROMPT.rstrip()):
+            os.write(master, b"y")
+            answered = True
+    os.close(master)
+    return subprocess.CompletedProcess(argv, proc.wait(timeout=10), out.decode(errors="replace"), "")
+
+
+def test_run_under_pty_answers_the_compinit_prompt():
+    """The harness's own environment guard, driven against a real `read -q` prompt so it
+    is exercised on every OS, not only where a group-writable fpath dir happens to exist."""
+    prompt = COMPINIT_PROMPT.decode()
+    r = _run_under_pty(["zsh", "-c", f'if read -q "?{prompt}"; then echo continued; else echo aborted; fi; echo rc=$?'],
+                       {**os.environ, "TERM": "dumb"}, timeout=15)
+    assert "continued" in r.stdout and "aborted" not in r.stdout and "rc=0" in r.stdout, r.stdout
+    # and a command that never asks is untouched
+    r = _run_under_pty(["zsh", "-c", "echo plain; echo rc=$?"], {**os.environ, "TERM": "dumb"}, timeout=15)
+    assert "plain" in r.stdout and "rc=0" in r.stdout
 
 
 @pytest.fixture
@@ -196,12 +272,14 @@ def zsh(tmp_path):
     (tmp_path / "ps.txt").write_text("1 0 launchd\n")
     log = tmp_path / "tmux.log"
 
-    def call(snippet, **extra):
+    def call(snippet, _tty=False, **extra):
         env = {"HOME": str(home), "XDG_CACHE_HOME": str(home / ".cache"),
                "PATH": f"{bins}:{os.environ.get('PATH', '')}", "TERM": "dumb",
                "TMUX_LOG": str(log), "FAKE_PS": str(tmp_path / "ps.txt"), **extra}
-        return subprocess.run(["zsh", "-c", f"source {ZSHRC} >/dev/null 2>&1; {snippet}"],
-                              env=env, capture_output=True, text=True, timeout=60)
+        argv = ["zsh", "-c", f"source {ZSHRC} >/dev/null 2>&1; {snippet}"]
+        if not _tty:
+            return subprocess.run(argv, env=env, capture_output=True, text=True, timeout=60)
+        return _run_under_pty(argv, env)
 
     call.log = log
     call.home = home
@@ -771,3 +849,68 @@ def test_zsh_nosleep_lid_closed_only_when_macos_would_sleep_on_it(nosleep):
     assert not closed(("AppleClamshellCausesSleep", "No"), ("AppleClamshellState", "Yes"))   # clamshell mode
     assert not closed(("AppleClamshellCausesSleep", "Yes"), ("AppleClamshellState", "No"))   # lid open
     assert not closed()                                                                      # no lid at all
+
+
+# ─── t resume: the picker renders the display column, for every agent ─────────────
+
+
+def test_zsh_resume_picker_shows_the_display_column_for_every_row(zsh, tmp_path):
+    """What fzf DISPLAYS for each `t resume` row is the padded display column — slot,
+    date (⬡-marked for codex), title — for a dead claude conversation, a dead codex
+    thread and a live slot alike. The column is the LAST tab field and the picker must
+    render it as such (--with-nth=-1): when the agent field landed as a 10th column, a
+    hard-coded --with-nth=10 showed every dead row as the bare word `claude` — and a
+    query matched nothing else — which is "t resume shows no session info"
+    (2026-09-14). Driven under a pty, because the fzf branch is gated on -t 0/1."""
+    for name, body in (("fzf", FZF_STUB), ("gh", "#!/bin/bash\nexit 1\n")):   # gh: no network for the PR tag
+        stub = tmp_path / "stubbin" / name
+        stub.write_text(body)
+        stub.chmod(0o755)
+    wt3 = f"{zsh.home}/code/.worktrees/api/3"
+    # slot 3: one claude conversation (its cwd-keyed project dir) + one codex thread
+    proj = zsh.home / ".claude" / "projects" / re.sub(r"[^A-Za-z0-9]", "-", wt3)
+    proj.mkdir(parents=True)
+    (proj / "c1.jsonl").write_text('{"type":"user","message":{"content":"fix the login bug"}}\n')
+    _codex_home(zsh, [(SID, wt3, "t", 100, 0, None)])
+    log = tmp_path / "fzf.log"
+    r = zsh("_t_resume api --live; echo rc=$?", _tty=True, FZF_LOG=str(log),
+            FAKE_SESSIONS="dev-api-4", FAKE_SESSION_PATH=f"{zsh.home}/code/.worktrees/api/4")
+    assert "rc=1" in r.stdout, r.stdout                        # esc in the picker → rc 1, nothing spawned
+    rows = log.read_text().splitlines()
+    assert len(rows) == 3, rows
+    assert rows[0].split()[:3] == ["4", "●", "active"]         # the live slot pins to the top
+    dead = sorted(rows[1:])
+    assert dead[0].split()[0] == "3" and dead[0].endswith("fix the login bug")
+    assert dead[1].split()[:2] == ["3", "⬡"] and "Reply with exactly the word OK" in dead[1]
+    assert not any(row.strip() in ("claude", "codex", "-") for row in rows)   # never a bare field
+    # the padded layout: slot right-aligned in 2, then the 14-wide date cell
+    assert all(row.startswith(" 3  ") or row.startswith(" 4  ") for row in rows)
+
+
+def test_zsh_resume_pick_revives_the_row_with_its_own_agent(zsh, tmp_path):
+    """A picked codex row revives through `codex resume <thread>`, a picked claude row
+    through `claude -r <sid>` — the agent rides in the row (field 10) and the sid is the
+    transcript's own (a rollout's trailing uuid; a claude file's basename)."""
+    for name, body in (("fzf", FZF_STUB), ("gh", "#!/bin/bash\nexit 1\n")):
+        stub = tmp_path / "stubbin" / name
+        stub.write_text(body)
+        stub.chmod(0o755)
+    wt3 = f"{zsh.home}/code/.worktrees/api/3"
+    pathlib.Path(wt3).mkdir(parents=True)                        # present → no rebuild (no git)
+    proj = zsh.home / ".claude" / "projects" / re.sub(r"[^A-Za-z0-9]", "-", wt3)
+    proj.mkdir(parents=True)
+    (proj / "c1.jsonl").write_text('{"type":"user","message":{"content":"fix the login bug"}}\n')
+    _codex_home(zsh, [(SID, wt3, "t", 100, 0, None)])
+    log = tmp_path / "fzf.log"
+    r = zsh("_t_resume api; echo rc=$?", _tty=True, FZF_LOG=str(log), FZF_PICK="word OK")
+    assert "rc=0" in r.stdout and f"Resuming {SID[:8]} in dev-api-3 ({wt3})" in r.stdout, r.stdout
+    tlog = zsh.log.read_text().splitlines()
+    assert f"send-keys -t dev-api-3 codex resume {SID}; exit Enter" in tlog
+    assert "set-environment -t dev-api-3 DEV_AGENT codex" in tlog
+    assert "attach-session -t dev-api-3" in tlog
+    zsh.log.write_text("")
+    r = zsh("_t_resume api 3; echo rc=$?", _tty=True, FZF_LOG=str(log), FZF_PICK="login bug")
+    assert "rc=0" in r.stdout, r.stdout
+    tlog = zsh.log.read_text().splitlines()
+    assert "send-keys -t dev-api-3 claude -r c1; exit Enter" in tlog
+    assert "set-environment -t dev-api-3 DEV_AGENT claude" in tlog

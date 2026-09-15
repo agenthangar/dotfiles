@@ -316,6 +316,20 @@ def test_zsh_agent_launch_lines(zsh):
     assert r.stdout.splitlines() == ["claude --session-id abc", "codex", "claude -r abc", "codex resume abc"]
 
 
+def test_zsh_agent_glyphs_match_bin_t(zsh, t_mod):
+    """The zsh agent table (_DEV_AGENTS order, _DEV_AGENT_GLYPH icons, _dev_agent_legend)
+    is the twin of bin/t's _INSTALL_AGENTS glyphs: same agents, same order, same icons,
+    same legend. A future agent lands in both with an icon, or this refuses it."""
+    r = zsh("print -rl -- $_DEV_AGENTS; echo --; for a in $_DEV_AGENTS; do _dev_agent_glyph $a; done; echo --; _dev_agent_legend")
+    agents, glyphs, legend = r.stdout.split("--\n")
+    assert agents.split() == list(t_mod._INSTALL_AGENTS)
+    assert glyphs.split() == [t_mod._agent_glyph(a) for a in t_mod._INSTALL_AGENTS]
+    assert legend.strip() == t_mod._agent_legend()
+    # every agent a slot may run has an icon; anything else renders `?`, never blank
+    r = zsh("for a in claude codex gpt; do _dev_agent_valid $a && _dev_agent_glyph $a || echo no:$a:$(_dev_agent_glyph $a); done")
+    assert r.stdout.split() == ["✱", "⬡", "no:gpt:?"]
+
+
 def test_zsh_agent_check_points_at_t_install(zsh):
     r = zsh("_dev_agent_check definitely-not-a-binary; echo rc=$?")
     assert "rc=1" in r.stdout and "t install definitely-not-a-binary" in r.stderr
@@ -923,15 +937,17 @@ def test_zsh_resume_picker_shows_the_display_column_for_every_row(zsh, tmp_path)
     assert "rc=1" in r.stdout, r.stdout                        # esc in the picker → rc 1, nothing spawned
     rows = log.read_text().splitlines()
     assert len(rows) == 3, rows                                # the subagent thread adds no row
-    assert rows[0].split()[:4] == ["4", "claude", "●", "active"]   # the live slot pins to the top, agent named
+    assert rows[0].split()[:5] == ["4", "✱", "claude", "●", "active"]   # the live slot pins to the top, agent named
     dead = sorted(rows[1:])
-    assert dead[0].split()[:2] == ["3", "claude"] and dead[0].endswith("fix the login bug")
-    assert dead[1].split()[:2] == ["3", "codex"] and "Reply with exactly the word OK" in dead[1]
+    assert dead[0].split()[:3] == ["3", "✱", "claude"] and dead[0].endswith("fix the login bug")
+    assert dead[1].split()[:3] == ["3", "⬡", "codex"] and "Reply with exactly the word OK" in dead[1]
     assert not any(row.strip() in ("claude", "codex", "-") for row in rows)   # never a bare field
-    # the padded layout: slot right-aligned in 2, then the agent column padded to the
-    # widest agent, then the 14-wide date cell
+    # the padded layout: slot right-aligned in 2, then the `<icon> <name>` column padded
+    # to the widest agent, then the 14-wide date cell
     assert all(row.startswith(" 3  ") or row.startswith(" 4  ") for row in rows)
-    assert {row[4:10] for row in rows} == {"claude", "codex "}
+    assert {row[4:12] for row in rows} == {"✱ claude", "⬡ codex "}
+    # the fzf header spells the full legend — every supported tool, not just the ones on screen
+    assert (tmp_path / "fzf.log.header").read_text().startswith("✱ claude · ⬡ codex · ◆ cursor")
 
 
 def test_zsh_resume_pick_revives_the_row_with_its_own_agent(zsh, tmp_path):

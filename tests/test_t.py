@@ -950,36 +950,59 @@ def test_dev_url_ignores_a_non_numeric_trailing_segment(t_mod, monkeypatch, tmp_
 def test_slot_line_marks_and_columns(t_mod):
     st = t_mod.Style(tty=False)
     row = {"host": "local", "slot": "ff-3", "state": "attached", "context": "active", "summary": "x"}
-    assert t_mod._slot_line(row, st, 7, 20) == "● ✓     ff-3    x"
+    assert t_mod._slot_line(row, st, 7, 20) == "● ✓ ✱   ff-3    x"
     row = dict(row, state="detached", context="idle")
-    assert t_mod._slot_line(row, st, 7, 20) == "○       ff-3    x"
-    # a dead slot has no marks — its summary carries the story — and is truncated to avail
+    assert t_mod._slot_line(row, st, 7, 20) == "○   ✱   ff-3    x"
+    # a dead slot has no state marks — its summary carries the story — and is truncated to avail
     row = dict(row, state="dead", context="none", summary="a" * 30)
     line = t_mod._slot_line(row, st, 7, 20)
-    assert line.startswith("        ff-3    ") and line.endswith("…")
+    assert line.startswith("    ✱   ff-3    ") and line.endswith("…")
     assert len(line) == 8 + 7 + 1 + 20
     # the t ls -r HOST column; a local row leaves it blank
-    assert t_mod._slot_line(dict(row, host="mini"), st, 7, 20, host_w=4).startswith("        mini ff-3")
-    assert t_mod._slot_line(dict(row, host="local"), st, 7, 20, host_w=4).startswith(" " * 13 + "ff-3")
+    assert t_mod._slot_line(dict(row, host="mini"), st, 7, 20, host_w=4).startswith("    ✱   mini ff-3")
+    assert t_mod._slot_line(dict(row, host="local"), st, 7, 20, host_w=4).startswith("    ✱   " + " " * 5 + "ff-3")
 
 
 def test_slot_line_agent_glyph_keeps_the_status_width(t_mod):
     st = t_mod.Style(tty=False)
     row = {"host": "local", "slot": "ff-3", "state": "attached", "context": "active", "summary": "x"}
-    claude = t_mod._slot_line(dict(row, agent="claude"), st, 7, 20)
-    codex = t_mod._slot_line(dict(row, agent="codex"), st, 7, 20)
-    assert claude == "● ✓     ff-3    x"                 # unchanged for the default agent
-    assert codex == "● ✓ ⬡   ff-3    x"                 # third glyph, same 8-column budget
-    assert len(claude) == len(codex)
-    assert t_mod._slot_line(row, st, 7, 20) == claude   # no agent key at all = claude
+    lines = {a: t_mod._slot_line(dict(row, agent=a), st, 7, 20) for a in t_mod._INSTALL_AGENTS}
+    assert lines["claude"] == "● ✓ ✱   ff-3    x"       # every agent has its icon, claude too
+    assert lines["codex"] == "● ✓ ⬡   ff-3    x"        # third glyph, same 8-column budget
+    assert lines["cursor"] == "● ✓ ◆   ff-3    x"
+    assert len({len(v) for v in lines.values()}) == 1
+    assert t_mod._slot_line(row, st, 7, 20) == lines["claude"]   # no agent key at all = claude
+    assert t_mod._slot_line(dict(row, agent="gpt"), st, 7, 20) == "● ✓ ?   ff-3    x"
 
 
-def test_header_agent_legend_only_when_a_codex_row_is_shown(t_mod):
+def test_header_lists_every_agent_always(t_mod):
     st = t_mod.Style(tty=False)
-    assert "⬡" not in t_mod._header(st, "")
-    assert "⬡" not in t_mod._header(st, "", ["claude", "claude"])
-    h = t_mod._header(st, "/code/ff", ["claude", "codex"])
-    assert " · ⬡ codex" in h and "(repo: ff" in h
+    legend = t_mod._agent_legend()
+    assert legend == "✱ claude · ⬡ codex · ◆ cursor"
+    assert t_mod._header(st, "").endswith(" · " + legend)          # nothing on screen: still the full legend
+    h = t_mod._header(st, "/code/ff")
+    assert " · " + legend in h and "(repo: ff" in h
+
+
+def test_every_agent_has_a_distinct_single_column_glyph(t_mod):
+    """The rule a future agent must meet: an entry in _INSTALL_AGENTS carries a `glyph`
+    — one printable, single-column, non-wide character no other agent uses — and the
+    legend names every agent with it, in table order. Add an agent without one and
+    this refuses it; the zsh twin is pinned to this table in test_agent_seam.py."""
+    import unicodedata
+    glyphs = {}
+    for agent, spec in t_mod._INSTALL_AGENTS.items():
+        g = spec.get("glyph")
+        assert g and len(g) == 1 and not g.isspace() and g != "?", agent
+        assert unicodedata.east_asian_width(g) not in ("W", "F"), (agent, g)   # one terminal column
+        assert unicodedata.category(g)[0] not in ("C", "Z"), (agent, g)         # printable, not a control/space
+        glyphs[agent] = g
+    assert len(set(glyphs.values())) == len(glyphs), glyphs
+    assert tuple(t_mod._INSTALL_AGENTS) == t_mod.INSTALL_AGENTS
+    assert t_mod._agent_legend() == " · ".join(f"{glyphs[a]} {a}" for a in t_mod.INSTALL_AGENTS)
+    assert all(t_mod._agent_glyph(a) == g for a, g in glyphs.items()) and t_mod._agent_glyph("gpt") == "?"
+    # the parity matrix header (t -h, t install --status, README) names each agent with its icon
+    assert t_mod._agent_parity_render()[0].split()[1:] == [w for a in t_mod.INSTALL_AGENTS for w in (glyphs[a], a)]
 
 
 def test_slot_line_colours_only_through_the_style(t_mod):

@@ -898,6 +898,24 @@ def test_zsh_nosleep_net_floor_is_tunable(nosleep):
 
 
 
+def test_zsh_nosleep_lock_locks_then_sleeps_the_display(nosleep, tmp_path):
+    # lid close: lock the screen (SACLockScreenImmediate via python ctypes), THEN put the
+    # display to sleep — under disablesleep macOS leaves the panel lit behind a closed lid
+    # until the displaysleep timer. Both calls are stubbed: the real ones would lock and
+    # blank the developer's screen mid-test.
+    bins = tmp_path / "stubbin"
+    for name, tag in (("python3", ""), ("pmset", "pmset ")):
+        stub = bins / name
+        stub.write_text('#!/bin/bash\nprintf "%s%%s\\n" "$*" >> "$LOCK_LOG"\nexit 0\n' % tag)
+        stub.chmod(0o755)
+    log = tmp_path / "lock.log"
+    r = nosleep("_nosleep_lock", LOCK_LOG=str(log))
+    calls = log.read_text().splitlines()
+    assert len(calls) == 2 and "SACLockScreenImmediate" in calls[0]     # lock first …
+    assert calls[1] == "pmset displaysleepnow"                          # … then the display off
+    assert r.stdout.strip() == "nosleep: lid closed — screen locked, display off"
+
+
 def test_zsh_nosleep_lid_closed_only_when_macos_would_sleep_on_it(nosleep):
     # AppleClamshellCausesSleep is the kernel's own verdict (shouldSleepOnClamshellClosed:
     # No while an external display on power drives the Mac) and it ignores pmset

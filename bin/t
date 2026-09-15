@@ -322,18 +322,28 @@ def _scope_filter(rows, scope, wt_scope=""):
     return [r for r in rows if ok(r["cwd"])]
 
 
-AGENT_GLYPH = {"codex": "⬡"}   # the STATUS glyph per non-default agent; claude adds no noise
+# Every agent's ICON lives in _INSTALL_AGENTS (the one agent table, further down) as
+# its `glyph`; these two are how every view reads it. A future agent MUST carry one —
+# test_every_agent_has_a_distinct_single_column_glyph refuses the table without it —
+# and the legend lists EVERY agent, always, not just the non-default ones on screen
+# (a claude row used to carry no mark and the legend named only codex: "give an icon
+# and add every tool supported to the legend", 2026-09-14). The zsh twin
+# (_DEV_AGENT_GLYPH / _dev_agent_legend in .zshrc) is pinned equal to this table.
+def _agent_glyph(agent):
+    return _INSTALL_AGENTS.get(agent, {}).get("glyph", "?")
 
 
-def _header(st, scope, agents=()):
+def _agent_legend():
+    return " · ".join(f"{spec['glyph']} {a}" for a, spec in _INSTALL_AGENTS.items())
+
+
+def _header(st, scope):
     note = ""
     if scope:
         # Make the scoped repo prominent (bold cyan) — the rest of the note stays dim.
         repo = os.path.basename(scope)
         note = f"   {st.y}(repo: {st.r}{st.b}{st.c}{repo}{st.r}{st.y} — --all for all){st.r}"
-    # the agent legend appears only when a non-claude slot is on screen
-    legend = "".join(f" · {AGENT_GLYPH[a]} {a}" for a in AGENT_GLYPH if a in set(agents))
-    return f"dev sessions   {st.g}●{st.r} attached · {st.c}✓{st.r} active context{legend}{note}"
+    return f"dev sessions   {st.g}●{st.r} attached · {st.c}✓{st.r} active context · {_agent_legend()}{note}"
 
 
 def _ls_scope(cfg, repo, all_repos, cwd):
@@ -396,8 +406,8 @@ def _slot_line(r, st, name_w, avail, host_w=None):
     Style is the only colour, so Style(tty=False) yields a label a picker can measure."""
     amark = {"attached": f"{st.g}●{st.r}", "detached": "○"}.get(r.get("state"), " ")
     cmark = f"{st.c}✓{st.r}" if r.get("context") == "active" else " "
-    # third glyph = the agent, blank for claude: same 8-column STATUS budget as before
-    gmark = AGENT_GLYPH.get(r.get("agent", "claude"), " ")
+    # third glyph = the agent's icon (every agent has one — the header legend says which)
+    gmark = _agent_glyph(r.get("agent", "claude"))
     host = ""
     if host_w is not None:
         cell = "" if r.get("host", "local") == "local" else r["host"]
@@ -411,7 +421,7 @@ def _render_local(rows, scope, st, has_remote=False):
     avail = _columns() - 11 - name_w
     if avail < 12:
         avail = 80 - 11 - name_w
-    print(_header(st, scope, [r.get("agent") for r in rows]))
+    print(_header(st, scope))
     print()
     print(f"  {st.y}{'STATUS':<8}{'SESSION':<{name_w}} WORKING ON{st.r}")
     has_fg = False
@@ -434,7 +444,7 @@ def _render_remote(rows, scope, st):
     avail = _columns() - 12 - host_w - name_w
     if avail < 12:
         avail = 80 - 12 - host_w - name_w
-    print(_header(st, scope, [r.get("agent") for r in rows]))
+    print(_header(st, scope))
     print()
     print(f"  {st.y}{'STATUS':<8}{'HOST':<{host_w}} {'SESSION':<{name_w}} WORKING ON{st.r}")
     has_fg = False
@@ -2508,6 +2518,7 @@ _CURL_CURSOR = "curl https://cursor.com/install -fsS | bash"
 
 _INSTALL_AGENTS = {
     "claude": {
+        "glyph": "✱",
         "label": "Claude Code", "bin": "claude",
         "install": {"darwin": _CURL_CLAUDE, "linux": _CURL_CLAUDE},
         "login": ["claude", "auth", "login"],
@@ -2517,6 +2528,7 @@ _INSTALL_AGENTS = {
         "note": None,
     },
     "codex": {
+        "glyph": "⬡",
         "label": "Codex CLI (OpenAI)", "bin": "codex",
         # brew's cask on a Mac that has brew (updatable with brew upgrade --cask); the
         # vendor script everywhere else — no Node dependency on the Linux node
@@ -2530,6 +2542,7 @@ _INSTALL_AGENTS = {
                  "continue') — t doctor checks"),
     },
     "cursor": {
+        "glyph": "◆",
         "label": "Cursor CLI (cursor-agent)", "bin": "cursor-agent",
         "install": {"darwin": _CURL_CURSOR, "linux": _CURL_CURSOR},
         "login": ["cursor-agent", "login"],
@@ -3072,9 +3085,11 @@ _AGENT_PARITY = [
 def _agent_parity_render():
     """The matrix as aligned plain-text lines (no ANSI: it is embedded in README and
     argparse's epilog verbatim)."""
-    widths = [max(len(r[i]) for r in _AGENT_PARITY) for i in range(4)]
+    # the header names each agent with its icon — the same legend every slot view carries
+    rows = [tuple(_AGENT_PARITY[0][:1]) + tuple(f"{_agent_glyph(a)} {a}" for a in _AGENT_PARITY[0][1:])] + _AGENT_PARITY[1:]
+    widths = [max(len(r[i]) for r in rows) for i in range(4)]
     lines = []
-    for n, row in enumerate(_AGENT_PARITY):
+    for n, row in enumerate(rows):
         cells = [f"{c:<{widths[i]}}" for i, c in enumerate(row)]
         lines.append("  " + "  ".join(cells).rstrip())
         if n == 0:
@@ -3827,10 +3842,10 @@ def cmd_doctor(cfg, args):
     for a in INSTALL_AGENTS:
         p = facts_agents[a]
         if not p["version"]:
-            print("  %-8s missing — t install %s" % (a, a))
+            print("  %s %-8s missing — t install %s" % (_agent_glyph(a), a, a))
         else:
-            print("  %-8s %s · %s" % (a, p["version"], "logged in" if p["logged_in"]
-                                        else "NOT logged in — t install %s" % a))
+            print("  %s %-8s %s · %s" % (_agent_glyph(a), a, p["version"], "logged in" if p["logged_in"]
+                                           else "NOT logged in — t install %s" % a))
     codex_hook = codex_used = None
     if facts_agents["codex"]["version"] or os.path.isdir(os.path.join(HOME, ".codex")):
         codex_hook = _codex_hook_state(os.path.join(HOME, ".codex", "hooks.json"))
@@ -5261,9 +5276,9 @@ Run `t <verb> -h` for a verb's own flags.""")
             "its host) instead of resuming; naming a live slot explicitly always attaches. "
             "Worktree-per-session repos only (a shared tree's transcripts are "
             "ambiguous per-slot — use `t push -p` there). Agents: a claude conversation "
-            "and a codex thread are offered alike — every row names its agent in a column — "
-            "each revived by its own binary; a cursor chat has no dev slot — `t cursor ls` / "
-            "`t cursor resume <id>`.")
+            "and a codex thread are offered alike — every row carries its agent's icon and name "
+            f"({_agent_legend()}) — each revived by its own binary; a cursor chat has no dev slot "
+            "— `t cursor ls` / `t cursor resume <id>`.")
     sp.add_argument("repo", nargs="?", help="DEV_REPOS key; defaults to the repo your cwd is in")
     sp.add_argument("slot", nargs="?", help="slot number; a lone slot implies the cwd repo")
     sp.add_argument("-f", "--fg", action="store_true", help="resume inline in THIS terminal (no tmux slot)")

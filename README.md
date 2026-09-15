@@ -135,7 +135,7 @@ Not every verb supports every agent yet. The matrix below is **generated from
 support without the README saying so:
 
 ```text
-  surface                                                 claude                          codex                                                                 cursor
+  surface                                                 ✱ claude                        ⬡ codex                                                               ◆ cursor
   ------------------------------------------------------  ------------------------------  --------------------------------------------------------------------  -------------------------------------------------
   t install (install · login · update)                    ✓                               ✓                                                                     ✓
   dev slots: t open / ls / kill / read / paste            ✓                               ✓ t open --codex · DEV_AGENT                                          ✗ no slot — t cursor ls

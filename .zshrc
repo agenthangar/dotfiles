@@ -776,6 +776,22 @@ _dev_branch_for() { print -r -- "${DEV_BRANCHES[$1]:-$DEV_BRANCH}" }
 # the hook set.
 # _dev_agent_valid <name> — the closed set (a typo in DEV_AGENT must not launch `$a`).
 _dev_agent_valid() { case "$1" in claude|codex) return 0 ;; *) return 1 ;; esac }
+# _DEV_AGENTS / _DEV_AGENT_GLYPH — every agent the tooling supports, in legend order,
+# and each one's ICON: the twin of bin/t's _INSTALL_AGENTS glyphs, pinned equal by
+# test_zsh_agent_glyphs_match_bin_t — a new agent lands in BOTH tables with an icon,
+# or the suite refuses it. Wider than _dev_agent_valid on purpose: cursor never
+# occupies a slot, but every legend lists every supported tool. `t resume` rows show
+# `<icon> <name>`; `t ls` rows the icon alone under a header that spells the legend.
+typeset -ga _DEV_AGENTS=(claude codex cursor)
+typeset -gA _DEV_AGENT_GLYPH=( claude '✱' codex '⬡' cursor '◆' )
+# _dev_agent_glyph <agent> — its icon (`?` for anything outside the table).
+_dev_agent_glyph() { print -r -- "${_DEV_AGENT_GLYPH[$1]:-?}" }
+# _dev_agent_legend — `✱ claude · ⬡ codex · ◆ cursor`, the one legend every view prints.
+_dev_agent_legend() {
+  local a; local -a parts
+  for a in $_DEV_AGENTS; do parts+=("${_DEV_AGENT_GLYPH[$a]} $a"); done
+  print -r -- "${(j: · :)parts}"
+}
 # _dev_agent_for <repo> [override] — the agent a NEW slot of <repo> gets: the --codex /
 # --claude flag, else DEV_AGENT[repo], else DEV_AGENT_DEFAULT. Prints it; rc 1 + a
 # pointer at ~/.zshrc.local for anything outside the set.
@@ -4716,9 +4732,10 @@ _t_resume() {
   # appended here — fzf renders raw \t fields at literal tab stops (nothing
   # lines up), so both fzf and the no-fzf listing show the same pre-padded
   # gh-style row: [repo]  slot  agent  [origin]  date|●-where  title. The agent
-  # is a WORD column on every row (a ⬡ in the date cell was too easy to miss and
-  # needed a legend — "need to more clearly indicate which is claude, codex",
-  # 2026-09-14). fzf
+  # column is `<icon> <name>` on every row — a ⬡ in the date cell was too easy to
+  # miss ("need to more clearly indicate which is claude, codex"), and the icon
+  # is the same one `t ls` shows — under the full legend (_dev_agent_legend: every
+  # supported tool, always) on the fzf header and the listing's footer. fzf
   # renders it as --with-nth=-1 — the LAST field, the same rule as the listing's
   # `${c##*$'\t'}` — never a fixed index: when the agent field landed as column
   # 10, a hard-coded --with-nth=10 showed every dead row as the word `claude`
@@ -4738,12 +4755,13 @@ _t_resume() {
   for c in "${(@)cands}"; do
     f=("${(@ps:\t:)c}")
     [[ ${f[9]:-} != - && -n ${f[9]:-} ]] && (( ${#f[9]} > ow )) && ow=${#f[9]}
-    (( ${#f[10]} > aw )) && aw=${#f[10]}
+    (( ${#f[10]} + 2 > aw )) && aw=$(( ${#f[10]} + 2 ))   # `<icon> <name>`
   done
+  local legend; legend=$(_dev_agent_legend)
   for c in "${(@)cands}"; do
     f=("${(@ps:\t:)c}")
     org=${f[9]:-}; [[ $org == - ]] && org=
-    agent=${f[10]:-claude}
+    agent="${_DEV_AGENT_GLYPH[${f[10]:-claude}]:-?} ${f[10]:-claude}"
     if [[ -n $all_mode ]]; then
       if (( ow )); then
         cands[$i]+=$'\t'"$(printf '%-*s  %2s  %-*s  %-*s  %-14s  %s' "$rw" "$f[1]" "$f[2]" "$aw" "$agent" "$ow" "$org" "$f[5]" "$f[6]")"
@@ -4774,7 +4792,7 @@ _t_resume() {
     # still matches "fix bug").
     pick=$(print -rl -- "${(@)cands}" | fzf --multi --marker='✓' --bind 'space:toggle+down' \
       --delimiter=$'\t' --with-nth=-1 --no-hscroll \
-      --header='space marks ✓ — every mark revives, first attaches' --prompt="$fprompt") || return 1
+      --header="${legend}   ·   space marks ✓ — every mark revives, first attaches" --prompt="$fprompt") || return 1
     [[ -n $pick ]] || return 1
   elif [[ -n $slot ]]; then
     # Explicit slot but no TTY/fzf to pick with: the newest conversation IS the
@@ -4783,6 +4801,7 @@ _t_resume() {
     pick=${cands[1]}
     echo "Slot $slot has $#cands saved conversations — resuming the newest (run from a terminal to pick):" >&2
     for c in "${(@)cands}"; do echo "  ${c##*$'\t'}" >&2; done
+    echo "  $legend" >&2
   else
     if [[ -n $all_mode ]]; then
       echo "Several resumable conversations — name one (t resume <repo> <slot>):" >&2
@@ -4790,6 +4809,7 @@ _t_resume() {
       echo "Several resumable conversations for $repo — name one (t resume $repo <slot>):" >&2
     fi
     for c in "${(@)cands}"; do echo "  ${c##*$'\t'}" >&2; done
+    echo "  $legend" >&2
     return 1
   fi
   # Multi-pick (only the fzf branch can produce one — $pick then holds one row

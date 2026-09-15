@@ -878,10 +878,16 @@ try:
     c.execute('pragma busy_timeout=500')
     q = ("select id, rollout_path, cwd, coalesce(nullif(name,''), title, ''), updated_at "
          "from threads where archived=0 and ")
+    # A subagent thread (source = '{"subagent": {"thread_spawn": {"parent_thread_id": …}}}',
+    # title '') is a helper the parent spawned — codex's `<sid>/subagents/` — not a
+    # conversation: it copies the parent's brief as its first prompt, so listed as one it
+    # is the parent's row repeated once per helper (ff-35 showed four). An exact-id
+    # lookup stays unfiltered (a beam by id is deliberate).
+    sub = "instr(source, '\"subagent\"')=0 and "
     if mode == 'cwd':
-        rows = c.execute(q + "cwd=? order by updated_at desc", (arg,)).fetchall()
+        rows = c.execute(q + sub + "cwd=? order by updated_at desc", (arg,)).fetchall()
     elif mode == 'prefix':
-        rows = c.execute(q + "cwd like ? order by updated_at desc", (arg.replace('%', '') + '%',)).fetchall()
+        rows = c.execute(q + sub + "cwd like ? order by updated_at desc", (arg.replace('%', '') + '%',)).fetchall()
     else:
         rows = c.execute(q + "id=? order by updated_at desc", (arg,)).fetchall()
 except Exception:
@@ -948,15 +954,21 @@ for p in glob.glob(os.path.join(root, '*', '*', '*', 'rollout-*.jsonl')):
     try: st = os.stat(p)
     except OSError: continue
     k = known.get(p)
-    if not (isinstance(k, list) and len(k) == 2 and k[0] == st.st_ino):
-        cwd = ''
+    # entry = [inode, cwd, kind]; kind 'sub' marks a subagent thread's rollout (see
+    # _codex_threads) — a 2-element entry is from before that field and is re-read once
+    if not (isinstance(k, list) and len(k) == 3 and k[0] == st.st_ino):
+        cwd, kind = '', ''
         try:
             with open(p, 'rb') as fh: first = fh.readline(65536).decode('utf-8', 'replace')
             d = json.loads(first)
-            if d.get('type') == 'session_meta': cwd = (d.get('payload') or {}).get('cwd') or ''
+            if d.get('type') == 'session_meta':
+                pl = d.get('payload') or {}
+                cwd = pl.get('cwd') or ''
+                if pl.get('thread_source') == 'subagent' or isinstance(pl.get('source'), dict) and 'subagent' in pl['source']:
+                    kind = 'sub'
         except (OSError, ValueError, AttributeError): pass
-        known[p] = k = [st.st_ino, cwd]; changed = True
-    if k[1] == want: out.append((st.st_mtime, p))
+        known[p] = k = [st.st_ino, cwd, kind]; changed = True
+    if k[1] == want and not k[2]: out.append((st.st_mtime, p))
 if changed:
     try:
         os.makedirs(os.path.dirname(cache), exist_ok=True)
@@ -4711,7 +4723,7 @@ _t_resume() {
   # origin column only appears when some row has one (a single-machine setup
   # never sees it); all-repos mode adds the repo column. Both pad to the widest
   # value in this candidate set.
-  local pick c fprompt; local -a f
+  local pick c fprompt legend=; local -a f
   local rw=0 ow=0 i=1
   if [[ -n $all_mode ]]; then
     fprompt="resume (${days}d)> "
@@ -4722,6 +4734,9 @@ _t_resume() {
   for c in "${(@)cands}"; do
     f=("${(@ps:\t:)c}")
     [[ ${f[9]:-} != - && -n ${f[9]:-} ]] && (( ${#f[9]} > ow )) && ow=${#f[9]}
+    # the ⬡ in a codex row's date cell gets its legend (fzf header / listing footer)
+    # only when such a row is on screen — the `t ls` header rule
+    [[ ${f[10]:-} == codex ]] && legend=" · ⬡ codex"
   done
   for c in "${(@)cands}"; do
     f=("${(@ps:\t:)c}")
@@ -4756,7 +4771,7 @@ _t_resume() {
     # still matches "fix bug").
     pick=$(print -rl -- "${(@)cands}" | fzf --multi --marker='✓' --bind 'space:toggle+down' \
       --delimiter=$'\t' --with-nth=-1 --no-hscroll \
-      --header='space marks ✓ — every mark revives, first attaches' --prompt="$fprompt") || return 1
+      --header="space marks ✓ — every mark revives, first attaches${legend}" --prompt="$fprompt") || return 1
     [[ -n $pick ]] || return 1
   elif [[ -n $slot ]]; then
     # Explicit slot but no TTY/fzf to pick with: the newest conversation IS the
@@ -4765,6 +4780,7 @@ _t_resume() {
     pick=${cands[1]}
     echo "Slot $slot has $#cands saved conversations — resuming the newest (run from a terminal to pick):" >&2
     for c in "${(@)cands}"; do echo "  ${c##*$'\t'}" >&2; done
+    [[ -n $legend ]] && echo "  (⬡ = a codex thread)" >&2
   else
     if [[ -n $all_mode ]]; then
       echo "Several resumable conversations — name one (t resume <repo> <slot>):" >&2
@@ -4772,6 +4788,7 @@ _t_resume() {
       echo "Several resumable conversations for $repo — name one (t resume $repo <slot>):" >&2
     fi
     for c in "${(@)cands}"; do echo "  ${c##*$'\t'}" >&2; done
+    [[ -n $legend ]] && echo "  (⬡ = a codex thread)" >&2
     return 1
   fi
   # Multi-pick (only the fzf branch can produce one — $pick then holds one row

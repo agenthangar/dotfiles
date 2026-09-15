@@ -7,6 +7,17 @@
 # ~/.cursor/cli-config.json; everything else (WebFetch, mcp__, Skill, WebSearch, an
 # exact `Bash(cmd)`) is claude-only. `t permissions --show` prints the translations.
 #
+# ENV ASSIGNMENTS — `Bash(*=* node *)`: Claude strips a leading `NAME=value` only for
+# its built-in safe list (NODE_ENV, CI, TZ …), so `DATABASE_URL=… node …` needs a rule
+# that spells the assignment out (`*=*` = any variable, any value; SPACE spelling only —
+# the `:*` form of such a rule is accepted by Claude and never matches, and the lint
+# refuses it). Cursor gets it as a whole-line glob. Codex CANNOT take it: its parser
+# hands a script with an assignment (or a redirect) to the rules as one opaque token —
+# and the prompt such a script raises is the sandbox blocking the network, so the same
+# `dots` turns the codex workspace-write sandbox's network on (add-only,
+# ~/.codex/config.toml `[sandbox_workspace_write] network_access = true`; set it false
+# by hand to keep the sandbox offline — a hand-set value is never flipped).
+#
 # ADD-AND-RETIRE: deleting a rule here leaves it on every machine that already has it
 # (the merge never removes what it does not know). To take a rule back, MOVE it to
 # permissions.retire. `mcp__sessions` is not here: install_claude_mcp_allow owns it.
@@ -58,6 +69,17 @@ Bash(npx tailwindcss:*)
 Bash(npx tsc:*)
 Bash(npx vite:*)
 Bash(npx vitest:*)
+
+# node toolchain with a leading env assignment (`DATABASE_URL=… node …`,
+# `TEST_PG_PORT=… npm run test:db`) — see ENV ASSIGNMENTS above; claude + cursor only,
+# and the reason codex's sandbox goes online (2026-09-14)
+Bash(*=* node *)
+Bash(*=* npx tsx *)
+Bash(*=* npm run *)
+Bash(*=* npm start *)
+Bash(*=* npm test *)
+Bash(*=* npx vitest *)
+Bash(*=* npx playwright *)
 
 # system + package managers + processes
 Bash(brew install:*)

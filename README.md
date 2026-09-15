@@ -135,21 +135,21 @@ Not every verb supports every agent yet. The matrix below is **generated from
 support without the README saying so:
 
 ```text
-  surface                                                 claude                          codex                                            cursor
-  ------------------------------------------------------  ------------------------------  -----------------------------------------------  -------------------------------------------
-  t install (install · login · update)                    ✓                               ✓                                                ✓
-  dev slots: t open / ls / kill / read / paste            ✓                               ✓ t open --codex · DEV_AGENT                     ✗ no slot — t cursor ls
-  t push / t pop                                          ✓                               ✓                                                ✗ no slot
-  t resume (dead slots)                                   ✓                               ✓ (its sqlite thread index)                      → t cursor resume
-  t beam / --from (move a session)                        ✓                               ✓ (rollout + .origin)                            → t cursor [id] --host / --from
-  csync (iCloud union of transcripts)                     ✓ projects + plans              ✓ codex-sessions                                 ✓ cursor-chats
-  SessionStart stamps (registry · opened · origin)        ✓ settings.json hook            ✓ hooks.json (trust once at startup)             ✗ no hook wired
-  t plan                                                  ✓                               ✗ codex keeps no plan files (says so)            ✗
-  /tpush · /tpop slash commands                           ✓ ~/.claude/commands            ✓ ~/.codex/prompts                               ✗
-  t find / t mcp (transcript search)                      ✓                               ✗ claude transcripts only                        ✗
-  t doctor agent row (version · login · hook)             ✓                               ✓                                                ✓ version · login
-  permissions (agents/permissions.allow, synced by dots)  ✓ ~/.claude/settings.json       ✓ ~/.codex/rules/dotfiles.rules (Bash prefixes)  ✓ ~/.cursor/cli-config.json (Bash prefixes)
-  nosleep (hold sleep while an agent works)               ✓ caffeinate child · net bytes  ✓ net bytes                                      ✓ net bytes
+  surface                                                 claude                          codex                                                                 cursor
+  ------------------------------------------------------  ------------------------------  --------------------------------------------------------------------  -------------------------------------------------
+  t install (install · login · update)                    ✓                               ✓                                                                     ✓
+  dev slots: t open / ls / kill / read / paste            ✓                               ✓ t open --codex · DEV_AGENT                                          ✗ no slot — t cursor ls
+  t push / t pop                                          ✓                               ✓                                                                     ✗ no slot
+  t resume (dead slots)                                   ✓                               ✓ (its sqlite thread index)                                           → t cursor resume
+  t beam / --from (move a session)                        ✓                               ✓ (rollout + .origin)                                                 → t cursor [id] --host / --from
+  csync (iCloud union of transcripts)                     ✓ projects + plans              ✓ codex-sessions                                                      ✓ cursor-chats
+  SessionStart stamps (registry · opened · origin)        ✓ settings.json hook            ✓ hooks.json (trust once at startup)                                  ✗ no hook wired
+  t plan                                                  ✓                               ✗ codex keeps no plan files (says so)                                 ✗
+  /tpush · /tpop slash commands                           ✓ ~/.claude/commands            ✓ ~/.codex/prompts                                                    ✗
+  t find / t mcp (transcript search)                      ✓                               ✗ claude transcripts only                                             ✗
+  t doctor agent row (version · login · hook)             ✓                               ✓                                                                     ✓ version · login
+  permissions (agents/permissions.allow, synced by dots)  ✓ ~/.claude/settings.json       ✓ ~/.codex/rules/dotfiles.rules (argv prefixes) · sandbox network on  ✓ ~/.cursor/cli-config.json (argv + env prefixes)
+  nosleep (hold sleep while an agent works)               ✓ caffeinate child · net bytes  ✓ net bytes                                                           ✓ net bytes
 ```
 
 Codex needs one manual step after install: its SessionStart hook (the same
@@ -163,7 +163,16 @@ machine's agents get — Claude Code's rule syntax, one rule per line — and `d
 own config: `~/.claude/settings.json` verbatim, and every `Bash(<words>:*)` prefix
 rule as a `prefix_rule` in `~/.codex/rules/dotfiles.rules` and a `Shell(<words>)`
 in `~/.cursor/cli-config.json` (the rest — WebFetch, MCP tools, skills — is
-Claude-only). It is **add-and-retire**: deleting a rule from the list changes
+Claude-only). A rule with a leading env assignment — `Bash(*=* node *)`, needed
+because Claude strips a leading `NAME=value` only for its built-in safe list, so
+`DATABASE_URL=… node …` matches nothing else; space spelling only, the `:*` form
+of such a rule is accepted by Claude and never matches — reaches Claude and, as a
+whole-line glob, cursor. Codex cannot take it: its parser hands a script with an
+assignment (or a redirect) to the rules as one opaque token, and the prompt such a
+script raises is the sandbox blocking the network, so the same `dots` turns the
+codex workspace-write sandbox's network on (`[sandbox_workspace_write]
+network_access = true` in `~/.codex/config.toml`, add-only — set it false by hand
+to keep the sandbox offline). It is **add-and-retire**: deleting a rule from the list changes
 nothing anywhere; moving it to `agents/permissions.retire` removes it everywhere
 on the next `dots`. Hand-added rules, deny lists and the rest of each file are
 never touched. `t permissions` reports what is in sync and what is waiting,

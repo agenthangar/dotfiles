@@ -168,10 +168,12 @@ prview() {
 #
 # Blocks SYSTEM sleep via `pmset disablesleep 1` + a background caffeinate, while
 # the display still dims and sleeps on its own schedule (that is what locks the Mac
-# at a desk), and LOCKS the screen the moment the lid closes — with sleep disabled a
-# closed lid no longer sleeps, so it no longer locks either (not when docked to an
-# external display: macOS never slept on that lid close, so there is no lock to
-# replace, and the closed lid is simply how the Mac sits). It keeps holding only
+# at a desk), and LOCKS the screen and turns the display OFF the moment the lid
+# closes — with sleep disabled a closed lid no longer sleeps, so it no longer locks,
+# and the panel would stay lit behind the lid until the displaysleep timer; the Mac
+# keeps running throughout (not when docked to an external display: macOS never
+# slept on that lid close, so there is no lock to replace, and the closed lid is
+# simply how the Mac sits). It keeps holding only
 # while BOTH signals stay fresh: internet (an HTTPS exchange with
 # api.anthropic.com) and tokens burning — a local claude, codex or cursor-agent
 # mid-turn (Claude Code runs its own caffeinate while a turn is in flight; for
@@ -315,13 +317,21 @@ _nosleep_lid_closed() {
 }
 # _nosleep_lock — lock the screen now. SACLockScreenImmediate is the call behind the
 # Apple-menu Lock Screen item: instant, and it needs no Accessibility grant (the
-# ctrl-cmd-q keystroke route does). It is a private framework, so a failure falls
-# back to sleeping the display, which the screen-lock delay turns into a lock.
+# ctrl-cmd-q keystroke route does). It is a private framework; if the call fails, the
+# display sleep below still lands and the screen-lock delay turns it into a lock.
 _nosleep_lock() {
-  python3 -c 'import ctypes; ctypes.CDLL("/System/Library/PrivateFrameworks/login.framework/login").SACLockScreenImmediate()' 2>/dev/null \
-    || pmset displaysleepnow 2>/dev/null
+  python3 -c 'import ctypes; ctypes.CDLL("/System/Library/PrivateFrameworks/login.framework/login").SACLockScreenImmediate()' 2>/dev/null
+  # Then sleep the display: with sleep disabled a closed lid neither sleeps the Mac nor
+  # darkens its panel — the backlight stays lit behind the lid until pmset's displaysleep
+  # timer (10 min). displaysleepnow puts it to sleep at once while the Mac keeps running
+  # (caffeinate + the flag hold system sleep; opening the lid wakes the display). Lock
+  # first, so what the lid-open wake shows is the login window. No "is the panel lit?"
+  # re-check while closed: IOMobileFramebufferShim's CurrentPowerState reads 1 for the
+  # unconnected external ports too, so it tracks the driver, not the backlight — a mouse
+  # nudge that relights the panel behind the lid falls back to the timer.
+  pmset displaysleepnow 2>/dev/null
   [[ -t 1 ]] && printf '\r\e[K'                      # nosleep's status line leaves no newline
-  echo "nosleep: lid closed — screen locked"
+  echo "nosleep: lid closed — screen locked, display off"
 }
 # _nosleep_pmset_held — true while pmset's disablesleep flag is set (one ~10 ms read).
 # The flag is what keeps a CLOSED lid from sleeping the Mac; caffeinate alone holds

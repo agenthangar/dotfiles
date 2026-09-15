@@ -4464,10 +4464,10 @@ _t_resume() {
   fi
   remote_rows=$(print -r -- "$all_rows" | awk -F'\t' '$1 != "local"')
   # Local live titles, keyed by short session name (dev- prefix stripped).
-  local -A local_sum; local _lsn _lsum
-  while IFS=$'\t' read -r _lsn _lsum; do
-    [[ -n $_lsn ]] && local_sum[$_lsn]=$_lsum
-  done < <(print -r -- "$all_rows" | awk -F'\t' '$1 == "local" {print $4 "\t" $7}')
+  local -A local_sum local_agent; local _lsn _lsum _lag
+  while IFS=$'\t' read -r _lsn _lsum _lag; do
+    [[ -n $_lsn ]] && { local_sum[$_lsn]=$_lsum; local_agent[$_lsn]=${_lag:-claude}; }
+  done < <(print -r -- "$all_rows" | awk -F'\t' '$1 == "local" {print $4 "\t" $7 "\t" $8}')
 
   # Candidates: dead slots whose worktree project dir holds a transcript —
   # EVERY conversation in the slot, newest first, not just the newest .jsonl
@@ -4483,10 +4483,10 @@ _t_resume() {
   # does not redeclare, it PRINTS `x=value` (the `_ok=claw` junk-output bug).
   local -a cands slots tx
   local -a pending _mpaths _mrows _mf _PR_STALE
-  local -A remote_live_host remote_live_alias remote_live_sum
+  local -A remote_live_host remote_live_alias remote_live_sum remote_live_agent
   local -A meta_title meta_pr
   local _p _mr _mrest
-  local n wt sid busy rhost _rdir _rbase _rhost _rn _ralias _rsum _ok _stale stale_path agent _ag
+  local n wt sid busy rhost _rdir _rbase _rhost _rn _ralias _rsum _rag _ok _stale stale_path agent _ag
   local txf title when ep org orgf hf skipped=0 hidden_live=0
   local reopened opf opep REPLY
   local _rwtr=${DEV_WORKTREE_ROOT:-}
@@ -4509,16 +4509,16 @@ _t_resume() {
   done
   for repo in $repos; do
     _rdir=${DEV_REPOS[$repo]}; _rbase=${_rdir:t}
-    remote_live_host=(); remote_live_alias=(); remote_live_sum=()
+    remote_live_host=(); remote_live_alias=(); remote_live_sum=(); remote_live_agent=()
     if [[ -n $remote_rows ]]; then
-      while IFS=$'\t' read -r _rhost _rn _ralias _rsum; do
-        [[ -n $_rn ]] && { remote_live_host[$_rn]=$_rhost; remote_live_alias[$_rn]=$_ralias; remote_live_sum[$_rn]=$_rsum; }
+      while IFS=$'\t' read -r _rhost _rn _ralias _rsum _rag; do
+        [[ -n $_rn ]] && { remote_live_host[$_rn]=$_rhost; remote_live_alias[$_rn]=$_ralias; remote_live_sum[$_rn]=$_rsum; remote_live_agent[$_rn]=${_rag:-claude}; }
       done < <(print -r -- "$remote_rows" | awk -F'\t' -v d="$(_dev_homerel "$_rdir")" -v wtr="$(_dev_homerel "$_rwtr")" -v b="$_rbase" '
         { c=$3; sub(/^\/(Users|home)\/[^\/]+\//, "", c) }
         (c==d || (wtr != "" && b != "" && index(c, wtr "/" b "/") == 1)) {
           n = $4; sub(/^.*-/, "", n)
           r = $4; sub(/-[^-]+$/, "", r)
-          print $1 "\t" n "\t" r "\t" $7
+          print $1 "\t" n "\t" r "\t" $7 "\t" $8
         }')
     fi
     # Which slots to look at. NOT a fixed 1..20 range (which silently capped the
@@ -4548,7 +4548,7 @@ _t_resume() {
         # key (field 1, stripped after the global sort below): a live session is
         # "now", so the max sentinel pins it above every dead transcript.
         [[ -n $live_flag ]] || { (( hidden_live++ )); continue; }
-        cands+=(9999999999$'\t'"$repo"$'\t'"$n"$'\t'-$'\t'"$wt"$'\t'"● active"$'\t'"${local_sum[${busy#dev-}]:-(live session)}"$'\t'here$'\t'-$'\t'-$'\t'-)
+        cands+=(9999999999$'\t'"$repo"$'\t'"$n"$'\t'-$'\t'"$wt"$'\t'"● active"$'\t'"${local_sum[${busy#dev-}]:-(live session)}"$'\t'here$'\t'-$'\t'-$'\t'"${local_agent[${busy#dev-}]:-$(_dev_agent_of_session "$busy")}")
         continue
       fi
       # Remote-live: same treatment as local live (see the scan note above).
@@ -4560,7 +4560,7 @@ _t_resume() {
           return
         fi
         [[ -n $live_flag ]] || { (( hidden_live++ )); continue; }
-        cands+=(9999999999$'\t'"$repo"$'\t'"$n"$'\t'-$'\t'"$wt"$'\t'"● on $rhost"$'\t'"${remote_live_sum[$n]:-(live session)}"$'\t'"$rhost"$'\t'"${remote_live_alias[$n]}"$'\t'-$'\t'-)
+        cands+=(9999999999$'\t'"$repo"$'\t'"$n"$'\t'-$'\t'"$wt"$'\t'"● on $rhost"$'\t'"${remote_live_sum[$n]:-(live session)}"$'\t'"$rhost"$'\t'"${remote_live_alias[$n]}"$'\t'-$'\t'"${remote_live_agent[$n]:-claude}")
         continue
       fi
       # Name-only collision: a dev-<alias>-${n} tmux session (any alias keying
@@ -4589,7 +4589,7 @@ _t_resume() {
           return
         fi
         [[ -n $live_flag ]] || { (( hidden_live++ )); continue; }
-        cands+=(9999999999$'\t'"$repo"$'\t'"$n"$'\t'-$'\t'"${stale_path:-$wt}"$'\t'"● active"$'\t'"${local_sum[${_stale#dev-}]:-(live session)}"$'\t'here$'\t'-$'\t'-$'\t'-)
+        cands+=(9999999999$'\t'"$repo"$'\t'"$n"$'\t'-$'\t'"${stale_path:-$wt}"$'\t'"● active"$'\t'"${local_sum[${_stale#dev-}]:-(live session)}"$'\t'here$'\t'-$'\t'-$'\t'"${local_agent[${_stale#dev-}]:-$(_dev_agent_of_session "$_stale")}")
         continue
       fi
       # every conversation either agent recorded in this worktree: claude's project
@@ -4666,10 +4666,10 @@ _t_resume() {
       elif [[ -n ${host_alias[$org]:-} ]]; then org=${host_alias[$org]}
       fi
     fi
-    # a codex row is marked in its date cell (⬡ — the `t ls` glyph) so a picker with
-    # both agents says which binary each pick will run; field 4 is the real sid (the
-    # trailing uuid of a rollout filename), field 11 the agent for the spawn
-    _ag=$(_dev_transcript_agent "$txf"); [[ $_ag == codex ]] && when="⬡ $when"
+    # field 4 is the real sid (the trailing uuid of a rollout filename); the agent
+    # (field 11 here, 10 once the sort key is stripped) gets its own display column
+    # AND picks the binary a pick spawns
+    _ag=$(_dev_transcript_agent "$txf")
     cands+=("$ep"$'\t'"$repo"$'\t'"$n"$'\t'"$(_dev_transcript_sid "$txf")"$'\t'"$wt"$'\t'"$when"$'\t'"$title"$'\t'-$'\t'-$'\t'"${org[1,10]}"$'\t'"$_ag")
   done
   # ONE detached refresh for the whole scan, instead of a `gh pr view` child per
@@ -4709,12 +4709,16 @@ _t_resume() {
   # alias for a slot live on a $REMOTE_HOSTS
   # host (pick → attach in place, never a second owner); origin is the machine a
   # dead conversation LAST RAN on (`-`/empty = here or unstamped — live rows name
-  # their host in the ● label instead); agent is what a dead pick spawns (`-` on
-  # a live row — it attaches, nothing is spawned). EVERY row carries all ten,
-  # sentinelled, so the positional reads below never slide. One ALIGNED display
-  # column (11) is appended here — fzf renders raw \t fields at literal tab
-  # stops (nothing lines up), so both fzf and the no-fzf listing show the same
-  # pre-padded gh-style row: [repo]  slot  [origin]  date|●-where  title. fzf
+  # their host in the ● label instead); agent is the row's claude/codex — what a
+  # dead pick spawns, and what a live slot is running (from the live scan, else
+  # the session's own stamp). EVERY row carries all ten, sentinelled, so the
+  # positional reads below never slide. One ALIGNED display column (11) is
+  # appended here — fzf renders raw \t fields at literal tab stops (nothing
+  # lines up), so both fzf and the no-fzf listing show the same pre-padded
+  # gh-style row: [repo]  slot  agent  [origin]  date|●-where  title. The agent
+  # is a WORD column on every row (a ⬡ in the date cell was too easy to miss and
+  # needed a legend — "need to more clearly indicate which is claude, codex",
+  # 2026-09-14). fzf
   # renders it as --with-nth=-1 — the LAST field, the same rule as the listing's
   # `${c##*$'\t'}` — never a fixed index: when the agent field landed as column
   # 10, a hard-coded --with-nth=10 showed every dead row as the word `claude`
@@ -4723,8 +4727,8 @@ _t_resume() {
   # origin column only appears when some row has one (a single-machine setup
   # never sees it); all-repos mode adds the repo column. Both pad to the widest
   # value in this candidate set.
-  local pick c fprompt legend=; local -a f
-  local rw=0 ow=0 i=1
+  local pick c fprompt; local -a f
+  local rw=0 ow=0 aw=0 i=1
   if [[ -n $all_mode ]]; then
     fprompt="resume (${days}d)> "
     for c in "${(@)cands}"; do f=("${(@ps:\t:)c}"); (( ${#f[1]} > rw )) && rw=${#f[1]}; done
@@ -4734,24 +4738,23 @@ _t_resume() {
   for c in "${(@)cands}"; do
     f=("${(@ps:\t:)c}")
     [[ ${f[9]:-} != - && -n ${f[9]:-} ]] && (( ${#f[9]} > ow )) && ow=${#f[9]}
-    # the ⬡ in a codex row's date cell gets its legend (fzf header / listing footer)
-    # only when such a row is on screen — the `t ls` header rule
-    [[ ${f[10]:-} == codex ]] && legend=" · ⬡ codex"
+    (( ${#f[10]} > aw )) && aw=${#f[10]}
   done
   for c in "${(@)cands}"; do
     f=("${(@ps:\t:)c}")
     org=${f[9]:-}; [[ $org == - ]] && org=
+    agent=${f[10]:-claude}
     if [[ -n $all_mode ]]; then
       if (( ow )); then
-        cands[$i]+=$'\t'"$(printf '%-*s  %2s  %-*s  %-14s  %s' "$rw" "$f[1]" "$f[2]" "$ow" "$org" "$f[5]" "$f[6]")"
+        cands[$i]+=$'\t'"$(printf '%-*s  %2s  %-*s  %-*s  %-14s  %s' "$rw" "$f[1]" "$f[2]" "$aw" "$agent" "$ow" "$org" "$f[5]" "$f[6]")"
       else
-        cands[$i]+=$'\t'"$(printf '%-*s  %2s  %-14s  %s' "$rw" "$f[1]" "$f[2]" "$f[5]" "$f[6]")"
+        cands[$i]+=$'\t'"$(printf '%-*s  %2s  %-*s  %-14s  %s' "$rw" "$f[1]" "$f[2]" "$aw" "$agent" "$f[5]" "$f[6]")"
       fi
     else
       if (( ow )); then
-        cands[$i]+=$'\t'"$(printf '%2s  %-*s  %-14s  %s' "$f[2]" "$ow" "$org" "$f[5]" "$f[6]")"
+        cands[$i]+=$'\t'"$(printf '%2s  %-*s  %-*s  %-14s  %s' "$f[2]" "$aw" "$agent" "$ow" "$org" "$f[5]" "$f[6]")"
       else
-        cands[$i]+=$'\t'"$(printf '%2s  %-14s  %s' "$f[2]" "$f[5]" "$f[6]")"
+        cands[$i]+=$'\t'"$(printf '%2s  %-*s  %-14s  %s' "$f[2]" "$aw" "$agent" "$f[5]" "$f[6]")"
       fi
     fi
     (( i++ ))
@@ -4771,7 +4774,7 @@ _t_resume() {
     # still matches "fix bug").
     pick=$(print -rl -- "${(@)cands}" | fzf --multi --marker='✓' --bind 'space:toggle+down' \
       --delimiter=$'\t' --with-nth=-1 --no-hscroll \
-      --header="space marks ✓ — every mark revives, first attaches${legend}" --prompt="$fprompt") || return 1
+      --header='space marks ✓ — every mark revives, first attaches' --prompt="$fprompt") || return 1
     [[ -n $pick ]] || return 1
   elif [[ -n $slot ]]; then
     # Explicit slot but no TTY/fzf to pick with: the newest conversation IS the
@@ -4780,7 +4783,6 @@ _t_resume() {
     pick=${cands[1]}
     echo "Slot $slot has $#cands saved conversations — resuming the newest (run from a terminal to pick):" >&2
     for c in "${(@)cands}"; do echo "  ${c##*$'\t'}" >&2; done
-    [[ -n $legend ]] && echo "  (⬡ = a codex thread)" >&2
   else
     if [[ -n $all_mode ]]; then
       echo "Several resumable conversations — name one (t resume <repo> <slot>):" >&2
@@ -4788,7 +4790,6 @@ _t_resume() {
       echo "Several resumable conversations for $repo — name one (t resume $repo <slot>):" >&2
     fi
     for c in "${(@)cands}"; do echo "  ${c##*$'\t'}" >&2; done
-    [[ -n $legend ]] && echo "  (⬡ = a codex thread)" >&2
     return 1
   fi
   # Multi-pick (only the fzf branch can produce one — $pick then holds one row

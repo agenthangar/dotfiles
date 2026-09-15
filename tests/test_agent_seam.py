@@ -175,6 +175,9 @@ for a in sys.argv[1:]:
     elif a.startswith("--delimiter="): delim = a[len("--delimiter="):]
 i = int(nth)
 want = os.environ.get("FZF_PICK")
+for a in sys.argv[1:]:
+    if a.startswith("--header="):
+        with open(os.environ["FZF_LOG"] + ".header", "w") as hf: hf.write(a[len("--header="):])
 with open(os.environ["FZF_LOG"], "a") as log:
     for line in sys.stdin.read().splitlines():
         f = line.split(delim)
@@ -388,10 +391,20 @@ CREATE TABLE threads (id TEXT PRIMARY KEY, rollout_path TEXT NOT NULL, created_a
 """
 
 
-def _codex_home(zsh, threads):
+# what codex 0.154 records for a thread its parent spawned (index `source` column and
+# the rollout's session_meta.source alike); the parent's own source is the string 'cli'
+SUBAGENT_SOURCE = ('{"subagent":{"thread_spawn":{"parent_thread_id":"' + SID
+                   + '","depth":1,"agent_path":"/root/backend_audit","agent_nickname":"Newton","agent_role":null}}}')
+
+
+def _codex_home(zsh, threads, scan_cwd=False):
     """Materialise ~/.codex: a rollout per thread under sessions/YYYY/MM/DD plus a
     state_5.sqlite built from the real `threads` DDL. threads: [(sid, cwd, title,
-    updated_at, archived, name)]. Returns {sid: rollout path}."""
+    updated_at, archived, name[, source])] — source defaults to 'cli'; a subagent
+    spawn (SUBAGENT_SOURCE) is written into the index row AND the rollout's
+    session_meta the way codex 0.154 does. scan_cwd=True also stamps the thread's cwd
+    into its rollout's session_meta (the fixture carries a literal /Users/me path), so
+    _codex_rollout_scan sees it too. Returns {sid: rollout path}."""
     import sqlite3
     home = zsh.home
     day = home / ".codex" / "sessions" / "2026" / "09" / "09"
@@ -399,12 +412,19 @@ def _codex_home(zsh, threads):
     db = sqlite3.connect(str(home / ".codex" / "state_5.sqlite"))
     db.executescript(THREADS_DDL)
     paths = {}
-    for sid, cwd, title, upd, archived, name in threads:
+    for sid, cwd, title, upd, archived, name, *rest in threads:
+        source = rest[0] if rest else "cli"
         p = day / f"rollout-2026-09-09T22-20-09-{sid}.jsonl"
-        p.write_text(FIXTURE_ROLLOUT.read_text().replace(SID, sid))
+        text = FIXTURE_ROLLOUT.read_text().replace(SID, sid)
+        if scan_cwd:
+            text = text.replace("/Users/me/code/.worktrees/api/3", cwd)
+        if source != "cli":
+            assert text.count('"source": "cli"') == 1
+            text = text.replace('"source": "cli"', f'"source": {source}, "thread_source": "subagent"')
+        p.write_text(text)
         paths[sid] = p
         db.execute("insert into threads values (?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                   (sid, str(p), upd, upd, "cli", "openai", cwd, title, "ws", "on-request",
+                   (sid, str(p), upd, upd, source, "openai", cwd, title, "ws", "on-request",
                     archived, title, name))
     db.commit()
     db.close()
@@ -493,6 +513,30 @@ def test_zsh_meta_batch_titles_a_codex_rollout(zsh):
     (proj / "c1.jsonl").write_text('{"type":"user","message":{"content":"fix the login bug"}}\n')
     r = zsh(f"_transcript_meta_batch {proj / 'c1.jsonl'} {paths[SID]}")
     assert [ln.split("\t")[1] for ln in r.stdout.splitlines()] == ["fix the login bug", title]
+
+
+def test_zsh_codex_subagent_threads_are_not_conversations(zsh):
+    """A thread the parent spawned (`source` = a subagent JSON, empty title, the same
+    first prompt as the parent's brief) is codex's `<sid>/subagents/` — listed as a
+    conversation it repeated the parent's row once per helper (ff-35: four rows, one
+    thread). Both enumerators skip it; an exact-id lookup does not."""
+    wt = f"{zsh.home}/code/.worktrees/api/3"
+    sub = "aaaaaaaa-0000-0000-0000-00000000000b"
+    paths = _codex_home(zsh, [(SID, wt, "the parent", 100, 0, None),
+                              (sub, wt, "", 200, 0, None, SUBAGENT_SOURCE)], scan_cwd=True)
+    assert zsh(f"_codex_threads_for_cwd {wt}").stdout.splitlines()[0].startswith(SID)
+    assert sub not in zsh(f"_codex_threads_for_cwd {wt}").stdout
+    assert sub not in zsh(f"_codex_threads prefix {zsh.home}/code/.worktrees/api/").stdout
+    assert zsh(f"_codex_rollout_scan {wt}").stdout.splitlines() == [str(paths[SID])]
+    assert zsh(f"_dev_agent_transcripts_for_cwd codex {wt}").stdout.splitlines() == [str(paths[SID])]
+    assert zsh(f"_dev_repo_slots api").stdout.split() == ["3"]
+    assert sub in zsh(f"_codex_thread_lookup {sub}").stdout            # by id: still found
+    # a cache the OLD scan wrote (2-element entries, subagents listed) is re-read, not trusted
+    cache = zsh.home / ".cache" / "claude-sessions" / "rollout-cwd.json"
+    ino = paths[sub].stat().st_ino
+    cache.write_text(json.dumps({str(paths[sub]): [ino, wt], str(paths[SID]): [paths[SID].stat().st_ino, wt]}))
+    assert zsh(f"_codex_rollout_scan {wt}").stdout.splitlines() == [str(paths[SID])]
+    assert json.loads(cache.read_text())[str(paths[sub])] == [ino, wt, "sub"]
 
 
 def test_zsh_self_sid_and_agent(zsh, tmp_path):
@@ -871,13 +915,15 @@ def test_zsh_resume_picker_shows_the_display_column_for_every_row(zsh, tmp_path)
     proj = zsh.home / ".claude" / "projects" / re.sub(r"[^A-Za-z0-9]", "-", wt3)
     proj.mkdir(parents=True)
     (proj / "c1.jsonl").write_text('{"type":"user","message":{"content":"fix the login bug"}}\n')
-    _codex_home(zsh, [(SID, wt3, "t", 100, 0, None)])
+    _codex_home(zsh, [(SID, wt3, "t", 100, 0, None),
+                      ("aaaaaaaa-0000-0000-0000-00000000000b", wt3, "", 200, 0, None, SUBAGENT_SOURCE)])
     log = tmp_path / "fzf.log"
     r = zsh("_t_resume api --live; echo rc=$?", _tty=True, FZF_LOG=str(log),
             FAKE_SESSIONS="dev-api-4", FAKE_SESSION_PATH=f"{zsh.home}/code/.worktrees/api/4")
     assert "rc=1" in r.stdout, r.stdout                        # esc in the picker → rc 1, nothing spawned
     rows = log.read_text().splitlines()
-    assert len(rows) == 3, rows
+    assert len(rows) == 3, rows                                # the subagent thread adds no row
+    assert (tmp_path / "fzf.log.header").read_text().endswith(" · ⬡ codex")   # the glyph's legend
     assert rows[0].split()[:3] == ["4", "●", "active"]         # the live slot pins to the top
     dead = sorted(rows[1:])
     assert dead[0].split()[0] == "3" and dead[0].endswith("fix the login bug")

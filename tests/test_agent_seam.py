@@ -900,8 +900,8 @@ def test_zsh_nosleep_lid_closed_only_when_macos_would_sleep_on_it(nosleep):
 
 def test_zsh_resume_picker_shows_the_display_column_for_every_row(zsh, tmp_path):
     """What fzf DISPLAYS for each `t resume` row is the padded display column — slot,
-    date (⬡-marked for codex), title — for a dead claude conversation, a dead codex
-    thread and a live slot alike. The column is the LAST tab field and the picker must
+    agent (the word: claude / codex), date, title — for a dead claude conversation, a
+    dead codex thread and a live slot alike. The column is the LAST tab field and the picker must
     render it as such (--with-nth=-1): when the agent field landed as a 10th column, a
     hard-coded --with-nth=10 showed every dead row as the bare word `claude` — and a
     query matched nothing else — which is "t resume shows no session info"
@@ -923,14 +923,15 @@ def test_zsh_resume_picker_shows_the_display_column_for_every_row(zsh, tmp_path)
     assert "rc=1" in r.stdout, r.stdout                        # esc in the picker → rc 1, nothing spawned
     rows = log.read_text().splitlines()
     assert len(rows) == 3, rows                                # the subagent thread adds no row
-    assert (tmp_path / "fzf.log.header").read_text().endswith(" · ⬡ codex")   # the glyph's legend
-    assert rows[0].split()[:3] == ["4", "●", "active"]         # the live slot pins to the top
+    assert rows[0].split()[:4] == ["4", "claude", "●", "active"]   # the live slot pins to the top, agent named
     dead = sorted(rows[1:])
-    assert dead[0].split()[0] == "3" and dead[0].endswith("fix the login bug")
-    assert dead[1].split()[:2] == ["3", "⬡"] and "Reply with exactly the word OK" in dead[1]
+    assert dead[0].split()[:2] == ["3", "claude"] and dead[0].endswith("fix the login bug")
+    assert dead[1].split()[:2] == ["3", "codex"] and "Reply with exactly the word OK" in dead[1]
     assert not any(row.strip() in ("claude", "codex", "-") for row in rows)   # never a bare field
-    # the padded layout: slot right-aligned in 2, then the 14-wide date cell
+    # the padded layout: slot right-aligned in 2, then the agent column padded to the
+    # widest agent, then the 14-wide date cell
     assert all(row.startswith(" 3  ") or row.startswith(" 4  ") for row in rows)
+    assert {row[4:10] for row in rows} == {"claude", "codex "}
 
 
 def test_zsh_resume_pick_revives_the_row_with_its_own_agent(zsh, tmp_path):

@@ -5261,8 +5261,9 @@ Run `t <verb> -h` for a verb's own flags.""")
             "its host) instead of resuming; naming a live slot explicitly always attaches. "
             "Worktree-per-session repos only (a shared tree's transcripts are "
             "ambiguous per-slot — use `t push -p` there). Agents: a claude conversation "
-            "and a codex thread (⬡ in its date cell) are offered alike, each revived by its "
-            "own binary; a cursor chat has no dev slot — `t cursor ls` / `t cursor resume <id>`.")
+            "and a codex thread are offered alike — every row names its agent in a column — "
+            "each revived by its own binary; a cursor chat has no dev slot — `t cursor ls` / "
+            "`t cursor resume <id>`.")
     sp.add_argument("repo", nargs="?", help="DEV_REPOS key; defaults to the repo your cwd is in")
     sp.add_argument("slot", nargs="?", help="slot number; a lone slot implies the cwd repo")
     sp.add_argument("-f", "--fg", action="store_true", help="resume inline in THIS terminal (no tmux slot)")

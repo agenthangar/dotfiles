@@ -40,6 +40,7 @@ def test_perm_parse_drops_comments_blanks_and_duplicates(t_mod):
     ("Bash(xxd)", None),                      # exact command: a prefix would widen it
     ("Bash(git commit -m ':*)", None),        # a quote: shell syntax
     ("Bash(PORT=3000 npm start:*)", None),    # env assignment, not an argv
+    ("Bash(DATABASE_URL=* node *)", None),     # env assignment: cursor + claude only
     ("Bash(find . -name *.ts:*)", None),      # glob
     ("Bash(echo $HOME:*)", None),
     ("Bash(cat a | b:*)", None),
@@ -55,13 +56,61 @@ def test_perm_bash_prefix(t_mod, rule, prefix):
     assert t_mod._perm_bash_prefix(rule) == prefix
 
 
+@pytest.mark.parametrize("rule,parsed", [
+    ("Bash(gh pr:*)", ([], ["gh", "pr"])),
+    ("Bash(DATABASE_URL=* node *)", ([("DATABASE_URL", "*")], ["node"])),
+    ("Bash(DATABASE_URL=* node:*)", None),     # the `:*` spelling: Claude accepts it, never matches it
+    ("Bash(*=* node:*)", None),
+    ("Bash(*=* npm run *)", ([("*", "*")], ["npm", "run"])),          # any variable
+    ("Bash(PORT=3000 npm start *)", ([("PORT", "3000")], ["npm", "start"])),
+    ("Bash(A=1 B=* npm run *)", ([("A", "1"), ("B", "*")], ["npm", "run"])),
+    ("Bash(A=$X node *)", None),               # an expansion in the value
+    ("Bash(A=b:c node *)", None),              # a colon: cursor splits its pattern on it
+    ("Bash(A='x y' node *)", None),            # a quote
+    ("Bash(DATABASE_URL=* *)", None),          # an assignment with no command after it
+    ("Bash(DATABASE_URL=*:*)", None),
+    ("Bash(DATABASE_URL=* node)", None),       # exact, not a prefix rule
+    ("Bash(1A=x node *)", None),               # not a variable name
+    ("Bash(xxd)", None),
+    ("WebSearch", None),
+])
+def test_perm_bash_rule(t_mod, rule, parsed):
+    assert t_mod._perm_bash_rule(rule) == parsed
+
+
 def test_perm_translate_per_agent(t_mod):
-    rules = ["Bash(awk *)", "Bash(awk:*)", "Bash(gh pr:*)", "Bash(xxd)", "WebSearch", "mcp__x__y"]
+    rules = ["Bash(awk *)", "Bash(awk:*)", "Bash(gh pr:*)", "Bash(xxd)", "WebSearch", "mcp__x__y",
+             "Bash(DATABASE_URL=* node *)", "Bash(*=* node *)", "Bash(PORT=3000 npm start *)"]
     assert t_mod._perm_translate(rules, "claude") == rules
+    # codex: argv prefixes only — an assignment is one opaque token to its rules
     assert t_mod._perm_translate(rules, "codex") == [
         'prefix_rule(pattern=["awk"], decision="allow")',
         'prefix_rule(pattern=["gh", "pr"], decision="allow")']
-    assert t_mod._perm_translate(rules, "cursor") == ["Shell(awk)", "Shell(gh pr)"]
+    # cursor: the assignment rides along as a whole-line glob, never the `:*` spelling
+    assert t_mod._perm_translate(rules, "cursor") == [
+        "Shell(awk)", "Shell(gh pr)", "Shell(DATABASE_URL=* node *)", "Shell(*=* node *)",
+        "Shell(PORT=3000 npm start *)"]
+
+
+def test_perm_lint_refuses_the_colon_spelling_of_an_env_rule(t_mod):
+    assert t_mod._perm_lint(["Bash(gh pr:*)", "Bash(*=* node *)", "Bash(xxd)", "WebSearch"]) == []
+    bad = t_mod._perm_lint(["Bash(DATABASE_URL=* node:*)", "Bash(*=* npm run:*)"])
+    assert [r for r, _ in bad] == ["Bash(DATABASE_URL=* node:*)", "Bash(*=* npm run:*)"]
+    assert "Bash(DATABASE_URL=* node *)" in bad[0][1] and "Bash(*=* npm run *)" in bad[1][1]
+
+
+def test_perm_cursor_rule_is_what_its_matcher_takes():
+    """cursor's matchGlob (2026.02 bundle): `^` + escaped pattern with `\\*` → `.*` + `$`
+    over the full command text; a plain prefix is startsWith('<words> ')."""
+    import re
+
+    def match_glob(pattern, text):
+        return re.match("^%s$" % re.escape(pattern.strip()).replace(r"\*", ".*"), text) is not None
+    g = "DATABASE_URL=* node *"
+    assert match_glob(g, "DATABASE_URL=postgres://u:p@localhost:55435/db node node_modules/vitest/vitest.mjs run x")
+    assert match_glob(g, "DATABASE_URL='' node -e 1")
+    assert not match_glob(g, "node -e 1") and not match_glob(g, "DATABASE_URL=x npm test")
+    assert match_glob("*=* node *", "TEST_PG_PORT=55433 node x") and not match_glob("*=* node *", "node x")
 
 
 def test_perm_codex_file_is_header_plus_rules(t_mod):
@@ -155,6 +204,91 @@ def test_perm_codex_sync(t_mod, tmp_path):
     assert 'pattern=["gh", "pr"]' not in p.read_text()
 
 
+@pytest.mark.parametrize("have,expect", [
+    ("", "append"),
+    ('model = "gpt-6"\n', "append"),
+    ('model = "gpt-6"', "append"),                                            # no trailing newline
+    ('[sandbox_workspace_write]\nwritable_roots = []\n\n[foo]\na = 1\n', "insert"),
+    ('[sandbox_workspace_write]  # hi\nnetwork_access = false\n', None),   # hand-set: never flipped
+    ('[sandbox_workspace_write]\nnetwork_access = true\n', None),
+    ('sandbox_workspace_write = { network_access = true }\n', None),        # inline table
+    ('sandbox_workspace_write.network_access = false\n', None),             # dotted
+    ('[profiles.x]\nnetwork_access = true\n', None),                       # any spelling anywhere: skip
+])
+def test_perm_codex_network_plan(t_mod, have, expect):
+    out = t_mod._perm_codex_network_plan(have)
+    if expect is None:
+        assert out is None
+        return
+    tomllib = pytest.importorskip("tomllib")
+    data = tomllib.loads(out)
+    assert data["sandbox_workspace_write"]["network_access"] is True
+    assert out.count("network_access") == 1 and out.endswith("\n")
+    if expect == "insert":
+        assert data["sandbox_workspace_write"]["writable_roots"] == [] and data["foo"]["a"] == 1
+        assert out.index("network_access") < out.index("writable_roots")
+    else:
+        assert out.startswith(have.rstrip("\n")) and "[sandbox_workspace_write]\nnetwork_access = true" in out
+        if have:
+            assert tomllib.loads(have) == {k: v for k, v in data.items() if k != "sandbox_workspace_write"}
+
+
+def test_perm_codex_network_sync(t_mod, tmp_path):
+    p = tmp_path / ".codex" / "config.toml"
+    rep = t_mod._perm_codex_network_sync(str(p))
+    assert rep["state"] == "pending" and not p.exists()
+    assert rep["add"] == ["config.toml: [sandbox_workspace_write] network_access = true"]
+    rep = t_mod._perm_codex_network_sync(str(p), apply=True)
+    assert rep["state"] == "applied" and "network_access = true" in p.read_text()
+    assert t_mod._perm_codex_network_sync(str(p), apply=True) == {"state": "synced", "add": []}
+    p.write_text('[sandbox_workspace_write]\nnetwork_access = false\n')
+    assert t_mod._perm_codex_network_sync(str(p), apply=True)["state"] == "synced"
+    assert p.read_text() == '[sandbox_workspace_write]\nnetwork_access = false\n'
+    p.write_bytes(b"\xff\xfe not text")
+    assert t_mod._perm_codex_network_sync(str(p), apply=True)["state"] is None
+    assert p.read_bytes() == b"\xff\xfe not text"
+
+
+def test_perm_codex_network_sync_never_writes_what_would_not_parse(t_mod, tmp_path, monkeypatch):
+    p = tmp_path / "config.toml"
+    p.write_text('model = "gpt-6"\n')
+    monkeypatch.setattr(t_mod, "_perm_toml_ok", lambda text: False)
+    rep = t_mod._perm_codex_network_sync(str(p), apply=True)
+    assert rep == {"state": None, "add": []} and p.read_text() == 'model = "gpt-6"\n'
+
+
+def test_perm_toml_ok(t_mod):
+    assert t_mod._perm_toml_ok('a = 1\n')
+    tomllib = pytest.importorskip("tomllib")
+    assert not t_mod._perm_toml_ok('a = 1\na = 2\n')
+
+
+def test_perm_sync_codex_carries_the_network_line(t_mod, tmp_path):
+    home = tmp_path
+    (home / ".codex").mkdir()
+    (home / ".codex" / "config.toml").write_text('model = "gpt-6"\n')
+    reps = t_mod._perm_sync(str(home), ALLOW, RETIRE, which=lambda n: None)
+    rep = reps["codex"]
+    assert rep["state"] == "pending" and rep["network"] == "pending"
+    assert rep["add"][-1] == "config.toml: [sandbox_workspace_write] network_access = true"
+    assert "3 to add" in t_mod._perm_line("codex", rep) and t_mod._perm_short("codex", rep) == "codex 3 to add, 0 to retire"
+    reps = t_mod._perm_sync(str(home), ALLOW, RETIRE, apply=True, which=lambda n: None)
+    assert reps["codex"]["state"] == "applied" and reps["codex"]["network"] == "applied"
+    assert (home / ".codex" / "config.toml").read_text().startswith('model = "gpt-6"\n')
+    assert "network_access = true" in (home / ".codex" / "config.toml").read_text()
+    reps = t_mod._perm_sync(str(home), ALLOW, RETIRE, which=lambda n: None)
+    assert reps["codex"]["state"] == "synced" and reps["codex"]["network"] == "synced"
+    # rules in sync, only the network line waiting → still a pending codex
+    (home / ".codex" / "config.toml").write_text('model = "gpt-6"\n')
+    rep = t_mod._perm_sync(str(home), ALLOW, RETIRE, which=lambda n: None)["codex"]
+    assert rep["state"] == "pending" and rep["add"] == ["config.toml: [sandbox_workspace_write] network_access = true"]
+    # an unreadable config.toml is said, and the rules half still syncs
+    (home / ".codex" / "config.toml").write_bytes(b"\xff\xfe")
+    rep = t_mod._perm_sync(str(home), ALLOW, RETIRE, apply=True, which=lambda n: None)["codex"]
+    assert rep["state"] == "synced" and rep["network"] is None
+    assert "config.toml unreadable" in t_mod._perm_line("codex", rep)
+
+
 def test_perm_targets_gating(t_mod, tmp_path):
     home = tmp_path
     none = lambda name: None
@@ -214,8 +348,9 @@ def test_shipped_lists_are_well_formed(t_mod):
         for bad in ("/Users/", "/home/", "/root/", "/tmp/", "\n"):
             assert bad not in r, r
         if r.startswith("Bash("):
-            # every Bash rule is a prefix rule, so it reaches codex and cursor too
-            assert t_mod._perm_bash_prefix(r), r
+            # every Bash rule is a prefix rule, so it reaches cursor too (and codex,
+            # unless it carries an env assignment — those are opaque to codex's rules)
+            assert t_mod._perm_bash_rule(r), r
         # the blanket mcp__sessions rule has its own seed (install_claude_mcp_allow),
         # and per-tool rules would read to it as a hand-narrowing
         assert not r.startswith("mcp__sessions"), r
@@ -227,6 +362,14 @@ def test_shipped_lists_are_well_formed(t_mod):
     # "tidy" cannot quietly drop them
     for r in ("Bash(bash:*)", "Bash(python3:*)", "Bash(node:*)", "Bash(curl:*)", "Bash(claude:*)"):
         assert r in allow
+    # the env-prefixed node toolchain (2026-09-14): any variable, space spelling, so it
+    # reaches claude (verified matching on 2.1.271) and cursor; never the `:*` spelling
+    assert t_mod._perm_lint(allow + retire) == []
+    for r in ("Bash(*=* node *)", "Bash(*=* npm run *)", "Bash(*=* npm test *)", "Bash(*=* npx vitest *)"):
+        assert r in allow, r
+        assert t_mod._perm_bash_rule(r)[0] == [("*", "*")]
+    assert "Shell(*=* node *)" in t_mod._perm_translate(allow, "cursor")
+    assert not any('"*=*"' in c for c in t_mod._perm_translate(allow, "codex"))
 
 
 @pytest.mark.skipif(not shutil.which("codex"), reason="codex CLI not installed")
@@ -342,9 +485,14 @@ def test_links_only_seeds_codex_rules_for_a_real_codex_home(t_mod, box):
     r = relink(co, home)
     assert r.returncode == 0, r.stderr
     assert "permissions: codex — added" in r.stdout
+    assert "permissions: codex — sandbox network on" in r.stdout
     allow, _ = t_mod._perm_lists(str(REPO_ROOT))
     assert (home / ".codex" / "rules" / "dotfiles.rules").read_text() == t_mod._perm_codex_file(allow)
+    # the same dots turned the workspace-write sandbox's network on, add-only
+    cfg = (home / ".codex" / "config.toml").read_text()
+    assert cfg.startswith('model = "gpt-6"\n') and "[sandbox_workspace_write]\nnetwork_access = true" in cfg
     assert "permissions:" not in relink(co, home).stdout
+    assert (home / ".codex" / "config.toml").read_text() == cfg
 
 
 def test_links_only_merges_cursor_config_and_keeps_its_login(box):

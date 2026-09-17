@@ -365,6 +365,29 @@ def test_lines_cover_every_state(t_mod):
         # quiet (the dots path) says only what it changed
         assert (t_mod._trust_line("claude", rep, quiet=True) is not None) == (st == "applied")
     assert "NOT trusted: /code/api" in t_mod._trust_line("codex", {"path": "/x", "state": "pending", "add": ["/code/api"], "want": 1})
+    # the already-trusted repos are NAMED next to the missing ones — a line that listed
+    # only the missing read as "the repos being trusted", with dotfiles apparently left out
+    rep = {"path": "/x", "state": "pending", "add": ["/code/new"], "have": ["/code/dotfiles", "/code/ff"], "want": 3}
+    assert t_mod._trust_line("codex", rep) == "⬡ codex   NOT trusted: /code/new — t trust · already: /code/dotfiles, /code/ff"
+    rep = {"path": "/x", "state": "synced", "add": [], "have": ["/code/dotfiles"], "want": 1}
+    assert t_mod._trust_line("claude", rep) == "✱ claude  already trusted: /code/dotfiles"
+    rep = {"path": "/x", "state": "applied", "add": ["/code/new"], "have": ["/code/dotfiles"], "want": 2}
+    assert t_mod._trust_line("claude", rep, quiet=True) == "✱ claude  trusted /code/new · already: /code/dotfiles"
+
+
+def test_sync_reports_what_was_already_trusted(t_mod, tmp_path):
+    home = _home(tmp_path, cursor=False)
+    old, new = _repo(tmp_path / "code" / "dotfiles"), _repo(tmp_path / "code" / "new")
+    t_mod._trust_sync(str(home), t_mod._trust_records([str(old)]), apply=True, which=NONE)
+    reps = t_mod._trust_sync(str(home), t_mod._trust_records([str(old), str(new)]), which=NONE)
+    for a in ("claude", "codex"):
+        assert reps[a]["state"] == "pending"
+        assert [os.path.realpath(p) for p in reps[a]["add"]] == [os.path.realpath(str(new))]
+        assert [os.path.realpath(p) for p in reps[a]["have"]] == [os.path.realpath(str(old))]
+        assert "dotfiles" in t_mod._trust_line(a, reps[a]) and "new" in t_mod._trust_line(a, reps[a])
+    assert reps["cursor"] == {"state": "absent", "add": [], "have": [], "path": None, "want": 2}
+    reps = t_mod._trust_sync(str(home), t_mod._trust_records([str(old), str(new)]), apply=True, which=NONE)
+    assert len(reps["claude"]["have"]) == 1 and reps["claude"]["state"] == "applied"
 
 
 def _args(**kw):

@@ -4245,8 +4245,11 @@ def _trust_targets(home, which=shutil.which):
 
 
 def _trust_sync(home, recs, apply=False, which=shutil.which):
-    """{agent: {"path", "state", "add", "want"}} — state "absent" for an agent that is
-    not on this machine; want = how many paths this agent is asked about."""
+    """{agent: {"path", "state", "add", "have", "want"}} — state "absent" for an agent
+    that is not on this machine; add = the paths still to trust, have = the ones it
+    trusted BEFORE this call (a report that named only the missing ones read as "the
+    repos being trusted", and dotfiles — trusted long ago — looked left out);
+    want = how many paths this agent is asked about."""
     targets = _trust_targets(home, which)
     out = {}
     for agent in INSTALL_AGENTS:
@@ -4259,17 +4262,22 @@ def _trust_sync(home, recs, apply=False, which=shutil.which):
             rep = _trust_codex_sync(path, paths, apply)
         else:
             rep = _trust_cursor_sync(path, paths, home, apply)
-        rep.update(path=path, want=len(paths))
+        known = rep["state"] in ("synced", "pending", "applied")
+        rep.update(path=path, want=len(paths),
+                   have=[p for p in paths if p not in rep["add"]] if known else [])
         out[agent] = rep
     return out
 
 
 def _trust_line(agent, rep, quiet=False):
-    """One line per agent; None when quiet and nothing changed (the dots path)."""
+    """One line per agent; None when quiet and nothing changed (the dots path). The
+    already-trusted repos are always named next to the missing ones, so "is X in
+    there?" answers itself from the line."""
     st, n = rep["state"], len(rep["add"])
     names = ", ".join(_tilde(p) for p in rep["add"])
+    have = ", ".join(_tilde(p) for p in rep.get("have") or [])
     if st == "applied":
-        text = "trusted %s" % names
+        text = "trusted %s" % names + (" · already: %s" % have if have else "")
     elif quiet:
         return None
     elif st == "absent":
@@ -4280,10 +4288,10 @@ def _trust_line(agent, rep, quiet=False):
         text = "a running claude is writing ~/%s — re-run t trust" % _TRUST_CLAUDE
     elif st is None:
         text = "%s unreadable or not the expected shape — left alone" % _tilde(rep["path"])
-    elif st == "synced":
-        text = "already trusted" + (" (%d)" % rep["want"] if rep["want"] > 1 else "")
+    elif st == "synced" or not n:
+        text = "already trusted" + (": %s" % have if have else "")
     else:
-        text = "NOT trusted: %s — t trust" % names if n else "already trusted"
+        text = "NOT trusted: %s — t trust" % names + (" · already: %s" % have if have else "")
     return "%s %-7s %s" % (_agent_glyph(agent), agent, text)
 
 

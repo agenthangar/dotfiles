@@ -497,34 +497,41 @@ def _bridge(home, repos):
     (d / "config.sh").write_text("".join("DEV_REPOS[%s]=%s\n" % (k, v) for k, v in repos.items()))
 
 
+def _relink(co, home, **extra):
+    # bin/t finds the config bridge through $XDG_CONFIG_HOME when it is set — and a
+    # GitHub runner sets it, so an unpinned sandbox run read the RUNNER's config dir,
+    # found no repos, and trusted nothing (green locally, red in CI)
+    return relink(co, home, XDG_CONFIG_HOME=str(home / ".config"), **extra)
+
+
 def test_links_only_trusts_every_registered_repo(box, tmp_path):
     co, home = box
     api = _repo(tmp_path / "code" / "api")
     _bridge(home, {"api": str(api), "dot": str(co)})
-    r = relink(co, home)
+    r = _relink(co, home)
     assert r.returncode == 0, r.stderr
     assert "trust:" not in r.stdout                       # no agent has run here yet: nothing to write
     assert not (home / ".claude.json").exists()
     (home / ".claude.json").write_text(json.dumps({"projects": {}}))
     (home / ".codex" / "config.toml").write_text('model = "gpt-6"\n')
-    r = relink(co, home)
+    r = _relink(co, home)
     assert r.returncode == 0, r.stderr
     assert "trust: ✱ claude  trusted" in r.stdout and "trust: ⬡ codex   trusted" in r.stdout
     projects = json.loads((home / ".claude.json").read_text())["projects"]
     trusted = {os.path.realpath(k) for k, v in projects.items() if v.get("hasTrustDialogAccepted")}
     assert trusted == {os.path.realpath(str(api)), os.path.realpath(str(co))}
     assert 'trust_level = "trusted"' in (home / ".codex" / "config.toml").read_text()
-    assert "trust:" not in relink(co, home).stdout        # silent once in sync
+    assert "trust:" not in _relink(co, home).stdout        # silent once in sync
 
 
 def test_links_only_trust_opt_out_and_stub_bin_t(box, tmp_path):
     co, home = box
     _bridge(home, {"dot": str(co)})
     (home / ".claude.json").write_text(json.dumps({"projects": {}}))
-    r = relink(co, home, DOTFILES_NO_TRUST="1")
+    r = _relink(co, home, DOTFILES_NO_TRUST="1")
     assert r.returncode == 0 and json.loads((home / ".claude.json").read_text()) == {"projects": {}}
     (co / "bin" / "t").write_text("#!/usr/bin/env python3\nraise SystemExit(3)\n")   # an older checkout
-    r = relink(co, home)
+    r = _relink(co, home)
     assert r.returncode == 0, r.stderr
     assert json.loads((home / ".claude.json").read_text()) == {"projects": {}}
 

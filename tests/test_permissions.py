@@ -267,26 +267,156 @@ def test_perm_sync_codex_carries_the_network_line(t_mod, tmp_path):
     home = tmp_path
     (home / ".codex").mkdir()
     (home / ".codex" / "config.toml").write_text('model = "gpt-6"\n')
-    reps = t_mod._perm_sync(str(home), ALLOW, RETIRE, which=lambda n: None)
+    reps = t_mod._perm_sync(str(home), ALLOW, RETIRE, which=lambda n: None, modes=False)
     rep = reps["codex"]
     assert rep["state"] == "pending" and rep["network"] == "pending"
     assert rep["add"][-1] == "config.toml: [sandbox_workspace_write] network_access = true"
     assert "3 to add" in t_mod._perm_line("codex", rep) and t_mod._perm_short("codex", rep) == "codex 3 to add, 0 to retire"
-    reps = t_mod._perm_sync(str(home), ALLOW, RETIRE, apply=True, which=lambda n: None)
+    reps = t_mod._perm_sync(str(home), ALLOW, RETIRE, apply=True, which=lambda n: None, modes=False)
     assert reps["codex"]["state"] == "applied" and reps["codex"]["network"] == "applied"
     assert (home / ".codex" / "config.toml").read_text().startswith('model = "gpt-6"\n')
     assert "network_access = true" in (home / ".codex" / "config.toml").read_text()
-    reps = t_mod._perm_sync(str(home), ALLOW, RETIRE, which=lambda n: None)
+    reps = t_mod._perm_sync(str(home), ALLOW, RETIRE, which=lambda n: None, modes=False)
     assert reps["codex"]["state"] == "synced" and reps["codex"]["network"] == "synced"
     # rules in sync, only the network line waiting → still a pending codex
     (home / ".codex" / "config.toml").write_text('model = "gpt-6"\n')
-    rep = t_mod._perm_sync(str(home), ALLOW, RETIRE, which=lambda n: None)["codex"]
+    rep = t_mod._perm_sync(str(home), ALLOW, RETIRE, which=lambda n: None, modes=False)["codex"]
     assert rep["state"] == "pending" and rep["add"] == ["config.toml: [sandbox_workspace_write] network_access = true"]
     # an unreadable config.toml is said, and the rules half still syncs
     (home / ".codex" / "config.toml").write_bytes(b"\xff\xfe")
-    rep = t_mod._perm_sync(str(home), ALLOW, RETIRE, apply=True, which=lambda n: None)["codex"]
+    rep = t_mod._perm_sync(str(home), ALLOW, RETIRE, apply=True, which=lambda n: None, modes=False)["codex"]
     assert rep["state"] == "synced" and rep["network"] is None
     assert "config.toml unreadable" in t_mod._perm_line("codex", rep)
+
+
+# ─── default permission mode: claude auto · codex full access ───────────────────
+
+@pytest.mark.parametrize("data,seeds", [
+    ({"permissions": {"allow": []}}, True),
+    ({"permissions": {"allow": [], "defaultMode": "default"}}, False),      # a choice, even the stock one
+    ({"permissions": {"allow": [], "defaultMode": "plan"}}, False),
+    ({"permissions": {"allow": [], "disableAutoMode": "disable"}}, False),
+    ({"permissions": {"allow": []}, "disableAutoMode": "disable"}, False),
+    ({"permissions": []}, False),
+    ({}, False),                                                            # _perm_json_sync makes the key first
+])
+def test_perm_claude_mode_plan(t_mod, data, seeds):
+    assert t_mod._perm_claude_mode_plan(data) is seeds
+
+
+def test_perm_json_sync_seeds_claudes_default_mode_once(t_mod, tmp_path):
+    p = tmp_path / "settings.json"
+    p.write_text(json.dumps({"model": "fable", "permissions": {"allow": list(ALLOW)}}))
+    rep = t_mod._perm_json_sync(str(p), ALLOW, [], mode="auto")
+    assert rep["state"] == "pending" and rep["mode"] == "pending"
+    assert rep["add"] == ['settings.json: permissions.defaultMode = "auto"']
+    rep = t_mod._perm_json_sync(str(p), ALLOW, [], apply=True, mode="auto")
+    assert rep["state"] == "applied" and rep["mode"] == "applied"
+    data = json.loads(p.read_text())
+    # the pair Claude's own opt-in dialog leaves behind; everything else untouched
+    assert data["permissions"]["defaultMode"] == "auto" and data["skipAutoPermissionPrompt"] is True
+    assert data["model"] == "fable" and data["permissions"]["allow"] == ALLOW
+    rep = t_mod._perm_json_sync(str(p), ALLOW, [], apply=True, mode="auto")
+    assert rep["state"] == "synced" and rep["mode"] == "synced" and rep["add"] == []
+    # switched by hand afterwards → never flipped back
+    data["permissions"]["defaultMode"] = "default"
+    p.write_text(json.dumps(data))
+    assert t_mod._perm_json_sync(str(p), ALLOW, [], apply=True, mode="auto")["state"] == "synced"
+    assert json.loads(p.read_text())["permissions"]["defaultMode"] == "default"
+    # cursor's file (mode=None) never grows the key
+    assert "mode" not in t_mod._perm_json_sync(str(p), ALLOW, [])
+
+
+CODEX_MODE = 'approval_policy = "never"'
+
+
+@pytest.mark.parametrize("have", [
+    'approval_policy = "on-request"\n',
+    'sandbox_mode = "workspace-write"\n',
+    'default_permissions = "mine"\n',
+    '[profiles.safe]\nsandbox_mode = "read-only"\n',          # a profile's counts: over-skip
+    'model = "x"\n  approval_policy="never"\n',
+])
+def test_perm_codex_mode_plan_leaves_a_named_mode_alone(t_mod, have):
+    assert t_mod._perm_codex_mode_plan(have) is None
+
+
+def test_perm_codex_mode_plan_lands_above_the_first_table(t_mod):
+    plan = t_mod._perm_codex_mode_plan
+    out = plan("")
+    assert out.startswith(CODEX_MODE) and out.endswith('sandbox_mode = "danger-full-access"\n')
+    assert plan('model = "x"').startswith('model = "x"\napproval_policy')         # no trailing newline
+    have = 'model = "x"\n\n# about the sandbox\n[sandbox_workspace_write]\nnetwork_access = true\n'
+    out = plan(have)
+    lines = out.split("\n")
+    # top-level keys must precede the first table — and its comment stays on it
+    assert lines.index('sandbox_mode = "danger-full-access"') < lines.index("# about the sandbox")
+    assert lines.index("# about the sandbox") + 1 == lines.index("[sandbox_workspace_write]")
+    assert plan(out) is None                                                       # idempotent
+    tomllib = pytest.importorskip("tomllib")
+    data = tomllib.loads(out)
+    assert data["approval_policy"] == "never" and data["sandbox_mode"] == "danger-full-access"
+    assert data["sandbox_workspace_write"] == {"network_access": True} and data["model"] == "x"
+    data = tomllib.loads(plan("[a]\nb = 1\n"))                                     # a header on line 1
+    assert data["approval_policy"] == "never" and data["a"] == {"b": 1}
+
+
+def test_perm_codex_mode_sync(t_mod, tmp_path, monkeypatch):
+    p = tmp_path / "config.toml"
+    rep = t_mod._perm_codex_mode_sync(str(p))
+    assert rep["state"] == "pending" and rep["add"] == [
+        'config.toml: approval_policy = "never" · sandbox_mode = "danger-full-access"']
+    assert t_mod._perm_codex_mode_sync(str(p), apply=True)["state"] == "applied"
+    assert t_mod._perm_codex_mode_sync(str(p), apply=True) == {"state": "synced", "add": []}
+    p.write_bytes(b"\xff\xfe")
+    assert t_mod._perm_codex_mode_sync(str(p), apply=True) == {"state": None, "add": []}
+    p.write_text('model = "x"\n')
+    monkeypatch.setattr(t_mod, "_perm_toml_ok", lambda text: False)                # would not parse → untouched
+    assert t_mod._perm_codex_mode_sync(str(p), apply=True) == {"state": None, "add": []}
+    assert p.read_text() == 'model = "x"\n'
+
+
+def test_perm_sync_seeds_both_default_modes_and_can_be_told_not_to(t_mod, tmp_path):
+    home = tmp_path
+    (home / ".claude").mkdir()
+    (home / ".claude" / "settings.json").write_text(json.dumps({"permissions": {"allow": list(ALLOW)}}))
+    (home / ".codex").mkdir()
+    (home / ".codex" / "config.toml").write_text('model = "gpt-6"\n')
+    off = t_mod._perm_sync(str(home), ALLOW, RETIRE, which=lambda n: None, modes=False)
+    assert "mode" not in off["claude"] and "mode" not in off["codex"] and off["claude"]["state"] == "synced"
+    reps = t_mod._perm_sync(str(home), ALLOW, RETIRE, apply=True, which=lambda n: None)
+    assert reps["claude"]["mode"] == "applied" and reps["codex"]["mode"] == "applied"
+    assert json.loads((home / ".claude" / "settings.json").read_text())["permissions"]["defaultMode"] == "auto"
+    toml = (home / ".codex" / "config.toml").read_text()
+    # both halves of the one file landed: the mode above the table the network line made
+    assert toml.index(CODEX_MODE) < toml.index("[sandbox_workspace_write]") and toml.startswith('model = "gpt-6"\n')
+    reps = t_mod._perm_sync(str(home), ALLOW, RETIRE, which=lambda n: None)
+    assert {a: r["state"] for a, r in reps.items()} == {"claude": "synced", "codex": "synced", "cursor": "absent"}
+
+
+def test_cmd_permissions_apply_says_which_mode_it_seeded(t_mod, tmp_path, monkeypatch, capsys):
+    import argparse
+    home = tmp_path
+    (home / ".claude").mkdir()
+    (home / ".claude" / "settings.json").write_text(json.dumps({"permissions": {"allow": []}}))
+    (home / ".codex").mkdir()
+    (home / ".codex" / "config.toml").write_text("")
+    monkeypatch.setattr(t_mod, "HOME", str(home))
+    monkeypatch.setattr(t_mod, "_perm_root", lambda: str(REPO_ROOT))
+    monkeypatch.setenv("DOTFILES_NO_AGENT_MODES", "1")
+    ns = argparse.Namespace(apply=True, show=False)
+    assert t_mod.cmd_permissions(None, ns) == 0
+    assert "default mode" not in capsys.readouterr().out
+    assert "defaultMode" not in (home / ".claude" / "settings.json").read_text()
+    monkeypatch.delenv("DOTFILES_NO_AGENT_MODES")
+    assert t_mod.cmd_permissions(None, ns) == 0
+    out = capsys.readouterr().out
+    assert 'permissions: claude — default mode: permissions.defaultMode = "auto"' in out
+    assert "permissions: codex — default mode: approval_policy" in out
+    assert "added 0" not in out                  # the rules landed on the first run; only the modes now
+    assert t_mod.cmd_permissions(None, ns) == 0 and capsys.readouterr().out == ""
+    assert t_mod.cmd_permissions(None, argparse.Namespace(apply=False, show=True)) == 0
+    assert "DOTFILES_NO_AGENT_MODES=1 opts out" in capsys.readouterr().out
 
 
 def test_perm_targets_gating(t_mod, tmp_path):
@@ -314,13 +444,13 @@ def test_perm_sync_reports_every_agent(t_mod, tmp_path):
     (home / ".claude" / "settings.json").write_text(json.dumps({"permissions": {"allow": []}}))
     (home / ".cursor").mkdir()
     (home / ".cursor" / "cli-config.json").write_text(json.dumps({"permissions": {"allow": ["Shell(ls)"]}}))
-    reps = t_mod._perm_sync(str(home), ALLOW, RETIRE, which=lambda n: None)
+    reps = t_mod._perm_sync(str(home), ALLOW, RETIRE, which=lambda n: None, modes=False)
     assert reps["codex"]["state"] == "absent" and reps["codex"]["path"] is None
     assert reps["claude"]["state"] == "pending" and reps["claude"]["add"] == ALLOW
     assert reps["cursor"]["state"] == "pending" and reps["cursor"]["add"] == ["Shell(gh pr)", "Shell(npx playwright)"]
-    reps = t_mod._perm_sync(str(home), ALLOW, RETIRE, apply=True, which=lambda n: None)
+    reps = t_mod._perm_sync(str(home), ALLOW, RETIRE, apply=True, which=lambda n: None, modes=False)
     assert {a: r["state"] for a, r in reps.items()} == {"claude": "applied", "codex": "absent", "cursor": "applied"}
-    reps = t_mod._perm_sync(str(home), ALLOW, RETIRE, which=lambda n: None)
+    reps = t_mod._perm_sync(str(home), ALLOW, RETIRE, which=lambda n: None, modes=False)
     assert {a: r["state"] for a, r in reps.items()} == {"claude": "synced", "codex": "absent", "cursor": "synced"}
     assert "3 to add" not in t_mod._perm_line("claude", reps["claude"])
     assert t_mod._perm_short("codex", reps["codex"]) == "codex not installed"

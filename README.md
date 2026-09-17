@@ -19,7 +19,8 @@ shim in `.zshrc` for verbs that must run in your shell).
 | `t push` / `t pop` | Move a session between a foreground terminal and a detached tmux slot — one-live-owner guarantee |
 | `t beam <repo> [slot] --host <h>` | Teleport a running session to another machine; pull one back with `t open … --here` |
 | `t find <query>` | Semantic search across saved sessions ("which one was working on X?"), reranked by Claude |
-| `t install [agent…]` | Install and log in the agent CLIs — Claude Code, Codex, Cursor — on this machine and every remote host, `t setup`-style: one checklist with the present entries locked, the vendors' commands shown before anything runs ([details](#agents)) |
+| `t install [agent…]` | Install and log in the agent CLIs — Claude Code, Codex, Cursor — on this machine and every remote host, `t setup`-style: one checklist with the present entries locked, the vendors' commands shown before anything runs; `--reinstall` runs an installer again for an agent already here; ends by opening `t setup` when `~/code` holds repos not registered yet ([details](#agents)) |
+| `t trust [dir…]` | Trust a folder in every installed agent at once — Claude Code, Codex, Cursor each keep their own "do you trust this folder?" answer. Bare: the repo you are standing in. Every registered repo is trusted by default (`dots` runs `t trust --all`) |
 | `t new [name]` | Wizard: create `~/code/<name>` + a GitHub repo (owner picked from your orgs; squash-only, auto-merge), register it here and clone + register it on every remote host. Re-running resumes; on an existing repo it just finishes the wiring |
 | `t mcp` | The `sessions` MCP server Claude Code spawns, so any Claude session can answer "which session is/was working on X?" from every saved transcript and the live slots. `--install` registers it (`dots` does), `--call <tool> '<json>'` runs one tool by hand |
 
@@ -113,7 +114,30 @@ each one's login command — device-code variants over ssh. It is a checklist li
 `t setup`: installed and logged-in entries are locked under a ✓, the rest are
 pre-marked, and the review screen shows the exact commands before `y` runs any.
 `t install --status` prints this machine's state; `t doctor` reports an agent that
-is installed but not logged in.
+is installed but not logged in. An installed agent is a locked row, so running its
+installer again is its own `reinstall <agent>` row under OPTIONS — `t install codex
+--reinstall` pre-marks it — and it goes back through the door the binary came in by
+(`npm install -g`, `brew reinstall --cask`, or the vendor script): the vendor script
+run over an npm install leaves two binaries and lets `PATH` pick. A run that changes
+anything ends with a **sync** — what `dots` does for an agent that is here: codex's
+hook, the allow list and default permission mode below, and trust for every
+registered repo — and then, when `~/code` holds git repos `DEV_REPOS` does not know
+yet, opens `t setup` (under `-y` it only names it), so a fresh machine goes
+`install.sh` → `t install` → registered, trusted repos in one sitting.
+
+**Folders are trusted up front.** Each agent asks "do you trust this folder?" once
+per folder and keeps the answer in its own store; `t trust` writes it for all three —
+`~/.claude.json` (`projects[dir].hasTrustDialogAccepted`, the key Claude's own error
+text tells you to set), `~/.codex/config.toml` (`[projects."dir"] trust_level =
+"trusted"`), and cursor-agent's `~/.cursor/projects/<slug>/.workspace-trusted`
+marker. Claude and Codex both key trust on the **canonical repo** — a git worktree
+resolves to its main checkout, while a trusted *parent* directory covers nothing
+beneath it — so one entry per repo covers every per-session worktree. Every
+registered repo is trusted by default: `dots` runs `t trust --all -q`, and `t setup`,
+`t new` and `t install` trust what they register (on the remote hosts too). Add-only
+(an explicit Codex `untrusted` is never flipped), `$HOME` and anything above it is
+refused, `t trust --status` reports without writing, `t doctor` carries the same
+line, and `DOTFILES_NO_TRUST=1` opts a machine out of the automatic paths.
 
 A dev slot runs either agent: `t open <repo> --codex` starts Codex CLI in a fresh
 slot (`--claude` forces Claude), `DEV_AGENT[repo]=codex` in `~/.zshrc.local` makes
@@ -135,21 +159,23 @@ Not every verb supports every agent yet. The matrix below is **generated from
 support without the README saying so:
 
 ```text
-  surface                                                 ✱ claude                        ⬡ codex                                                               ◆ cursor
-  ------------------------------------------------------  ------------------------------  --------------------------------------------------------------------  -------------------------------------------------
-  t install (install · login · update)                    ✓                               ✓                                                                     ✓
-  dev slots: t open / ls / kill / read / paste            ✓                               ✓ t open --codex · DEV_AGENT                                          ✗ no slot — t cursor ls
-  t push / t pop                                          ✓                               ✓                                                                     ✗ no slot
-  t resume (dead slots)                                   ✓                               ✓ (its sqlite thread index)                                           → t cursor resume
-  t beam / --from (move a session)                        ✓                               ✓ (rollout + .origin)                                                 → t cursor [id] --host / --from
-  csync (iCloud union of transcripts)                     ✓ projects + plans              ✓ codex-sessions                                                      ✓ cursor-chats
-  SessionStart stamps (registry · opened · origin)        ✓ settings.json hook            ✓ hooks.json (trust once at startup)                                  ✗ no hook wired
-  t plan                                                  ✓                               ✗ codex keeps no plan files (says so)                                 ✗
-  /tpush · /tpop slash commands                           ✓ ~/.claude/commands            ✓ ~/.codex/prompts                                                    ✗
-  t find / t mcp (transcript search)                      ✓                               ✗ claude transcripts only                                             ✗
-  t doctor agent row (version · login · hook)             ✓                               ✓                                                                     ✓ version · login
-  permissions (agents/permissions.allow, synced by dots)  ✓ ~/.claude/settings.json       ✓ ~/.codex/rules/dotfiles.rules (argv prefixes) · sandbox network on  ✓ ~/.cursor/cli-config.json (argv + env prefixes)
-  nosleep (hold sleep while an agent works)               ✓ caffeinate child · net bytes  ✓ net bytes                                                           ✓ net bytes
+  surface                                                      ✱ claude                          ⬡ codex                                                               ◆ cursor
+  -----------------------------------------------------------  --------------------------------  --------------------------------------------------------------------  -------------------------------------------------
+  t install (install · login · update · reinstall)             ✓                                 ✓                                                                     ✓
+  dev slots: t open / ls / kill / read / paste                 ✓                                 ✓ t open --codex · DEV_AGENT                                          ✗ no slot — t cursor ls
+  t push / t pop                                               ✓                                 ✓                                                                     ✗ no slot
+  t resume (dead slots)                                        ✓                                 ✓ (its sqlite thread index)                                           → t cursor resume
+  t beam / --from (move a session)                             ✓                                 ✓ (rollout + .origin)                                                 → t cursor [id] --host / --from
+  csync (iCloud union of transcripts)                          ✓ projects + plans                ✓ codex-sessions                                                      ✓ cursor-chats
+  SessionStart stamps (registry · opened · origin)             ✓ settings.json hook              ✓ hooks.json (trust once at startup)                                  ✗ no hook wired
+  t plan                                                       ✓                                 ✗ codex keeps no plan files (says so)                                 ✗
+  /tpush · /tpop slash commands                                ✓ ~/.claude/commands              ✓ ~/.codex/prompts                                                    ✗
+  t find / t mcp (transcript search)                           ✓                                 ✗ claude transcripts only                                             ✗
+  t doctor agent row (version · login · hook)                  ✓                                 ✓                                                                     ✓ version · login
+  permissions (agents/permissions.allow, synced by dots)       ✓ ~/.claude/settings.json         ✓ ~/.codex/rules/dotfiles.rules (argv prefixes) · sandbox network on  ✓ ~/.cursor/cli-config.json (argv + env prefixes)
+  default permission mode (seeded when the config names none)  ✓ auto (permissions.defaultMode)  ✓ full access (approval never · danger-full-access)                   ✗ left as cursor-agent set it
+  t trust (folder trust · every registered repo on dots)       ✓ ~/.claude.json projects         ✓ ~/.codex/config.toml [projects]                                     ✓ ~/.cursor/projects/<slug> marker
+  nosleep (hold sleep while an agent works)                    ✓ caffeinate child · net bytes    ✓ net bytes                                                           ✓ net bytes
 ```
 
 Codex needs one manual step after install: its SessionStart hook (the same
@@ -175,7 +201,16 @@ network_access = true` in `~/.codex/config.toml`, add-only — set it false by h
 to keep the sandbox offline). It is **add-and-retire**: deleting a rule from the list changes
 nothing anywhere; moving it to `agents/permissions.retire` removes it everywhere
 on the next `dots`. Hand-added rules, deny lists and the rest of each file are
-never touched. `t permissions` reports what is in sync and what is waiting,
+never touched. The same step seeds each agent's **default permission mode** where
+its config names none: Claude Code's auto mode (`permissions.defaultMode = "auto"`,
+with the `skipAutoPermissionPrompt` its opt-in dialog would write) and Codex's Full
+Access preset (`approval_policy = "never"` + `sandbox_mode = "danger-full-access"`,
+the pair its `/permissions` picker writes). A mode you chose yourself — any mode — is
+never changed, `DOTFILES_NO_AGENT_MODES=1` opts a machine out, and Cursor's is left
+as cursor-agent set it. Full access means Codex runs commands unsandboxed and
+unasked: that is the point on your own machines, and a reason to read this
+paragraph before running `install.sh` on one that is not.
+`t permissions` reports what is in sync and what is waiting,
 `t permissions --show` prints each rule's translations, `t doctor` carries the
 same line, and `DOTFILES_NO_PERMISSIONS=1` opts a machine out. The shipped list
 is deliberately broad — it allows `bash`, `python3`, `node`, `curl` and `claude`

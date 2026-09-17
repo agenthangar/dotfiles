@@ -289,6 +289,34 @@ def zsh(tmp_path):
     return call
 
 
+T_STUB = """#!/bin/sh
+# a stand-in for bin/t: says how it was called; `t install --writes` registers a repo
+# the way the chained `t setup` would
+echo "t $* shim=$T_SETUP_SHIM"
+case "$*" in *--writes*) echo 'DEV_REPOS[new]="$HOME/code/new"' >> "$HOME/.zshrc.local" ;; esac
+case "$*" in *--fails*) exit 3 ;; esac
+exit 0
+"""
+
+
+def test_zsh_t_install_reloads_only_when_the_chained_setup_wrote(zsh, tmp_path):
+    (tmp_path / "stubbin" / "t").write_text(T_STUB)
+    (tmp_path / "stubbin" / "t").chmod(0o755)
+    (zsh.home / ".zshrc").write_text("echo RELOADED\n")
+    r = zsh("t install codex; echo rc=$?")
+    assert "t install codex shim=1" in r.stdout and "RELOADED" not in r.stdout and "rc=0" in r.stdout
+    # the install ended in `t setup`, which appended a repo → the new cd alias must go live
+    r = zsh("t install --writes; echo rc=$?")
+    assert r.stdout.index("t install --writes") < r.stdout.index("RELOADED") and "rc=0" in r.stdout
+    # install's rc is install's — and a write still reloads under a failing run
+    r = zsh("t install --fails; echo rc=$?")
+    assert "rc=3" in r.stdout and "RELOADED" not in r.stdout
+    r = zsh("t install --writes --fails; echo rc=$?")
+    assert "RELOADED" in r.stdout and "rc=3" in r.stdout
+    # -h still goes straight to the bin's argparse
+    assert "shim=" in zsh("t install -h").stdout and "RELOADED" not in zsh("t install -h").stdout
+
+
 def test_zsh_agent_for_precedence(zsh):
     assert zsh("_dev_agent_for api").stdout.strip() == "codex"          # DEV_AGENT[api]
     assert zsh("_dev_agent_for api claude").stdout.strip() == "claude"  # --claude wins

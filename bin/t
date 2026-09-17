@@ -28,6 +28,7 @@ import re
 import shlex
 import shutil
 import socket
+import stat
 import subprocess
 import sys
 import time
@@ -1534,7 +1535,7 @@ def cmd_setup(cfg, args):
     if err:
         print(f"t setup: {err}", file=sys.stderr)
         return 1
-    trailer = _setup_hosts_trailer(land_hosts)
+    trailer = _setup_trailer(land_hosts, trust=not os.environ.get(_TRUST_NO_ENV))
 
     # dedup state: union of the live file lines and the (possibly stale) cache
     reg_paths = ({os.path.realpath(_expand_home(v)) for v in f_repos.values()} |
@@ -1644,6 +1645,7 @@ def cmd_setup(cfg, args):
         print("✓ appended to ~/.zshrc.local:")
         for ln in block.splitlines():
             print(f"  {st.y}{ln}{st.r}" if ln.startswith("#") else f"  {ln}")
+    _trust_auto([_expand_home(v) for v in add_repos.values()])
     if add_repos and land_hosts:
         _hosts_land(cfg, add_repos, args.hosts)
     if not os.environ.get("T_SETUP_SHIM"):
@@ -1813,7 +1815,7 @@ def _new_state_summary(state):
     return "exists — NOT a git repo" if state["nonempty"] else "exists (empty)"
 
 
-def _new_plan(name, alias, owner, private, path, state, gh, register, hosts):
+def _new_plan(name, alias, owner, private, path, state, gh, register, hosts, trust=None):
     """The ordered check-then-do steps. Each record: step, do (run|skip|error), label,
     cmd (argv for subprocess steps; None for the python register step), warn. An
     origin that already points elsewhere RETARGETS the slug (with a warn) — settings
@@ -1888,6 +1890,9 @@ def _new_plan(name, alias, owner, private, path, state, gh, register, hosts):
     rk, rmsg = register
     rec("register", rk, rmsg or f"DEV_REPOS[{alias}]={_homeify(path)} → ~/.zshrc.local",
         alias=alias, path=path)
+    if trust:   # _trust_step's verdict: every registered repo is trusted by default
+        rec("trust", trust, f"trust {p} in each installed agent (t trust)" if trust == "run"
+            else f"{p} already trusted in each installed agent", path=path)
     for h, target in hosts:
         rec(f"host:{h}", "run", f"{h}: clone + register", _new_ssh_argv(target, url, name, alias),
             host=h, target=target, url=url)
@@ -1995,6 +2000,27 @@ def _new_render(steps, st):
     if hosts:
         lines.append(f"{st.c}→{st.r} {', '.join(hosts)}: clone + register")
     return lines
+
+
+def _setup_unregistered(cfg, local_text, roots):
+    """Git checkouts under `roots` that neither ~/.zshrc.local nor the config cache
+    registers — exactly what `t setup` would offer as repos (cmd_setup's dedup rule),
+    for `t install` to decide whether setup is worth opening."""
+    f_repos, _, _ = _local_entries(local_text)
+    reg = ({os.path.realpath(_expand_home(v)) for v in f_repos.values()} |
+           {os.path.realpath(v) for v in cfg.repos.values()})
+    roots = [r for r in roots if os.path.isdir(r)]
+    return _scan_repos(roots, reg | {cfg.worktree_root}) if roots else []
+
+
+def _setup_trailer(hosts, trust=True):
+    """Everything `y` does beyond the append, for the review screen: trust the picked
+    repos in each installed agent (unless DOTFILES_NO_TRUST), then the hosts clause."""
+    parts = ["trust the picked repos in each installed agent"] if trust else []
+    ht = _setup_hosts_trailer(hosts)
+    if ht:
+        parts.append(ht[len("then "):])
+    return "then " + ", then ".join(parts) if parts else None
 
 
 def _setup_hosts_trailer(hosts):
@@ -2191,7 +2217,8 @@ def _new_wizard(cfg, answers, ctx):
                 ui.done("hosts", ", ".join(picked) or "none")
             answers.update({"owner": owner, "visibility": "private" if private else "public",
                             "alias": alias, "hosts": [h for h, _ in hosts]})
-            steps = _new_plan(name, alias, owner, private, path, state, gh, register, hosts)
+            steps = _new_plan(name, alias, owner, private, path, state, gh, register, hosts,
+                              trust=_new_trust(ctx, path))
             errs = [s for s in steps if s["do"] == "error"]
             body = [f"{rail}  {ln}" for ln in _new_render(steps, st)]
             if errs:
@@ -2281,13 +2308,20 @@ def _new_prompt_flow(cfg, answers, ctx):
                 hosts.append((h, t))
     answers.update({"owner": owner, "visibility": "private" if private else "public",
                     "alias": alias, "hosts": [h for h, _ in hosts]})
-    steps = _new_plan(name, alias, owner, private, path, state, gh, register, hosts)
+    steps = _new_plan(name, alias, owner, private, path, state, gh, register, hosts,
+                      trust=_new_trust(ctx, path))
     print(f"\n{st.b}review{st.r} — what will run:\n")
     for ln in _new_render(steps, st):
         print(f"  {ln}")
     if any(s["do"] == "error" for s in steps):
         return steps, answers
     return (steps, answers) if _confirm("proceed?") else None
+
+
+def _new_trust(ctx, path):
+    """The plan's trust verdict through ctx (a test ctx without the probe = no step)."""
+    probe = ctx.get("trust")
+    return probe(path) if probe else None
 
 
 def _new_resolve(cfg, answers, ctx):
@@ -2311,7 +2345,8 @@ def _new_resolve(cfg, answers, ctx):
         hosts = [(h, cfg.hosts[h]) for h in answers["hosts"]]
     answers.update({"owner": owner, "visibility": "private" if private else "public",
                     "alias": alias, "hosts": [h for h, _ in hosts]})
-    return _new_plan(name, alias, owner, private, path, state, gh, register, hosts)
+    return _new_plan(name, alias, owner, private, path, state, gh, register, hosts,
+                     trust=_new_trust(ctx, path))
 
 
 def _new_walk(steps, answers, pre="", close=False):
@@ -2330,6 +2365,8 @@ def _new_walk(steps, answers, pre="", close=False):
         if s["step"] == "register":
             _new_sh_register(alias, s["path"], "t new")
             registered = True
+        elif s["step"] == "trust":
+            _trust_auto([s["path"]], say=None)
         else:
             if s["step"] == "init" and s["cmd"][:2] == ["git", "init"]:
                 os.makedirs(os.path.dirname(s["cmd"][-1]), exist_ok=True)
@@ -2385,7 +2422,8 @@ def cmd_new(cfg, args):
         return gh_cache[slug]
     ctx = {"probe": lambda n: (_new_path(n), _new_sh_state(_new_path(n))),
            "gh": gh_for, "owners": _new_sh_owners, "f_repos": f_repos,
-           "whence": lambda a: None if a in registered else _new_sh_whence(a)}
+           "whence": lambda a: None if a in registered else _new_sh_whence(a),
+           "trust": lambda path: _trust_step([path])}
     st = Style()
     tty_ok = sys.stdin.isatty() and sys.stdout.isatty()
     if args.dry_run or args.yes or not tty_ok:
@@ -2467,6 +2505,7 @@ def cmd_new_land(cfg, args):
                 return 1
         else:
             _new_sh_register(args.alias, path, "t new")
+    _trust_auto([path], say=None)   # a registered repo is a trusted one, on every host
     print(_NEW_SENTINEL + _new_land_summary(steps))
     return 0
 
@@ -2521,6 +2560,7 @@ _INSTALL_AGENTS = {
         "glyph": "✱",
         "label": "Claude Code", "bin": "claude",
         "install": {"darwin": _CURL_CLAUDE, "linux": _CURL_CLAUDE},
+        "npm": "@anthropic-ai/claude-code", "cask": "claude-code",
         "login": ["claude", "auth", "login"],
         "login_headless": ["claude", "auth", "login"],
         "status": ["claude", "auth", "status"],
@@ -2534,6 +2574,7 @@ _INSTALL_AGENTS = {
         # vendor script everywhere else — no Node dependency on the Linux node
         "install": {"darwin": "brew install --cask codex", "darwin-nobrew": _CURL_CODEX,
                     "linux": _CURL_CODEX},
+        "npm": "@openai/codex", "cask": "codex",
         "login": ["codex", "login"],
         "login_headless": ["codex", "login", "--device-auth"],
         "status": ["codex", "login", "status"],
@@ -2545,6 +2586,7 @@ _INSTALL_AGENTS = {
         "glyph": "◆",
         "label": "Cursor CLI (cursor-agent)", "bin": "cursor-agent",
         "install": {"darwin": _CURL_CURSOR, "linux": _CURL_CURSOR},
+        "npm": None, "cask": None,
         "login": ["cursor-agent", "login"],
         "login_headless": ["env", "NO_OPEN_BROWSER=1", "cursor-agent", "login"],
         "status": ["cursor-agent", "status"],
@@ -2565,6 +2607,34 @@ def _install_cmd(agent, os_name, has_brew=True):
     if key == "darwin" and not has_brew and "darwin-nobrew" in table:
         key = "darwin-nobrew"
     line = table.get(key) or table["linux"]
+    return line, ["sh", "-c", line]
+
+
+def _install_method(exe_real):
+    """How the binary at this REAL path got here — "npm" (under a node_modules; checked
+    first, since Homebrew's node keeps its globals under /opt/homebrew too), "brew" (a
+    Caskroom / Cellar path), else "script" (the vendor installer's ~/.local tree). A
+    reinstall must go back through the SAME door: the vendor script run over an npm
+    install leaves two binaries, and which one PATH finds is then an accident."""
+    parts = (exe_real or "").split(os.sep)
+    if "node_modules" in parts:
+        return "npm"
+    if "Caskroom" in parts or "Cellar" in parts:
+        return "brew"
+    return "script"
+
+
+def _install_reinstall_cmd(agent, method, os_name, has_brew=True):
+    """(label, argv) that reinstalls an agent already here, by the method it came in
+    with; anything the table has no npm package / cask for falls back to the vendor
+    one-liner, which overwrites its own tree in place."""
+    spec = _INSTALL_AGENTS[agent]
+    if method == "npm" and spec.get("npm"):
+        line = "npm install -g %s@latest" % spec["npm"]
+    elif method == "brew" and spec.get("cask") and has_brew:
+        line = "brew reinstall --cask %s" % spec["cask"]
+    else:
+        return _install_cmd(agent, os_name, has_brew)
     return line, ["sh", "-c", line]
 
 
@@ -2616,24 +2686,27 @@ def _install_probe(agents=INSTALL_AGENTS):
         spec = _INSTALL_AGENTS[a]
         exe = shutil.which(spec["bin"]) or os.path.join(HOME, ".local", "bin", spec["bin"])
         if not os.path.exists(exe):
-            out[a] = {"bin": None, "version": None, "logged_in": None}
+            out[a] = {"bin": None, "path": None, "version": None, "logged_in": None}
             continue
         r = _run([exe, "--version"], timeout=20)
         ver = _install_version(r.stdout) if r.returncode == 0 else None
         s = _run([exe] + spec["status"][1:], timeout=30)
-        out[a] = {"bin": exe, "version": ver or "?",
+        out[a] = {"bin": exe, "path": os.path.realpath(exe), "version": ver or "?",
                   "logged_in": _install_status_ok(a, s.returncode, s.stdout + s.stderr)}
     return out
 
 
-def _install_items(probed, want, hosts, update=False, no_login=False):
+def _install_items(probed, want, hosts, update=False, no_login=False, reinstall=False):
     """The checklist item model `t install` renders — pure and testable, the
     _setup_items shape (header / spacer / locked / toggle rows in one list).
     probed: _install_probe output; want: agents named on the command line (None =
     pre-mark every missing / logged-out one); hosts: [(alias, target)]. An installed
     agent is a locked ✓ row with its version, a logged-in one a locked ✓ under LOGIN,
     so "why isn't X offered?" answers itself. Login rows for a not-yet-installed
-    agent follow its install mark (login needs the binary first)."""
+    agent follow its install mark (login needs the binary first). OPTIONS carries one
+    `reinstall <agent>` toggle per installed agent (off unless --reinstall, which
+    pre-marks the named agents, or all of them) — a present agent is otherwise a
+    locked row, so this is the only door to running its installer again."""
     def wanted(a):
         return (a in want) if want is not None else True
 
@@ -2664,6 +2737,10 @@ def _install_items(probed, want, hosts, update=False, no_login=False):
                   {"t": "toggle", "sec": "options", "kind": "update",
                    "alias": "update installed agents", "value": ", ".join(installed),
                    "checked": bool(update)}]
+        items += [{"t": "toggle", "sec": "options", "kind": "reinstall", "agent": a,
+                   "alias": f"reinstall {a}",
+                   "value": f"{probed[a]['version']} · via {_install_method(probed[a].get('path'))}",
+                   "checked": bool(reinstall) and wanted(a)} for a in installed]
     if hosts:
         items += [{"t": "spacer", "sec": "hosts"},
                   {"t": "header", "sec": "hosts", "label": "HOSTS · then run t install there"}]
@@ -2674,14 +2751,16 @@ def _install_items(probed, want, hosts, update=False, no_login=False):
 
 
 def _install_result(items):
-    """{install: [agents], login: [agents], update: bool, hosts: [aliases]} from the
-    checked toggles, agents in INSTALL_AGENTS order."""
-    sel = {"install": [], "login": [], "update": False, "hosts": []}
+    """{install: [agents], login: [agents], reinstall: [agents], update: bool, hosts:
+    [aliases]} from the checked toggles, agents in INSTALL_AGENTS order."""
+    sel = {"install": [], "login": [], "reinstall": [], "update": False, "hosts": []}
     for it in items:
         if it["t"] != "toggle" or not it["checked"]:
             continue
         if it["kind"] in ("install", "login"):
             sel[it["kind"]].append(it["alias"])
+        elif it["kind"] == "reinstall":
+            sel["reinstall"].append(it["agent"])
         elif it["kind"] == "update":
             sel["update"] = True
         elif it["kind"] == "host":
@@ -2689,7 +2768,7 @@ def _install_result(items):
     return sel
 
 
-def _install_ssh_argv(target, agents, no_login=False, update=False):
+def _install_ssh_argv(target, agents, no_login=False, update=False, reinstall=False):
     """`ssh -t <target> "zsh -lic 't install <agents> -y --no-hosts …'"` — the two
     quoting layers of _new_ssh_argv, but -t and NO BatchMode-style silencing of the
     far side: the remote login step prompts (a device code) through this TTY."""
@@ -2698,6 +2777,8 @@ def _install_ssh_argv(target, agents, no_login=False, update=False):
         words.append("--no-login")
     if update:
         words.append("--update")
+    if reinstall:
+        words.append("--reinstall")
     inner = " ".join(shlex.quote(w) for w in words)
     return ["ssh", "-t", "-o", "ConnectTimeout=5", target, f"zsh -lic {shlex.quote(inner)}"]
 
@@ -2727,9 +2808,14 @@ def _install_host_line(host, status):
 def _install_plan(sel, probed, os_name, has_brew, headless, hosts):
     """sel (_install_result) + probed state → ordered check-then-do step records, the
     `t new` record shape ({step, do: run|skip|error, label, cmd, warn, interactive}).
-    Per agent: install (skip when present), update (when asked and present), login
-    (skip when logged in; error when the binary is neither present nor selected —
-    login needs it first). Then one `host:<alias>` step per picked host. Because
+    Per agent: install (skip when present), reinstall (when marked and present — by
+    the method the binary came in with, and instead of the updater), update (when
+    asked and present), login (skip when logged in; error when the binary is neither
+    present nor selected — login needs it first). Then `sync`, whenever a local step
+    runs: install.sh links-only, i.e. what `dots` does for an agent that is here —
+    codex's hook, the allow list + default permission mode, trust for every registered
+    repo — all of which gate on a binary or a config the steps above just created.
+    Then one `host:<alias>` step per picked host. Because
     every step re-checks the probed state, a re-run after a failed login renders the
     done steps as `=` and offers only what is left."""
     steps = []
@@ -2747,6 +2833,9 @@ def _install_plan(sel, probed, os_name, has_brew, headless, hosts):
             else:
                 label, cmd = _install_cmd(a, os_name, has_brew)
                 rec(f"install:{a}", "run", label, cmd, warn=_INSTALL_AGENTS[a]["note"])
+        elif present and a in sel.get("reinstall", ()):
+            label, cmd = _install_reinstall_cmd(a, _install_method(p.get("path")), os_name, has_brew)
+            rec(f"reinstall:{a}", "run", label, cmd)
         elif present and sel["update"]:
             rec(f"update:{a}", "run", " ".join(_INSTALL_AGENTS[a]["update"]),
                 list(_INSTALL_AGENTS[a]["update"]))
@@ -2759,12 +2848,17 @@ def _install_plan(sel, probed, os_name, has_brew, headless, hosts):
             else:
                 rec(f"login:{a}", "error",
                     f"{a} login: not installed and not selected for install")
-    agents = [a for a in INSTALL_AGENTS if a in sel["install"] or a in sel["login"]]
+    if any(s["do"] == "run" for s in steps):
+        rec("sync", "run", "sync the installed agents: codex hook · permissions + default "
+            "mode · trust every registered repo (install.sh links-only, what dots does)")
+    redo = list(sel.get("reinstall", ()))
+    agents = [a for a in INSTALL_AGENTS if a in sel["install"] or a in sel["login"] or a in redo]
     for alias, target in hosts:
         if alias not in sel["hosts"]:
             continue
         argv = _install_ssh_argv(target, agents or list(INSTALL_AGENTS),
-                                 no_login=not sel["login"], update=sel["update"])
+                                 no_login=not sel["login"], update=sel["update"],
+                                 reinstall=bool(redo))
         rec(f"host:{alias}", "run", f"{alias}: t install {' '.join(agents) or 'everything'}",
             argv, host=alias, interactive=True)
     return steps
@@ -2788,14 +2882,16 @@ def _install_render(steps, st):
     if hosts:
         run = next((s for s in steps if s["step"].startswith("host:")), None)
         what = run["label"].split(": ", 1)[1] if run else "t install"
-        lines.append(f"{st.c}→{st.r} then on {', '.join(hosts)}: {what} -y --no-hosts")
+        flags = " --reinstall" if run and "--reinstall" in run["cmd"][-1] else ""
+        lines.append(f"{st.c}→{st.r} then on {', '.join(hosts)}: {what} -y --no-hosts{flags}")
     return lines
 
 
 def _install_relink():
-    """Re-run the live install.sh in links-only mode so a seed that keys on a binary
-    just installed (install_codex_hooks) lands now, not on the next dots. Same
-    capability guard as _dots_relink in .zshrc."""
+    """Re-run the live install.sh in links-only mode so every seed that keys on a
+    binary or a config an install / login just created — install_codex_hooks,
+    install_agent_permissions (+ the default mode), install_agent_trust — lands now,
+    not on the next dots. Same capability guard as _dots_relink in .zshrc."""
     live = os.path.dirname(os.path.realpath(os.path.join(HOME, ".zshrc")))
     inst = os.path.join(live, "install.sh")
     try:
@@ -2814,10 +2910,10 @@ def _install_relink():
 def _install_walk(steps, close=False):
     """Run the plan: `=` for a skip, ✓ per step. Interactive steps (logins, hosts)
     inherit the TTY; an install that fails skips that agent's login (it would only
-    fail again). A codex install re-seeds the hooks file at once. Host outcomes never
-    change the rc; a failed local step does."""
+    fail again). The `sync` step is the links-only relink (hooks, permissions, trust —
+    see _install_plan). Host outcomes never change the rc; a failed local step does."""
     st = Style()
-    failed, skipped_login, codex_landed = 0, set(), False
+    failed, skipped_login = 0, set()
     for s in steps:
         if s["step"].startswith("host:"):
             continue
@@ -2828,6 +2924,10 @@ def _install_walk(steps, close=False):
         if s["do"] == "error" or (kind == "login" and agent in skipped_login):
             print(f"{st.b}✗ {s['label']}{st.r}")
             failed += s["do"] == "error"
+            continue
+        if kind == "sync":
+            _install_relink()
+            print(f"✓ {s['label']}")
             continue
         if s["interactive"]:
             rc = subprocess.call(s["cmd"])
@@ -2848,10 +2948,6 @@ def _install_walk(steps, close=False):
         print(f"✓ {s['label']}")
         if s.get("warn"):
             print(f"{st.y}  ⚠ {s['warn']}{st.r}")
-        if kind == "install" and agent == "codex":
-            codex_landed = True
-    if codex_landed:
-        _install_relink()
     for s in steps:
         if s["step"].startswith("host:"):
             print(f"{st.c}→{st.r} {s['label']}")
@@ -3012,7 +3108,8 @@ def cmd_install(cfg, args):
         print(f"t install: {err}", file=sys.stderr)
         return 1
     want = args.agents or None
-    items = _install_items(probed, want, hosts, update=args.update, no_login=args.no_login)
+    items = _install_items(probed, want, hosts, update=args.update, no_login=args.no_login,
+                           reinstall=args.reinstall)
     os_name = "darwin" if sys.platform == "darwin" else "linux"
     has_brew, headless = bool(shutil.which("brew")), _install_headless(os.environ, args.headless)
 
@@ -3025,7 +3122,7 @@ def cmd_install(cfg, args):
         lines = _install_render(steps, st)
         if not lines:
             print("nothing to do — every agent is installed and logged in")
-            return 0
+            return 0 if args.dry_run else _install_then_setup(cfg, args, 0, chain=False)
         if args.dry_run or not args.yes:
             print("would run:" if args.dry_run else "t install would run:")
             for ln in lines:
@@ -3035,10 +3132,10 @@ def cmd_install(cfg, args):
             print("\nt install is interactive — run it from a terminal, or pass -y "
                   "(or --dry-run)", file=sys.stderr)
             return 1
-        return _install_walk(steps)
+        return _install_then_setup(cfg, args, _install_walk(steps), chain=False)
     if not _selectable(items):
         print("nothing to do — every agent is installed and logged in")
-        return 0
+        return _install_then_setup(cfg, args, 0)
     wizard_ran = True
     try:
         confirmed = _install_wizard(items, plan)
@@ -3050,7 +3147,33 @@ def cmd_install(cfg, args):
         if not wizard_ran:
             print("t install: aborted — nothing run")
         return 1
-    return _install_walk(plan(), close=wizard_ran)
+    return _install_then_setup(cfg, args, _install_walk(plan(), close=wizard_ran))
+
+
+def _install_then_setup(cfg, args, rc, chain=True):
+    """After the agents: are there git checkouts under ~/code that DEV_REPOS does not
+    know? Then the machine is not onboarded yet — a fresh box goes install.sh → t
+    install → t setup, and the third step was the one nobody remembered — so open `t
+    setup` right here (its own wizard; q leaves it, and what it registers it also
+    trusts). chain=False (-y, no tty) only names the command: -y means no questions.
+    Install's rc stands either way — quitting setup is not an install failure."""
+    try:
+        with open(ZSHRC_LOCAL, errors="ignore") as fh:
+            local_text = fh.read()
+    except OSError:
+        local_text = ""
+    cands = _setup_unregistered(cfg, local_text, [os.path.join(HOME, "code")])
+    if not cands:
+        return rc
+    st = Style()
+    what = f"{len(cands)} git repo(s) under ~/code not registered yet"
+    if not chain:
+        print(f"{st.c}→{st.r} {what} — run: t setup")
+        return rc
+    print(f"{st.c}→{st.r} {what} — opening t setup\n")
+    cmd_setup(cfg, argparse.Namespace(dirs=[], dry_run=False, hosts=args.hosts,
+                                      no_hosts=args.no_hosts))
+    return rc
 
 
 # ─── agent parity — one table, rendered everywhere it is documented ────────────
@@ -3063,7 +3186,7 @@ def cmd_install(cfg, args):
 
 _AGENT_PARITY = [
     ("surface", "claude", "codex", "cursor"),
-    ("t install (install · login · update)", "✓", "✓", "✓"),
+    ("t install (install · login · update · reinstall)", "✓", "✓", "✓"),
     ("dev slots: t open / ls / kill / read / paste", "✓", "✓ t open --codex · DEV_AGENT", "✗ no slot — t cursor ls"),
     ("t push / t pop", "✓", "✓", "✗ no slot"),
     ("t resume (dead slots)", "✓", "✓ (its sqlite thread index)", "→ t cursor resume"),
@@ -3078,6 +3201,10 @@ _AGENT_PARITY = [
     ("permissions (agents/permissions.allow, synced by dots)", "✓ ~/.claude/settings.json",
      "✓ ~/.codex/rules/dotfiles.rules (argv prefixes) · sandbox network on",
      "✓ ~/.cursor/cli-config.json (argv + env prefixes)"),
+    ("default permission mode (seeded when the config names none)", "✓ auto (permissions.defaultMode)",
+     "✓ full access (approval never · danger-full-access)", "✗ left as cursor-agent set it"),
+    ("t trust (folder trust · every registered repo on dots)", "✓ ~/.claude.json projects",
+     "✓ ~/.codex/config.toml [projects]", "✓ ~/.cursor/projects/<slug> marker"),
     ("nosleep (hold sleep while an agent works)", "✓ caffeinate child · net bytes", "✓ net bytes", "✓ net bytes"),
 ]
 
@@ -3264,6 +3391,12 @@ _PERM_RETIRE = os.path.join("agents", "permissions.retire")
 _PERM_CODEX_RULES = os.path.join(".codex", "rules", "dotfiles.rules")
 _PERM_CODEX_CONFIG = os.path.join(".codex", "config.toml")
 _PERM_CODEX_NETWORK = "[sandbox_workspace_write]\nnetwork_access = true"
+# the permission MODE each agent starts in when its config names none — claude's auto
+# mode, codex's Full Access preset (what its /permissions picker writes). Add-only like
+# the network key: a config that already names a mode, ANY mode, is never touched.
+_PERM_CLAUDE_MODE = "auto"
+_PERM_CODEX_MODE = 'approval_policy = "never"\nsandbox_mode = "danger-full-access"'
+_PERM_NO_MODES_ENV = "DOTFILES_NO_AGENT_MODES"
 _PERM_CODEX_HEADER = (
     "# Managed by dotfiles: regenerated from agents/permissions.allow by `dots`\n"
     "# (t permissions --apply). Hand edits here are overwritten — put yours in default.rules.\n")
@@ -3418,12 +3551,28 @@ def _perm_write(path, text):
     os.replace(tmp, path)
 
 
-def _perm_json_sync(path, allow, retire, apply=False):
+def _perm_claude_mode_plan(data, mode=_PERM_CLAUDE_MODE):
+    """Would Claude's settings get `permissions.defaultMode = <mode>`? Only when the
+    file names NO default mode — a hand-picked one (any value, `default` included) is
+    a choice — and auto mode is not disabled there. Pure; the caller writes."""
+    perms = data.get("permissions")
+    if not isinstance(perms, dict) or "defaultMode" in perms:
+        return False
+    return "disable" not in (perms.get("disableAutoMode"), data.get("disableAutoMode"))
+
+
+def _perm_json_sync(path, allow, retire, apply=False, mode=None):
     """Sync one JSON permissions file — Claude's settings.json and cursor's
     cli-config.json share the permissions.allow shape. Returns {"state", "add",
     "retire"}: state "missing" (no file: install.sh's seed / the agent's first run
     makes one, the next dots merges), None (unreadable or foreign-shaped: not ours to
-    repair), "synced", "pending" (changes waiting; apply=False) or "applied"."""
+    repair), "synced", "pending" (changes waiting; apply=False) or "applied".
+
+    mode (claude only): the default permission mode to seed when the file names none —
+    one pseudo-add, like codex's network line, plus rep["mode"] (its own state).
+    `skipAutoPermissionPrompt` rides with it: that is the key Claude's own auto-mode
+    opt-in dialog writes (read off 2.1.274's settings schema), and Claude RESETS it
+    whenever it is set without defaultMode = auto, so the two only make sense as a pair."""
     rep = {"state": None, "add": [], "retire": []}
     try:
         with open(path, encoding="utf-8") as fh:
@@ -3443,11 +3592,20 @@ def _perm_json_sync(path, allow, retire, apply=False):
         return rep
     new, added, removed = _perm_list_plan(cur, allow, retire)
     rep.update(add=added, retire=removed, state="synced")
-    if not added and not removed:
+    seed_mode = bool(mode) and _perm_claude_mode_plan(data, mode)
+    if mode:
+        rep["mode"] = "pending" if seed_mode else "synced"
+    if seed_mode:
+        rep["add"] = added + ['settings.json: permissions.defaultMode = "%s"' % mode]
+    if not added and not removed and not seed_mode:
         return rep
     rep["state"] = "pending"
     if apply:
         perms["allow"] = new
+        if seed_mode:
+            perms["defaultMode"] = mode
+            data.setdefault("skipAutoPermissionPrompt", True)
+            rep["mode"] = "applied"
         _perm_write(path, json.dumps(data, indent=2) + "\n")
         rep["state"] = "applied"
     return rep
@@ -3547,6 +3705,58 @@ def _perm_codex_network_sync(path, apply=False):
     return rep
 
 
+_PERM_CODEX_MODE_KEY = re.compile(r"^\s*(approval_policy|sandbox_mode|default_permissions)\s*=")
+_PERM_TOML_COMMENT = re.compile(r"^\s*(#.*)?$")
+
+
+def _perm_codex_mode_plan(text):
+    """~/.codex/config.toml with the Full Access preset as its TOP-LEVEL default —
+    `approval_policy = "never"` + `sandbox_mode = "danger-full-access"`, the pair
+    codex's own /permissions picker writes (verified on 0.154 with `codex debug
+    prompt-input`: the model-visible permissions block reads danger-full-access) — or
+    None when the file already names a mode: either key, or `default_permissions`,
+    ANYWHERE in the file (a profile's counts too — over-skipping is the safe
+    direction), whatever the value. A top-level key must precede the first table, so
+    the pair goes above the first `[header]` — and above the comment block sitting on
+    that header, which belongs to it."""
+    lines = text.split("\n")
+    if any(_PERM_CODEX_MODE_KEY.match(l) for l in lines):
+        return None
+    first, second = _PERM_CODEX_MODE.split("\n")
+    ours = [first + "  # dotfiles: t permissions — full access by default (change either "
+            "value and it is never flipped back)", second]
+    at = next((i for i, l in enumerate(lines) if _PERM_TOML_HEADER.match(l)), None)
+    if at is None:
+        body = text if not text or text.endswith("\n") else text + "\n"
+        return body + "\n".join(ours) + "\n"
+    while at > 0 and lines[at - 1].strip() and _PERM_TOML_COMMENT.match(lines[at - 1]):
+        at -= 1
+    return "\n".join(lines[:at] + ours + [""] + lines[at:])
+
+
+def _perm_codex_mode_sync(path, apply=False):
+    """The default-mode half of the codex report — _perm_codex_network_sync's shape."""
+    rep = {"state": None, "add": []}
+    try:
+        with open(path, encoding="utf-8") as fh:
+            have = fh.read()
+    except FileNotFoundError:
+        have = ""
+    except (OSError, UnicodeDecodeError):
+        return rep
+    want = _perm_codex_mode_plan(have)
+    if want is None:
+        rep["state"] = "synced"
+        return rep
+    if not _perm_toml_ok(want):
+        return rep
+    rep.update(state="pending", add=["config.toml: " + _PERM_CODEX_MODE.replace("\n", " · ")])
+    if apply:
+        _perm_write(path, want)
+        rep["state"] = "applied"
+    return rep
+
+
 def _perm_targets(home, which=shutil.which):
     """Which agents this machine syncs, with each one's file. codex is gated like its
     hook seed (the binary, or a REAL codex home — not the bare ~/.codex link_all
@@ -3561,9 +3771,10 @@ def _perm_targets(home, which=shutil.which):
     return t
 
 
-def _perm_sync(home, allow, retire, apply=False, which=shutil.which):
+def _perm_sync(home, allow, retire, apply=False, which=shutil.which, modes=True):
     """One report per agent — {agent: {"path", "state", "add", "retire"}}; an agent
-    not on this machine reports state "absent"."""
+    not on this machine reports state "absent". modes=False (DOTFILES_NO_AGENT_MODES)
+    leaves each agent's default permission mode out of it."""
     targets = _perm_targets(home, which)
     out = {}
     for agent in _PERM_AGENTS:
@@ -3576,12 +3787,18 @@ def _perm_sync(home, allow, retire, apply=False, which=shutil.which):
             net = _perm_codex_network_sync(os.path.join(home, _PERM_CODEX_CONFIG), apply)
             rank = {"synced": 0, "applied": 1, "pending": 2}
             rep["network"] = net["state"]
-            rep["add"] = rep["add"] + net["add"]
-            if rank.get(net["state"], -1) > rank[rep["state"]]:
-                rep["state"] = net["state"]
+            halves = [net]
+            if modes:
+                halves.append(_perm_codex_mode_sync(os.path.join(home, _PERM_CODEX_CONFIG), apply))
+                rep["mode"] = halves[-1]["state"]
+            for half in halves:
+                rep["add"] = rep["add"] + half["add"]
+                if rank.get(half["state"], -1) > rank[rep["state"]]:
+                    rep["state"] = half["state"]
         else:
             rep = _perm_json_sync(path, _perm_translate(allow, agent),
-                                  _perm_translate(retire, agent), apply)
+                                  _perm_translate(retire, agent), apply,
+                                  mode=_PERM_CLAUDE_MODE if modes and agent == "claude" else None)
         rep["path"] = path
         out[agent] = rep
     return out
@@ -3671,26 +3888,477 @@ def cmd_permissions(cfg, args):
             print("    cursor  %s" % _perm_cursor_rule(argv, env))
         print("codex sandbox: %s → ~/.codex/config.toml when absent (never flips a hand-set value)"
               % _PERM_CODEX_NETWORK.replace("\n", " "))
+        print("default mode: claude permissions.defaultMode = \"%s\" · codex %s — each only "
+              "when its config names no mode (%s=1 opts out)"
+              % (_PERM_CLAUDE_MODE, _PERM_CODEX_MODE.replace("\n", " · "), _PERM_NO_MODES_ENV))
         return 0
-    reps = _perm_sync(HOME, allow, retire, apply=args.apply)
+    reps = _perm_sync(HOME, allow, retire, apply=args.apply,
+                      modes=not os.environ.get(_PERM_NO_MODES_ENV))
     if args.apply:
         for agent in _PERM_AGENTS:
             rep = reps[agent]
             if rep["state"] != "applied":
                 continue
             net = rep.get("network") == "applied"
-            added = len(rep["add"]) - (1 if net else 0)
+            mode = rep.get("mode") == "applied"
+            added = len(rep["add"]) - net - mode
             if added or rep["retire"]:
                 print("permissions: %s — added %d, retired %d in %s"
                       % (agent, added, len(rep["retire"]), rep["path"].replace(HOME, "~")))
             if net:
                 print("permissions: codex — sandbox network on: %s in ~/.codex/config.toml"
                       % _PERM_CODEX_NETWORK.replace("\n", " "))
+            if mode:
+                print("permissions: %s — default mode: %s" % (agent, {
+                    "claude": 'permissions.defaultMode = "%s" in ~/.claude/settings.json'
+                              % _PERM_CLAUDE_MODE,
+                    "codex": "%s in ~/.codex/config.toml" % _PERM_CODEX_MODE.replace("\n", " · "),
+                }[agent]))
         return 0
     print("permissions — %s: %d rule(s), %d retired → each installed agent's own config"
           % (os.path.join(root, _PERM_ALLOW).replace(HOME, "~"), len(allow), len(retire)))
     for agent in _PERM_AGENTS:
         print("  " + _perm_line(agent, reps[agent]))
+    return 0
+
+
+# ─── t trust — folder trust, in every installed agent's own store ────────────────
+#
+# Each agent asks "do you trust this folder?" once per folder and remembers the answer
+# in its own place; `t trust` writes that answer for all of them, and every REGISTERED
+# repo (DEV_REPOS) is trusted by default — `dots` runs `t trust --all`, and t setup /
+# t new / t install trust what they just registered. Where each one keeps it, all read
+# off the binaries and verified (claude 2.1.274 · codex 0.154 · cursor 2026.09.15):
+#
+#   claude  ~/.claude.json  projects["<dir>"].hasTrustDialogAccepted = true — the key
+#           Claude's own error text tells you to set by hand. Looked up on the CANONICAL
+#           repo root (a linked worktree resolves to its main checkout), then by walking
+#           up from the cwd — but only as far as the git root, so a trusted ~/code does
+#           NOT cover the repos under it (it did once; that is why this verb exists).
+#   codex   ~/.codex/config.toml  [projects."<dir>"] trust_level = "trusted" — verified
+#           with `codex debug prompt-input` over a sandbox CODEX_HOME: trusting the
+#           canonical repo covers its linked worktrees; trusting a parent dir covers nothing.
+#   cursor  ~/.cursor/projects/<slug>/.workspace-trusted (slug: non-alphanumerics → `-`).
+#           Its check walks up through every parent, so a linked worktree — which does
+#           not sit under its canonical repo — gets a marker of its own, and --all adds
+#           one for $DEV_WORKTREE_ROOT, covering every session worktree at once.
+#
+# So the unit is the canonical repo: one entry per repo covers every per-session
+# worktree in claude and codex. Same write contract as the permission sync — add-only
+# (an explicit codex `untrusted`, or any other key, is never touched), tmp + os.replace,
+# silent unless something changed, an unreadable or foreign-shaped file left alone, an
+# agent gated on the config its own first run creates. ~/.claude.json is the one file
+# here that carries a login and that a LIVE claude rewrites constantly, so its write
+# goes through the same `<file>.lock` directory lock Claude takes (proper-lockfile: a
+# mkdir) and re-reads under it, and the tmp file is born 0600. DOTFILES_NO_TRUST=1
+# opts a machine out of the automatic paths; `t trust` by hand always works.
+
+_TRUST_CLAUDE = ".claude.json"
+_TRUST_CURSOR_GATE = os.path.join(".cursor", "cli-config.json")
+_TRUST_CURSOR_DIR = os.path.join(".cursor", "projects")
+_TRUST_CURSOR_MARK = ".workspace-trusted"
+_TRUST_NO_ENV = "DOTFILES_NO_TRUST"
+_TRUST_GITDIR_RE = re.compile(r"gitdir:\s*(.+?)\s*$", re.M)
+_TRUST_CODEX_HEADER = re.compile(
+    r"""^\s*\[\s*projects\s*\.\s*(?:"((?:[^"\\]|\\.)*)"|'([^']*)')\s*\]""")
+_TRUST_CODEX_FOREIGN = re.compile(r"^\s*projects\s*(=|\.)")
+
+
+def _trust_canonical(root, gitfile):
+    """The main checkout behind a linked worktree's `.git` FILE (`gitdir: <main>/.git/
+    worktrees/<name>`); any other gitfile (a submodule, a bare repo's worktree) is its
+    own root."""
+    try:
+        with open(gitfile, encoding="utf-8", errors="ignore") as fh:
+            m = _TRUST_GITDIR_RE.search(fh.read())
+    except OSError:
+        return root
+    if not m:
+        return root
+    parts = os.path.normpath(os.path.join(root, m.group(1))).split(os.sep)
+    if len(parts) >= 4 and parts[-2] == "worktrees" and parts[-3] == ".git":
+        return os.sep.join(parts[:-3]) or os.sep
+    return root
+
+
+def _trust_git_roots(path):
+    """(git_root, canonical_root) for a directory, (None, None) outside any repo — the
+    `.git` walk Claude and codex both do, without a git subprocess."""
+    d = os.path.abspath(path)
+    while True:
+        g = os.path.join(d, ".git")
+        if os.path.isdir(g):
+            return d, d
+        if os.path.isfile(g):
+            return d, _trust_canonical(d, g)
+        parent = os.path.dirname(d)
+        if parent == d:
+            return None, None
+        d = parent
+
+
+def _trust_too_wide(path, home):
+    """$HOME, anything above it, or a path under 3 segments — cursor's own rule for a
+    marker it will not honour, applied to every agent: trusting your whole home is not
+    what anyone means by `t trust`."""
+    p, h = os.path.abspath(path), os.path.abspath(home)
+    return p == h or h.startswith(p.rstrip(os.sep) + os.sep) or len([x for x in p.split(os.sep) if x]) < 3
+
+
+def _trust_records(dirs, extra_trees=()):
+    """[{dir, repo, tree}] — repo: what claude + codex key on (the canonical root, else
+    the dir itself); tree: the checkout the dir is in, which cursor needs as well when
+    it is a linked worktree. extra_trees: cursor-only parents ($DEV_WORKTREE_ROOT).
+    Deduped by repo+tree, order kept."""
+    out, seen = [], set()
+    for d in dirs:
+        d = os.path.abspath(os.path.expanduser(d))
+        tree, repo = _trust_git_roots(d)
+        rec = {"dir": d, "repo": repo or d, "tree": tree or d, "cursor_only": False}
+        if (rec["repo"], rec["tree"]) not in seen:
+            seen.add((rec["repo"], rec["tree"]))
+            out.append(rec)
+    for d in extra_trees:
+        d = os.path.abspath(os.path.expanduser(d))
+        if (d, d) not in seen:
+            seen.add((d, d))
+            out.append({"dir": d, "repo": d, "tree": d, "cursor_only": True})
+    return out
+
+
+def _trust_spellings(path):
+    """A path and its realpath when they differ — Claude's own trust seeding writes
+    both, since which one a process reports as its cwd depends on how it got there."""
+    real = os.path.realpath(path)
+    return [path] if real == path else [path, real]
+
+
+def _trust_agent_paths(recs, agent):
+    paths = []
+    for r in recs:
+        if agent == "cursor":
+            want = [r["repo"]] + ([r["tree"]] if r["tree"] != r["repo"] else [])
+        else:
+            want = [] if r["cursor_only"] else [r["repo"]]
+        for w in want:
+            paths += [p for p in _trust_spellings(w) if p not in paths]
+    return paths
+
+
+def _trust_claude_plan(data, paths):
+    """The paths a ~/.claude.json dict does not trust yet; None when `projects` (or an
+    entry we would touch) is not the expected shape."""
+    projects = data.get("projects", {}) if isinstance(data, dict) else None
+    if not isinstance(projects, dict):
+        return None
+    if any(p in projects and not isinstance(projects[p], dict) for p in paths):
+        return None
+    return [p for p in paths if (projects.get(p) or {}).get("hasTrustDialogAccepted") is not True]
+
+
+def _trust_lock(lock, wait=3.0, stale=30.0):
+    """Take Claude's config lock the way proper-lockfile does — mkdir <file>.lock.
+    True: held (the caller rmdirs it). False: a lock older than `stale` is in the way —
+    its holder is gone (a live one refreshes the mtime every few seconds) — so go
+    ahead without one; it is not ours to remove. None: a live claude holds it past
+    `wait` — skip this run rather than write into its read-modify-write."""
+    deadline = time.time() + wait
+    while True:
+        try:
+            os.mkdir(lock)
+            return True
+        except FileExistsError:
+            try:
+                if time.time() - os.stat(lock).st_mtime > stale:
+                    return False
+            except OSError:
+                continue
+            if time.time() > deadline:
+                return None
+            time.sleep(0.1)
+        except OSError:
+            return False
+
+
+def _trust_write_private(path, text, mode=0o600):
+    """tmp + os.replace with the tmp born at `mode` — ~/.claude.json carries the login."""
+    tmp = "%s.%d.tmp" % (path, os.getpid())
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        fh.write(text)
+    os.replace(tmp, path)
+
+
+def _trust_read_json(path):
+    try:
+        with open(path, encoding="utf-8") as fh:
+            return json.load(fh)
+    except ValueError:
+        return None
+
+
+def _trust_claude_sync(path, paths, apply=False):
+    """{"state", "add"} for ~/.claude.json — "missing" (claude has not run here yet; the
+    file is never created: it carries the login), None (unreadable / foreign shape),
+    "busy" (a live claude held its lock), "synced" / "pending" / "applied"."""
+    rep = {"state": None, "add": []}
+    try:
+        data = _trust_read_json(path)
+    except OSError:
+        rep["state"] = "missing"
+        return rep
+    todo = None if data is None else _trust_claude_plan(data, paths)
+    if todo is None:
+        return rep
+    rep.update(state="pending" if todo else "synced", add=todo)
+    if not todo or not apply:
+        return rep
+    held = _trust_lock(path + ".lock")
+    if held is None:
+        rep["state"] = "busy"
+        return rep
+    try:
+        data = _trust_read_json(path)          # again, under the lock: claude may have written
+        todo = None if data is None else _trust_claude_plan(data, paths)
+        if todo is None:
+            rep.update(state=None, add=[])
+            return rep
+        for p in todo:
+            data.setdefault("projects", {}).setdefault(p, {})["hasTrustDialogAccepted"] = True
+        if todo:
+            mode = stat.S_IMODE(os.stat(path).st_mode)
+            _trust_write_private(path, json.dumps(data, indent=2, ensure_ascii=False) + "\n", mode)
+        rep.update(state="applied", add=todo)
+    except OSError:
+        rep.update(state=None, add=[])
+    finally:
+        if held:
+            try:
+                os.rmdir(path + ".lock")
+            except OSError:
+                pass
+    return rep
+
+
+def _trust_toml_key(path):
+    return '"%s"' % path.replace("\\", "\\\\").replace('"', '\\"')
+
+
+def _trust_codex_plan(text, paths):
+    """(new_text, added) for ~/.codex/config.toml: one `[projects."<dir>"]` table with
+    trust_level = "trusted" appended per path that has NO projects table yet — a table
+    that exists is a decision, `untrusted` included. (None, []) when `projects` is
+    spelled as an inline table or dotted keys (older codex wrote it inline): a table
+    header cannot extend those, so the file is left alone."""
+    lines = text.split("\n")
+    if any(_TRUST_CODEX_FOREIGN.match(l) for l in lines):
+        return None, []
+    have = set()
+    for l in lines:
+        m = _TRUST_CODEX_HEADER.match(l)
+        if not m:
+            continue
+        if m.group(1) is not None:
+            try:
+                have.add(json.loads('"%s"' % m.group(1)))
+            except ValueError:
+                have.add(m.group(1))
+        else:
+            have.add(m.group(2))
+    added = [p for p in paths if p not in have]
+    if not added:
+        return text, []
+    body = text if not text or text.endswith("\n") else text + "\n"
+    for p in added:
+        body += "%s[projects.%s]\ntrust_level = \"trusted\"\n" % ("\n" if body else "", _trust_toml_key(p))
+    return body, added
+
+
+def _trust_codex_sync(path, paths, apply=False):
+    rep = {"state": None, "add": []}
+    try:
+        with open(path, encoding="utf-8") as fh:
+            have = fh.read()
+    except FileNotFoundError:
+        have = ""
+    except (OSError, UnicodeDecodeError):
+        return rep
+    want, added = _trust_codex_plan(have, paths)
+    if want is None or not _perm_toml_ok(want):
+        return rep
+    rep.update(state="pending" if added else "synced", add=added)
+    if added and apply:
+        _perm_write(path, want)
+        rep["state"] = "applied"
+    return rep
+
+
+def _trust_cursor_slug(path):
+    """cursor-agent's project-dir name for a workspace path (its workspace-paths.js)."""
+    return re.sub(r"-+", "-", re.sub(r"[^a-zA-Z0-9]", "-", path)).strip("-")
+
+
+def _trust_cursor_covered(projects_dir, path, home):
+    """Does cursor already trust `path`? Its own marker, or any parent's — the walk its
+    check does, skipping the parents it refuses to honour (_trust_too_wide)."""
+    d = os.path.abspath(path)
+    while True:
+        mark = os.path.join(projects_dir, _trust_cursor_slug(d), _TRUST_CURSOR_MARK)
+        if os.path.exists(mark) and (d == os.path.abspath(path) or not _trust_too_wide(d, home)):
+            return True
+        parent = os.path.dirname(d)
+        if parent == d:
+            return False
+        d = parent
+
+
+def _trust_cursor_sync(projects_dir, paths, home, apply=False):
+    rep = {"state": "synced", "add": [p for p in paths
+                                       if not _trust_cursor_covered(projects_dir, p, home)]}
+    if not rep["add"]:
+        return rep
+    rep["state"] = "pending"
+    if apply:
+        try:
+            for p in rep["add"]:
+                _perm_write(os.path.join(projects_dir, _trust_cursor_slug(p), _TRUST_CURSOR_MARK),
+                            json.dumps({"trustedAt": time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime()),
+                                        "workspacePath": p, "trustMethod": "t-trust"}, indent=2))
+            rep["state"] = "applied"
+        except OSError:
+            rep.update(state=None, add=[])
+    return rep
+
+
+def _trust_targets(home, which=shutil.which):
+    """Which agents this machine trusts folders in — _perm_targets' gates: claude on the
+    ~/.claude.json its first run writes, codex on the binary or a REAL codex home,
+    cursor on the config cursor-agent writes at its first run."""
+    t = {}
+    if os.path.exists(os.path.join(home, _TRUST_CLAUDE)):
+        t["claude"] = os.path.join(home, _TRUST_CLAUDE)
+    if "codex" in _perm_targets(home, which):
+        t["codex"] = os.path.join(home, _PERM_CODEX_CONFIG)
+    if os.path.exists(os.path.join(home, _TRUST_CURSOR_GATE)):
+        t["cursor"] = os.path.join(home, _TRUST_CURSOR_DIR)
+    return t
+
+
+def _trust_sync(home, recs, apply=False, which=shutil.which):
+    """{agent: {"path", "state", "add", "want"}} — state "absent" for an agent that is
+    not on this machine; want = how many paths this agent is asked about."""
+    targets = _trust_targets(home, which)
+    out = {}
+    for agent in INSTALL_AGENTS:
+        path, paths = targets.get(agent), _trust_agent_paths(recs, agent)
+        if not path:
+            rep = {"state": "absent", "add": []}
+        elif agent == "claude":
+            rep = _trust_claude_sync(path, paths, apply)
+        elif agent == "codex":
+            rep = _trust_codex_sync(path, paths, apply)
+        else:
+            rep = _trust_cursor_sync(path, paths, home, apply)
+        rep.update(path=path, want=len(paths))
+        out[agent] = rep
+    return out
+
+
+def _trust_line(agent, rep, quiet=False):
+    """One line per agent; None when quiet and nothing changed (the dots path)."""
+    st, n = rep["state"], len(rep["add"])
+    names = ", ".join(_tilde(p) for p in rep["add"])
+    if st == "applied":
+        text = "trusted %s" % names
+    elif quiet:
+        return None
+    elif st == "absent":
+        text = "not installed here"
+    elif st == "missing":
+        text = "no ~/%s yet — start claude once; the next dots trusts" % _TRUST_CLAUDE
+    elif st == "busy":
+        text = "a running claude is writing ~/%s — re-run t trust" % _TRUST_CLAUDE
+    elif st is None:
+        text = "%s unreadable or not the expected shape — left alone" % _tilde(rep["path"])
+    elif st == "synced":
+        text = "already trusted" + (" (%d)" % rep["want"] if rep["want"] > 1 else "")
+    else:
+        text = "NOT trusted: %s — t trust" % names if n else "already trusted"
+    return "%s %-7s %s" % (_agent_glyph(agent), agent, text)
+
+
+def _trust_short(agent, rep):
+    """`<agent> <trusted>/<asked>` for t doctor's one-line summary."""
+    st = rep["state"]
+    if st == "absent":
+        return "%s not installed" % agent
+    if st == "missing":
+        return "%s no config yet" % agent
+    if st is None or st == "busy":
+        return "%s config unreadable" % agent
+    return "%s %d/%d" % (agent, rep["want"] - (len(rep["add"]) if st == "pending" else 0), rep["want"])
+
+
+def _trust_all_dirs(cfg):
+    """(dirs, extra_trees) for --all: every registered repo whose dir exists, plus the
+    session-worktree root for cursor's parent walk."""
+    dirs = [d for d in dict.fromkeys(cfg.repos.values()) if os.path.isdir(d)]
+    extra = [cfg.worktree_root] if os.path.isdir(cfg.worktree_root) else []
+    return dirs, extra
+
+
+def _trust_auto(dirs, extra_trees=(), say=print):
+    """The automatic path (t setup / t new / new-land after registering): trust, say
+    only what changed (say=None: nothing — new-land's stdout is a parsed sentinel).
+    DOTFILES_NO_TRUST=1 turns it off."""
+    if os.environ.get(_TRUST_NO_ENV) or not dirs:
+        return
+    for agent, rep in _trust_sync(HOME, _trust_records(dirs, extra_trees), apply=True).items():
+        line = _trust_line(agent, rep, quiet=True)
+        if line and say:
+            say(line)
+
+
+def _trust_step(dirs):
+    """"run" / "skip" / None for a plan's trust step over `dirs`: None when the
+    automatic path is off, "skip" when every installed agent already trusts them."""
+    if os.environ.get(_TRUST_NO_ENV):
+        return None
+    reps = _trust_sync(HOME, _trust_records(dirs))
+    return "run" if any(r["state"] == "pending" for r in reps.values()) else "skip"
+
+
+def cmd_trust(cfg, args):
+    """See the section comment above. Bare: trust the repo (or plain folder) $PWD is
+    in. --all: every registered repo. --status: report, write nothing. -q: print only
+    what changed (what install.sh runs on every dots)."""
+    if args.all:
+        dirs, extra = _trust_all_dirs(cfg)
+        if not dirs:
+            if not args.quiet:
+                print("t trust: no registered repos — t setup registers them", file=sys.stderr)
+            return 0 if args.quiet else 1
+    else:
+        dirs, extra = [os.path.abspath(os.path.expanduser(d)) for d in (args.dirs or ["."])], []
+        bad = [d for d in dirs if not os.path.isdir(d)]
+        if bad:
+            print("t trust: not a directory: %s" % ", ".join(bad), file=sys.stderr)
+            return 1
+    recs = _trust_records(dirs, extra)
+    wide = [r["repo"] for r in recs if _trust_too_wide(r["repo"], HOME)]
+    if wide:
+        print("t trust: refusing %s — that is your home directory or above it; trust the "
+              "project folder instead" % ", ".join(_tilde(w) for w in wide), file=sys.stderr)
+        return 1
+    reps = _trust_sync(HOME, recs, apply=not args.status)
+    if not args.quiet:
+        what = ("%d registered repo(s)" % len(dirs) if args.all
+                else ", ".join(_tilde(r["repo"]) for r in recs))
+        print("trust — %s%s" % (what, " (status only)" if args.status else ""))
+    for agent in INSTALL_AGENTS:
+        line = _trust_line(agent, reps[agent], quiet=args.quiet)
+        if line:
+            print(("trust: " if args.quiet else "  ") + line)
     return 0
 
 
@@ -3771,6 +4439,12 @@ def _doctor_findings(facts):
                    "agents/permissions.allow), or t permissions --apply"
                    % ", ".join("%s (%d to add, %d to retire)" % (a, len(r["add"]), len(r["retire"]))
                                for a, r in pend))
+    untrusted = [(a, r) for a, r in sorted((facts.get("trust_sync") or {}).items())
+                 if r.get("state") == "pending"]
+    if untrusted:
+        out.append("⚠ registered repos not trusted yet: %s — run dots (it trusts every "
+                   "DEV_REPOS repo), or t trust --all"
+                   % ", ".join("%s (%d)" % (a, len(r["add"])) for a, r in untrusted))
     if not out:
         out.append("✓ nothing suspicious found")
     return out
@@ -3846,7 +4520,7 @@ def cmd_doctor(cfg, args):
         else:
             print("  %s %-8s %s · %s" % (_agent_glyph(a), a, p["version"], "logged in" if p["logged_in"]
                                            else "NOT logged in — t install %s" % a))
-    codex_hook = codex_used = None
+    codex_hook = codex_used = codex_trusted = None
     if facts_agents["codex"]["version"] or os.path.isdir(os.path.join(HOME, ".codex")):
         codex_hook = _codex_hook_state(os.path.join(HOME, ".codex", "hooks.json"))
         codex_used = os.path.isdir(os.path.join(HOME, ".codex", "sessions"))
@@ -3860,18 +4534,26 @@ def cmd_doctor(cfg, args):
     perm_sync = None
     try:
         allow, retire = _perm_lists(_perm_root())
-        perm_sync = _perm_sync(HOME, allow, retire)
+        perm_sync = _perm_sync(HOME, allow, retire,
+                               modes=not os.environ.get(_PERM_NO_MODES_ENV))
         print("  permissions %s (%d rules — t permissions)"
               % (" · ".join(_perm_short(a, perm_sync[a]) for a in _PERM_AGENTS), len(allow)))
     except OSError:
         print("  permissions no agents/permissions.allow in the live checkout")
+    # every registered repo vs each agent's folder-trust store — `t trust --status --all`
+    trust_dirs, trust_extra = _trust_all_dirs(cfg)
+    trust_sync = _trust_sync(HOME, _trust_records(trust_dirs, trust_extra)) if trust_dirs else None
+    if trust_sync:
+        print("  trust       %s (%d registered repos — t trust --all)"
+              % (" · ".join(_trust_short(a, trust_sync[a]) for a in INSTALL_AGENTS), len(trust_dirs)))
 
     # dotfiles: which checkout is live, is it current, are the links in place
     section("Dotfiles")
     facts = {"in_tmux": bool(os.environ.get("TMUX")),
              "term_program": os.environ.get("TERM_PROGRAM"), "tui": tui,
              "agents": facts_agents, "codex_hook": codex_hook, "codex_used": codex_used,
-             "codex_hook_trusted": codex_trusted, "perm_sync": perm_sync}
+             "codex_hook_trusted": codex_trusted, "perm_sync": perm_sync,
+             "trust_sync": trust_sync}
     zrc = os.path.join(HOME, ".zshrc")
     live_src = None
     if os.path.islink(zrc):
@@ -5435,12 +6117,20 @@ Run `t <verb> -h` for a verb's own flags.""")
             "each agent's login command shown verbatim in a review before anything runs "
             "(y runs, n goes back, q aborts). Logins are interactive (browser, or a device "
             "code over ssh / --headless). Every REMOTE_HOSTS host is then offered the same "
-            "run over ssh -t. Re-running is safe: present entries are never re-offered.")
+            "run over ssh -t. Re-running is safe: present entries are never re-offered — "
+            "running an installer again is its own OPTIONS row (reinstall <agent>), which "
+            "--reinstall pre-marks. A run that changes anything ends by syncing each "
+            "installed agent (codex's hook, the allow list + default permission mode, trust "
+            "for every registered repo), and when ~/code holds git repos DEV_REPOS does not "
+            "know yet, `t setup` opens next (under -y it is only named).")
     sp.add_argument("agents", nargs="*", metavar="agent",
                     help=f"pre-mark only these ({', '.join(INSTALL_AGENTS)}); default: every missing one")
     sp.add_argument("-y", "--yes", action="store_true", help="no list, no review: run the marks as they stand")
     sp.add_argument("--no-login", action="store_true", help="install only, skip the login steps")
     sp.add_argument("--update", action="store_true", help="also run each installed agent's updater")
+    sp.add_argument("--reinstall", action="store_true",
+                    help="run the installer again for agents already here (the named ones, else "
+                         "all) — by the method each came in with: npm, brew, or the vendor script")
     sp.add_argument("--headless", action="store_true",
                     help="use the device-code logins (automatic over ssh)")
     hg = sp.add_mutually_exclusive_group()
@@ -5462,9 +6152,28 @@ Run `t <verb> -h` for a verb's own flags.""")
             "assignment (`Bash(DATABASE_URL=* node:*)`) reaches claude and cursor; codex "
             "cannot express one, so --apply turns its workspace-write sandbox's network on "
             "in ~/.codex/config.toml instead — the prompt such a script raises is the "
-            "sandbox blocking the network.")
+            "sandbox blocking the network. --apply also seeds each agent's DEFAULT permission "
+            "mode where its config names none: claude's auto mode "
+            "(permissions.defaultMode) and codex's Full Access preset (approval_policy = "
+            "never + sandbox_mode = danger-full-access); a mode you set yourself, any mode, "
+            "is never changed, and DOTFILES_NO_AGENT_MODES=1 opts a machine out.")
     sp.add_argument("--apply", action="store_true", help="merge the adds and retires now (what dots does)")
     sp.add_argument("--show", action="store_true", help="print every rule with its codex / cursor translation")
+
+    sp = sub.add_parser("trust", help="trust a folder in every installed agent (claude, codex, cursor)",
+        description="Answer each agent's 'do you trust this folder?' prompt ahead of time, in "
+            "its own store: ~/.claude.json (projects[dir].hasTrustDialogAccepted), "
+            "~/.codex/config.toml ([projects.\"dir\"] trust_level), and cursor-agent's "
+            "~/.cursor/projects/<slug>/.workspace-trusted marker. Bare: the repo $PWD is in "
+            "(a per-session worktree resolves to its canonical repo, which is what claude "
+            "and codex key on — one entry covers every worktree). Every registered repo is "
+            "trusted by default: `dots` runs --all -q, and t setup / t new / t install trust "
+            "what they register. Add-only — an explicit codex `untrusted` is never flipped — "
+            "and $HOME or anything above it is refused.")
+    sp.add_argument("dirs", nargs="*", metavar="dir", help="folders to trust (default: the current one)")
+    sp.add_argument("-a", "--all", action="store_true", help="every registered repo (DEV_REPOS) — what dots runs")
+    sp.add_argument("--status", action="store_true", help="report what is trusted where; write nothing")
+    sp.add_argument("-q", "--quiet", action="store_true", help="print only what changed")
 
     sub.add_parser("doctor", help="diagnose this machine's dotfiles/tmux/Claude setup",
         description="Read-only diagnostics for when the tooling misbehaves: which checkout the "
@@ -5519,7 +6228,7 @@ IMPLEMENTED = {
     "plan": cmd_plan, "paste": cmd_paste, "kill": cmd_kill, "setup": cmd_setup,
     "land": cmd_land, "kill-owner": cmd_kill_owner, "cursor": cmd_cursor,
     "doctor": cmd_doctor, "mcp": cmd_mcp, "new": cmd_new, "new-land": cmd_new_land,
-    "install": cmd_install, "permissions": cmd_permissions,
+    "install": cmd_install, "permissions": cmd_permissions, "trust": cmd_trust,
 }
 
 

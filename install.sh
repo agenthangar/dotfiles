@@ -497,6 +497,26 @@ install_agent_permissions() {
 }
 install_agent_permissions
 
+# Every REGISTERED repo (DEV_REPOS) is trusted in each installed agent's own store —
+# ~/.claude.json, ~/.codex/config.toml, cursor-agent's .workspace-trusted markers — so
+# a session never opens on a "do you trust this folder?" prompt. Both claude and codex
+# key trust on the CANONICAL repo (a linked worktree resolves to it), so one entry per
+# repo covers every per-session worktree. `t trust --all -q` is the whole step (the
+# by-hand twin is `t trust`; `t doctor` reports the same state): add-only, silent
+# unless it trusted something, an agent that is not here is skipped. Links-only like
+# the seeds above so a repo registered on one machine is trusted on the next `dots`
+# everywhere; grep-guarded for the same stub / older-checkout reason as the
+# permissions step. It reads the repos from the t config bridge (~/.config/t/config.sh),
+# so a box with no registered repos is a no-op. DOTFILES_NO_TRUST=1 opts a machine out.
+install_agent_trust() {
+    [[ -z "${DOTFILES_NO_TRUST:-}" ]] || return 0
+    command -v python3 >/dev/null 2>&1 || return 0
+    grep -q 'def cmd_trust' "$LINK_SRC/bin/t" 2>/dev/null || return 0
+    python3 "$LINK_SRC/bin/t" trust --all -q \
+        || echo "⚠ t trust --all failed (rc $?) — run it by hand" >&2
+}
+install_agent_trust
+
 # Everything below is the FULL install. The links-only relink stops here, before the
 # tmux source-file, the ssh Include rewrite, the ~/.zshrc.local and settings.json
 # seeds, the global gitconfig/hooksPath writes, the PII denylist branch (which would

@@ -149,7 +149,7 @@ def test_install_result_collects_checked_toggles(t_mod):
             it["checked"] = True
     sel = t_mod._install_result(items)
     assert sel == {"install": ["codex", "cursor"], "login": ["codex", "cursor"],
-                   "update": True, "hosts": ["mini"]}
+                   "reinstall": [], "update": True, "hosts": ["mini"]}
     assert t_mod._selectable(items)   # the shared selectable() works on this model too
 
 
@@ -169,14 +169,16 @@ def test_install_plan_full_matrix(t_mod):
     assert by["install:cursor"]["do"] == "run" and by["install:cursor"]["cmd"][0] == "sh"
     assert by["login:cursor"]["do"] == "run"
     # order: each agent's install precedes its login; agents in table order
+    # … and `sync` closes the local steps: the seeds gate on what those just created
     assert [s["step"] for s in steps] == ["install:claude", "login:claude", "install:codex",
-                                          "login:codex", "install:cursor", "login:cursor"]
+                                          "login:codex", "install:cursor", "login:cursor", "sync"]
 
 
 def test_install_plan_codex_install_carries_the_hook_note_and_headless_login(t_mod):
     sel = {"install": ["codex"], "login": ["codex"], "update": False, "hosts": []}
     steps = t_mod._install_plan(sel, _probed(), "linux", False, True, [])
-    inst, login = steps
+    inst, login, sync = steps
+    assert sync["step"] == "sync" and sync["cmd"] is None
     assert inst["do"] == "run" and "chatgpt.com/codex/install.sh" in inst["label"]
     assert "hooks prompt" in inst["warn"]
     assert login["cmd"] == ["codex", "login", "--device-auth"]
@@ -193,7 +195,7 @@ def test_install_plan_update_only_for_installed_unselected_agents(t_mod):
     probed = _probed(claude=("2.1", True), cursor=("2026.1", True))
     sel = {"install": ["codex"], "login": [], "update": True, "hosts": []}
     steps = t_mod._install_plan(sel, probed, "darwin", True, False, [])
-    assert [s["step"] for s in steps] == ["update:claude", "install:codex", "update:cursor"]
+    assert [s["step"] for s in steps] == ["update:claude", "install:codex", "update:cursor", "sync"]
     assert steps[0]["cmd"] == ["claude", "update"] and steps[0]["do"] == "run"
 
 
@@ -243,6 +245,122 @@ def test_install_render_marks_and_host_trailer(t_mod):
     # the hosts get every agent named for install OR login: a login the local box did
     # not need may still be missing there
     assert lines[-1] == "→ then on mini: t install claude codex cursor -y --no-hosts"
+
+
+# ─── reinstall ─────────────────────────────────────────────────────────────────
+
+@pytest.mark.parametrize("path,method", [
+    ("/opt/homebrew/lib/node_modules/@anthropic-ai/claude-code/bin/claude.exe", "npm"),  # under brew's prefix, still npm
+    ("/opt/homebrew/Caskroom/codex/0.154.0/bin/codex", "brew"),
+    ("/opt/homebrew/Cellar/foo/1.0/bin/foo", "brew"),
+    ("/Users/me/.local/share/cursor-agent/versions/2026.09/cursor-agent", "script"),
+    ("/Users/me/.local/bin/claude", "script"),
+    (None, "script"),
+])
+def test_install_method_reads_the_door_the_binary_came_in_by(t_mod, path, method):
+    assert t_mod._install_method(path) == method
+
+
+def test_install_reinstall_cmd_goes_back_through_the_same_door(t_mod):
+    rc = t_mod._install_reinstall_cmd
+    assert rc("claude", "npm", "darwin")[0] == "npm install -g @anthropic-ai/claude-code@latest"
+    assert rc("codex", "npm", "linux")[0] == "npm install -g @openai/codex@latest"
+    assert rc("codex", "brew", "darwin") == ("brew reinstall --cask codex",
+                                             ["sh", "-c", "brew reinstall --cask codex"])
+    # no brew on PATH, or nothing in the table for that door → the vendor one-liner
+    assert rc("codex", "brew", "darwin", has_brew=False) == t_mod._install_cmd("codex", "darwin", False)
+    assert rc("cursor", "npm", "darwin") == t_mod._install_cmd("cursor", "darwin")
+    assert rc("claude", "script", "linux") == t_mod._install_cmd("claude", "linux")
+
+
+def test_install_items_offer_a_reinstall_row_per_installed_agent(t_mod):
+    probed = _probed(claude=("2.1", True), codex=("0.15", True))
+    probed["codex"]["path"] = "/opt/homebrew/Caskroom/codex/0.15/bin/codex"
+    rows = lambda items: {it["agent"]: (it["alias"], it["value"], it["checked"])   # noqa: E731
+                          for it in items if it.get("kind") == "reinstall"}
+    got = rows(t_mod._install_items(probed, None, []))
+    assert got == {"claude": ("reinstall claude", "2.1 · via script", False),
+                   "codex": ("reinstall codex", "0.15 · via brew", False)}       # never pre-marked…
+    assert all(c for _, _, c in rows(t_mod._install_items(probed, None, [], reinstall=True)).values())
+    named = rows(t_mod._install_items(probed, ["codex"], [], reinstall=True))    # …unless asked, by name
+    assert {a: c for a, (_, _, c) in named.items()} == {"claude": False, "codex": True}
+    # a missing agent has no reinstall row: --reinstall on it is a plain install
+    assert "cursor" not in got
+    sel = t_mod._install_result(t_mod._install_items(probed, ["codex"], [], reinstall=True))
+    assert sel["reinstall"] == ["codex"] and sel["install"] == []
+
+
+def test_install_plan_reinstall_replaces_update_and_reaches_the_hosts(t_mod):
+    probed = _probed(claude=("2.1", True), codex=("0.15", True))
+    probed["claude"]["path"] = "/opt/homebrew/lib/node_modules/@anthropic-ai/claude-code/bin/claude.exe"
+    probed["codex"]["path"] = "/opt/homebrew/Caskroom/codex/0.15/bin/codex"
+    sel = {"install": [], "login": [], "reinstall": ["claude", "codex"], "update": True, "hosts": ["mini"]}
+    steps = t_mod._install_plan(sel, probed, "darwin", True, False, [("mini", "me@mini")])
+    assert [s["step"] for s in steps] == ["reinstall:claude", "reinstall:codex", "sync", "host:mini"]
+    assert steps[0]["label"] == "npm install -g @anthropic-ai/claude-code@latest"
+    assert steps[1]["cmd"] == ["sh", "-c", "brew reinstall --cask codex"]
+    assert "t install claude codex -y --no-hosts --no-login --update --reinstall" in steps[-1]["cmd"][-1]
+    lines = t_mod._install_render(steps, _St())
+    assert lines[:2] == ["+ npm install -g @anthropic-ai/claude-code@latest", "+ brew reinstall --cask codex"]
+    assert lines[2].startswith("+ sync the installed agents")
+    assert lines[-1].endswith("-y --no-hosts --reinstall")
+    # a sel from before the key existed (a stale caller) still plans
+    assert t_mod._install_plan({"install": [], "login": [], "update": False, "hosts": []},
+                               probed, "darwin", True, False, []) == []
+
+
+def test_install_plan_sync_only_when_a_local_step_runs(t_mod):
+    probed = _probed(claude=("2.1", True))
+    sel = {"install": ["claude"], "login": ["claude"], "reinstall": [], "update": False, "hosts": ["mini"]}
+    steps = t_mod._install_plan(sel, probed, "darwin", True, False, [("mini", "me@mini")])
+    assert [s["step"] for s in steps] == ["install:claude", "login:claude", "host:mini"]   # all skips: no sync
+    assert t_mod.build_parser().parse_args(["install", "codex", "--reinstall"]).reinstall is True
+
+
+def test_install_ssh_argv_carries_reinstall(t_mod):
+    argv = t_mod._install_ssh_argv("me@mini", ["codex"], reinstall=True)
+    assert argv[-1] == "zsh -lic 't install codex -y --no-hosts --reinstall'"
+
+
+# ─── the t setup chain ─────────────────────────────────────────────────────────
+
+def test_setup_unregistered_is_what_t_setup_would_offer(t_mod, tmp_path):
+    import argparse
+    code = tmp_path / "code"
+    for name in ("api", "web", "new-thing"):
+        (code / name / ".git").mkdir(parents=True)
+    (code / ".worktrees" / "api" / "1").mkdir(parents=True)
+    (code / ".worktrees" / "api" / "1" / ".git").write_text("gitdir: x\n")
+    cfg = argparse.Namespace(repos={"api": str(code / "api")}, worktree_root=str(code / ".worktrees"))
+    local = 'DEV_REPOS[web]="%s"\n' % (code / "web")
+    got = t_mod._setup_unregistered(cfg, local, [str(code), str(tmp_path / "missing")])
+    assert [os.path.basename(p) for p in got] == ["new-thing"]        # cache + file both count; worktrees never
+    assert t_mod._setup_unregistered(cfg, local + 'DEV_REPOS[n]="%s"\n' % (code / "new-thing"), [str(code)]) == []
+    assert t_mod._setup_unregistered(cfg, "", [str(tmp_path / "missing")]) == []
+
+
+def test_install_then_setup_opens_setup_only_when_there_is_something_to_register(t_mod, tmp_path, monkeypatch, capsys):
+    import argparse
+    home = tmp_path / "home"
+    (home / "code" / "api" / ".git").mkdir(parents=True)
+    monkeypatch.setattr(t_mod, "HOME", str(home))
+    monkeypatch.setattr(t_mod, "ZSHRC_LOCAL", str(home / ".zshrc.local"))       # absent: a fresh box
+    opened = []
+    monkeypatch.setattr(t_mod, "cmd_setup", lambda cfg, a: opened.append(a) or 1)  # the user quit it
+    cfg = argparse.Namespace(repos={}, worktree_root=str(home / "code" / ".worktrees"))
+    args = argparse.Namespace(hosts="mini", no_hosts=False)
+    # -y / no tty: name the command, ask nothing
+    assert t_mod._install_then_setup(cfg, args, 0, chain=False) == 0
+    assert "1 git repo(s) under ~/code not registered yet — run: t setup" in capsys.readouterr().out
+    assert opened == []
+    # interactive: open it, hand it the same host choice — and install's rc stands
+    assert t_mod._install_then_setup(cfg, args, 1) == 1
+    assert "opening t setup" in capsys.readouterr().out
+    assert len(opened) == 1 and opened[0].hosts == "mini" and opened[0].dirs == [] and not opened[0].dry_run
+    # everything registered → silent, setup never opens
+    (home / ".zshrc.local").write_text('DEV_REPOS[api]="$HOME/code/api"\n')
+    assert t_mod._install_then_setup(cfg, args, 0) == 0
+    assert capsys.readouterr().out == "" and len(opened) == 1
 
 
 def test_install_render_empty_when_nothing_to_do(t_mod):

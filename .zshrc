@@ -6218,8 +6218,26 @@ t() {
     setup)  T_SETUP_SHIM=1 command t setup "$@" && source ~/.zshrc ;;
     # new writes DEV_REPOS too (the repo it just created) → the same reload.
     new)    T_SETUP_SHIM=1 command t new "$@" && source ~/.zshrc ;;
+    # install can END in `t setup` (it opens it when ~/code holds repos DEV_REPOS does
+    # not know yet), so it owes the same reload — but only when that setup actually
+    # wrote: ~/.zshrc.local's mtime is the evidence, since install's rc says nothing
+    # about it (quitting setup is not an install failure, and most runs never open it).
+    install) _t_install "$@" ;;
     *)      command t "$verb" "$@" ;; # ls/read/plan/paste/kill/on/session-rows/land/kill-owner/new-land
   esac
+}
+
+# _t_install — `t install` through the bin, then reload iff it changed ~/.zshrc.local
+# (see the shim arm above). mtime AND size: zstat's mtime is whole seconds, and an
+# append always moves the size. zstat, not stat: the portability convention.
+_t_install() {
+  local -A before after
+  zstat -H before ~/.zshrc.local 2>/dev/null
+  T_SETUP_SHIM=1 command t install "$@"
+  local rc=$?
+  zstat -H after ~/.zshrc.local 2>/dev/null
+  [[ "${after[mtime]:-}:${after[size]:-}" == "${before[mtime]:-}:${before[size]:-}" ]] || source ~/.zshrc
+  return $rc
 }
 
 # _t_cd — cd the CALLING shell into a dev slot's worktree (gh-grammar `t cd [repo] [slot]`).
@@ -6451,7 +6469,7 @@ help() {
   local -A hints=(
     "Repo shortcuts (cd)" "+ add a repo: t setup (or DEV_REPOS[key]=~/code/repo in ~/.zshrc.local)"
     "Remote machines"     "+ add a host: t setup (or REMOTE_HOSTS[key]=user@host in ~/.zshrc.local)"
-    "Agents (claude · codex · cursor)" "+ install / log in an agent CLI: t install · per-verb support: t install --status · the shared allow list: t permissions"
+    "Agents (claude · codex · cursor)" "+ install / log in an agent CLI: t install · per-verb support: t install --status · the shared allow list + default mode: t permissions · trust a folder: t trust"
   )
 
   # Palette — bold, UPPERCASE section headers (man-page / `gh` convention; bold is
@@ -6508,7 +6526,7 @@ alias h=help   # `h` is a shorthand for `help`
 # key for `on`), and slot/flags after. Pulls live from the ${(k)DEV_REPOS} /
 # ${(k)REMOTE_HOSTS} arrays so it stays current with ~/.zshrc.local.
 _t() {
-  local -a verbs=(open ls kill push pop resume beam read plan paste find on cursor setup new install permissions)
+  local -a verbs=(open ls kill push pop resume beam read plan paste find on cursor setup new install permissions trust)
   if (( CURRENT == 2 )); then
     _describe -t verbs 't verb' verbs
     return
@@ -6537,8 +6555,11 @@ _t() {
       if (( CURRENT == 3 )) && [[ ${words[CURRENT]} != -* ]]; then _message 'repo name'
       else _values 'flag' --owner --public --private --alias --hosts --no-hosts -y --yes --dry-run -h --help; fi ;;
     install)
-      if [[ ${words[CURRENT]} == -* ]]; then _values 'flag' --status --update --no-login --headless --hosts --no-hosts -y --yes --dry-run -h --help
+      if [[ ${words[CURRENT]} == -* ]]; then _values 'flag' --status --update --reinstall --no-login --headless --hosts --no-hosts -y --yes --dry-run -h --help
       else _values 'agent' claude codex cursor; fi ;;
+    trust)
+      if [[ ${words[CURRENT]} == -* ]]; then _values 'flag' -a --all --status -q --quiet -h --help
+      else _files -/; fi ;;
   esac
 }
 _sleepmgr_cmd() { _arguments '1:command:(status disable enable help)' }

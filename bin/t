@@ -456,7 +456,7 @@ def _render_remote(rows, scope, st):
     foot = ("attach (auto-finds its host): t open <repo> <slot> · "
             "pull here: t beam <repo> <slot> --from <host>")
     if has_fg:
-        foot += " · foreground: t on <host> t open <id>"
+        foot += " · foreground: t open <id>"
     print()
     print(f"  {st.y}{foot}{st.r}")
 
@@ -5866,7 +5866,8 @@ examples:
   t paste 4               slot-only args mean the cwd repo (all verbs)
   t open ff -r --new      start a fresh session on the default remote host
   t open ff --host mini   start/attach a session on 'mini' (a specific remote host)
-  t open a4aa5f6a         adopt a foreground (:fg) session here (id from t ls)
+  t open a4aa5f6a         open a foreground (:fg) session by id from t ls (any machine)
+  t open dotfiles-pr47    attach a pr-watch session in place (its :fg label from t ls)
   t ls                    list this repo's live sessions
   t ls -r                 list live sessions across every machine
   t push                  send the current session to a background tmux slot
@@ -5893,10 +5894,13 @@ Run `t <verb> -h` for a verb's own flags.""")
         description="Open or reattach a Claude session in a per-repo tmux slot. Bare `t open` "
             "(or a lone slot like `t open 3`) targets the repo your cwd is in. A slot that is "
             "live only on another host is attached in place automatically — no flag needed. "
+            "A foreground / :fg row from `t ls` is opened by its shown id/label, on whichever "
+            "machine holds it: one living in a tmux session (a pr-watch `pr-*` one) is attached "
+            "in place, a true foreground claude is moved into this terminal. "
             "`--new` forces a fresh session, `--fg` runs inline without a tmux slot, and "
             "`-r`/`--host` open or attach on a remote host (`-r --new` starts one there).")
     sp.add_argument("repo", nargs="?", help="DEV_REPOS key, or a foreground session id/repo:id from `t ls`")
-    sp.add_argument("slot", nargs="?", help="slot number, 'fg' (adopt a :fg session), or a session id")
+    sp.add_argument("slot", nargs="?", help="slot number, 'fg' (this repo's :fg session), or a session id")
     sp.add_argument("--new", action="store_true", help="force a fresh session")
     sp.add_argument("--fg", action="store_true", help="no tmux: foreground-resume / run inline")
     sp.add_argument("-l", "--local", "--here", dest="local", action="store_true", help="force this machine: skip the remote auto-attach probe (combine with --fg for local foreground)")

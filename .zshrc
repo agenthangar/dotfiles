@@ -2116,10 +2116,23 @@ _dev_pid_tree_claude_pid() {
 # Cache misses are cheap to be wrong about (a title is cosmetic) but the invalidation
 # above means a stale one needs an in-place same-inode rewrite that shrinks nothing —
 # which append-only .jsonl never does.
+#   CODEX TITLES COME FROM THE INDEX, NOT THE FILE. claude writes its /rename and its
+#   generated title INTO the transcript (the `custom-title` / `ai-title` records
+#   below); codex writes neither — verified on 0.154, a renamed thread's name appears
+#   nowhere in its rollout, only in ~/.codex/state_5.sqlite's `threads.name` (its
+#   `title` column is the raw first prompt, so it buys nothing over the file). So a
+#   rollout's name is looked up LIVE, one read-only query per batch keyed on the sid
+#   in the filename, and is deliberately NOT folded into the per-path cache: codex
+#   generates the name a turn AFTER the prompt and a /rename appends no byte at all,
+#   so a cache keyed on "bytes since last scan" would pin the first prompt forever —
+#   which is exactly how a renamed codex slot kept its opening line as its `t ls`
+#   title. Names are per-host by nature (the index is machine-local runtime state;
+#   only rollouts travel), so a synced-in rollout reads as its first prompt until
+#   that host's codex indexes it.
 _transcript_meta_batch() {
   (( $# )) || return 0
-  python3 - "$@" <<'PY'
-import hashlib, json, os, re, sys
+  python3 - "$(_codex_db)" "$@" <<'PY'
+import hashlib, json, os, re, sqlite3, sys
 
 CACHE = os.path.join(os.environ.get('XDG_CACHE_HOME') or os.path.expanduser('~/.cache'),
                      'claude-sessions', 'meta')
@@ -2145,6 +2158,30 @@ def save(key, st):
         os.replace(tmp, os.path.join(CACHE, key))
     except OSError:
         pass
+
+
+def codex_names(db, paths):
+    """{rollout path: codex's own short thread title}, for the rollouts in this batch.
+    Unknown ids, an unnamed thread, a missing/locked/corrupt index → simply absent, so
+    the caller falls back to the first prompt."""
+    ids = {}
+    for p in paths:
+        base = os.path.basename(p)
+        if base.startswith('rollout-') and base.endswith('.jsonl'):
+            ids[base[:-len('.jsonl')][-36:]] = p      # rollout-<ts>-<uuid>.jsonl
+    if not ids or not db:
+        return {}
+    out = {}
+    try:
+        c = sqlite3.connect('file:%s?mode=ro' % db, uri=True, timeout=0.5)
+        c.execute('pragma busy_timeout=500')
+        for sid, name in c.execute('select id, name from threads where id in (%s)'
+                                   % ','.join('?' * len(ids)), tuple(ids)):
+            if name and name.strip() and sid in ids:
+                out[ids[sid]] = name
+    except Exception:
+        pass
+    return out
 
 
 def scan_codex(st, text):
@@ -2198,7 +2235,10 @@ def scan(st, text):
         if hits: st['pr'] = hits[-1]
 
 
-for path in sys.argv[1:]:
+db, paths = sys.argv[1], sys.argv[2:]
+names = codex_names(db, paths)
+
+for path in paths:
     if not path:
         continue
     try:
@@ -2223,7 +2263,8 @@ for path in sys.argv[1:]:
             scan(st, data[:cut + 1].decode('utf-8', 'replace'))
             st['off'] += cut + 1
             save(key, st)
-    title = ' '.join((st['ct'] or st['at'] or st['msg'] or '').split())[:50]
+    # codex's own name wins over the rollout's first prompt, as claude's does
+    title = ' '.join((names.get(path) or st['ct'] or st['at'] or st['msg'] or '').split())[:50]
     sys.stdout.write('%s\t%s\t%s\n' % (path, title, st['pr'] or ''))
 PY
 }

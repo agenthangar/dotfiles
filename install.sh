@@ -545,7 +545,10 @@ retire_pr_watch() {
     local label="com.chrisobrien-ai.pr-watch"
     local plist="$HOME/Library/LaunchAgents/$label.plist"
     [[ -e "$plist" ]] || return 0
-    command -v launchctl >/dev/null 2>&1 && launchctl bootout "gui/$(id -u)/$label" 2>/dev/null || true
+    # if-then, not `A && B || true`: that C runs when A is FALSE too (SC2015).
+    if command -v launchctl >/dev/null 2>&1; then
+        launchctl bootout "gui/$(id -u)/$label" 2>/dev/null || true
+    fi
     rm -f "$plist"
     echo "Retired the pr-watch LaunchAgent (booted out, $plist removed)"
 }

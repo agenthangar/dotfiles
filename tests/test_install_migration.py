@@ -6,7 +6,7 @@ used to resolve through. So it is tested against a real git repo in a throwaway
 $HOME rather than by reading the code.
 
 Everything runs under tmp_path with HOME overridden, so no test touches the real
-machine. Coverage is scoped to bin/t and bin/pr-watch in pyproject.toml, so these
+machine. Coverage is scoped to bin/t in pyproject.toml, so these
 subprocess-driven tests do not dilute the coverage ratchet.
 """
 
@@ -23,7 +23,7 @@ INSTALL_SH = REPO_ROOT / "install.sh"
 # migration cares about paths and git state, never file contents.
 STUB_BINS = [
     "sleep-manager", "csync", "cursor-beam", "pii-scan",
-    "claude-stamp-tmux", "t", "pr-watch",
+    "claude-stamp-tmux", "t",
 ]
 
 
@@ -59,10 +59,6 @@ def _seed_worktree(path):
         (path / "codex" / "prompts" / c).write_text("x\n")
     (path / "claude" / "settings.json.example").write_text("{}\n")
     (path / "ssh" / "dotfiles.conf").write_text("# ssh\n")
-    # install.sh seds this into ~/Library/LaunchAgents; content is irrelevant.
-    (path / "launchd" / "com.chrisobrien-ai.pr-watch.plist").write_text(
-        "<plist>__DOTFILES_BIN__</plist>\n"
-    )
 
 
 @pytest.fixture
@@ -121,10 +117,11 @@ def run_install(cwd, home, **extra_env):
         # developer's ~/.claude.json through `claude mcp add`, not $HOME's), so a
         # sandboxed run must not reach it.
         "DOTFILES_NO_MCP": "1",
-        # launchd needs no flag: install_pr_watch only bootstraps when
-        # $HOME/.config/pr-watch/enabled exists, which a fake HOME never has. (An
-        # earlier PR_WATCH_NO_BOOTSTRAP here read as protection but install.sh has
-        # never looked at it.)
+        # launchd needs no flag: the only agent install.sh ever bootstrapped was
+        # pr-watch's, and that is retired — retire_pr_watch now boots it OUT, and it
+        # returns early unless a plist exists in $HOME (see
+        # test_install_retire_pr_watch.py). An earlier PR_WATCH_NO_BOOTSTRAP here read
+        # as protection but install.sh never looked at it.
     }
     env.update(extra_env)
     return subprocess.run(

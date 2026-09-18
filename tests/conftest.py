@@ -1,11 +1,11 @@
-"""Pytest fixtures that import the extensionless bin scripts as modules.
+"""Pytest fixtures that import the extensionless bin script as a module.
 
-`bin/t` and `bin/pr-watch` are executables symlinked onto PATH by install.sh and
-referenced by the `t()` zsh shim and the pr-watch launchd plist — renaming them to
-`.py` would break those references. So we load them in place via importlib instead.
+`bin/t` is an executable symlinked onto PATH by install.sh and referenced by the
+`t()` zsh shim — renaming it to `.py` would break those references. So we load it
+in place via importlib instead.
 
-Both scripts guard their entrypoint with `if __name__ == "__main__"`, so importing
-runs only their (side-effect-free) module-level constant setup, not the CLI.
+It guards its entrypoint with `if __name__ == "__main__"`, so importing runs only
+its (side-effect-free) module-level constant setup, not the CLI.
 """
 
 import importlib.util
@@ -36,8 +36,3 @@ def load_script(path, mod_name):
 @pytest.fixture(scope="session")
 def t_mod():
     return load_script(BIN / "t", "t_bin")
-
-
-@pytest.fixture(scope="session")
-def prwatch_mod():
-    return load_script(BIN / "pr-watch", "pr_watch_bin")

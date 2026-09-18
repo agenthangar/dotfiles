@@ -187,7 +187,7 @@ def zsh_capture(snippet, stdin=subprocess.DEVNULL):
 def _run(cmd, cwd=None, timeout=None):
     """subprocess.run with captured text output that never raises: a missing binary
     reads as rc 127 and a timeout as rc 124, both with the reason in .stderr, so
-    callers classify outcomes instead of catching exceptions (bin/pr-watch's run()).
+    callers classify outcomes instead of catching exceptions.
     stdin is /dev/null: nothing run through here may prompt, and a child that touched
     the tty from inside the raw-mode wizard would leave it reading a terminal it no
     longer owns (see _new_sh_whence)."""
@@ -5867,7 +5867,7 @@ examples:
   t open ff -r --new      start a fresh session on the default remote host
   t open ff --host mini   start/attach a session on 'mini' (a specific remote host)
   t open a4aa5f6a         open a foreground (:fg) session by id from t ls (any machine)
-  t open dotfiles-pr47    attach a pr-watch session in place (its :fg label from t ls)
+  t open dotfiles:fg      attach a claude running in a plain tmux session, in place
   t ls                    list this repo's live sessions
   t ls -r                 list live sessions across every machine
   t push                  send the current session to a background tmux slot
@@ -5895,7 +5895,7 @@ Run `t <verb> -h` for a verb's own flags.""")
             "(or a lone slot like `t open 3`) targets the repo your cwd is in. A slot that is "
             "live only on another host is attached in place automatically — no flag needed. "
             "A foreground / :fg row from `t ls` is opened by its shown id/label, on whichever "
-            "machine holds it: one living in a tmux session (a pr-watch `pr-*` one) is attached "
+            "machine holds it: one living in a tmux session of its own is attached "
             "in place, a true foreground claude is moved into this terminal. "
             "`--new` forces a fresh session, `--fg` runs inline without a tmux slot, and "
             "`-r`/`--host` open or attach on a remote host (`-r --new` starts one there).")
@@ -5924,8 +5924,8 @@ Run `t <verb> -h` for a verb's own flags.""")
     sp = sub.add_parser("kill", help="tear down a session",
         description="Tear down a dev session (kill its tmux slot). Names default to the cwd "
             "repo, so `t kill 3` kills this repo's slot 3 and `t kill all` kills every slot for "
-            "it. A foreground / :fg row from `t ls` (a bare `claude`, or a pr-watch `pr-*` "
-            "session) is killed by its shown id/label — `t kill dotfiles-pr47:fg` or `t kill "
+            "it. A foreground / :fg row from `t ls` (a bare `claude`, or one in a tmux "
+            "session of its own) is killed by its shown id/label — `t kill dotfiles:fg` or `t kill "
             "<short-id>` — since it is not a dev slot. Confirms first while a Claude is live "
             "unless `-y`; `-r` kills it on its remote host instead.")
     sp.add_argument("repo", nargs="?", help="DEV_REPOS key (or a :fg id/label); defaults to the repo your cwd is in")

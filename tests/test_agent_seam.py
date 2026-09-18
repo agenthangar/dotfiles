@@ -557,6 +557,45 @@ def test_zsh_meta_batch_titles_a_codex_rollout(zsh):
     assert [ln.split("\t")[1] for ln in r.stdout.splitlines()] == ["fix the login bug", title]
 
 
+def test_zsh_meta_batch_prefers_the_codex_thread_name(zsh):
+    """codex keeps a thread's generated/renamed short title in its INDEX, never in the
+    rollout (0.154) — and mints it a turn after the first prompt, appending no byte, so
+    a title cached with the scan offset would pin the opening line forever. That is the
+    bug: a renamed codex slot still read as its first prompt in `t ls`."""
+    import sqlite3
+    wt = f"{zsh.home}/code/.worktrees/api/3"
+    paths = _codex_home(zsh, [(SID, wt, "t", 100, 0, None)])
+    first = "Reply with exactly the word OK and nothing else."
+    assert zsh(f"_transcript_title {paths[SID]}").stdout.strip() == first   # unnamed: the prompt
+    db = zsh.home / ".codex" / "state_5.sqlite"
+
+    def name_it(name):
+        c = sqlite3.connect(str(db))
+        c.execute("update threads set name=? where id=?", (name, SID))
+        c.commit()
+        c.close()
+
+    # codex names the thread AFTER the transcript was already scanned and cached
+    name_it("Add a daily debug view")
+    assert zsh(f"_transcript_title {paths[SID]}").stdout.strip() == "Add a daily debug view"
+    name_it("   ")                                    # blank is not a name
+    assert zsh(f"_transcript_title {paths[SID]}").stdout.strip() == first
+    name_it("renamed by hand")                        # a later /rename, still no new bytes
+    # ... and a claude transcript in the same batch keeps its own title
+    proj = zsh.home / ".claude" / "projects" / "x"
+    proj.mkdir(parents=True)
+    (proj / "c1.jsonl").write_text('{"type":"user","message":{"content":"fix the login bug"}}\n')
+    r = zsh(f"_transcript_meta_batch {proj / 'c1.jsonl'} {paths[SID]}")
+    assert [ln.split("\t")[1] for ln in r.stdout.splitlines()] == ["fix the login bug", "renamed by hand"]
+    # an index that is missing or corrupt falls back to the first prompt, silently
+    db.write_text("not a database")
+    r = zsh(f"_transcript_title {paths[SID]}")
+    assert r.stdout.strip() == first and r.stderr == ""
+    db.unlink()
+    r = zsh(f"_transcript_title {paths[SID]}")
+    assert r.stdout.strip() == first and r.stderr == ""
+
+
 def test_zsh_codex_subagent_threads_are_not_conversations(zsh):
     """A thread the parent spawned (`source` = a subagent JSON, empty title, the same
     first prompt as the parent's brief) is codex's `<sid>/subagents/` — listed as a

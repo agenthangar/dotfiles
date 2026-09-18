@@ -256,7 +256,6 @@ link_all() {
     link "$LINK_SRC/bin/pii-scan"         "$HOME/bin/pii-scan"
     link "$LINK_SRC/bin/claude-stamp-tmux" "$HOME/bin/claude-stamp-tmux"
     link "$LINK_SRC/bin/t"                "$HOME/bin/t"
-    link "$LINK_SRC/bin/pr-watch"         "$HOME/bin/pr-watch"
     link "$LINK_SRC/claude/commands/tpush.md" "$HOME/.claude/commands/tpush.md"
     link "$LINK_SRC/claude/commands/tpop.md"  "$HOME/.claude/commands/tpop.md"
     # Codex CLI's twins of /tpush and /tpop (custom prompts: ~/.codex/prompts/<name>.md
@@ -271,6 +270,14 @@ link_all() {
     if [[ -L "$HOME/.claude/commands/todo.md" ]]; then
         rm -f "$HOME/.claude/commands/todo.md"
         echo "Removed retired link: ~/.claude/commands/todo.md"
+    fi
+    # pr-watch is retired the same way, and the dangling link matters MORE here: it
+    # sits on $PATH, so `pr-watch` would resolve to a broken symlink (an exec error,
+    # not a clean "command not found") and any surviving launchd plist would keep
+    # firing it every 5 minutes. retire_pr_watch below boots out that plist.
+    if [[ -L "$HOME/bin/pr-watch" ]]; then
+        rm -f "$HOME/bin/pr-watch"
+        echo "Removed retired link: ~/bin/pr-watch"
     fi
     # ~/.ssh must exist and be 0700 before the snippet can land in it. The Include
     # rewrite that pairs with this link stays below, in the full-install section.
@@ -288,8 +295,8 @@ link_all
 # reconciles", and a step only reachable by a manual full install breaks that (it is
 # how a released change lands on one machine and silently not on another). Safe here
 # for the same reasons link_all is: offline, idempotent, and it touches exactly one
-# key that this script itself wrote — unlike the brew/launchd/PII steps the exit
-# exists to skip.
+# key that this script itself wrote — unlike the brew/PII steps the exit exists to
+# skip.
 #
 # `t todo` is retired, and with it the statusLine it seeded (`t todo --statusline`).
 # The seed lived in settings.json.example AND in this targeted merge (Claude writes to
@@ -517,11 +524,39 @@ install_agent_trust() {
 }
 install_agent_trust
 
+# pr-watch — RETIRED. It was an autonomous PR fixer on a launchd StartInterval timer:
+# every 5 minutes it polled for a CONFLICTING / CI-failed PR and spawned a detached
+# `claude --dangerously-skip-permissions` to fix and push it.
+#
+# Unlike the statusline retirement above, an un-seed here is not tidiness — it is the
+# kill switch. The plist is a REAL file this script wrote into ~/Library/LaunchAgents
+# (materialized with expanded paths, never a symlink), so deleting bin/pr-watch alone
+# would leave launchd firing a vanished command on a timer, on exactly the machines
+# that were opted in. It therefore runs in the LINKS-ONLY path, above the exit below,
+# for the sharpest form of the usual reason: a plain `dots` must disarm every machine,
+# and a step only a manual full install reaches would leave one armed forever.
+#
+# Only OUR label is touched, and a bootout of something already gone is not an error
+# (launchctl says "Could not find service", rc 3 — hence the `|| true`). The opt-in
+# flag (~/.config/pr-watch/enabled) and the run state (~/.cache/pr-watch, the log) are
+# deliberately left alone: the `t todo` stance — nothing reads them once the code is
+# gone, and deleting a user's files is not an installer's business.
+retire_pr_watch() {
+    local label="com.chrisobrien-ai.pr-watch"
+    local plist="$HOME/Library/LaunchAgents/$label.plist"
+    [[ -e "$plist" ]] || return 0
+    command -v launchctl >/dev/null 2>&1 && launchctl bootout "gui/$(id -u)/$label" 2>/dev/null || true
+    rm -f "$plist"
+    echo "Retired the pr-watch LaunchAgent (booted out, $plist removed)"
+}
+retire_pr_watch
+
 # Everything below is the FULL install. The links-only relink stops here, before the
 # tmux source-file, the ssh Include rewrite, the ~/.zshrc.local and settings.json
 # seeds, the global gitconfig/hooksPath writes, the PII denylist branch (which would
 # DELETE the denylist when PII_SCRUB_RULES is unset — always true from a shell hook),
-# the launchd agent restart, and brew bundle.
+# and brew bundle. (The launchd agent restart is gone with pr-watch; its un-seed is
+# above, in the links-only path, so a plain `dots` disarms an opted-in machine.)
 if [[ -n "${DOTFILES_LINKS_ONLY:-}" ]]; then
     exit 0
 fi
@@ -665,35 +700,6 @@ fi
 # launchd agent: iCloud Drive is TCC-protected and background agents are denied,
 # whereas the shell runs in the Terminal's already-approved context. Nothing to
 # set up here — the hook fires csync at most every 15 min from your prompt.
-
-# pr-watch LaunchAgent — the autonomous PR fixer. Unlike csync, a launchd agent IS
-# right here: pr-watch only talks to gh/git/tmux, none of them TCC-protected. We
-# materialize the plist with real paths (launchctl can fail to bootstrap a symlinked
-# plist, same reasoning as ~/.claude/settings.json) but leave it INERT — poll() is a
-# no-op until `pr-watch enable` creates ~/.config/pr-watch/enabled, so a fresh clone
-# never silently arms an agent that pushes code. Only (re)load it when already opted
-# in, so re-running install.sh picks up plist changes without arming a new machine.
-install_pr_watch() {
-    local plist="$HOME/Library/LaunchAgents/$1"
-    local label="${1%.plist}"
-    mkdir -p "$HOME/Library/LaunchAgents"
-    sed "s|__HOME__|$HOME|g" "$LINK_SRC/launchd/$1" > "$plist"
-    if [[ -e "$HOME/.config/pr-watch/enabled" ]]; then
-        launchctl bootout "gui/$(id -u)/$label" 2>/dev/null || true
-        if launchctl bootstrap "gui/$(id -u)" "$plist" 2>/dev/null; then
-            echo "Reloaded pr-watch LaunchAgent (this machine is opted in)"
-        else
-            echo "Installed $plist but could not bootstrap it — run 'pr-watch enable'"
-        fi
-    else
-        echo "Installed $plist (inert — run 'pr-watch enable' to arm the PR watcher)"
-    fi
-}
-if [[ "$(uname)" == "Darwin" ]]; then
-    install_pr_watch "com.chrisobrien-ai.pr-watch.plist"
-else
-    echo "Skipping pr-watch LaunchAgent (launchd is macOS-only)."
-fi
 
 # Install the Homebrew tools the shell config depends on (gh, jq, tmux, fzf, glow).
 # Idempotent — brew bundle skips anything already installed. Skipped entirely if

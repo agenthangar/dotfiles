@@ -16,7 +16,7 @@ A fake `pbcopy` is put FIRST on PATH, so the tests both work on Linux CI (where
 there is no pbcopy) and never touch the developer's real clipboard on macOS.
 
 Everything runs on a throwaway `tmux -L` socket under tmp_path. Coverage is scoped
-to bin/t and bin/pr-watch in pyproject.toml, so these do not dilute the ratchet.
+to bin/t in pyproject.toml, so these do not dilute the ratchet.
 """
 
 import os

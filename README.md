@@ -292,7 +292,7 @@ Run it by hand anytime: `pii-scan` (all tracked files) or `pii-scan --staged`.
 
 ## Tests
 
-The Python CLIs (`bin/t`, `bin/pr-watch`) have a `pytest` suite covering their
+The Python CLI (`bin/t`) has a `pytest` suite covering its
 pure logic (config parsing, path→repo resolution, the capture-pane ANSI stripper,
 PR triage). The test deps are **dev/CI-only** — `install.sh` never installs them.
 

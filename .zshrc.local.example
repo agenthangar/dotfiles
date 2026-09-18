@@ -45,15 +45,3 @@ DEV_REPOS[web]="$HOME/code/my-web"
 # so compdef is available here. Guard with -f so a missing file is a no-op.
 # [[ -f "$HOME/.tool/completions/tool.zsh" ]] && source "$HOME/.tool/completions/tool.zsh"
 
-# pr-watch — the autonomous PR fixer (bin/pr-watch) — is OFF by default and is NOT
-# armed by installing the dotfiles. It edits code and pushes on its own, so opt in
-# PER MACHINE (only where you want it running) with:  pr-watch enable
-# Disarm + boot out the launchd agent with:           pr-watch disable
-# (Optional) watch a different repo than chrisobrien-ai/dotfiles. Set BOTH (the
-# env var is for interactive runs; the config file is read by the LaunchAgent,
-# which does NOT source zsh, so a plain `export` never reaches the 5-min poll):
-# export PR_WATCH_REPO=owner/name
-# mkdir -p ~/.config/pr-watch && cat > ~/.config/pr-watch/config <<'EOF'
-# PR_WATCH_REPO=owner/name
-# PR_WATCH_REPO_ROOT=/absolute/path/to/local/checkout
-# EOF

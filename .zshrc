@@ -116,7 +116,7 @@ _help_style() {
 # reuses it, so a key added once stays loaded until reboot. An empty agent is
 # refilled from the macOS Keychain (--apple-load-keychain), so a reboot does
 # not bring back per-connection passphrase prompts — background ssh users
-# (worktree-sweep fetches, csync, pr-watch) prompt-spam the console otherwise.
+# (worktree-sweep fetches, csync) prompt-spam the console otherwise.
 # Requires the passphrase to be IN the Keychain: one-time per machine, run
 #   ssh-add --apple-use-keychain ~/.ssh/id_ed25519
 # (UseKeychain in ~/.ssh/config only READS the Keychain; it never writes it.)
@@ -2562,11 +2562,13 @@ _dev_adopt_fg() {
 # tmux session. `t open` never moves a session; _dev_adopt_fg's stop-and-resume is the
 # exception forced by a TRUE foreground agent having no tmux to attach to — but a
 # `<repo>:<id>` / `:fg` row can equally be an agent inside a NON-dev tmux session
-# (pr-watch's `pr-dotfiles-N`), and those attach like any slot. This is `t open`'s
+# (a claude you started in a tmux session yourself), and those attach like any slot.
+# This is `t open`'s
 # companion to _dev_kill_fg, which has reached those rows since the `t kill dotfiles-pr47`
 # gap: before this, `t open dotfiles-pr136` said "no foreground session" and could not
-# have adopted it either — pr-watch launches claude by `send-keys`, so the SessionStart
-# hook never registers it and the row carries no id to resume. Returns 0 handled (attached,
+# have adopted it either — the now-retired pr-watch launched claude by `send-keys`, so
+# the SessionStart hook never registered it and the row carried no id to resume; any
+# `send-keys`-launched agent has that shape. Returns 0 handled (attached,
 # or told the user exactly which handle to name), 1 if <handle> matched rows but none live
 # in tmux (the caller falls through to the adopt/move path), 2 if nothing matched at all
 # (the caller may look at the other machines). Repo-key matching is ON (see _dev_fg_match):
@@ -2835,7 +2837,7 @@ _dev_list() {
   done <<< "$fgrows"
   # reattach legend: tmux slots via `t open <repo> <slot>`; a foreground (:fg) row is
   # bound to its terminal, so it comes back foreground via `t open <id>`. Kill a :fg row
-  # (a foreground claude or a pr-watch `pr-*` session) with `t kill <id>` — it is not a
+  # (a foreground claude, or one in a tmux session of its own) with `t kill <id>` — not a
   # dev slot, so `t kill <repo> <slot>` does not apply. Both shown only when a :fg row exists.
   local foot="reattach: t open <repo> <slot>"
   [[ -n $fgrows ]] && foot+=" · foreground: t open <id> · kill: t kill <id>"
@@ -3098,8 +3100,8 @@ _dev_kill_one() {
 
 # _dev_tmux_session_of_pid <pid> — print the tmux session <pid> runs inside (walk its
 # ancestry until an ancestor is some pane's pid), else return 1. Lets _dev_kill_fg tell a
-# claude living in a NON-dev tmux session (e.g. pr-watch's `pr-dotfiles-N` — kill the
-# whole session) from a true no-tmux foreground claude (SIGTERM the process). The map is
+# claude living in a NON-dev tmux session (kill the whole session) from a true no-tmux
+# foreground claude (SIGTERM the process). The map is
 # built over ALL sessions, not just dev-*, precisely because these targets are non-dev.
 _dev_tmux_session_of_pid() {
   local pid="$1" line up
@@ -3119,7 +3121,7 @@ _dev_tmux_session_of_pid() {
 # _dev_fg_pids — one row per live agent process that is NOT the agent of a
 # dev-<repo>-<slot> pane: "<pid>\t<sid>\t<cwd>\t<label>\t<agent>". The pid-keyed view of
 # the `<repo>:<id>` / `<repo>:fg` rows `t ls` shows — true foreground agents AND agents
-# living in a NON-dev tmux session (pr-watch's `pr-dotfiles-N`). Labels are built exactly
+# living in a NON-dev tmux session of their own. Labels are built exactly
 # as _dev_fg_rows builds them (registry sid → `<repo>:<short sid>`, else `<repo>:fg`) so
 # the same handles address the same rows; the agent THIS shell runs under is skipped —
 # never kill or attach the session you are typing in. _dev_fg_rows keeps its own copy of
@@ -3181,8 +3183,8 @@ _dev_fg_match() {
 # _dev_kill_fg <handle> [force] — kill FOREGROUND / non-dev-slot claude sessions: the
 # `<repo>:<id>` / `<repo>:fg` rows `t ls` shows via _dev_fg_rows (live claudes not owned
 # by a dev-<repo>-<slot> pane — true foreground claudes AND claudes in a non-dev tmux
-# session like pr-watch's `pr-dotfiles-N`). _dev_kill only tears down dev slots, so this
-# is the companion path for those rows — the gap that made `t kill dotfiles-pr47` report
+# session of its own). _dev_kill only tears down dev slots, so this is the companion
+# path for those rows — the gap that made `t kill dotfiles-pr47` report
 # "no session". Rows + handle matching come from _dev_fg_match (with the repo-part rule
 # suppressed for a DEV_REPOS key, so `t kill dotfiles` still lists dev slots). Kill
 # mechanics via _dev_tmux_session_of_pid: a claude inside a tmux session → kill that
@@ -3271,7 +3273,7 @@ _dev_kill() {
       print -r -- "t kill — tear down a dev session (or all of a repo's)"
       print -r -- ""
       print -r -- "Usage: t kill [repo] <slot|all> [-y]   (no repo: the one \$PWD is in; --remote kills on its host)"
-      print -r -- "       t kill <id>                     (a foreground / :fg row from \`t ls\` — e.g. a pr-watch pr-* session)"
+      print -r -- "       t kill <id>                     (a foreground / :fg row from \`t ls\`)"
     } | _help_style
     return 1
   fi
@@ -3291,7 +3293,7 @@ _dev_kill() {
       _dev_remote_delegate "$repo" "$slot" kill ${force:+-y} && return
     fi
     # No dev slot here. The target may be a FOREGROUND / non-dev-slot claude — the
-    # `<repo>:<id>` / `:fg` rows `t ls` shows (a true foreground claude or a pr-watch
+    # `<repo>:<id>` / `:fg` rows `t ls` shows (a true foreground claude, or one in a
     # `pr-*` session). Those never match the dev-slot grep above, so try that path
     # before giving up (only for a slot-less handle — fg rows carry no slot number).
     # rc 2 = no fg row matched → fall through; 0/1 = matched (killed / skipped) → done.
@@ -3537,8 +3539,8 @@ _t_dev() {
   fi
 
   # `t open <repo> fg|<id>` — reattach a FOREGROUND (:fg) session listed by `t ls`.
-  # _dev_open_fg picks how: a row living in a non-dev tmux session (pr-watch's
-  # `pr-dotfiles-N`), here or on another host, is ATTACHED in place; a true foreground
+  # _dev_open_fg picks how: a row living in a non-dev tmux session of its own, here or
+  # on another host, is ATTACHED in place; a true foreground
   # agent is bound to its own terminal, so getting into it means MOVING it — stop that
   # owner and `claude -r` in THIS terminal. The tmux-slot analog is `t open <repo> <slot>`. (`fg` as the slot keyword mirrors the
   # `:fg` label and scopes to the repo; an id-shaped slot — see _dev_fg_handle —
@@ -4008,8 +4010,9 @@ _dev_remote_fg_kill() {
 # each host's fg rows) for the ones matching — exact label, the label's repo part, or a
 # bare id prefix — and run `t open` on the winner's host over ssh -t, letting that host's
 # own _dev_open_fg attach it in place (or adopt it into the ssh terminal, as it would
-# locally). This is what makes `t open dotfiles-pr136` work from the laptop for a pr-watch
-# session on mini, in place of the hand-written `t on mini tmux attach -t …` the `t ls -r`
+# locally). This is what makes `t open <label>` work from the laptop for a session in a
+# plain tmux session on mini (the retired pr-watch's `pr-dotfiles-N` was the case that
+# surfaced it), in place of the hand-written `t on mini tmux attach -t …` the `t ls -r`
 # footer used to have to recommend. One match → go; several → fzf-pick (no TTY: print the
 # exact handles); none → 2, so the caller falls back to the local adopt path.
 #

@@ -7,9 +7,9 @@
 # (caffeinate, pmset, rsync, sed, awk, column, less, git) are intentionally left
 # out — they ship with the OS / Xcode CLT.
 
-brew "gh"    # prview() / pr-watch            — PR status + polling via the GitHub CLI
+brew "gh"    # prview() / t doctor / t resume  — PR status + state via the GitHub CLI
 brew "jq"    # prview()                       — parse gh's JSON output
-brew "tmux"  # t open / t pop / t paste / t read / pr-watch — the Claude Code dev-session workflow
+brew "tmux"  # t open / t pop / t paste / t read — the Claude Code dev-session workflow
 brew "fzf"   # t push / t open / t find       — fuzzy-pick a Claude session
 brew "glow"  # t plan                         — render Claude plan markdown in-terminal
 

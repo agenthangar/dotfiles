@@ -102,7 +102,7 @@ jobs:
         if: always()
         run: rm -f "$RUNNER_TEMP/scrub-rules.json"
 
-  # pytest suite for the pure logic in the Python bins (bin/t, bin/pr-watch).
+  # pytest suite for the pure logic in the Python bin (bin/t).
   # Coverage is scoped (in pyproject.toml) to those two files and excludes the
   # subprocess/ssh/tmux/CLI glue, so --cov-fail-under guards the deterministic
   # helpers we actually test. The threshold is a RATCHET: raise it as coverage
@@ -169,11 +169,11 @@ jobs:
   # CodeQL static analysis (SAST) over the Python. Only `python` is requested:
   # CodeQL has no shell language, so the Bash scripts (install.sh, bin/csync,
   # sleep-manager, …) are out of scope here — shellcheck covers them. The two
-  # interesting targets, bin/t and bin/pr-watch, are EXTENSIONLESS; CodeQL's
-  # Python extractor finds them anyway via their `#!/usr/bin/env python3` shebang
+  # interesting target, bin/t, is EXTENSIONLESS; CodeQL's
+  # Python extractor finds it anyway via its `#!/usr/bin/env python3` shebang
   # (plus tests/*.py by extension). Do NOT add a paths/extension filter to "tidy"
-  # this — a `.py`-only filter would silently drop the bins that shell out and
-  # (pr-watch) auto-push, which are the whole reason this job exists. Python is
+  # this — a `.py`-only filter would silently drop the one bin that shells out to
+  # ssh/git/tmux, which is the whole reason this job exists. Python is
   # interpreted, so no autobuild step is needed: init → analyze.
   codeql:
     name: CodeQL

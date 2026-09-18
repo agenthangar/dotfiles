@@ -5,7 +5,7 @@ stub `ps` / `tmux` binaries on PATH that answer from fixtures and log their argv
 Today this covers bin/claude-stamp-tmux, the SessionStart hook every "which slot is
 running what" answer depends on (registry, opened stamp, origin stamp, tmux stamp).
 The zsh `_dev_agent_*` seam lands here next. Coverage is scoped to bin/t and
-bin/pr-watch in pyproject.toml, so these subprocess tests do not move the ratchet.
+pyproject.toml, so these subprocess tests do not move the ratchet.
 """
 
 import json
@@ -772,9 +772,9 @@ PR_WATCH_CWD = ".cache/pr-watch/worktrees/dotfiles-pr136"
 
 
 def _fg_world(zsh, tmp_path, *, panes=None, registered=None):
-    """A process table holding one pr-watch-style claude (pid 4242, under shell 4200, no
-    registry entry — pr-watch launches it by send-keys, so the SessionStart hook never
-    sees it) plus, with <registered>, a second claude the hook DID register. Returns the
+    """A process table holding one send-keys-launched claude (pid 4242, under shell 4200,
+    no registry entry — the SessionStart hook never sees one, as the retired pr-watch's
+    sessions showed) plus, with <registered>, a second claude the hook DID register. Returns the
     extra env the fg helpers need. <panes> maps a pid to the tmux session it sits in."""
     cwd = f"{zsh.home}/{PR_WATCH_CWD}"
     pathlib.Path(cwd).mkdir(parents=True, exist_ok=True)
@@ -795,9 +795,9 @@ def _fg_world(zsh, tmp_path, *, panes=None, registered=None):
 
 
 def test_zsh_fg_pids_labels_a_claude_with_no_registry_entry(zsh, tmp_path):
-    """A pr-watch claude is in no registry, so its row carries sid `-` and the `<repo>:fg`
-    label — `<repo>` being the cwd's basename, since the pr-watch worktree is no DEV_REPOS
-    repo. This is the row `t open` could never reach: no id to resume."""
+    """A send-keys-launched claude is in no registry, so its row carries sid `-` and the
+    `<repo>:fg` label — `<repo>` being the cwd's basename, since this worktree is no
+    DEV_REPOS repo. This is the row `t open` could never reach: no id to resume."""
     env = _fg_world(zsh, tmp_path)
     r = zsh("_dev_fg_pids", **env)
     assert r.returncode == 0, r.stderr
@@ -823,7 +823,7 @@ def test_zsh_fg_match_rules(zsh, tmp_path):
 
 def test_zsh_attach_fg_attaches_a_non_dev_tmux_session_in_place(zsh, tmp_path):
     """The gap this closes: `t open dotfiles-pr136` used to report "no foreground session"
-    for a pr-watch claude, and could not have adopted it either (no id). It lives in a tmux
+    for such a claude, and could not have adopted it either (no id). It lives in a tmux
     session, so it is attached in place — never moved."""
     env = _fg_world(zsh, tmp_path, panes={4200: "pr-dotfiles-136"})
     r = zsh("_dev_attach_fg dotfiles-pr136; echo rc=$?", _tty=True, **env)

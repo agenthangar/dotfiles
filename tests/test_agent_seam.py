@@ -24,7 +24,14 @@ REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
 HOOK = REPO_ROOT / "bin" / "claude-stamp-tmux"
 
 PS_STUB = r"""#!/bin/bash
-# ps -o comm= -p <pid> | ps -o ppid= -p <pid>, answered from $FAKE_PS ("pid ppid comm")
+# ps -o comm= -p <pid> | ps -o ppid= -p <pid>, answered from $FAKE_PS ("pid ppid comm").
+# `ps -Axo pid,comm` (the whole table — what _dev_fg_pids enumerates over) is answered
+# too; `-Axo pid,ppid,comm` deliberately is NOT, so _dev_ps_snapshot stays empty and the
+# walkers keep taking their per-pid fallback path, as every other test here assumes.
+if [[ "$1" == -Axo ]]; then
+  [[ "$2" == pid,comm ]] && awk '{print $1, $3}' "$FAKE_PS"
+  exit 0
+fi
 pid="${@: -1}"
 while read -r p pp c; do
   if [[ "$p" == "$pid" ]]; then
@@ -37,6 +44,18 @@ exit 1
 
 TMUX_STUB = r"""#!/bin/bash
 printf '%s\n' "$*" >> "$TMUX_LOG"
+"""
+
+LSOF_STUB = r"""#!/bin/bash
+# lsof -a -p <pid> -d cwd -Fn, answered from $FAKE_LSOF ("pid path"). Silent otherwise —
+# which is what the real lsof does for the invented pids these tests use.
+pid=""
+while [[ $# -gt 0 ]]; do [[ "$1" == -p ]] && pid="$2"; shift; done
+[[ -n "$pid" && -n "${FAKE_LSOF:-}" ]] || exit 1
+while read -r p path; do
+  [[ "$p" == "$pid" ]] && { echo "n$path"; exit 0; }
+done < "$FAKE_LSOF"
+exit 1
 """
 
 
@@ -201,7 +220,7 @@ case "$1" in
   has-session)      [[ -n "${FAKE_HAS_SESSION:-}" ]] || exit 1 ;;
   list-sessions)    [[ -n "${FAKE_SESSIONS:-}" ]] && printf '%s\n' $FAKE_SESSIONS ;;
   display-message)  [[ -n "${FAKE_SESSION_PATH:-}" && "$*" == *session_path* ]] && echo "$FAKE_SESSION_PATH" ;;
-  list-panes)       : ;;
+  list-panes)       [[ -n "${FAKE_PANES:-}" ]] && printf '%s\n' "$FAKE_PANES" ;;
 esac
 exit 0
 """
@@ -268,7 +287,8 @@ def zsh(tmp_path):
         'DEV_AGENT[api]=codex\n')
     bins = tmp_path / "stubbin"
     bins.mkdir()
-    for name, body in (("tmux", TMUX_LOG_STUB), ("uuidgen", UUIDGEN_STUB), ("ps", PS_STUB)):
+    for name, body in (("tmux", TMUX_LOG_STUB), ("uuidgen", UUIDGEN_STUB), ("ps", PS_STUB),
+                       ("lsof", LSOF_STUB)):
         f = bins / name
         f.write_text(body)
         f.chmod(0o755)
@@ -741,6 +761,167 @@ def test_zsh_kill_one_runs_tmux_kill_session(zsh):
     assert "command not found" not in r.stderr
     assert "Killed dev-api-3" in r.stdout
     assert "kill-session -t dev-api-3" in zsh.log.read_text().splitlines()
+
+
+SSH_STUB = """#!/bin/bash
+printf '%s\\n' "$*" >> "$SSH_LOG"
+exit 0
+"""
+
+PR_WATCH_CWD = ".cache/pr-watch/worktrees/dotfiles-pr136"
+
+
+def _fg_world(zsh, tmp_path, *, panes=None, registered=None):
+    """A process table holding one pr-watch-style claude (pid 4242, under shell 4200, no
+    registry entry — pr-watch launches it by send-keys, so the SessionStart hook never
+    sees it) plus, with <registered>, a second claude the hook DID register. Returns the
+    extra env the fg helpers need. <panes> maps a pid to the tmux session it sits in."""
+    cwd = f"{zsh.home}/{PR_WATCH_CWD}"
+    pathlib.Path(cwd).mkdir(parents=True, exist_ok=True)
+    table = ["1 0 launchd", "4200 1 zsh", "4242 4200 claude"]
+    lsof = [f"4242 {cwd}"]
+    if registered:
+        sid, rcwd = registered
+        table.append("5555 4200 claude")
+        pathlib.Path(rcwd).mkdir(parents=True, exist_ok=True)
+        (zsh.home / ".cache" / "claude-sessions").mkdir(parents=True, exist_ok=True)
+        (zsh.home / ".cache" / "claude-sessions" / "5555").write_text(f"{sid}\t{rcwd}\n")
+    (tmp_path / "ps.txt").write_text("\n".join(table) + "\n")
+    (tmp_path / "lsof.txt").write_text("\n".join(lsof) + "\n")
+    env = {"FAKE_LSOF": str(tmp_path / "lsof.txt")}
+    if panes:
+        env["FAKE_PANES"] = "\n".join(f"{pid} {sess}" for pid, sess in panes.items())
+    return env
+
+
+def test_zsh_fg_pids_labels_a_claude_with_no_registry_entry(zsh, tmp_path):
+    """A pr-watch claude is in no registry, so its row carries sid `-` and the `<repo>:fg`
+    label — `<repo>` being the cwd's basename, since the pr-watch worktree is no DEV_REPOS
+    repo. This is the row `t open` could never reach: no id to resume."""
+    env = _fg_world(zsh, tmp_path)
+    r = zsh("_dev_fg_pids", **env)
+    assert r.returncode == 0, r.stderr
+    cwd = f"{zsh.home}/{PR_WATCH_CWD}"
+    assert r.stdout.splitlines() == [f"4242\t-\t{cwd}\tdotfiles-pr136:fg\tclaude"], r.stdout
+
+
+def test_zsh_fg_match_rules(zsh, tmp_path):
+    """One home for the three handle rules — and the repo-key gate that keeps `t kill
+    <repo>` on dev slots while `t open <repo> fg` reaches that repo's fg rows."""
+    env = _fg_world(zsh, tmp_path, registered=(f"{SID}", f"{zsh.home}/code/api"))
+    m = lambda snippet: zsh(snippet, **env)
+    assert "dotfiles-pr136:fg" in m("_dev_fg_match dotfiles-pr136:fg").stdout      # exact label
+    assert "dotfiles-pr136:fg" in m("_dev_fg_match dotfiles-pr136").stdout         # repo part
+    assert f"api:{SID[:8]}" in m(f"_dev_fg_match {SID[:6]}").stdout                # id prefix
+    # `api` IS a DEV_REPOS key: suppressed for kill, allowed when the caller asks
+    r = m("_dev_fg_match api; echo rc=$?")
+    assert "rc=1" in r.stdout and "api:" not in r.stdout, r.stdout
+    assert f"api:{SID[:8]}" in m("_dev_fg_match api 1").stdout
+    # a handle nothing answers
+    assert "rc=1" in m("_dev_fg_match beefcafe; echo rc=$?").stdout
+
+
+def test_zsh_attach_fg_attaches_a_non_dev_tmux_session_in_place(zsh, tmp_path):
+    """The gap this closes: `t open dotfiles-pr136` used to report "no foreground session"
+    for a pr-watch claude, and could not have adopted it either (no id). It lives in a tmux
+    session, so it is attached in place — never moved."""
+    env = _fg_world(zsh, tmp_path, panes={4200: "pr-dotfiles-136"})
+    r = zsh("_dev_attach_fg dotfiles-pr136; echo rc=$?", _tty=True, **env)
+    assert "rc=0" in r.stdout, r.stdout
+    assert "Attaching dotfiles-pr136:fg in place (tmux session pr-dotfiles-136)" in r.stdout
+    assert "attach-session -t pr-dotfiles-136" in zsh.log.read_text().splitlines()
+
+
+def test_zsh_attach_fg_rc_tells_the_caller_which_way_to_fall_through(zsh, tmp_path):
+    """rc 1 = matched but no tmux (adopt it), rc 2 = nothing here matched (try the other
+    machines). _dev_open_fg branches on exactly this, so the two must stay distinct."""
+    env = _fg_world(zsh, tmp_path)                       # no panes → nothing to attach
+    assert "rc=1" in zsh("_dev_attach_fg dotfiles-pr136; echo rc=$?", **env).stdout
+    assert "rc=2" in zsh("_dev_attach_fg beefcafe; echo rc=$?", **env).stdout
+    assert "rc=2" in zsh("_dev_attach_fg; echo rc=$?", **env).stdout
+
+
+def test_zsh_attach_fg_disambiguates_several_tmux_rows(zsh, tmp_path):
+    """`t open api fg` with two tmux'd fg sessions in that repo: pick one, or (no picker)
+    be told the exact handles. Never a silent first-match — the handles are the way back."""
+    for name, body in (("fzf", FZF_STUB),):
+        stub = tmp_path / "stubbin" / name
+        stub.write_text(body)
+        stub.chmod(0o755)
+    api = f"{zsh.home}/code/api"
+    pathlib.Path(api).mkdir(parents=True, exist_ok=True)
+    reg = zsh.home / ".cache" / "claude-sessions"
+    reg.mkdir(parents=True, exist_ok=True)
+    (tmp_path / "ps.txt").write_text("1 0 launchd\n4200 1 zsh\n4300 1 zsh\n"
+                                     "4242 4200 claude\n5555 4300 claude\n")
+    for pid, sid in ((4242, "aaaa1111-0000-0000-0000-000000000000"),
+                     (5555, "bbbb2222-0000-0000-0000-000000000000")):
+        (reg / str(pid)).write_text(f"{sid}\t{api}\n")
+    env = {"FAKE_PANES": "4200 pr-api-1\n4300 pr-api-2"}
+    # no picker: the handles, not a guess
+    r = zsh("_dev_attach_fg api; echo rc=$?", **env)
+    assert "rc=0" in r.stdout and "attach-session" not in zsh.log.read_text(), r.stdout
+    assert "t open api:aaaa1111   (tmux pr-api-1)" in r.stderr, r.stderr
+    assert "t open api:bbbb2222   (tmux pr-api-2)" in r.stderr, r.stderr
+    # with fzf: the label is what the row DISPLAYS, so a pick can be typed by handle
+    log = tmp_path / "fzf.log"
+    r = zsh("_dev_attach_fg api", _tty=True, FZF_LOG=str(log), FZF_PICK="api:bbbb2222", **env)
+    assert log.read_text().splitlines() == ["api:aaaa1111", "api:bbbb2222"], log.read_text()
+    assert "Attaching api:bbbb2222 in place (tmux session pr-api-2)" in r.stdout, r.stdout
+    assert "attach-session -t pr-api-2" in zsh.log.read_text().splitlines()
+
+
+def test_zsh_open_fg_attaches_before_it_adopts(zsh, tmp_path):
+    """Order matters: `t open` must not stop-and-move a session it could have attached.
+    With a tmux session the row is attached; without one the same handle falls through to
+    the adopt path, which for an id-less row can only explain itself."""
+    env = _fg_world(zsh, tmp_path, panes={4200: "pr-dotfiles-136"})
+    r = zsh("_dev_open_fg dotfiles-pr136; echo rc=$?", _tty=True, **env)
+    assert "rc=0" in r.stdout and "Attaching dotfiles-pr136:fg in place" in r.stdout, r.stdout
+    assert "attach-session -t pr-dotfiles-136" in zsh.log.read_text().splitlines()
+    del env["FAKE_PANES"]
+    r = zsh("_dev_open_fg dotfiles-pr136; echo rc=$?", **env)
+    assert "Attaching" not in r.stdout, r.stdout
+    assert "predate the session registry" in r.stderr, r.stderr
+
+
+def test_zsh_open_fg_forwards_the_rows_own_label_to_the_host_that_has_it(zsh, tmp_path):
+    """Nothing local answers the handle → attach it on the host whose fg rows do. The
+    forwarded command carries the ROW's label, not the user's handle: `t open ff fg` finds
+    a row labelled `ff:fg`, and forwarding `ff` would open a dev SLOT over there."""
+    stub = tmp_path / "stubbin" / "ssh"
+    stub.write_text(SSH_STUB)
+    stub.chmod(0o755)
+    (zsh.home / ".zshrc.local").write_text(
+        'DEV_REPOS[api]="$HOME/code/api"\nDEV_REPOS[ff]="$HOME/code/ff"\n'
+        'REMOTE_HOSTS[mini]=me@mini\n')
+    (tmp_path / "ps.txt").write_text("1 0 launchd\n")            # no local agents at all
+    rows = "\t".join(["mini", "-", f"{zsh.home}/code/ff", "ff:fg",
+                      "attached", "unknown", "(foreground codex)"])
+    log = tmp_path / "ssh.log"
+    env = {"SSH_LOG": str(log), "FAKE_ROWS": rows}
+    snippet = '_dev_rows_all() { print -r -- "$FAKE_ROWS" }; _dev_open_fg ff; echo rc=$?'
+    r = zsh(snippet, _tty=True, **env)
+    assert "rc=0" in r.stdout, r.stdout
+    assert "Attaching foreground 'ff:fg' on mini" in r.stdout, r.stdout
+    assert log.read_text().splitlines() == ["-t me@mini zsh -lic 't open ff:fg'"], log.read_text()
+
+
+def test_zsh_open_fg_skips_the_remote_probe_when_a_local_row_matched(zsh, tmp_path):
+    """The remote look runs only on a local MISS — a local row with no tmux belongs to the
+    adopt path, not to another machine (which cannot own the same live process)."""
+    stub = tmp_path / "stubbin" / "ssh"
+    stub.write_text(SSH_STUB)
+    stub.chmod(0o755)
+    (zsh.home / ".zshrc.local").write_text(
+        'DEV_REPOS[api]="$HOME/code/api"\nREMOTE_HOSTS[mini]=me@mini\n')
+    env = _fg_world(zsh, tmp_path)                               # matches, but no tmux
+    log = tmp_path / "ssh.log"
+    r = zsh('_dev_rows_all() { print -r -- "$FAKE_ROWS" }; _dev_open_fg dotfiles-pr136',
+            SSH_LOG=str(log), FAKE_ROWS="\t".join(
+                ["mini", "-", "/x", "dotfiles-pr136:fg", "attached", "unknown", "(fg)"]), **env)
+    assert not log.exists(), log.read_text()
+    assert "predate the session registry" in r.stderr, r.stderr
 
 
 _ZSH_TIED_SPECIALS = {"path", "fpath", "cdpath", "manpath", "mailpath", "module_path", "prompt"}

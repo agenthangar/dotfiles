@@ -112,6 +112,42 @@ Bash(diffstat:*)
 Bash(pdftotext:*)
 Bash(pdftoppm:*)
 
+# the rest of a pipeline (2026-09-17). Claude and cursor treat these as read-only
+# without a rule; codex does not: when its model asks to run a command outside the
+# sandbox, every segment of `ps … | rg … | head` must match a rules-file entry or the
+# whole thing prompts (a heuristics-safe `head` counts for nothing there — bypass_sandbox
+# needs an explicit policy match per segment). Bare `sed` is in: it edits only with -i.
+Bash(head:*)
+Bash(tail:*)
+Bash(wc:*)
+Bash(sed:*)
+Bash(sort:*)
+Bash(uniq:*)
+Bash(cut:*)
+Bash(tr:*)
+Bash(diff:*)
+Bash(stat:*)
+Bash(pwd:*)
+Bash(which:*)
+Bash(xargs:*)
+Bash(tee:*)
+Bash(mkdir:*)
+Bash(cp:*)
+Bash(mv:*)
+Bash(touch:*)
+Bash(date:*)
+Bash(env:*)
+Bash(basename:*)
+Bash(dirname:*)
+Bash(readlink:*)
+Bash(true:*)
+Bash(git status:*)
+Bash(git log:*)
+Bash(git diff:*)
+Bash(git show:*)
+Bash(git branch:*)
+Bash(git rev-parse:*)
+
 # claude-only, generic tool rules (no project names, no fetch domains — see above)
 WebSearch
 DesignSync

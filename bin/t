@@ -432,7 +432,7 @@ def _render_local(rows, scope, st, has_remote=False):
             has_fg = True
     foot = "reattach: t open <repo> <slot>"
     if has_fg:
-        foot += " · foreground: t open <id>"
+        foot += " · foreground: t open <its SESSION name>"
     if has_remote:
         foot += " · other machines: t ls -r"
     print()
@@ -456,7 +456,7 @@ def _render_remote(rows, scope, st):
     foot = ("attach (auto-finds its host): t open <repo> <slot> · "
             "pull here: t beam <repo> <slot> --from <host>")
     if has_fg:
-        foot += " · foreground: t open <id>"
+        foot += " · foreground: t open <its SESSION name>"
     print()
     print(f"  {st.y}{foot}{st.r}")
 
@@ -5867,7 +5867,7 @@ examples:
   t open ff -r --new      start a fresh session on the default remote host
   t open ff --host mini   start/attach a session on 'mini' (a specific remote host)
   t open a4aa5f6a         open a foreground (:fg) session by id from t ls (any machine)
-  t open dotfiles:fg      attach a claude running in a plain tmux session, in place
+  t open ff:p4242         open an fg row with no session id by its pid label (as t ls shows it)
   t ls                    list this repo's live sessions
   t ls -r                 list live sessions across every machine
   t push                  send the current session to a background tmux slot
@@ -5894,13 +5894,14 @@ Run `t <verb> -h` for a verb's own flags.""")
         description="Open or reattach a Claude session in a per-repo tmux slot. Bare `t open` "
             "(or a lone slot like `t open 3`) targets the repo your cwd is in. A slot that is "
             "live only on another host is attached in place automatically — no flag needed. "
-            "A foreground / :fg row from `t ls` is opened by its shown id/label, on whichever "
+            "A foreground row from `t ls` (`<repo>:<id>`, or `<repo>:p<pid>` when no session id is "
+            "recorded yet) is opened by that SESSION name, on whichever "
             "machine holds it: one living in a tmux session of its own is attached "
             "in place, a true foreground claude is moved into this terminal. "
             "`--new` forces a fresh session, `--fg` runs inline without a tmux slot, and "
             "`-r`/`--host` open or attach on a remote host (`-r --new` starts one there).")
     sp.add_argument("repo", nargs="?", help="DEV_REPOS key, or a foreground session id/repo:id from `t ls`")
-    sp.add_argument("slot", nargs="?", help="slot number, 'fg' (this repo's :fg session), or a session id")
+    sp.add_argument("slot", nargs="?", help="slot number, 'fg' (this repo's foreground sessions), or a session id")
     sp.add_argument("--new", action="store_true", help="force a fresh session")
     sp.add_argument("--fg", action="store_true", help="no tmux: foreground-resume / run inline")
     sp.add_argument("-l", "--local", "--here", dest="local", action="store_true", help="force this machine: skip the remote auto-attach probe (combine with --fg for local foreground)")
@@ -5925,10 +5926,10 @@ Run `t <verb> -h` for a verb's own flags.""")
         description="Tear down a dev session (kill its tmux slot). Names default to the cwd "
             "repo, so `t kill 3` kills this repo's slot 3 and `t kill all` kills every slot for "
             "it. A foreground / :fg row from `t ls` (a bare `claude`, or one in a tmux "
-            "session of its own) is killed by its shown id/label — `t kill dotfiles:fg` or `t kill "
+            "session of its own) is killed by its shown SESSION name — `t kill ff:p4242` or `t kill "
             "<short-id>` — since it is not a dev slot. Confirms first while a Claude is live "
             "unless `-y`; `-r` kills it on its remote host instead.")
-    sp.add_argument("repo", nargs="?", help="DEV_REPOS key (or a :fg id/label); defaults to the repo your cwd is in")
+    sp.add_argument("repo", nargs="?", help="DEV_REPOS key (or a foreground row's SESSION name); defaults to the repo your cwd is in")
     sp.add_argument("slot", nargs="?", help="slot number; a lone slot implies the cwd repo")
     sp.add_argument("-y", "--yes", action="store_true", help="skip the 'Claude is live' confirm")
     sp.add_argument("-r", "--remote", action="store_true", help="kill it on its host instead")

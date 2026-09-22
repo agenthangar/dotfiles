@@ -2436,7 +2436,11 @@ _dev_fg_rows() {
     # Label is "<repo>:<short-sid>" — the short Claude session id makes each
     # foreground row UNIQUE (two `dot` foreground claudes were both "dot:fg" before)
     # and is the handle `t open <id>` reattaches by. The colon marks an fg row (tmux
-    # slots use "<repo>-<num>"). A pre-registry session (no id) falls back to ":fg".
+    # slots use "<repo>-<num>"). A session with no registered id (a codex before its first
+    # prompt mints the thread, a send-keys launch the hook never saw) is labelled by its
+    # PID instead — "<repo>:p<pid>" (_dev_fg_label). It used to be a bare "<repo>:fg", so
+    # three idle codexes in ff rendered as three identical "ff:fg" rows no handle could
+    # tell apart ("they need some sort of uniq identifier", 2026-09-21).
     if [[ -n $sid ]]; then
       label="${repo}:${sid[1,8]}"
       local -a tx=( $(_dev_agent_transcript "$agent" "$sid" 2>/dev/null) )
@@ -2444,7 +2448,7 @@ _dev_fg_rows() {
       if [[ -n $title ]]; then context=active; summary=$title
       else context=idle; summary='(idle — no conversation)'; fi
     else
-      label="${repo}:fg"; sid='-'; context=unknown; summary="(foreground $agent)"
+      _dev_fg_label "$repo" - "$pid"; label=$REPLY; sid='-'; context=unknown; summary="(foreground $agent)"
     fi
     printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$sid" "$cwd" "$label" attached "$context" "$summary" "$agent"
   done
@@ -2456,6 +2460,34 @@ _dev_fg_rows() {
   # scans look failed to _dev_rows_all, which drops their (good) rows.
   return 0
 }
+
+# _dev_fg_label <repo> <sid|-> <pid> — the handle an fg row is shown and addressed by:
+# "<repo>:<short sid>" when the registry knows the session id, else "<repo>:p<pid>". Both
+# are unique on their host; the `p` keeps a pid from reading as a hex id prefix or a slot
+# number. ONE home for it: _dev_fg_rows renders the label and _dev_fg_pids matches on it,
+# so the two must never spell it differently. Returns through $REPLY (no fork per row).
+_dev_fg_label() {
+  if [[ -n $2 && $2 != - ]]; then REPLY="$1:${2[1,8]}"; else REPLY="$1:p$3"; fi
+}
+
+# _DEV_FG_MATCH_AWK — the fg-handle rules as one awk function, fgm(label, sid), shared by
+# the local matcher (_dev_fg_match) and the two cross-host scans (_dev_remote_fg_kill /
+# _dev_remote_fg_open), which had each open-coded them. Reads awk vars h (the handle),
+# idp (its part after the last `:`), isrepo (non-empty = h is a DEV_REPOS key) and ro
+# (non-empty = a DEV_REPOS key may still match its repo's fg rows — the open verbs).
+# A row matches on: its exact label; its repo part (gated as above); `<repo>:fg`, the old
+# id-less label, kept as "that repo's fg rows" so existing habits still resolve; a bare
+# `p<pid>` against a pid label; or a bare short session-id prefix (never for a repo key).
+_DEV_FG_MATCH_AWK='
+function fgm(label, sid,   repo, lid) {
+  repo = label; sub(/:.*/, "", repo); lid = label; sub(/^[^:]*:/, "", lid)
+  if (label == h) return 1
+  if (h == repo && (isrepo == "" || ro != "")) return 1
+  if (h ~ /:fg$/ && substr(h, 1, length(h) - 3) == repo) return 1
+  if (h ~ /^p[0-9]+$/ && lid == h) return 1
+  if (index(h, ":") == 0 && isrepo == "" && sid != "-" && index(sid, idp) == 1) return 1
+  return 0
+}'
 
 # _dev_pid_for_sid <sid> — print the live `claude` pid that owns session <sid>, via
 # the claude-stamp-tmux registry (~/.cache/claude-sessions/<pid> = "<sid>\t<cwd>").
@@ -2473,13 +2505,13 @@ _dev_pid_for_sid() {
 }
 
 # _dev_fg_handle <arg> — is <arg> shaped like a foreground-session handle? True for
-# the displayed `repo:id` label (any `:`) and for a short session-id prefix: 4+ chars,
+# the displayed `repo:id` / `repo:p<pid>` label (any `:`), a bare `p<pid>`, and for a short session-id prefix: 4+ chars,
 # all hex, at least one letter — pure digits stay tmux slot numbers, so `t open dot
 # 1234` can never be stolen by a (rare) all-digit id prefix; type more chars or the
 # repo:id form for those. The dispatcher `_t_dev` uses this to tell slots from ids.
 _dev_fg_handle() {
   local h="$1"
-  [[ $h == *:* ]] && return 0
+  [[ $h == *:* || $h == p<-> ]] && return 0
   (( ${#h} >= 4 )) || return 1
   [[ $h != *[^0-9a-f]* && $h == *[a-f]* ]]
 }
@@ -2507,7 +2539,15 @@ _dev_adopt_fg() {
   rows=$(_dev_fg_rows 2>/dev/null | awk -F'\t' '$3 ~ /:/')
   [[ -n $rows ]] || { echo "t open: no foreground claude running (see \`t ls\`)." >&2; return 1; }
   local resumable; resumable=$(print -r -- "$rows" | awk -F'\t' '$1!="-"')
-  [[ -n $resumable ]] || { echo "t open: foreground claude(s) predate the session registry (no id recorded) — reattach from their own terminal." >&2; return 1; }
+  # An id-less row (label `<repo>:p<pid>`) named exactly: say why it cannot be moved, not
+  # "no match" — it is right there in `t ls`. It has no tmux either (_dev_attach_fg tried).
+  if [[ -n $arg ]] && print -r -- "$rows" | awk -F'\t' -v a="$arg" '$1=="-" && ($3==a || substr($3, index($3, ":")+1)==a) {f=1} END {exit !f}'; then
+    echo "t open: '$arg' has no session id recorded, so it cannot be moved here — and it runs in no tmux session to attach." >&2
+    echo "  (a codex mints its id at the first prompt; an agent launched by send-keys is never registered)" >&2
+    echo "  Get into it from the terminal it runs in, or \`t kill $arg\` it." >&2
+    return 1
+  fi
+  [[ -n $resumable ]] || { echo "t open: foreground session(s) have no session id recorded — reattach from their own terminal." >&2; return 1; }
   if [[ -n $arg ]]; then
     local sel
     if [[ -n ${DEV_REPOS[$arg]} ]]; then            # an exact repo key → that repo's rows
@@ -2840,7 +2880,7 @@ _dev_list() {
   # (a foreground claude, or one in a tmux session of its own) with `t kill <id>` — not a
   # dev slot, so `t kill <repo> <slot>` does not apply. Both shown only when a :fg row exists.
   local foot="reattach: t open <repo> <slot>"
-  [[ -n $fgrows ]] && foot+=" · foreground: t open <id> · kill: t kill <id>"
+  [[ -n $fgrows ]] && foot+=" · foreground: t open <session> · kill: t kill <session>"
   print -r -- ""
   print -r -- "  ${y}${foot}${r0}"
 }
@@ -3060,7 +3100,7 @@ _dev_list_remote() {
   # present — slot is field 4 of the prefixed rows).
   local foot="attach (auto-finds its host): t open <repo> <slot> · pull here: t beam <repo> <slot> --from <host>"
   print -r -- "$rows" | awk -F'\t' '$4 ~ /:/{f=1} END{exit !f}' \
-    && foot+=" · foreground: t on <host> t open <id> · kill: t kill -r <id>"
+    && foot+=" · foreground: t open <session> · kill: t kill -r <session>"
   print -r -- ""
   print -r -- "  ${y}${foot}${r0}"
 }
@@ -3151,7 +3191,8 @@ _dev_fg_pids() {
     repo=$(_dev_repo_of_dir "$cwd" 2>/dev/null); repo=${repo%%$'\t'*}   # worktree-aware
     [[ -n $repo ]] || repo=${cwd:t}                                     # else the basename
     agent=$(_dev_agent_of_comm "$(ps -o comm= -p $pid 2>/dev/null)"); [[ -n $agent ]] || agent=claude
-    if [[ -n $sid && $sid != - ]]; then label="${repo}:${sid[1,8]}"; else label="${repo}:fg"; sid=-; fi
+    [[ -n $sid ]] || sid=-
+    _dev_fg_label "$repo" "$sid" "$pid"; label=$REPLY
     printf '%s\t%s\t%s\t%s\t%s\n' "$pid" "$sid" "$cwd" "$label" "$agent"
   done
   return 0
@@ -3171,11 +3212,8 @@ _dev_fg_match() {
   [[ -n $handle ]] || return 1
   local idpart="${handle##*:}" out
   out=$(_dev_fg_pids | awk -F'\t' -v h="$handle" -v idp="$idpart" \
-          -v isrepo="${DEV_REPOS[$handle]:+1}" -v ro="${repo_ok:+1}" '
-        { repo=$4; sub(/:.*/, "", repo) }
-        $4 == h                                 { print; next }
-        h == repo && (isrepo == "" || ro != "") { print; next }
-        index(h, ":") == 0 && isrepo == "" && $2 != "-" && index($2, idp) == 1 { print }')
+          -v isrepo="${DEV_REPOS[$handle]:+1}" -v ro="${repo_ok:+1}" \
+          "$_DEV_FG_MATCH_AWK"' fgm($4, $2) { print }')
   [[ -n $out ]] || return 1
   print -r -- "$out"
 }
@@ -3984,12 +4022,9 @@ _dev_remote_fg_kill() {
   # DEV_REPOS key, so the repo-part branch is suppressed (a bare `t kill -r dotfiles`
   # must resolve dev slots, not a same-repo fg row).
   local hosts; hosts=$(_dev_rows_all 2>/dev/null \
-    | awk -F'\t' -v h="$handle" -v idp="$idpart" -v isrepo="${DEV_REPOS[$handle]:+1}" '
-        $1 != "local" && $4 ~ /:/ {
-          repo=$4; sub(/:.*/, "", repo);
-          if ($4==h || (h==repo && isrepo=="") || (index(h,":")==0 && isrepo=="" && $2!="-" && index($2,idp)==1))
-            if (!seen[$1]++) print $1
-        }')
+    | awk -F'\t' -v h="$handle" -v idp="$idpart" -v isrepo="${DEV_REPOS[$handle]:+1}" \
+        "$_DEV_FG_MATCH_AWK"'
+        $1 != "local" && $4 ~ /:/ && fgm($4, $2) { if (!seen[$1]++) print $1 }')
   [[ -n $hosts ]] || return 2
   local host rtarget rcmd rc=0
   for host in ${(f)hosts}; do
@@ -4029,12 +4064,9 @@ _dev_remote_fg_open() {
   # _dev_rows_all columns: host(1) sid(2) cwd(3) label(4) state(5) context(6) summary(7).
   # fg rows carry a `:` in the label; dev slots use `-`.
   local rows; rows=$(_dev_rows_all 2>/dev/null \
-    | awk -F'\t' -v h="$handle" -v idp="$idpart" -v isrepo="${DEV_REPOS[$handle]:+1}" '
-        $1 != "local" && $4 ~ /:/ {
-          repo=$4; sub(/:.*/, "", repo);
-          if ($4==h || h==repo || (index(h,":")==0 && isrepo=="" && $2!="-" && index($2,idp)==1))
-            if (!seen[$1 "\t" $4]++) print $1 "\t" $4 "\t" $7
-        }')
+    | awk -F'\t' -v h="$handle" -v idp="$idpart" -v isrepo="${DEV_REPOS[$handle]:+1}" -v ro=1 \
+        "$_DEV_FG_MATCH_AWK"'
+        $1 != "local" && $4 ~ /:/ && fgm($4, $2) { if (!seen[$1 "\t" $4]++) print $1 "\t" $4 "\t" $7 }')
   [[ -n $rows ]] || return 2
   local sel n; n=$(print -r -- "$rows" | grep -c .)
   if (( n == 1 )); then

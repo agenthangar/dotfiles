@@ -771,15 +771,20 @@ exit 0
 PR_WATCH_CWD = ".cache/pr-watch/worktrees/dotfiles-pr136"
 
 
-def _fg_world(zsh, tmp_path, *, panes=None, registered=None):
+def _fg_world(zsh, tmp_path, *, panes=None, registered=None, siblings=()):
     """A process table holding one send-keys-launched claude (pid 4242, under shell 4200,
     no registry entry — the SessionStart hook never sees one, as the retired pr-watch's
     sessions showed) plus, with <registered>, a second claude the hook DID register. Returns the
-    extra env the fg helpers need. <panes> maps a pid to the tmux session it sits in."""
+    extra env the fg helpers need. <panes> maps a pid to the tmux session it sits in;
+    <siblings> are more unregistered agents (pid, comm) in the SAME cwd — the three idle
+    codexes that all rendered as `ff:fg`."""
     cwd = f"{zsh.home}/{PR_WATCH_CWD}"
     pathlib.Path(cwd).mkdir(parents=True, exist_ok=True)
     table = ["1 0 launchd", "4200 1 zsh", "4242 4200 claude"]
     lsof = [f"4242 {cwd}"]
+    for pid, comm in siblings:
+        table.append(f"{pid} 4200 {comm}")
+        lsof.append(f"{pid} {cwd}")
     if registered:
         sid, rcwd = registered
         table.append("5555 4200 claude")
@@ -796,13 +801,32 @@ def _fg_world(zsh, tmp_path, *, panes=None, registered=None):
 
 def test_zsh_fg_pids_labels_a_claude_with_no_registry_entry(zsh, tmp_path):
     """A send-keys-launched claude is in no registry, so its row carries sid `-` and the
-    `<repo>:fg` label — `<repo>` being the cwd's basename, since this worktree is no
+    `<repo>:p<pid>` label — `<repo>` being the cwd's basename, since this worktree is no
     DEV_REPOS repo. This is the row `t open` could never reach: no id to resume."""
     env = _fg_world(zsh, tmp_path)
     r = zsh("_dev_fg_pids", **env)
     assert r.returncode == 0, r.stderr
     cwd = f"{zsh.home}/{PR_WATCH_CWD}"
-    assert r.stdout.splitlines() == [f"4242\t-\t{cwd}\tdotfiles-pr136:fg\tclaude"], r.stdout
+    assert r.stdout.splitlines() == [f"4242\t-\t{cwd}\tdotfiles-pr136:p4242\tclaude"], r.stdout
+
+
+def test_zsh_fg_rows_give_idless_siblings_distinct_labels(zsh, tmp_path):
+    """The reported case: several id-less agents in one repo were all `<repo>:fg`, so
+    nothing could name one of them. The pid label makes each row its own handle, in both
+    producers (the rendered rows and the pid-keyed rows the verbs match on)."""
+    env = _fg_world(zsh, tmp_path, siblings=((4243, "codex"), (4244, "codex")))
+    labels = [l.split("\t")[3] for l in zsh("_dev_fg_pids", **env).stdout.splitlines()]
+    assert labels == ["dotfiles-pr136:p4242", "dotfiles-pr136:p4243", "dotfiles-pr136:p4244"]
+    rows = zsh("_dev_fg_rows", **env).stdout.splitlines()
+    assert sorted(l.split("\t")[2] for l in rows) == labels, rows
+    # each label addresses exactly its own row; the bare `p<pid>` too
+    m = lambda h: zsh(f"_dev_fg_match {h}", **env).stdout.splitlines()
+    assert [l.split("\t")[0] for l in m("dotfiles-pr136:p4243")] == ["4243"]
+    assert [l.split("\t")[0] for l in m("p4244")] == ["4244"]
+    # the old `<repo>:fg` spelling still means "that repo's fg rows" — all three
+    assert len(m("dotfiles-pr136:fg")) == 3
+    assert zsh("_dev_fg_handle p4243 && echo yes", **env).stdout.strip() == "yes"
+    assert zsh("_dev_fg_handle 4243 || echo no", **env).stdout.strip() == "no"   # a slot
 
 
 def test_zsh_fg_match_rules(zsh, tmp_path):
@@ -810,8 +834,9 @@ def test_zsh_fg_match_rules(zsh, tmp_path):
     <repo>` on dev slots while `t open <repo> fg` reaches that repo's fg rows."""
     env = _fg_world(zsh, tmp_path, registered=(f"{SID}", f"{zsh.home}/code/api"))
     m = lambda snippet: zsh(snippet, **env)
-    assert "dotfiles-pr136:fg" in m("_dev_fg_match dotfiles-pr136:fg").stdout      # exact label
-    assert "dotfiles-pr136:fg" in m("_dev_fg_match dotfiles-pr136").stdout         # repo part
+    assert "dotfiles-pr136:p4242" in m("_dev_fg_match dotfiles-pr136:p4242").stdout  # exact label
+    assert "dotfiles-pr136:p4242" in m("_dev_fg_match dotfiles-pr136").stdout        # repo part
+    assert "dotfiles-pr136:p4242" in m("_dev_fg_match dotfiles-pr136:fg").stdout     # old spelling
     assert f"api:{SID[:8]}" in m(f"_dev_fg_match {SID[:6]}").stdout                # id prefix
     # `api` IS a DEV_REPOS key: suppressed for kill, allowed when the caller asks
     r = m("_dev_fg_match api; echo rc=$?")
@@ -828,7 +853,7 @@ def test_zsh_attach_fg_attaches_a_non_dev_tmux_session_in_place(zsh, tmp_path):
     env = _fg_world(zsh, tmp_path, panes={4200: "pr-dotfiles-136"})
     r = zsh("_dev_attach_fg dotfiles-pr136; echo rc=$?", _tty=True, **env)
     assert "rc=0" in r.stdout, r.stdout
-    assert "Attaching dotfiles-pr136:fg in place (tmux session pr-dotfiles-136)" in r.stdout
+    assert "Attaching dotfiles-pr136:p4242 in place (tmux session pr-dotfiles-136)" in r.stdout
     assert "attach-session -t pr-dotfiles-136" in zsh.log.read_text().splitlines()
 
 
@@ -877,12 +902,23 @@ def test_zsh_open_fg_attaches_before_it_adopts(zsh, tmp_path):
     the adopt path, which for an id-less row can only explain itself."""
     env = _fg_world(zsh, tmp_path, panes={4200: "pr-dotfiles-136"})
     r = zsh("_dev_open_fg dotfiles-pr136; echo rc=$?", _tty=True, **env)
-    assert "rc=0" in r.stdout and "Attaching dotfiles-pr136:fg in place" in r.stdout, r.stdout
+    assert "rc=0" in r.stdout and "Attaching dotfiles-pr136:p4242 in place" in r.stdout, r.stdout
     assert "attach-session -t pr-dotfiles-136" in zsh.log.read_text().splitlines()
     del env["FAKE_PANES"]
     r = zsh("_dev_open_fg dotfiles-pr136; echo rc=$?", **env)
     assert "Attaching" not in r.stdout, r.stdout
-    assert "predate the session registry" in r.stderr, r.stderr
+    assert "no session id recorded" in r.stderr, r.stderr
+
+
+def test_zsh_adopt_fg_explains_a_named_idless_row(zsh, tmp_path):
+    """`t open ff:p4242` on an id-less row with no tmux: say it cannot be moved and why,
+    never "no foreground session matching" — the row is right there in `t ls`."""
+    env = _fg_world(zsh, tmp_path)
+    for h in ("dotfiles-pr136:p4242", "p4242"):
+        r = zsh(f"_dev_open_fg {h}; echo rc=$?", **env)
+        assert "rc=1" in r.stdout, r.stdout
+        assert f"'{h}' has no session id recorded" in r.stderr, r.stderr
+        assert "no foreground session matching" not in r.stderr
 
 
 def test_zsh_open_fg_forwards_the_rows_own_label_to_the_host_that_has_it(zsh, tmp_path):
@@ -896,15 +932,40 @@ def test_zsh_open_fg_forwards_the_rows_own_label_to_the_host_that_has_it(zsh, tm
         'DEV_REPOS[api]="$HOME/code/api"\nDEV_REPOS[ff]="$HOME/code/ff"\n'
         'REMOTE_HOSTS[mini]=me@mini\n')
     (tmp_path / "ps.txt").write_text("1 0 launchd\n")            # no local agents at all
-    rows = "\t".join(["mini", "-", f"{zsh.home}/code/ff", "ff:fg",
+    rows = "\t".join(["mini", "-", f"{zsh.home}/code/ff", "ff:p4242",
                       "attached", "unknown", "(foreground codex)"])
     log = tmp_path / "ssh.log"
     env = {"SSH_LOG": str(log), "FAKE_ROWS": rows}
     snippet = '_dev_rows_all() { print -r -- "$FAKE_ROWS" }; _dev_open_fg ff; echo rc=$?'
     r = zsh(snippet, _tty=True, **env)
     assert "rc=0" in r.stdout, r.stdout
-    assert "Attaching foreground 'ff:fg' on mini" in r.stdout, r.stdout
-    assert log.read_text().splitlines() == ["-t me@mini zsh -lic 't open ff:fg'"], log.read_text()
+    assert "Attaching foreground 'ff:p4242' on mini" in r.stdout, r.stdout
+    assert log.read_text().splitlines() == ["-t me@mini zsh -lic 't open ff:p4242'"], log.read_text()
+
+
+def test_zsh_open_fg_names_each_of_several_idless_remote_rows(zsh, tmp_path):
+    """Three id-less codexes on mini: a bare `t open ff fg` from the laptop must list three
+    DISTINCT handles (the old identical `ff:fg` rows deduped to one), and naming one
+    forwards exactly that row."""
+    stub = tmp_path / "stubbin" / "ssh"
+    stub.write_text(SSH_STUB)
+    stub.chmod(0o755)
+    (zsh.home / ".zshrc.local").write_text(
+        'DEV_REPOS[ff]="$HOME/code/ff"\nREMOTE_HOSTS[mini]=me@mini\n')
+    (tmp_path / "ps.txt").write_text("1 0 launchd\n")
+    rows = "\n".join("\t".join(["mini", "-", f"{zsh.home}/code/ff", f"ff:p{pid}",
+                                 "attached", "unknown", "(foreground codex)"])
+                     for pid in (101, 202, 303))
+    log = tmp_path / "ssh.log"
+    env = {"SSH_LOG": str(log), "FAKE_ROWS": rows}
+    fake = '_dev_rows_all() { print -r -- "$FAKE_ROWS" }; '
+    r = zsh(fake + "_dev_remote_fg_open ff", **env)                 # no tty: the handles
+    for pid in (101, 202, 303):
+        assert f"t open ff:p{pid}   (on mini" in r.stderr, r.stderr
+    assert not log.exists()
+    r = zsh(fake + "_dev_remote_fg_open ff:p202; echo rc=$?", _tty=True, **env)
+    assert "rc=0" in r.stdout, r.stdout
+    assert log.read_text().splitlines() == ["-t me@mini zsh -lic 't open ff:p202'"]
 
 
 def test_zsh_open_fg_skips_the_remote_probe_when_a_local_row_matched(zsh, tmp_path):
@@ -919,9 +980,9 @@ def test_zsh_open_fg_skips_the_remote_probe_when_a_local_row_matched(zsh, tmp_pa
     log = tmp_path / "ssh.log"
     r = zsh('_dev_rows_all() { print -r -- "$FAKE_ROWS" }; _dev_open_fg dotfiles-pr136',
             SSH_LOG=str(log), FAKE_ROWS="\t".join(
-                ["mini", "-", "/x", "dotfiles-pr136:fg", "attached", "unknown", "(fg)"]), **env)
+                ["mini", "-", "/x", "dotfiles-pr136:p9", "attached", "unknown", "(fg)"]), **env)
     assert not log.exists(), log.read_text()
-    assert "predate the session registry" in r.stderr, r.stderr
+    assert "no session id recorded" in r.stderr, r.stderr
 
 
 _ZSH_TIED_SPECIALS = {"path", "fpath", "cdpath", "manpath", "mailpath", "module_path", "prompt"}

@@ -210,7 +210,7 @@ def test_ports_outside_the_pool_are_ignored(box):
 # --- ssh-match: which connections carry the tunnel -------------------------------
 
 
-def _match_home(box, listener=True, hosts=("chrisobrien@mini", '"Box-Two.local"')):
+def _match_home(box, listener=True, hosts=("me@mini", '"Box-Two.local"')):
     home = box.path / "home"
     if listener:
         agents = home / "Library" / "LaunchAgents"

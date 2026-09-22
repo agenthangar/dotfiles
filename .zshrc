@@ -832,10 +832,14 @@ _dev_agent_for() {
 }
 # _dev_agent_is_proc <comm> — is this process name an agent CLI? The ONE match every
 # process walk uses (the npm-launched codex can present as a native `codex-<triple>`
-# child of `node`; brew's cask is a bare `codex`).
-_dev_agent_is_proc() { case "${1:t}" in claude|codex|codex-*) return 0 ;; *) return 1 ;; esac }
+# child of `node`; brew's cask is a bare `codex`). The triple is spelled out, never a
+# bare `codex-*`: codex 0.154 runs HELPERS under itself (`codex-code-mode-host`), and the
+# wildcard counted each as an agent — every codex slot grew a phantom `(foreground
+# codex)` row in `t ls` (2026-09-21). Linux truncates comm to 15 chars, which still
+# keeps the `codex-aarch64-`/`codex-x86_64-` prefix.
+_dev_agent_is_proc() { case "${1:t}" in claude|codex|codex-aarch64-*|codex-x86_64-*) return 0 ;; *) return 1 ;; esac }
 # _dev_agent_of_comm <comm> — the agent name for a process name (empty if none).
-_dev_agent_of_comm() { case "${1:t}" in claude) print -r -- claude ;; codex|codex-*) print -r -- codex ;; esac }
+_dev_agent_of_comm() { case "${1:t}" in claude) print -r -- claude ;; codex|codex-aarch64-*|codex-x86_64-*) print -r -- codex ;; esac }
 # _dev_agent_of_session <tmux-session> — which agent a slot runs: the comm of its live
 # agent process (zero extra forks under _dev_ps_snapshot), else the DEV_AGENT stamp,
 # else claude (every pre-seam slot).
@@ -1998,7 +2002,7 @@ _dev_session_has_claude() {
     for pane_pid in ${=_DEV_PANE_PIDS[$s]:-}; do
       _dev_agent_is_proc "${_DEV_PS_COMM[$pane_pid]:-}" && return 0
       for kid in ${=_DEV_PS_KIDS[$pane_pid]:-}; do
-        case ${_DEV_PS_COMM[$kid]:-} in (claude|codex|codex-*|node) return 0 ;; esac
+        case ${_DEV_PS_COMM[$kid]:-} in (claude|codex|codex-aarch64-*|codex-x86_64-*|node) return 0 ;; esac
         stack=($kid)
         while (( $#stack )); do
           pid=$stack[1]; shift stack
@@ -2014,7 +2018,7 @@ _dev_session_has_claude() {
     _dev_agent_is_proc "$comm" && return 0
     for kid in ${(f)"$(pgrep -P "$pane_pid" 2>/dev/null)"}; do
       comm=$(ps -o comm= -p "$kid" 2>/dev/null)
-      case "${comm:t}" in (claude|codex|codex-*|node) return 0 ;; esac
+      case "${comm:t}" in (claude|codex|codex-aarch64-*|codex-x86_64-*|node) return 0 ;; esac
       _dev_pid_tree_has_claude "$kid" && return 0
     done
   done
@@ -2418,13 +2422,14 @@ _dev_fg_rows() {
       _dev_agent_is_proc "$(ps -o comm= -p $up 2>/dev/null)" && { me=$up; break; }
       up=$(ps -o ppid= -p $up 2>/dev/null | tr -d ' ')
     done
-    claudes=(${(f)"$(ps -Axo pid,comm 2>/dev/null | awk '$0 ~ /\.app\/Contents\// {next} {n=$2; sub(/.*\//,"",n)} n=="claude"||n=="codex"||n~/^codex-/{print $1}')"})
+    claudes=(${(f)"$(ps -Axo pid,comm 2>/dev/null | awk '$0 ~ /\.app\/Contents\// {next} {n=$2; sub(/.*\//,"",n)} n=="claude"||n=="codex"||n~/^codex-(aarch64|x86_64)-/{print $1}')"})
   fi
   local -A live
   local pid cwd repo k label sid title summary context agent
   for pid in ${(@)claudes}; do
     live[$pid]=1
     [[ -n ${inslot[$pid]} || $pid == $me ]] && continue
+    _dev_agent_nested "$pid" && continue          # part of another agent's session
     agent=$(_dev_agent_of_comm "${_DEV_PS_COMM[$pid]:-$(ps -o comm= -p $pid 2>/dev/null)}"); [[ -n $agent ]] || agent=claude
     sid= cwd=
     [[ -r $reg/$pid ]] && IFS=$'\t' read -r sid cwd < "$reg/$pid"
@@ -2468,6 +2473,30 @@ _dev_fg_rows() {
 # so the two must never spell it differently. Returns through $REPLY (no fork per row).
 _dev_fg_label() {
   if [[ -n $2 && $2 != - ]]; then REPLY="$1:${2[1,8]}"; else REPLY="$1:p$3"; fi
+}
+
+# _dev_agent_nested <pid> — true when an ANCESTOR of <pid> is itself an agent process: then
+# <pid> is part of that agent's session (a helper it spawned, a `claude -p` its tool ran),
+# never a foreground session of its own. Both fg producers skip such pids, which makes the
+# fg list robust to whatever an agent runs under itself — not only to the helper names
+# _dev_agent_is_proc already refuses. Snapshot walk when one is fresh, else ps forks.
+_dev_agent_nested() {
+  local up comm n=0
+  if _dev_snap_ok; then
+    up=${_DEV_PS_PPID[$1]:-}
+    while [[ -n $up && $up != 1 && $up != 0 ]] && (( n++ < 64 )); do
+      _dev_agent_is_proc "${_DEV_PS_COMM[$up]:-}" && return 0
+      up=${_DEV_PS_PPID[$up]:-}
+    done
+    return 1
+  fi
+  up=$(ps -o ppid= -p "$1" 2>/dev/null | tr -d ' ')
+  while [[ -n $up && $up != 1 && $up != 0 ]] && (( n++ < 64 )); do
+    comm=$(ps -o comm= -p "$up" 2>/dev/null)
+    _dev_agent_is_proc "$comm" && return 0
+    up=$(ps -o ppid= -p "$up" 2>/dev/null | tr -d ' ')
+  done
+  return 1
 }
 
 # _DEV_FG_MATCH_AWK — the fg-handle rules as one awk function, fgm(label, sid), shared by
@@ -3181,8 +3210,9 @@ _dev_fg_pids() {
     up=$(ps -o ppid= -p $up 2>/dev/null | tr -d ' ')
   done
   local pid cwd repo sid label agent
-  for pid in ${(f)"$(ps -Axo pid,comm 2>/dev/null | awk '$0 ~ /\.app\/Contents\// {next} {n=$2; sub(/.*\//,"",n)} n=="claude"||n=="codex"||n~/^codex-/{print $1}')"}; do
+  for pid in ${(f)"$(ps -Axo pid,comm 2>/dev/null | awk '$0 ~ /\.app\/Contents\// {next} {n=$2; sub(/.*\//,"",n)} n=="claude"||n=="codex"||n~/^codex-(aarch64|x86_64)-/{print $1}')"}; do
     [[ -n ${inslot[$pid]} || $pid == $me ]] && continue
+    _dev_agent_nested "$pid" && continue          # part of another agent's session
     sid= cwd=
     [[ -r $reg/$pid ]] && IFS=$'\t' read -r sid cwd < "$reg/$pid"
     [[ -n $cwd ]] || cwd=$(readlink "/proc/$pid/cwd" 2>/dev/null)   # Linux: no lsof needed

@@ -1,0 +1,163 @@
+#!/usr/bin/env bash
+# clip-bridge — make a tmux copy land on the clipboard of the machine you are SITTING
+# at, not the one tmux runs on.
+#
+# Why: .tmux.conf mirrors every copy into `pbcopy`, which is the clipboard of the host
+# running tmux. Locally that is right. Attached to the mini from the laptop it is the
+# MINI's clipboard — Cmd+V on the laptop pastes whatever was there before. The usual
+# fix, OSC 52 (tmux already emits it: set-clipboard external), is ignored by
+# Terminal.app (verified on macOS 26 — the escape reached the client tty and the
+# pasteboard never changed), and the mini cannot ssh back to the laptop (no host key,
+# no authorized key). So the text rides back over the ssh connection that is ALREADY
+# open, as a reverse tunnel:
+#
+#   laptop: launchd listens on 127.0.0.1:52520 and runs pbcopy per
+#           connection (socket-activated, inetd-style — no daemon, no code of ours
+#           running in the background)
+#   ssh:    ssh/config's `Match exec "clip-bridge ssh-match %h"` adds RemoteForwards
+#           from a small pool of ports on the far side to that listener, for our own
+#           REMOTE_HOSTS only (never github.com)
+#   mini:   `clip-bridge copy` (tmux's copy-command + buffer hooks) finds the tmux
+#           client that copied, walks up to its sshd-session, and sends the text into
+#           the pool port THAT connection forwarded
+#
+# A POOL, not one port: a second ssh to the same host cannot bind a port the first
+# holds, and the t tooling opens several at once (t ls -r fan-outs, attach, beam).
+# With one port, whichever connection happened to grab it first owned the bridge,
+# and it vanished the moment that connection (often a two-second fan-out) closed.
+# Each connection binds whichever pool ports are free; the copy uses its own
+# connection's port first, else a port held by another connection from the same peer
+# address (the same laptop — pool exhausted, or this one raced), else it falls back
+# to the local pbcopy. It never sends to a DIFFERENT peer: a copy made from the phone
+# must not land on the laptop's clipboard.
+#
+# Usage:
+#   clip-bridge copy              stdin → the right clipboard (tmux calls this)
+#   clip-bridge ssh-match <host>  rc 0 iff an ssh to <host> should carry the tunnel
+#
+# The ports are spelled out in three places that must agree: the pool here, the
+# RemoteForward lines in ssh/config, and the listener in
+# launchd/com.chrisobrien-ai.clip-bridge.plist (tests/test_clip_bridge.py pins it).
+# Test knobs: CLIP_BRIDGE_CLIENT_PID (skip the tmux lookup), CLIP_BRIDGE_PORTS
+# (the pool, "lo-hi").
+set -uo pipefail
+
+LABEL="com.chrisobrien-ai.clip-bridge"
+PORTS="${CLIP_BRIDGE_PORTS:-52521-52528}"
+PORT_LO="${PORTS%-*}"
+PORT_HI="${PORTS#*-}"
+
+local_copy() {
+    if command -v pbcopy >/dev/null 2>&1; then
+        pbcopy < "$1"
+    fi
+}
+
+# The nearest ancestor of $1 that is an sshd process (macOS shows the session process
+# as "sshd-session: user@ttys000", Linux as "sshd: user@pts/0" or sshd-session).
+# Prints nothing when $1 is a local client.
+sshd_above() {
+    local p="$1" comm hops=0
+    while [[ -n "$p" && "$p" -gt 1 && $hops -lt 32 ]]; do
+        comm=$(ps -o comm= -p "$p" 2>/dev/null) || return 0
+        case "${comm##*/}" in
+            sshd*) echo "$p"; return 0 ;;
+        esac
+        p=$(ps -o ppid= -p "$p" 2>/dev/null | tr -d ' ')
+        hops=$((hops + 1))
+    done
+}
+
+# Candidate pool ports for a copy made through sshd pid $1, best first: the ports
+# that connection itself listens on, then those of other sshd connections from the
+# same peer address. One lsof over every sshd process of ours.
+bridge_ports() {
+    local me="$1"
+    command -v lsof >/dev/null 2>&1 || return 0
+    lsof -nP -a -u "$(id -u)" -c sshd -iTCP -FpTn 2>/dev/null | awk \
+        -v me="$me" -v lo="$PORT_LO" -v hi="$PORT_HI" '
+        /^p/ { pid = substr($0, 2); next }
+        /^n/ { name = substr($0, 2); next }
+        /^TST=/ {
+            st = substr($0, 5)
+            if (st == "LISTEN") {
+                port = name; sub(/.*:/, "", port)
+                if (port + 0 >= lo + 0 && port + 0 <= hi + 0 && !seen[pid SUBSEP port]++)
+                    ports[pid] = ports[pid] " " port
+            } else if (st == "ESTABLISHED" && index(name, "->")) {
+                peer = name; sub(/.*->/, "", peer); sub(/:[0-9]+$/, "", peer)
+                peers[pid] = peer
+            }
+        }
+        END {
+            out = ports[me]
+            if (me in peers)
+                for (p in ports) if (p != me && peers[p] == peers[me]) out = out ports[p]
+            print out
+        }'
+}
+
+send_to() {
+    # bash's /dev/tcp, not nc: nc builds disagree on closing at stdin EOF (OpenBSD's
+    # holds the connection open, so pbcopy waits for an EOF that never comes), while
+    # closing the fd here always ends the stream. A refused connect (nothing bound
+    # there any more) fails the redirect, which is the signal to try the next port.
+    ( exec 3<>"/dev/tcp/127.0.0.1/$1" && cat "$2" >&3 ) 2>/dev/null
+}
+
+cmd_copy() {
+    local client sshd port tmp
+    # Global, not local: the EXIT trap fires after this function's locals are gone.
+    CLIP_TMP=$(mktemp "${TMPDIR:-/tmp}/clip-bridge.XXXXXX") || return 1
+    trap 'rm -f "$CLIP_TMP"' EXIT
+    tmp="$CLIP_TMP"
+    cat > "$tmp"
+
+    # The client that copied: tmux's "best" client for a job is the most recently
+    # active one, which is the one whose keys or mouse just made the selection.
+    client="${CLIP_BRIDGE_CLIENT_PID-}"
+    if [[ -z "$client" ]] && command -v tmux >/dev/null 2>&1; then
+        client=$(tmux display-message -p '#{client_pid}' 2>/dev/null)
+    fi
+    sshd=""
+    [[ -n "$client" ]] && sshd=$(sshd_above "$client")
+
+    if [[ -n "$sshd" ]]; then
+        for port in $(bridge_ports "$sshd"); do
+            send_to "$port" "$tmp" && return 0
+        done
+    fi
+    local_copy "$tmp"
+}
+
+# ssh_config's `Match exec` runs this for EVERY ssh (git's to github.com too), so it
+# must be fast, silent, and say yes only when (1) this machine runs the listener the
+# tunnel points at, and (2) the target is one of our own REMOTE_HOSTS — a forward
+# request to anyone else's server is at best refused noise.
+cmd_ssh_match() {
+    local host="${1:-}" cfg line target
+    [[ -n "$host" ]] || return 1
+    # ssh hostnames are case-insensitive; bash 3.2 (macOS) has no ${x,,}.
+    host=$(printf %s "$host" | tr '[:upper:]' '[:lower:]')
+    [[ -e "$HOME/Library/LaunchAgents/$LABEL.plist" ]] || return 1
+    cfg="${XDG_CONFIG_HOME:-$HOME/.config}/t/config.sh"
+    [[ -r "$cfg" ]] || return 1
+    while IFS= read -r line; do
+        [[ "$line" == REMOTE_HOSTS\[*\]=* ]] || continue
+        target="${line#*=}"
+        target="${target%\"}"; target="${target#\"}"
+        target="${target%\'}"; target="${target#\'}"
+        target="${target##*@}"
+        [[ "$(printf %s "$target" | tr '[:upper:]' '[:lower:]')" == "$host" ]] && return 0
+    done < "$cfg"
+    return 1
+}
+
+case "${1:-}" in
+    copy) cmd_copy ;;
+    ssh-match) shift; cmd_ssh_match "$@" ;;
+    -h|--help|"")
+        sed -n '2,/^set -uo/{/^set -uo/d;s/^# \{0,1\}//;p;}' "$0"
+        ;;
+    *) echo "clip-bridge: unknown command: $1 (copy | ssh-match <host>)" >&2; exit 2 ;;
+esac

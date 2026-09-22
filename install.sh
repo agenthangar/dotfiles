@@ -255,6 +255,7 @@ link_all() {
     link "$LINK_SRC/bin/cursor-beam"      "$HOME/bin/cursor-beam"
     link "$LINK_SRC/bin/pii-scan"         "$HOME/bin/pii-scan"
     link "$LINK_SRC/bin/claude-stamp-tmux" "$HOME/bin/claude-stamp-tmux"
+    link "$LINK_SRC/bin/clip-bridge"      "$HOME/bin/clip-bridge"
     link "$LINK_SRC/bin/t"                "$HOME/bin/t"
     link "$LINK_SRC/claude/commands/tpush.md" "$HOME/.claude/commands/tpush.md"
     link "$LINK_SRC/claude/commands/tpop.md"  "$HOME/.claude/commands/tpop.md"
@@ -553,6 +554,49 @@ retire_pr_watch() {
     echo "Retired the pr-watch LaunchAgent (booted out, $plist removed)"
 }
 retire_pr_watch
+
+# The laptop end of bin/clip-bridge: a socket-activated pbcopy on 127.0.0.1:52520
+# that ssh/config's RemoteForwards point at, so a copy made in tmux on ANOTHER host
+# (the mini) lands on the clipboard of the Mac you are typing at. See bin/clip-bridge.
+#
+# Links-only path for the usual reason (a plain `dots` must land it on every Mac).
+# The plist is a real copy, not a symlink — launchd reads it once at bootstrap and a
+# link into a checkout that later moves would load a stale or missing file. Copied
+# only when it differs, and (re)bootstrapped only when it changed or is not loaded,
+# so an unchanged `dots` is one `launchctl print` and silent.
+#
+# launchctl has no notion of $HOME: a sandboxed run (the install tests) would load
+# the sandbox's plist into the developer's REAL gui domain. So the copy lands under
+# any $HOME, but launchd is touched only when $HOME is this user's actual home.
+# DOTFILES_NO_CLIP_BRIDGE=1 opts a machine out. Off macOS it is a no-op, and then
+# clip-bridge's ssh-match says no, so no ssh ever requests the tunnel.
+install_clip_bridge() {
+    local label="com.chrisobrien-ai.clip-bridge"
+    local src="$LINK_SRC/launchd/$label.plist"
+    local dst="$HOME/Library/LaunchAgents/$label.plist"
+    local changed=0 real_home
+    [[ -z "${DOTFILES_NO_CLIP_BRIDGE:-}" ]] || return 0
+    [[ "$(uname)" == "Darwin" && -f "$src" ]] || return 0
+    if ! cmp -s "$src" "$dst" 2>/dev/null; then
+        mkdir -p "$(dirname "$dst")"
+        cp "$src" "$dst"
+        changed=1
+    fi
+    real_home=$(eval echo "~$(id -un)")
+    if [[ "$HOME" != "$real_home" ]] || ! command -v launchctl >/dev/null 2>&1; then
+        [[ $changed == 1 ]] && echo "Installed $dst (not loaded: \$HOME is not $real_home)"
+        return 0
+    fi
+    if [[ $changed == 1 ]] || ! launchctl print "gui/$(id -u)/$label" >/dev/null 2>&1; then
+        launchctl bootout "gui/$(id -u)/$label" 2>/dev/null || true
+        if launchctl bootstrap "gui/$(id -u)" "$dst" 2>/dev/null; then
+            echo "Loaded the clip-bridge listener (remote tmux copies reach this Mac's clipboard)"
+        else
+            echo "⚠ could not load $dst — remote tmux copies will stay on the remote host" >&2
+        fi
+    fi
+}
+install_clip_bridge
 
 # Everything below is the FULL install. The links-only relink stops here, before the
 # tmux source-file, the ssh Include rewrite, the ~/.zshrc.local and settings.json

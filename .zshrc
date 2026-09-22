@@ -4590,6 +4590,34 @@ _pr_state_flush() {
   _PR_STALE=()
 }
 
+# _t_resume_on_host <host> <sid> <wt> <agent> <attach|detach|fg> — `t resume --host`:
+# revive a DEAD conversation on another machine instead of here. It is `t beam`'s send
+# path minus the kill (the conversation is dead — nothing owns it here, and _t_resume
+# already refused anything live by id): carry the recorded worktree's uncommitted edits
+# to origin (_dev_worktree_beam_push — a no-op when the worktree is gone here, where the
+# host rebuilds it from its branch), rsync the transcript over, then have the host land
+# it through the shared _tbeam_land (worktree from origin, beam_sync, the slot-collision
+# reland, a first-class dev slot). attach = ssh -t straight into it; fg = resume in the
+# ssh foreground; detach = land and print the landed session name (last line).
+_t_resume_on_host() {
+  local host="$1" sid="$2" wt="$3" agent="$4" mode="$5"
+  local target="${REMOTE_HOSTS[$host]:-$host}"
+  command -v rsync >/dev/null 2>&1 || { echo "t resume --host: rsync not found" >&2; return 1; }
+  if ! _dev_worktree_beam_push "$wt" "$host" >&2; then
+    echo "⚠ couldn't fully commit/push $wt — $host may resume with stale code (the edits stay here)" >&2
+  fi
+  _tbeam_sync_transcript "$wt" "$target" "$agent" "$sid" >&2 || return 1
+  local env="TB_CWD=${(q)wt} TB_SID=${(q)sid} TB_AGENT=${(q)agent}"
+  case $mode in
+    fg)     ssh -t "$target" "$env TB_MODE=fg zsh -lic _tbeam_land" ;;
+    attach) ssh -t "$target" "$env TB_MODE=tmux TB_ATTACH=1 zsh -lic _tbeam_land" ;;
+    *)      local out; out=$(ssh -o BatchMode=yes "$target" "$env TB_MODE=tmux zsh -lic _tbeam_land" 2>&1)
+            local rc=$?
+            print -r -- "${out##*$'\n'}"
+            (( rc == 0 )) && [[ ${out##*$'\n'} == dev-* ]] ;;
+  esac
+}
+
 # _t_resume — the `t resume` verb: revive a DEAD dev slot's last conversation.
 # `t open` on a dead slot deliberately starts a FRESH claude (the worktree and its
 # uncommitted work are reused, but not the chat); this is the counterpart that brings
@@ -4637,9 +4665,10 @@ _pr_state_flush() {
 # User-facing help lives in bin/t (`t resume -h`); the t() shim routes -h there.
 _t_resume() {
   setopt local_options null_glob bare_glob_qual
-  local a no_tmux= all_flag= remote_flag= live_flag= days=30 _expect_days=; local -a pos
+  local a no_tmux= all_flag= remote_flag= live_flag= days=30 _expect_days= on_host= _expect_host=; local -a pos
   for a in "$@"; do
     if [[ -n $_expect_days ]]; then days=$a; _expect_days=; continue; fi
+    if [[ -n $_expect_host ]]; then on_host=$a; _expect_host=; continue; fi
     case "$a" in
       -f|--fg)     no_tmux=1 ;;
       -a|--all)    all_flag=1 ;;
@@ -4647,12 +4676,19 @@ _t_resume() {
       -l|--live)   live_flag=1 ;;
       --days)      _expect_days=1 ;;
       --days=*)    days=${a#--days=} ;;
+      --host)      _expect_host=1 ;;
+      --host=*)    on_host=${a#--host=} ;;
       -*)          echo "t resume: unknown flag: $a (t resume -h for flags)" >&2; return 1 ;;
       *)           pos+=("$a") ;;
     esac
   done
   if [[ $days != all && $days != <-> ]]; then
     echo "t resume: --days takes a number of days or 'all' (got: ${days:-nothing})." >&2; return 1
+  fi
+  # --host <h>: revive the pick ON <h> instead of here — the dead conversation is
+  # carried there by the `t beam` send machinery (_t_resume_on_host below).
+  if [[ -n $_expect_host || ( -n ${(M)@:#--host*} && -z $on_host ) ]]; then
+    echo "t resume: --host takes a host (one of: ${(k)REMOTE_HOSTS:-none configured})." >&2; return 1
   fi
   local repo="${pos[1]:-}" slot="${pos[2]:-}"
   # Repo-aware defaults (mirrors t plan/paste): lone numeric arg is a SLOT of the
@@ -4769,12 +4805,33 @@ _t_resume() {
   # path, same rule as _dev_remote_resolve so a `dev-dot-2` on mini matches
   # `dev-dotfiles-2` here — both key one dir); the alias is captured so an attach
   # needs no second scan.
-  local all_rows= remote_rows=
+  local all_rows= remote_rows= live_all=
   if (( ${#REMOTE_HOSTS} )); then
-    all_rows=$(_dev_rows_all 2>/dev/null | awk -F'\t' '$4 !~ /:/')
+    live_all=$(_dev_rows_all 2>/dev/null)
   else
-    all_rows=$(_dev_session_rows 2>/dev/null | awk -F'\t' '$3 !~ /:/ {print "local\t" $0}')
+    live_all=$(_dev_session_rows 2>/dev/null | awk -F'\t' '{print "local\t" $0}')
   fi
+  all_rows=$(print -r -- "$live_all" | awk -F'\t' 'NF && $4 !~ /:/')
+  # Live session IDS — every row, foreground ones included. The slot rules below
+  # match by PATH, and that misses a conversation resumed into a DIFFERENT slot
+  # than the one it was recorded in: a codex rollout names the worktree it started
+  # in (its first line) while `codex resume` from slot 5 runs it in slot 5's tree,
+  # so slot 13 read as dead and its thread was offered for a second resume — which
+  # codex answers by hanging silently (mini ff-13, 2026-09-21: the thread had been
+  # live in dev-ff-5 for 3.5 days). Keyed on the id, a candidate whose conversation
+  # is running ANYWHERE becomes a live row pointing at its owner.
+  # live_sid[sid] = loc \t alias \t slot \t summary \t agent, loc = here | <host>
+  # | fg:<host> (a foreground owner: alias = its `t open` label, slot = -).
+  local -A live_sid; local _lh _ls _lc _ln _lst _lctx _lsm _lag2
+  while IFS=$'\t' read -r _lh _ls _lc _ln _lst _lctx _lsm _lag2; do
+    [[ -n $_ls && $_ls != - && -n $_ln ]] || continue
+    [[ $_lh == local ]] && _lh=here
+    if [[ $_ln == *:* ]]; then
+      live_sid[$_ls]="fg:${_lh}"$'\t'"$_ln"$'\t'-$'\t'"$_lsm"$'\t'"${_lag2:-claude}"
+    else
+      live_sid[$_ls]="$_lh"$'\t'"${_ln%-*}"$'\t'"${_ln##*-}"$'\t'"$_lsm"$'\t'"${_lag2:-claude}"
+    fi
+  done <<< "$live_all"
   remote_rows=$(print -r -- "$all_rows" | awk -F'\t' '$1 != "local"')
   # Local live titles, keyed by short session name (dev- prefix stripped).
   local -A local_sum local_agent; local _lsn _lsum _lag
@@ -4797,7 +4854,8 @@ _t_resume() {
   local -a cands slots tx
   local -a pending _mpaths _mrows _mf _PR_STALE
   local -A remote_live_host remote_live_alias remote_live_sum remote_live_agent
-  local -A meta_title meta_pr
+  local -A meta_title meta_pr live_seen
+  local -a sidlive
   local _p _mr _mrest
   local n wt sid busy rhost _rdir _rbase _rhost _rn _ralias _rsum _rag _ok _stale stale_path agent _ag
   local txf title when ep org orgf hf skipped=0 hidden_live=0
@@ -4860,6 +4918,7 @@ _t_resume() {
         # business); -l/--live shows it as a labeled row (pick → attach). Sort
         # key (field 1, stripped after the global sort below): a live session is
         # "now", so the max sentinel pins it above every dead transcript.
+        live_seen[here/${busy#dev-}]=1
         [[ -n $live_flag ]] || { (( hidden_live++ )); continue; }
         cands+=(9999999999$'\t'"$repo"$'\t'"$n"$'\t'-$'\t'"$wt"$'\t'"● active"$'\t'"${local_sum[${busy#dev-}]:-(live session)}"$'\t'here$'\t'-$'\t'-$'\t'"${local_agent[${busy#dev-}]:-$(_dev_agent_of_session "$busy")}")
         continue
@@ -4872,6 +4931,7 @@ _t_resume() {
           _dev_remote_attach "$rhost"$'\t'"${remote_live_alias[$n]}"$'\t'"$n" ""
           return
         fi
+        live_seen[$rhost/${remote_live_alias[$n]}-$n]=1
         [[ -n $live_flag ]] || { (( hidden_live++ )); continue; }
         cands+=(9999999999$'\t'"$repo"$'\t'"$n"$'\t'-$'\t'"$wt"$'\t'"● on $rhost"$'\t'"${remote_live_sum[$n]:-(live session)}"$'\t'"$rhost"$'\t'"${remote_live_alias[$n]}"$'\t'-$'\t'"${remote_live_agent[$n]:-claude}")
         continue
@@ -4901,6 +4961,7 @@ _t_resume() {
           _t_dev "$repo" "$n"
           return
         fi
+        live_seen[here/${_stale#dev-}]=1
         [[ -n $live_flag ]] || { (( hidden_live++ )); continue; }
         cands+=(9999999999$'\t'"$repo"$'\t'"$n"$'\t'-$'\t'"${stale_path:-$wt}"$'\t'"● active"$'\t'"${local_sum[${_stale#dev-}]:-(live session)}"$'\t'here$'\t'-$'\t'-$'\t'"${local_agent[${_stale#dev-}]:-$(_dev_agent_of_session "$_stale")}")
         continue
@@ -4910,6 +4971,15 @@ _t_resume() {
       tx=( "$HOME/.claude/projects/${wt//[^A-Za-z0-9]/-}"/*.jsonl(Nom)
            ${(f)"$(_dev_agent_transcripts_for_cwd codex "$wt")"} )
       for txf in "${(@)tx}"; do
+        # Live by ID (see live_sid above): never a second resume — a live row
+        # aimed at the owner, collected apart so the dedup below can drop it when
+        # the owner's own slot already produced its row. Checked before --days:
+        # a running conversation is current whatever its file's mtime says.
+        sid=$(_dev_transcript_sid "$txf")
+        if [[ -n ${live_sid[$sid]:-} ]]; then
+          sidlive+=("$repo"$'\t'"$sid"$'\t'"$wt"$'\t'"${live_sid[$sid]}")
+          continue
+        fi
         ep=$(zstat +mtime "$txf" 2>/dev/null || echo 0)   # sort key + --days gate
         # Effective recency = max(transcript mtime, opened stamp): resuming
         # writes nothing to the .jsonl, so without the stamp a just-reopened
@@ -4933,6 +5003,27 @@ _t_resume() {
         pending+=("$ep"$'\t'"$repo"$'\t'"$n"$'\t'"$wt"$'\t'"$txf"$'\t'"${reopened:-0}")
       done
     done
+  done
+
+  # Conversations live under ANOTHER slot's session (or a foreground one). One row
+  # per owner — skipped when the owner's own slot row was already counted/emitted.
+  # Hidden like any live row unless -l, or unless a slot was named: `t resume ff 13`
+  # must say where 13's conversation went rather than "nothing to resume".
+  local _sl _sloc _salias _sslot _ssum _sag _skey _slabel
+  local -a _slf
+  for _sl in "${(@)sidlive}"; do
+    _slf=("${(@ps:\t:)_sl}")
+    _sloc=$_slf[4]; _salias=$_slf[5]; _sslot=$_slf[6]; _ssum=$_slf[7]; _sag=${_slf[8]:-claude}
+    if [[ $_sloc == fg:* ]]; then _skey="$_sloc/$_salias"; else _skey="$_sloc/$_salias-$_sslot"; fi
+    [[ -n ${live_seen[$_skey]:-} ]] && continue
+    live_seen[$_skey]=1
+    if [[ -z $live_flag && -z $slot ]]; then (( hidden_live++ )); continue; fi
+    case $_sloc in
+      here)  _slabel="● in $_salias-$_sslot" ;;
+      fg:*)  _slabel="● fg ${${_sloc#fg:}/here/here}" ;;
+      *)     _slabel="● $_salias-$_sslot on $_sloc" ;;
+    esac
+    cands+=(9999999999$'\t'"$_slf[1]"$'\t'"${${_sslot:#-}:-$slot}"$'\t'"$_slf[2]"$'\t'"$_slf[3]"$'\t'"$_slabel"$'\t'"${_ssum:-(live session)}"$'\t'"$_sloc"$'\t'"$_salias"$'\t'-$'\t'"$_sag")
   done
 
   # ONE batched metadata read for every surviving candidate (title + last PR URL),
@@ -5091,11 +5182,12 @@ _t_resume() {
       --delimiter=$'\t' --with-nth=-1 --no-hscroll \
       --header="${legend}   ·   space marks ✓ — every mark revives, first attaches" --prompt="$fprompt") || return 1
     [[ -n $pick ]] || return 1
-  elif [[ -n $slot ]]; then
-    # Explicit slot but no TTY/fzf to pick with: the newest conversation IS the
-    # documented contract ("revive the slot's last conversation") — take it, and
-    # list the rest so a specific pick is one fzf-equipped call away.
-    pick=${cands[1]}
+  elif [[ -n $slot ]] && { pick=; for c in "${(@)cands}"; do
+         f=("${(@ps:\t:)c}"); [[ $f[7] == - ]] && { pick=$c; break; }; done; [[ -n $pick ]]; }; then
+    # Explicit slot but no TTY/fzf to pick with: the newest DEAD conversation IS
+    # the documented contract ("revive the slot's last conversation") — take it
+    # (never a live row: attaching needs the terminal we lack), and list the rest
+    # so a specific pick is one fzf-equipped call away.
     echo "Slot $slot has $#cands saved conversations — resuming the newest (run from a terminal to pick):" >&2
     for c in "${(@)cands}"; do echo "  ${c##*$'\t'}" >&2; done
     echo "  $legend" >&2
@@ -5124,12 +5216,16 @@ _t_resume() {
       return 1
     fi
     local -A mp_taken
-    local mp_first_repo= mp_first_slot= mp_cwd mp_session mp_loc mp_pair mp_agent
+    local mp_first_repo= mp_first_slot= mp_first_session= mp_cwd mp_session mp_loc mp_pair mp_agent
     local -a mp_rest mp_unopened
     for pick in "${(@)picks}"; do
       f=("${(@ps:\t:)pick}")
       repo=$f[1]; slot=$f[2]; sid=$f[3]; wt=$f[4]; mp_loc="${f[7]:-}"; mp_agent="${f[10]:-claude}"
-      if [[ $mp_loc == here ]]; then
+      if [[ $mp_loc == fg:* ]]; then
+        echo "· $repo: that conversation is live as foreground ${f[8]} — attach with: t open ${f[8]}"
+        continue
+      elif [[ $mp_loc == here ]]; then
+        [[ -n ${f[8]:-} && $f[8] != - ]] && repo=$f[8]
         echo "· $repo $slot is already live here — attach with: t open $repo $slot"
         continue
       elif [[ -n $mp_loc && $mp_loc != - ]]; then
@@ -5138,6 +5234,19 @@ _t_resume() {
       fi
       if [[ -n ${mp_taken[$repo/$slot]:-} ]]; then
         echo "· ${sid:0:8}: $repo slot $slot already revived by an earlier mark — skipped (t resume $repo $slot swaps it)." >&2
+        continue
+      fi
+      if [[ -n $on_host ]]; then
+        # every mark lands DETACHED on the host; the first is attached below
+        mp_taken[$repo/$slot]=1
+        echo "Resuming ${sid:0:8} ($repo $slot) on $on_host"
+        mp_session=$(_t_resume_on_host "$on_host" "$sid" "$wt" "$mp_agent" detach) || {
+          echo "· $repo $slot: landing on $on_host failed — ${mp_session:-no output}" >&2; continue; }
+        if [[ -z $mp_first_repo ]]; then
+          mp_first_repo=$repo; mp_first_slot=$slot; mp_first_session=$mp_session
+        else
+          mp_rest+=("${${mp_session#dev-}%-*} ${mp_session##*-}")
+        fi
         continue
       fi
       if ! mp_cwd=$(_dev_ensure_session_cwd "$wt"); then
@@ -5157,6 +5266,17 @@ _t_resume() {
     if [[ -z $mp_first_repo ]]; then
       echo "Nothing revived — every marked row was already live or unrecoverable." >&2
       return 1
+    fi
+    if [[ -n $on_host ]]; then
+      # Remote landings: the rest are one `t open` away (it auto-finds the host);
+      # the first attaches in place over ssh when there is a terminal to do it in.
+      (( $#mp_rest )) && echo "Also landed on $on_host — attach with: ${(j: · :)${mp_rest/#/t open }}"
+      if [[ -t 0 && -t 1 ]]; then
+        ssh -t "${REMOTE_HOSTS[$on_host]:-$on_host}" "zsh -lic ${(q):-tmux attach -t $mp_first_session}"
+      else
+        echo "Attach with: t open ${${mp_first_session#dev-}%-*} ${mp_first_session##*-}"
+      fi
+      return
     fi
     # Every revived slot beyond the first opens in its OWN terminal tab, each
     # running the ordinary `t open` attach (_dev_open_tab); the first attaches
@@ -5188,13 +5308,36 @@ _t_resume() {
 
   # A LIVE row was picked: attach in place (local or on its host) — resuming it
   # here would mint a second owner of the session id (see the scan note above).
-  if [[ $loc == here ]]; then
+  if [[ $loc == fg:* ]]; then
+    echo "That conversation is live as foreground $lalias — attaching."
+    _dev_open_fg "$lalias"
+    return
+  elif [[ $loc == here ]]; then
+    [[ -n $lalias && $lalias != - ]] && repo=$lalias   # owner under another alias/slot
     echo "Slot $slot is live locally — attaching."
     _t_dev "$repo" "$slot"
     return
   elif [[ -n $loc && $loc != - ]]; then
     _dev_remote_attach "$loc"$'\t'"$lalias"$'\t'"$slot" ""
     return
+  fi
+
+  # --host: land it THERE (see _t_resume_on_host) — the local worktree is not
+  # rebuilt, the host materializes its own from the branch.
+  if [[ -n $on_host ]]; then
+    local hmode=detach
+    if [[ -n $no_tmux ]]; then hmode=fg
+    elif [[ -t 0 && -t 1 ]]; then hmode=attach
+    fi
+    echo "Resuming ${sid:0:8} ($repo $slot) on $on_host"
+    # attach/fg own the terminal through ssh -t — never capture their stdout
+    [[ $hmode == detach ]] || { _t_resume_on_host "$on_host" "$sid" "$wt" "$agent" "$hmode"; return; }
+    local landed; landed=$(_t_resume_on_host "$on_host" "$sid" "$wt" "$agent" detach) || {
+      echo "t resume --host: landing on $on_host failed: ${landed:-no output}" >&2
+      return 1
+    }
+    echo "Landed in $landed on $on_host — attach with: t open ${${landed#dev-}%-*} ${landed##*-}"
+    return 0
   fi
 
   # The recorded cwd is the transcript's lookup key: rebuild the worktree at the

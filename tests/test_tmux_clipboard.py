@@ -74,11 +74,24 @@ class Server:
         return ""
 
 
-def _make_server(tmp_path, with_pbcopy=True):
-    """Build a tmux server whose PATH does (or does not) contain a pbcopy."""
+def _make_server(tmp_path, with_pbcopy=True, with_bridge=False):
+    """Build a tmux server whose PATH does (or does not) contain a pbcopy, and whose
+    $HOME/bin does (or does not) hold clip-bridge — the state before and after
+    install.sh links it."""
     bindir = tmp_path / "fakebin"
     bindir.mkdir(exist_ok=True)
     clip_file = tmp_path / "clipboard.txt"
+    if with_bridge:
+        # A recording wrapper, so a test can tell the bridge ran rather than the
+        # pbcopy fallback (both end in the same fake pbcopy for a local client), and
+        # which tmux server its `display-message` would ask.
+        (tmp_path / "bin").mkdir(exist_ok=True)
+        wrapper = tmp_path / "bin" / "clip-bridge"
+        wrapper.write_text(
+            f'#!/bin/sh\necho "$*|$TMUX" >> "{tmp_path}/bridge-calls"\n'
+            f'exec "{REPO_ROOT / "bin" / "clip-bridge"}" "$@"\n'
+        )
+        wrapper.chmod(0o755)
 
     if with_pbcopy:
         fake = bindir / "pbcopy"
@@ -95,26 +108,43 @@ def _make_server(tmp_path, with_pbcopy=True):
     path = f"{bindir}:{inherited}" if with_pbcopy else f"{bindir}:/bin"
     env = {"PATH": path, "HOME": str(tmp_path), "TERM": "xterm-256color"}
 
-    socket = f"clip-{tmp_path.name}-{'y' if with_pbcopy else 'n'}"
+    socket = f"clip-{tmp_path.name}-{'y' if with_pbcopy else 'n'}{'b' if with_bridge else ''}"
     server = Server(socket, env, clip_file)
     server.tmux("kill-server", check=False)
     server.tmux("-f", str(TMUX_CONF), "new-session", "-d", "-s", "t", "-x", "80", "-y", "24")
     return server
 
 
-@pytest.fixture
-def server(tmp_path):
-    s = _make_server(tmp_path, with_pbcopy=True)
+@pytest.fixture(params=[False, True], ids=["pbcopy-fallback", "clip-bridge"])
+def server(tmp_path, request):
+    """Every copy path, both before clip-bridge is linked (the pbcopy fallback) and
+    after (through the bridge, which pbcopies a copy made by a local client)."""
+    s = _make_server(tmp_path, with_pbcopy=True, with_bridge=request.param)
     yield s
     s.tmux("kill-server", check=False)
 
 
 def test_config_applies_clipboard_mirroring_when_a_clipboard_tool_exists(server):
     """The if-shell guard must actually apply the block — skipping is silent."""
-    assert server.option("copy-command") == "pbcopy"
+    for got in (server.option("copy-command"), server.hook("after-set-buffer"),
+                server.hook("after-load-buffer")):
+        assert "clip-bridge" in got and "pbcopy" in got, got
 
-    assert "pbcopy" in server.hook("after-set-buffer")
-    assert "pbcopy" in server.hook("after-load-buffer")
+
+def test_with_clip_bridge_linked_every_copy_goes_through_it(tmp_path):
+    """Once install.sh links it, the bridge — not the fallback — handles the copy,
+    and the tmux it asks for the client is THIS server (tmux hands its jobs $TMUX),
+    never the developer's own."""
+    s = _make_server(tmp_path, with_pbcopy=True, with_bridge=True)
+    try:
+        s.tmux("set-buffer", "VIA-BRIDGE")
+        assert s.clipboard() == "VIA-BRIDGE"
+        calls = (tmp_path / "bridge-calls").read_text().splitlines()
+        assert calls and calls[0].startswith("copy|")
+        tmux_env = calls[0].split("|", 1)[1]
+        assert tmux_env and s.socket in tmux_env, tmux_env
+    finally:
+        s.tmux("kill-server", check=False)
 
 
 def test_claude_codes_copy_reaches_the_system_clipboard(server):

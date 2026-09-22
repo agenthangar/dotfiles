@@ -4,3 +4,25 @@ Host *
     # Pull the key's passphrase from the macOS Keychain so it survives reboots.
     UseKeychain yes
     IdentityFile ~/.ssh/id_ed25519
+
+# Clipboard bridge (bin/clip-bridge): carry tmux copies made on the far host back to
+# THIS Mac's clipboard, over the connection that is already open. Only for our own
+# REMOTE_HOSTS, and only when this machine runs the listener — clip-bridge decides,
+# and says no quickly for everything else (github.com, a Linux box).
+#
+# A pool of eight ports because the t tooling holds several connections to one host
+# at once and a port can be bound by only one of them; each connection takes the
+# ones still free. The "remote port forwarding failed" warning a taken port prints
+# is INFO-level, hence LogLevel ERROR (errors, host-key failures, still print).
+# Keep the ports in step with clip-bridge's pool and the launchd listener (52520).
+Match exec "test -x ~/bin/clip-bridge && ~/bin/clip-bridge ssh-match %h"
+    RemoteForward 52521 127.0.0.1:52520
+    RemoteForward 52522 127.0.0.1:52520
+    RemoteForward 52523 127.0.0.1:52520
+    RemoteForward 52524 127.0.0.1:52520
+    RemoteForward 52525 127.0.0.1:52520
+    RemoteForward 52526 127.0.0.1:52520
+    RemoteForward 52527 127.0.0.1:52520
+    RemoteForward 52528 127.0.0.1:52520
+    ExitOnForwardFailure no
+    LogLevel ERROR

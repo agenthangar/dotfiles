@@ -70,4 +70,8 @@ def test_nothing_in_the_repo_can_re_arm_it():
     to notice this test, since the danger was never the code but the TIMER."""
     root = pathlib.Path(__file__).resolve().parent.parent
     assert not (root / "bin" / "pr-watch").exists()
-    assert not (root / "launchd").exists()
+    # launchd/ itself is back (the clip-bridge listener), so pin the TIMER's plist
+    # by name and pin that nothing tracked there runs on an interval.
+    assert not list(root.glob("launchd/*pr-watch*"))
+    for plist in root.glob("launchd/*.plist"):
+        assert "StartInterval" not in plist.read_text(), plist

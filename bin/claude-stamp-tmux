@@ -81,7 +81,7 @@ while [[ -n $pid && $pid != 1 && $n -lt 10 ]]; do
   comm=$(ps -o comm= -p "$pid" 2>/dev/null); comm=${comm##*/}
   case $comm in
     claude)        agent=claude; break ;;
-    codex|codex-*) agent=codex;  break ;;
+    codex|codex-aarch64-*|codex-x86_64-*) agent=codex; break ;;
   esac
   pid=$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' '); n=$((n+1))
 done

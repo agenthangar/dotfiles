@@ -354,7 +354,11 @@ def test_zsh_agent_is_proc_and_of_comm(zsh):
             "_dev_agent_is_proc $c && echo yes:$c || echo no:$c; done")
     assert r.stdout.split() == ["yes:claude", "yes:/usr/local/bin/claude", "yes:codex",
                                 "yes:codex-aarch64-apple-darwin", "no:node", "no:zsh", "no:python3"]
-    r = zsh("_dev_agent_of_comm codex-x86; _dev_agent_of_comm /x/claude; _dev_agent_of_comm node; echo end")
+    # codex's own helpers are not agents (they made phantom fg rows under every codex slot)
+    r = zsh("_dev_agent_is_proc /opt/homebrew/Caskroom/codex/0.154.0/bin/codex-code-mode-host "
+            "|| echo no; _dev_agent_is_proc codex-x86_64-unk && echo yes")
+    assert r.stdout.split() == ["no", "yes"], r.stdout
+    r = zsh("_dev_agent_of_comm codex-x86_64-unknown-linux-musl; _dev_agent_of_comm /x/claude; _dev_agent_of_comm node; echo end")
     assert r.stdout.split() == ["codex", "claude", "end"]
 
 
@@ -827,6 +831,23 @@ def test_zsh_fg_rows_give_idless_siblings_distinct_labels(zsh, tmp_path):
     assert len(m("dotfiles-pr136:fg")) == 3
     assert zsh("_dev_fg_handle p4243 && echo yes", **env).stdout.strip() == "yes"
     assert zsh("_dev_fg_handle 4243 || echo no", **env).stdout.strip() == "no"   # a slot
+
+
+def test_zsh_fg_rows_skip_an_agent_nested_under_another(zsh, tmp_path):
+    """The mini's phantom rows: a codex slot's `codex` runs a helper under itself. Whatever
+    its name, an agent process with an agent ANCESTOR belongs to that session — it must
+    never surface as a `(foreground codex)` row of its own."""
+    env = _fg_world(zsh, tmp_path, siblings=((4243, "codex"),))
+    table = (tmp_path / "ps.txt").read_text()
+    # 4250: a claude that 4242's session spawned (e.g. a tool running `claude -p`)
+    (tmp_path / "ps.txt").write_text(table + "4250 4242 claude\n4251 4243 codex-aarch64-apple-darwin\n")
+    lsof = tmp_path / "lsof.txt"
+    cwd = f"{zsh.home}/{PR_WATCH_CWD}"
+    lsof.write_text(lsof.read_text() + f"4250 {cwd}\n4251 {cwd}\n")      # a cwd, so only the fix drops them
+    pids = [l.split("\t")[0] for l in zsh("_dev_fg_pids", **env).stdout.splitlines()]
+    assert pids == ["4242", "4243"], pids
+    rows = zsh("_dev_fg_rows", **env).stdout.splitlines()
+    assert sorted(l.split("\t")[2] for l in rows) == ["dotfiles-pr136:p4242", "dotfiles-pr136:p4243"], rows
 
 
 def test_zsh_fg_match_rules(zsh, tmp_path):

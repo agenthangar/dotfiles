@@ -1343,3 +1343,61 @@ def test_zsh_resume_pick_revives_the_row_with_its_own_agent(zsh, tmp_path):
     tlog = zsh.log.read_text().splitlines()
     assert "send-keys -t dev-api-3 claude -r c1; exit Enter" in tlog
     assert "set-environment -t dev-api-3 DEV_AGENT claude" in tlog
+
+
+def _resume_stubs(tmp_path, **extra):
+    for name, body in (("fzf", FZF_STUB), ("gh", "#!/bin/bash\nexit 1\n"), *extra.items()):
+        stub = tmp_path / "stubbin" / name
+        stub.write_text(body)
+        stub.chmod(0o755)
+
+
+def test_zsh_resume_never_resumes_a_conversation_live_in_another_slot(zsh, tmp_path):
+    """A conversation recorded in slot 3 but RUNNING in slot 5 (a codex thread resumed
+    from slot 5's tree: its rollout still names slot 3) is live by its ID. The path-based
+    slot scan read slot 3 as dead and offered the thread for a second `codex resume`,
+    which hangs silently behind the live owner (mini ff-13, 2026-09-21). It must become
+    a live row that attaches to slot 5 — never a resume."""
+    _resume_stubs(tmp_path)
+    wt3 = f"{zsh.home}/code/.worktrees/api/3"
+    wt5 = f"{zsh.home}/code/.worktrees/api/5"
+    pathlib.Path(wt3).mkdir(parents=True)
+    _codex_home(zsh, [(SID, wt3, "t", 100, 0, None)])
+    live = (f"_dev_session_rows() {{ print -r -- '{SID}\t{wt5}\tapi-5\tdetached\tactive\tAudit balances\tcodex'; }}; "
+            "_t_dev() { echo \"ATTACH $*\"; }; ")
+    # explicit slot, no TTY: nothing dead to take → listed, and NO resume was sent
+    r = zsh(live + "_t_resume api 3; echo rc=$?")
+    assert "rc=1" in r.stdout and "● in api-5" in r.stderr, (r.stdout, r.stderr)
+    assert "send-keys" not in zsh.log.read_text()
+    # under a TTY the sole (live) row auto-picks → attach the OWNER's slot
+    r = zsh(live + "_t_resume api 3; echo rc=$?", _tty=True)
+    assert "ATTACH api 5" in r.stdout and "send-keys" not in zsh.log.read_text(), r.stdout
+    # scan mode: hidden like any live row, and counted
+    r = zsh(live + "_t_resume api; echo rc=$?")
+    assert "1 live slot(s) hidden" in r.stderr and "send-keys" not in zsh.log.read_text()
+
+
+def test_zsh_resume_host_lands_the_pick_on_that_host(zsh, tmp_path):
+    """--host H revives a dead pick ON H through the beam send path: the transcript is
+    rsync'd there and _tbeam_land runs over ssh with the conversation in TB_* env —
+    nothing is resumed locally."""
+    log = tmp_path / "remote.log"
+    ssh = ('#!/bin/bash\nprintf "ssh %s\\n" "$*" >> "$REMOTE_LOG"\n'
+           'case "$*" in *_tbeam_land*) echo "some noise"; echo dev-api-3 ;; esac\n')
+    rsync = '#!/bin/bash\nprintf "rsync %s\\n" "$*" >> "$REMOTE_LOG"\n'
+    _resume_stubs(tmp_path, ssh=ssh, rsync=rsync)
+    wt3 = f"{zsh.home}/code/.worktrees/api/3"
+    proj = zsh.home / ".claude" / "projects" / re.sub(r"[^A-Za-z0-9]", "-", wt3)
+    proj.mkdir(parents=True)
+    (proj / "c1.jsonl").write_text('{"type":"user","message":{"content":"fix the login bug"}}\n')
+    r = zsh("REMOTE_HOSTS[mini]=mini.local; _dev_rows_all() { :; }; _t_resume api 3 --host mini; echo rc=$?",
+            REMOTE_LOG=str(log))
+    assert "rc=0" in r.stdout and "Landed in dev-api-3 on mini" in r.stdout, (r.stdout, r.stderr)
+    calls = log.read_text().splitlines()
+    assert any(c.startswith("rsync ") and "mini.local:.claude/projects/" in c for c in calls)
+    land = [c for c in calls if "_tbeam_land" in c]
+    assert len(land) == 1 and "mini.local" in land[0] and "TB_SID=c1" in land[0] and "TB_MODE=tmux" in land[0]
+    assert "TB_ATTACH" not in land[0]                       # no TTY → detached landing
+    assert "send-keys" not in zsh.log.read_text()           # nothing resumed here
+    r = zsh("_t_resume api 3 --host; echo rc=$?")
+    assert "rc=1" in r.stdout and "--host takes a host" in r.stderr

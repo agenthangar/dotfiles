@@ -5969,6 +5969,9 @@ Run `t <verb> -h` for a verb's own flags.""")
             "the verb for a running slot); -l/--live lists them as labeled rows — "
             "'● active' / '● on <host>' — and picking one ATTACHES in place (locally or on "
             "its host) instead of resuming; naming a live slot explicitly always attaches. "
+            "A conversation is live by its ID too: one resumed into ANOTHER slot (or run as "
+            "a foreground session) is shown as a row pointing at that owner — never resumed "
+            "a second time. --host H revives the pick on H instead of here. "
             "Worktree-per-session repos only (a shared tree's transcripts are "
             "ambiguous per-slot — use `t push -p` there). Agents: a claude conversation "
             "and a codex thread are offered alike — every row carries its agent's icon and name "
@@ -5985,6 +5988,9 @@ Run `t <verb> -h` for a verb's own flags.""")
              "csync is periodic and needs a shell on the far side), then scan as usual")
     sp.add_argument("--days", metavar="N", default="30",
         help="recency window for conversations (default 30; 'all' for everything)")
+    sp.add_argument("--host", metavar="H",
+        help="revive the pick ON host H instead of here (the `t beam` send: worktree edits "
+             "pushed, transcript rsync'd, landed in a dev slot there and attached)")
 
     sp = sub.add_parser("cd", help="cd this shell into a dev slot's worktree",
         description="cd the calling shell into a dev slot's worktree "

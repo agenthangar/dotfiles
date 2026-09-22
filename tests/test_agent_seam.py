@@ -641,13 +641,13 @@ def test_zsh_pr_tag_says_when_work_continued_past_a_merge(zsh, tmp_path):
     # no head sidecar yet: clean tree -> plain merged; dirty -> new work
     assert tag(url, str(wt)) == "· #5 merged"
     (wt / "edit.txt").write_text("x")
-    assert tag(url, str(wt)) == "· #5 merged → new work"
+    assert tag(url, str(wt)) == "· #5 merged, still in progress"
     (wt / "edit.txt").unlink()
     # sidecar known: HEAD on the merged head and clean -> merged; a new commit -> new work
     (prdir / "o#r#5.head").write_text(head)
     assert tag(url, str(wt)) == "· #5 merged"
     subprocess.run(git + ["commit", "-q", "--allow-empty", "-m", "follow-up"], check=True)
-    assert tag(url, str(wt)) == "· #5 merged → new work"
+    assert tag(url, str(wt)) == "· #5 merged, still in progress"
     # no worktree (t resume) or a vanished one -> the plain state
     assert tag(url) == "· #5 merged"
     assert tag(url, str(tmp_path / "gone")) == "· #5 merged"

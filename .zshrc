@@ -4565,7 +4565,7 @@ _pr_state_refresh() {
 # work in that tree: "merged" alone reads as "this slot is done", which is wrong
 # when the session kept iterating after the merge (the PR did not fix it, a follow-up
 # is under way) — so a HEAD that moved off the PR's merged head, or a dirty tree,
-# renders "merged → new work" instead. The tag stays until the session's next PR
+# renders "merged, still in progress" instead. The tag stays until the session's next PR
 # URL replaces it, since the last PR mention in the transcript is the one shown.
 _pr_state_tag() {
   local pru=$1 wt=${2:-}
@@ -4582,7 +4582,7 @@ _pr_state_tag() {
   prlab=${prst:+${(L)prst}}
   [[ -z $prlab ]] && command -v gh >/dev/null 2>&1 && prlab='?'
   if [[ $prst == MERGED && -n $wt ]] && _pr_work_continued "$wt" "$prcf.head"; then
-    prlab='merged → new work'
+    prlab='merged, still in progress'
   fi
   if [[ -z ${_PR_SPAWNED[$prkey]:-} ]]; then
     prmt=$(zstat +mtime "$prcf" 2>/dev/null || echo 0)

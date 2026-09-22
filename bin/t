@@ -213,6 +213,7 @@ class Style:
         self.c = "\033[36m" if tty else ""
         self.y = "\033[2m" if tty else ""
         self.b = "\033[1m" if tty else ""
+        self.w = "\033[33m" if tty else ""
         self.r = "\033[0m" if tty else ""
 
 
@@ -397,6 +398,9 @@ def cmd_ls(cfg, args):
     return 0
 
 
+_PR_WIP_RE = re.compile(r"#\d+ merged, still in progress")
+
+
 def _slot_line(r, st, name_w, avail, host_w=None):
     """ONE row of the slot view: `● ✓     <slot>  <working on>`. `t ls` and every
     slot picker draw their rows through this, so a slot reads the same wherever it is
@@ -414,6 +418,9 @@ def _slot_line(r, st, name_w, avail, host_w=None):
         cell = "" if r.get("host", "local") == "local" else r["host"]
         host = f"{cell:<{host_w}} "
     summary = _truncate(r.get("summary") or "", avail)
+    # a merged PR the slot kept working past (zsh _pr_state_tag) stands out of the dim
+    # summary — coloured AFTER truncation, so the width math never counts an escape
+    summary = _PR_WIP_RE.sub(lambda m: f"{st.r}{st.w}{m.group(0)}{st.r}{st.y}", summary)
     return f"{amark} {cmark} {gmark}   {host}{r['slot']:<{name_w}} {st.y}{summary}{st.r}"
 
 

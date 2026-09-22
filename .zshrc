@@ -3003,7 +3003,7 @@ _dev_session_rows() {
         # dedicated column would sit empty for every slot that has not opened a PR
         # yet, which is most of them. Only a row with a known transcript can carry
         # one; the _dev_session_summary fallback below never resolved a URL.
-        if [[ ${rowtx[$i]} != - ]]; then _pr_state_tag "${pr_of[${rowtx[$i]}]:-}"; summary+=$REPLY; fi
+        if [[ ${rowtx[$i]} != - ]]; then _pr_state_tag "${pr_of[${rowtx[$i]}]:-}" "$dir"; summary+=$REPLY; fi
         ;;
     esac
     # field 7 = agent (claude|codex): trailing, so every front-indexed consumer and a
@@ -4487,8 +4487,9 @@ _pr_state_refresh() {
   # Every declaration is hoisted out of the loops below: an assignmentless
   # `local x` re-run on an already-local x does not redeclare, it PRINTS
   # `x=value` (the _ok=claw junk-output bug documented on _t_resume).
-  local ref slug num st line f
-  local -A want got
+  local ref slug num st line f hd
+  local -a parts
+  local -A want got head
   local -i fallbacks
   for ref in "$@"; do
     slug=${ref%\#*}; num=${ref##*\#}
@@ -4496,11 +4497,12 @@ _pr_state_refresh() {
     want[$slug]="${want[$slug]:-} $num"
   done
   for slug in ${(k)want}; do
-    got=(); fallbacks=0
+    got=(); head=(); fallbacks=0
     for line in ${(f)"$(gh pr list --repo $slug --state all --limit 100 \
-                          --json number,state --jq '.[]|"\(.number) \(.state)"' 2>/dev/null)"}; do
+                          --json number,state,headRefOid --jq '.[]|"\(.number) \(.state) \(.headRefOid)"' 2>/dev/null)"}; do
       [[ -n $line ]] || continue
-      got[${line%% *}]=${line##* }
+      parts=(${=line})
+      got[$parts[1]]=$parts[2]; head[$parts[1]]=${parts[3]:-}
     done
     # Persist every state that ONE call returned, not just the refs asked about:
     # the entries are 6 bytes and terminal ones are cached forever, so warming the
@@ -4509,17 +4511,26 @@ _pr_state_refresh() {
     # rewriting them would only churn an mtime nothing reads.
     for num in ${(k)got} ${=want[$slug]}; do
       f="$prdir/${slug//\//#}#$num"
+      # A MERGED entry is terminal only once its .head sidecar exists — entries
+      # cached before the sidecar was introduced get it filled in once.
       if [[ -f $f ]]; then
         st=$(<$f)
-        [[ $st == MERGED || $st == CLOSED ]] && continue
+        [[ $st == CLOSED || ( $st == MERGED && -f $f.head ) ]] && continue
       fi
-      st=${got[$num]:-}
+      st=${got[$num]:-}; hd=${head[$num]:-}
       # Older than the list window — one direct lookup, bounded so a scan that
       # references many ancient PRs cannot fork-bomb gh.
       if [[ -z $st ]] && (( fallbacks < 8 )); then
         (( fallbacks++ ))
-        st=$(gh pr view "https://github.com/$slug/pull/$num" --json state --jq .state 2>/dev/null)
+        parts=(${=$(gh pr view "https://github.com/$slug/pull/$num" --json state,headRefOid \
+                     --jq '"\(.state) \(.headRefOid)"' 2>/dev/null)})
+        st=${parts[1]:-}; hd=${parts[2]:-}
       fi
+      # The merged head sha, for _pr_state_tag's "work continued past the merge"
+      # check. A sidecar rather than a second field, so every reader of the state
+      # file (the bin/t and tfind Python twins) keeps reading a bare state.
+      [[ $st == MERGED && -n $hd ]] &&
+        print -rn -- "$hd" > "$f.head.$$.tmp" 2>/dev/null && mv -f "$f.head.$$.tmp" "$f.head" 2>/dev/null
       # '?' records a lookup that FAILED, so _pr_state_stale can tell "never
       # asked" from "asked and could not tell".
       print -rn -- "${st:-?}" > "$f.$$.tmp" 2>/dev/null && mv -f "$f.$$.tmp" "$f" 2>/dev/null
@@ -4527,8 +4538,8 @@ _pr_state_refresh() {
   done
 }
 
-# _pr_state_tag <pr-url> — the shared " · #N <state>" renderer behind the PR tag in
-# both `t resume` and `t ls`. Sets $REPLY to the tag for a transcript's last PR URL
+# _pr_state_tag <pr-url> [worktree] — the shared " · #N <state>" renderer behind the
+# PR tag in both `t resume` and `t ls`. Sets $REPLY to the tag for a transcript's last PR URL
 # (empty for an empty url), reading the pr/ cache ONLY — never a blocking gh call.
 #
 # It returns through REPLY rather than stdout for two reasons, and the first is a
@@ -4549,28 +4560,57 @@ _pr_state_refresh() {
 # newest one — is ALWAYS the uncached one, since its PR was created after the last
 # scan. Where gh cannot answer at all (the Linux node) it degrades to a bare "#N",
 # because "?" on every row is noise, not information.
+#
+# With a [worktree] (a LIVE slot's, from `t ls`), a merged PR is checked against the
+# work in that tree: "merged" alone reads as "this slot is done", which is wrong
+# when the session kept iterating after the merge (the PR did not fix it, a follow-up
+# is under way) — so a HEAD that moved off the PR's merged head, or a dirty tree,
+# renders "merged → new work" instead. The tag stays until the session's next PR
+# URL replaces it, since the last PR mention in the transcript is the one shown.
 _pr_state_tag() {
-  local pru=$1
+  local pru=$1 wt=${2:-}
   REPLY=
   [[ -n $pru ]] || return 0
   local prdir="${XDG_CACHE_HOME:-$HOME/.cache}/claude-sessions/pr"
   local prp=${pru#github.com/}; prp=${prp/\/pull\//\/}
   local prkey=${prp//\//#} prnum=${pru##*/}
-  local prcf="$prdir/$prkey" prraw= prst= prlab= prmt
+  local prcf="$prdir/$prkey" prraw= prst= prlab= prmt prhead=
   if [[ -f $prcf ]]; then
     prraw=$(<$prcf)
     [[ $prraw == MERGED || $prraw == CLOSED || $prraw == OPEN ]] && prst=$prraw
   fi
   prlab=${prst:+${(L)prst}}
   [[ -z $prlab ]] && command -v gh >/dev/null 2>&1 && prlab='?'
+  if [[ $prst == MERGED && -n $wt ]] && _pr_work_continued "$wt" "$prcf.head"; then
+    prlab='merged → new work'
+  fi
   if [[ -z ${_PR_SPAWNED[$prkey]:-} ]]; then
     prmt=$(zstat +mtime "$prcf" 2>/dev/null || echo 0)
-    if _pr_state_stale "$prraw" $(( prmt ? EPOCHSECONDS - prmt : 999999999 )); then
+    # a MERGED entry without its head sidecar predates it: fetch it once
+    if _pr_state_stale "$prraw" $(( prmt ? EPOCHSECONDS - prmt : 999999999 )) ||
+       { [[ $prraw == MERGED && ! -f $prcf.head ]] && command -v gh >/dev/null 2>&1; }; then
       _PR_SPAWNED[$prkey]=1
       _PR_STALE+=("${prp%/*}#$prnum")
     fi
   fi
   REPLY=" · #$prnum${prlab:+ $prlab}"
+}
+
+# _pr_work_continued <worktree> <head-file> — has work gone on in <worktree> since
+# its PR merged? 0 = yes: HEAD is no longer the PR's merged head (a new commit, a
+# pull of main to start the follow-up), or the tree has uncommitted edits. HEAD is
+# compared first because it is one cheap rev-parse; the status walk runs only when
+# HEAD still sits on the merged head. An unknown head (sidecar not fetched yet)
+# falls back to the dirty check alone; anything unreadable = no (plain "merged").
+_pr_work_continued() {
+  local wt=$1 hf=$2 head= cur
+  [[ -e $wt/.git ]] || return 1
+  [[ -f $hf ]] && head=$(<$hf)
+  if [[ -n $head ]]; then
+    cur=$(git -C "$wt" rev-parse HEAD 2>/dev/null) || return 1
+    [[ $cur != $head ]] && return 0
+  fi
+  [[ -n $(git -C "$wt" status --porcelain 2>/dev/null) ]]
 }
 
 # _pr_state_flush — spawn ONE detached, per-repo-batched refresh for everything

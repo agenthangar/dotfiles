@@ -620,6 +620,56 @@ def test_zsh_meta_batch_prefers_the_codex_thread_name(zsh):
     assert r.stdout.strip() == first and r.stderr == ""
 
 
+def test_zsh_pr_tag_says_when_work_continued_past_a_merge(zsh, tmp_path):
+    """`t ls` showed `#580 merged` on a slot that was still iterating because the PR
+    had not fixed the problem — "merged" reads as "this slot is done". With the slot's
+    worktree, a HEAD moved off the PR's merged head (or a dirty tree) says so."""
+    wt = tmp_path / "wt"
+    wt.mkdir()
+    git = ["git", "-C", str(wt), "-c", "user.email=t@t", "-c", "user.name=t"]
+    subprocess.run(["git", "init", "-q", str(wt)], check=True)
+    subprocess.run(git + ["commit", "-q", "--allow-empty", "-m", "pr head"], check=True)
+    head = subprocess.run(git + ["rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip()
+    prdir = zsh.home / ".cache" / "claude-sessions" / "pr"
+    prdir.mkdir(parents=True)
+    (prdir / "o#r#5").write_text("MERGED")
+    url = "github.com/o/r/pull/5"
+
+    def tag(*args):
+        return zsh(f"typeset -a _PR_STALE; typeset -A _PR_SPAWNED; _pr_state_tag {' '.join(args)}; print -r -- \"$REPLY\"").stdout.strip()
+
+    # no head sidecar yet: clean tree -> plain merged; dirty -> new work
+    assert tag(url, str(wt)) == "· #5 merged"
+    (wt / "edit.txt").write_text("x")
+    assert tag(url, str(wt)) == "· #5 merged → new work"
+    (wt / "edit.txt").unlink()
+    # sidecar known: HEAD on the merged head and clean -> merged; a new commit -> new work
+    (prdir / "o#r#5.head").write_text(head)
+    assert tag(url, str(wt)) == "· #5 merged"
+    subprocess.run(git + ["commit", "-q", "--allow-empty", "-m", "follow-up"], check=True)
+    assert tag(url, str(wt)) == "· #5 merged → new work"
+    # no worktree (t resume) or a vanished one -> the plain state
+    assert tag(url) == "· #5 merged"
+    assert tag(url, str(tmp_path / "gone")) == "· #5 merged"
+
+
+def test_zsh_pr_refresh_records_the_merged_head(zsh, tmp_path):
+    """The batched refresh stores headRefOid beside a MERGED state (a sidecar, so the
+    state file stays a bare state for the Python readers), and back-fills it once for
+    a MERGED entry cached before the sidecar existed."""
+    stub = tmp_path / "stubbin" / "gh"
+    stub.write_text('#!/bin/sh\necho "5 MERGED abc123"\necho "6 OPEN def456"\n')
+    stub.chmod(0o755)
+    prdir = zsh.home / ".cache" / "claude-sessions" / "pr"
+    prdir.mkdir(parents=True)
+    (prdir / "o#r#5").write_text("MERGED")                # legacy: no .head
+    zsh("_pr_state_refresh 'o/r#5' 'o/r#6'")
+    assert (prdir / "o#r#5").read_text() == "MERGED"
+    assert (prdir / "o#r#5.head").read_text() == "abc123"
+    assert (prdir / "o#r#6").read_text() == "OPEN"
+    assert not (prdir / "o#r#6.head").exists()
+
+
 def test_zsh_codex_subagent_threads_are_not_conversations(zsh):
     """A thread the parent spawned (`source` = a subagent JSON, empty title, the same
     first prompt as the parent's brief) is codex's `<sid>/subagents/` — listed as a

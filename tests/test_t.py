@@ -975,6 +975,17 @@ def test_slot_line_agent_glyph_keeps_the_status_width(t_mod):
     assert t_mod._slot_line(dict(row, agent="gpt"), st, 7, 20) == "● ✓ ?   ff-3    x"
 
 
+def test_slot_line_highlights_a_merged_pr_still_in_progress(t_mod):
+    st = t_mod.Style(tty=True)
+    row = {"slot": "ff-20", "state": "detached", "context": "active",
+           "summary": "search cleanup · #580 merged, still in progress"}
+    line = t_mod._slot_line(row, st, 7, 80)
+    assert f"{st.w}#580 merged, still in progress{st.r}" in line
+    plain = t_mod._slot_line(dict(row, summary="search cleanup · #580 merged"), st, 7, 80)
+    assert st.w not in plain
+    assert t_mod._vis_len(line) == len(t_mod._slot_line(row, t_mod.Style(tty=False), 7, 80))
+
+
 def test_header_lists_every_agent_always(t_mod):
     st = t_mod.Style(tty=False)
     legend = t_mod._agent_legend()

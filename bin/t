@@ -3210,6 +3210,9 @@ _AGENT_PARITY = [
      "✓ ~/.cursor/cli-config.json (argv + env prefixes)"),
     ("default permission mode (seeded when the config names none)", "✓ auto (permissions.defaultMode)",
      "✓ full access (approval never · danger-full-access)", "✗ left as cursor-agent set it"),
+    ("default subagent model (seeded when the config names none)",
+     "✓ sonnet (env.CLAUDE_CODE_SUBAGENT_MODEL)", "✓ gpt-6-sol ([agents] default_subagent_model)",
+     "✗ not seeded"),
     ("t trust (folder trust · every registered repo on dots)", "✓ ~/.claude.json projects",
      "✓ ~/.codex/config.toml [projects]", "✓ ~/.cursor/projects/<slug> marker"),
     ("nosleep (hold sleep while an agent works)", "✓ caffeinate child · net bytes", "✓ net bytes", "✓ net bytes"),
@@ -3404,6 +3407,18 @@ _PERM_CODEX_NETWORK = "[sandbox_workspace_write]\nnetwork_access = true"
 _PERM_CLAUDE_MODE = "auto"
 _PERM_CODEX_MODE = 'approval_policy = "never"\nsandbox_mode = "danger-full-access"'
 _PERM_NO_MODES_ENV = "DOTFILES_NO_AGENT_MODES"
+# the model a SUBAGENT runs on when nothing names one — a Workflow script's agent(), an
+# Agent-tool call, a codex spawn_agent — one tier below the flagship each agent's main
+# loop runs, so an ultracode fan-out of a dozen agents does not bill a dozen flagships.
+# Config-level like the mode, add-only like the mode: a value already there, any value,
+# is a choice. claude reads it from settings.json's env block (CLAUDE_CODE_SUBAGENT_MODEL:
+# the LOWEST-priority default — a per-call model, workflow opts.model or an agent's
+# frontmatter still wins, and an org's availableModels still bounds it, all read off
+# 2.1.280); codex from [agents] default_subagent_model (0.155.1, verified live: the
+# spawned child's turn_context read gpt-6-sol under a gpt-6-astra parent).
+_PERM_CLAUDE_SUBAGENT = ("CLAUDE_CODE_SUBAGENT_MODEL", "sonnet")
+_PERM_CODEX_SUBAGENT = 'default_subagent_model = "gpt-6-sol"'
+_PERM_NO_SUBAGENT_ENV = "DOTFILES_NO_SUBAGENT_MODEL"
 _PERM_CODEX_HEADER = (
     "# Managed by dotfiles: regenerated from agents/permissions.allow by `dots`\n"
     "# (t permissions --apply). Hand edits here are overwritten — put yours in default.rules.\n")
@@ -3568,7 +3583,15 @@ def _perm_claude_mode_plan(data, mode=_PERM_CLAUDE_MODE):
     return "disable" not in (perms.get("disableAutoMode"), data.get("disableAutoMode"))
 
 
-def _perm_json_sync(path, allow, retire, apply=False, mode=None):
+def _perm_claude_subagent_plan(data, env=_PERM_CLAUDE_SUBAGENT):
+    """Would Claude's settings get env[<key>] = <model>? Only when the env block does
+    not name the key — present with ANY value (`inherit`, "") is a choice — and the
+    block, when there is one, is an object (foreign-shaped → left alone). Pure."""
+    block = data.get("env", {})
+    return isinstance(block, dict) and env[0] not in block
+
+
+def _perm_json_sync(path, allow, retire, apply=False, mode=None, subagent=None):
     """Sync one JSON permissions file — Claude's settings.json and cursor's
     cli-config.json share the permissions.allow shape. Returns {"state", "add",
     "retire"}: state "missing" (no file: install.sh's seed / the agent's first run
@@ -3579,7 +3602,10 @@ def _perm_json_sync(path, allow, retire, apply=False, mode=None):
     one pseudo-add, like codex's network line, plus rep["mode"] (its own state).
     `skipAutoPermissionPrompt` rides with it: that is the key Claude's own auto-mode
     opt-in dialog writes (read off 2.1.274's settings schema), and Claude RESETS it
-    whenever it is set without defaultMode = auto, so the two only make sense as a pair."""
+    whenever it is set without defaultMode = auto, so the two only make sense as a pair.
+
+    subagent (claude only): the (env key, model) pair to seed when the env block names
+    none — the same one-pseudo-add shape, with rep["subagent"] as its own state."""
     rep = {"state": None, "add": [], "retire": []}
     try:
         with open(path, encoding="utf-8") as fh:
@@ -3603,8 +3629,13 @@ def _perm_json_sync(path, allow, retire, apply=False, mode=None):
     if mode:
         rep["mode"] = "pending" if seed_mode else "synced"
     if seed_mode:
-        rep["add"] = added + ['settings.json: permissions.defaultMode = "%s"' % mode]
-    if not added and not removed and not seed_mode:
+        rep["add"] = rep["add"] + ['settings.json: permissions.defaultMode = "%s"' % mode]
+    seed_sub = bool(subagent) and _perm_claude_subagent_plan(data, subagent)
+    if subagent:
+        rep["subagent"] = "pending" if seed_sub else "synced"
+    if seed_sub:
+        rep["add"] = rep["add"] + ['settings.json: env.%s = "%s"' % subagent]
+    if not added and not removed and not seed_mode and not seed_sub:
         return rep
     rep["state"] = "pending"
     if apply:
@@ -3613,6 +3644,9 @@ def _perm_json_sync(path, allow, retire, apply=False, mode=None):
             perms["defaultMode"] = mode
             data.setdefault("skipAutoPermissionPrompt", True)
             rep["mode"] = "applied"
+        if seed_sub:
+            data.setdefault("env", {})[subagent[0]] = subagent[1]
+            rep["subagent"] = "applied"
         _perm_write(path, json.dumps(data, indent=2) + "\n")
         rep["state"] = "applied"
     return rep
@@ -3671,6 +3705,31 @@ def _perm_codex_network_plan(text):
     if text and not text.endswith("\n"):
         text += "\n"
     return text + ("\n" if text else "") + "[sandbox_workspace_write]\n" + line + "\n"
+
+
+_PERM_CODEX_AGENTS_HEADER = re.compile(r"^\s*\[\s*agents\s*\]\s*(#.*)?$")
+_PERM_CODEX_SUBAGENT_KEY = re.compile(r"^\s*(agents\s*\.\s*)?default_subagent_model\s*=")
+_PERM_CODEX_AGENTS_INLINE = re.compile(r"^\s*agents\s*=")
+
+
+def _perm_codex_subagent_plan(text):
+    """~/.codex/config.toml with `default_subagent_model` under [agents], or None when
+    the key is already there in any form (under the table, dotted, whatever its value)
+    or an inline `agents = {…}` table holds the table — a header cannot extend that.
+    The network plan's text surgery: under an existing [agents] header, else a new
+    table at the end."""
+    lines = text.split("\n")
+    if any(_PERM_CODEX_SUBAGENT_KEY.match(l) or _PERM_CODEX_AGENTS_INLINE.match(l)
+           for l in lines):
+        return None
+    line = _PERM_CODEX_SUBAGENT + "  # dotfiles: t permissions (change it and it is never flipped back)"
+    for i, l in enumerate(lines):
+        if _PERM_CODEX_AGENTS_HEADER.match(l):
+            lines.insert(i + 1, line)
+            return "\n".join(lines)
+    if text and not text.endswith("\n"):
+        text += "\n"
+    return text + ("\n" if text else "") + "[agents]\n" + line + "\n"
 
 
 def _perm_toml_ok(text):
@@ -3741,8 +3800,9 @@ def _perm_codex_mode_plan(text):
     return "\n".join(lines[:at] + ours + [""] + lines[at:])
 
 
-def _perm_codex_mode_sync(path, apply=False):
-    """The default-mode half of the codex report — _perm_codex_network_sync's shape."""
+def _perm_codex_half_sync(path, plan, label, apply=False):
+    """One add-only half of the codex config report — _perm_codex_network_sync's shape:
+    plan(text) -> the new text or None (nothing to do), label = the pseudo-add."""
     rep = {"state": None, "add": []}
     try:
         with open(path, encoding="utf-8") as fh:
@@ -3751,17 +3811,29 @@ def _perm_codex_mode_sync(path, apply=False):
         have = ""
     except (OSError, UnicodeDecodeError):
         return rep
-    want = _perm_codex_mode_plan(have)
+    want = plan(have)
     if want is None:
         rep["state"] = "synced"
         return rep
     if not _perm_toml_ok(want):
         return rep
-    rep.update(state="pending", add=["config.toml: " + _PERM_CODEX_MODE.replace("\n", " · ")])
+    rep.update(state="pending", add=["config.toml: " + label])
     if apply:
         _perm_write(path, want)
         rep["state"] = "applied"
     return rep
+
+
+def _perm_codex_mode_sync(path, apply=False):
+    """The default-mode half of the codex report."""
+    return _perm_codex_half_sync(path, _perm_codex_mode_plan,
+                                 _PERM_CODEX_MODE.replace("\n", " · "), apply)
+
+
+def _perm_codex_subagent_sync(path, apply=False):
+    """The subagent-model half of the codex report."""
+    return _perm_codex_half_sync(path, _perm_codex_subagent_plan,
+                                 "[agents] " + _PERM_CODEX_SUBAGENT, apply)
 
 
 def _perm_targets(home, which=shutil.which):
@@ -3778,10 +3850,12 @@ def _perm_targets(home, which=shutil.which):
     return t
 
 
-def _perm_sync(home, allow, retire, apply=False, which=shutil.which, modes=True):
+def _perm_sync(home, allow, retire, apply=False, which=shutil.which, modes=True,
+               subagent=True):
     """One report per agent — {agent: {"path", "state", "add", "retire"}}; an agent
     not on this machine reports state "absent". modes=False (DOTFILES_NO_AGENT_MODES)
-    leaves each agent's default permission mode out of it."""
+    leaves each agent's default permission mode out of it, subagent=False
+    (DOTFILES_NO_SUBAGENT_MODEL) its default subagent model."""
     targets = _perm_targets(home, which)
     out = {}
     for agent in _PERM_AGENTS:
@@ -3798,6 +3872,9 @@ def _perm_sync(home, allow, retire, apply=False, which=shutil.which, modes=True)
             if modes:
                 halves.append(_perm_codex_mode_sync(os.path.join(home, _PERM_CODEX_CONFIG), apply))
                 rep["mode"] = halves[-1]["state"]
+            if subagent:
+                halves.append(_perm_codex_subagent_sync(os.path.join(home, _PERM_CODEX_CONFIG), apply))
+                rep["subagent"] = halves[-1]["state"]
             for half in halves:
                 rep["add"] = rep["add"] + half["add"]
                 if rank.get(half["state"], -1) > rank[rep["state"]]:
@@ -3805,7 +3882,9 @@ def _perm_sync(home, allow, retire, apply=False, which=shutil.which, modes=True)
         else:
             rep = _perm_json_sync(path, _perm_translate(allow, agent),
                                   _perm_translate(retire, agent), apply,
-                                  mode=_PERM_CLAUDE_MODE if modes and agent == "claude" else None)
+                                  mode=_PERM_CLAUDE_MODE if modes and agent == "claude" else None,
+                                  subagent=(_PERM_CLAUDE_SUBAGENT if subagent and agent == "claude"
+                                            else None))
         rep["path"] = path
         out[agent] = rep
     return out
@@ -3898,9 +3977,13 @@ def cmd_permissions(cfg, args):
         print("default mode: claude permissions.defaultMode = \"%s\" · codex %s — each only "
               "when its config names no mode (%s=1 opts out)"
               % (_PERM_CLAUDE_MODE, _PERM_CODEX_MODE.replace("\n", " · "), _PERM_NO_MODES_ENV))
+        print("subagent model: claude env.%s = \"%s\" · codex [agents] %s — each only when "
+              "its config names none (%s=1 opts out)"
+              % (_PERM_CLAUDE_SUBAGENT + (_PERM_CODEX_SUBAGENT, _PERM_NO_SUBAGENT_ENV)))
         return 0
     reps = _perm_sync(HOME, allow, retire, apply=args.apply,
-                      modes=not os.environ.get(_PERM_NO_MODES_ENV))
+                      modes=not os.environ.get(_PERM_NO_MODES_ENV),
+                      subagent=not os.environ.get(_PERM_NO_SUBAGENT_ENV))
     if args.apply:
         for agent in _PERM_AGENTS:
             rep = reps[agent]
@@ -3908,7 +3991,8 @@ def cmd_permissions(cfg, args):
                 continue
             net = rep.get("network") == "applied"
             mode = rep.get("mode") == "applied"
-            added = len(rep["add"]) - net - mode
+            sub = rep.get("subagent") == "applied"
+            added = len(rep["add"]) - net - mode - sub
             if added or rep["retire"]:
                 print("permissions: %s — added %d, retired %d in %s"
                       % (agent, added, len(rep["retire"]), rep["path"].replace(HOME, "~")))
@@ -3920,6 +4004,11 @@ def cmd_permissions(cfg, args):
                     "claude": 'permissions.defaultMode = "%s" in ~/.claude/settings.json'
                               % _PERM_CLAUDE_MODE,
                     "codex": "%s in ~/.codex/config.toml" % _PERM_CODEX_MODE.replace("\n", " · "),
+                }[agent]))
+            if sub:
+                print("permissions: %s — default subagent model: %s" % (agent, {
+                    "claude": 'env.%s = "%s" in ~/.claude/settings.json' % _PERM_CLAUDE_SUBAGENT,
+                    "codex": "[agents] %s in ~/.codex/config.toml" % _PERM_CODEX_SUBAGENT,
                 }[agent]))
         return 0
     print("permissions — %s: %d rule(s), %d retired → each installed agent's own config"
@@ -4550,7 +4639,8 @@ def cmd_doctor(cfg, args):
     try:
         allow, retire = _perm_lists(_perm_root())
         perm_sync = _perm_sync(HOME, allow, retire,
-                               modes=not os.environ.get(_PERM_NO_MODES_ENV))
+                               modes=not os.environ.get(_PERM_NO_MODES_ENV),
+                               subagent=not os.environ.get(_PERM_NO_SUBAGENT_ENV))
         print("  permissions %s (%d rules — t permissions)"
               % (" · ".join(_perm_short(a, perm_sync[a]) for a in _PERM_AGENTS), len(allow)))
     except OSError:
@@ -6182,7 +6272,11 @@ Run `t <verb> -h` for a verb's own flags.""")
             "mode where its config names none: claude's auto mode "
             "(permissions.defaultMode) and codex's Full Access preset (approval_policy = "
             "never + sandbox_mode = danger-full-access); a mode you set yourself, any mode, "
-            "is never changed, and DOTFILES_NO_AGENT_MODES=1 opts a machine out.")
+            "is never changed, and DOTFILES_NO_AGENT_MODES=1 opts a machine out. It also seeds "
+            "the model a SUBAGENT runs on when nothing names one (a Workflow agent(), an Agent-"
+            "tool call, a codex spawn_agent): claude env.CLAUDE_CODE_SUBAGENT_MODEL = sonnet, "
+            "codex [agents] default_subagent_model = gpt-6-sol — add-only the same way, "
+            "DOTFILES_NO_SUBAGENT_MODEL=1 opts out.")
     sp.add_argument("--apply", action="store_true", help="merge the adds and retires now (what dots does)")
     sp.add_argument("--show", action="store_true", help="print every rule with its codex / cursor translation")
 

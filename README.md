@@ -159,23 +159,24 @@ Not every verb supports every agent yet. The matrix below is **generated from
 support without the README saying so:
 
 ```text
-  surface                                                      ✱ claude                          ⬡ codex                                                               ◆ cursor
-  -----------------------------------------------------------  --------------------------------  --------------------------------------------------------------------  -------------------------------------------------
-  t install (install · login · update · reinstall)             ✓                                 ✓                                                                     ✓
-  dev slots: t open / ls / kill / read / paste                 ✓                                 ✓ t open --codex · DEV_AGENT                                          ✗ no slot — t cursor ls
-  t push / t pop                                               ✓                                 ✓                                                                     ✗ no slot
-  t resume (dead slots)                                        ✓                                 ✓ (its sqlite thread index)                                           → t cursor resume
-  t beam / --from (move a session)                             ✓                                 ✓ (rollout + .origin)                                                 → t cursor [id] --host / --from
-  csync (iCloud union of transcripts)                          ✓ projects + plans                ✓ codex-sessions                                                      ✓ cursor-chats
-  SessionStart stamps (registry · opened · origin)             ✓ settings.json hook              ✓ hooks.json (trust once at startup)                                  ✗ no hook wired
-  t plan                                                       ✓                                 ✗ codex keeps no plan files (says so)                                 ✗
-  /tpush · /tpop slash commands                                ✓ ~/.claude/commands              ✓ ~/.codex/prompts                                                    ✗
-  t find / t mcp (transcript search)                           ✓                                 ✗ claude transcripts only                                             ✗
-  t doctor agent row (version · login · hook)                  ✓                                 ✓                                                                     ✓ version · login
-  permissions (agents/permissions.allow, synced by dots)       ✓ ~/.claude/settings.json         ✓ ~/.codex/rules/dotfiles.rules (argv prefixes) · sandbox network on  ✓ ~/.cursor/cli-config.json (argv + env prefixes)
-  default permission mode (seeded when the config names none)  ✓ auto (permissions.defaultMode)  ✓ full access (approval never · danger-full-access)                   ✗ left as cursor-agent set it
-  t trust (folder trust · every registered repo on dots)       ✓ ~/.claude.json projects         ✓ ~/.codex/config.toml [projects]                                     ✓ ~/.cursor/projects/<slug> marker
-  nosleep (hold sleep while an agent works)                    ✓ caffeinate child · net bytes    ✓ net bytes                                                           ✓ net bytes
+  surface                                                      ✱ claude                                   ⬡ codex                                                               ◆ cursor
+  -----------------------------------------------------------  -----------------------------------------  --------------------------------------------------------------------  -------------------------------------------------
+  t install (install · login · update · reinstall)             ✓                                          ✓                                                                     ✓
+  dev slots: t open / ls / kill / read / paste                 ✓                                          ✓ t open --codex · DEV_AGENT                                          ✗ no slot — t cursor ls
+  t push / t pop                                               ✓                                          ✓                                                                     ✗ no slot
+  t resume (dead slots)                                        ✓                                          ✓ (its sqlite thread index)                                           → t cursor resume
+  t beam / --from (move a session)                             ✓                                          ✓ (rollout + .origin)                                                 → t cursor [id] --host / --from
+  csync (iCloud union of transcripts)                          ✓ projects + plans                         ✓ codex-sessions                                                      ✓ cursor-chats
+  SessionStart stamps (registry · opened · origin)             ✓ settings.json hook                       ✓ hooks.json (trust once at startup)                                  ✗ no hook wired
+  t plan                                                       ✓                                          ✗ codex keeps no plan files (says so)                                 ✗
+  /tpush · /tpop slash commands                                ✓ ~/.claude/commands                       ✓ ~/.codex/prompts                                                    ✗
+  t find / t mcp (transcript search)                           ✓                                          ✗ claude transcripts only                                             ✗
+  t doctor agent row (version · login · hook)                  ✓                                          ✓                                                                     ✓ version · login
+  permissions (agents/permissions.allow, synced by dots)       ✓ ~/.claude/settings.json                  ✓ ~/.codex/rules/dotfiles.rules (argv prefixes) · sandbox network on  ✓ ~/.cursor/cli-config.json (argv + env prefixes)
+  default permission mode (seeded when the config names none)  ✓ auto (permissions.defaultMode)           ✓ full access (approval never · danger-full-access)                   ✗ left as cursor-agent set it
+  default subagent model (seeded when the config names none)   ✓ sonnet (env.CLAUDE_CODE_SUBAGENT_MODEL)  ✓ gpt-6-sol ([agents] default_subagent_model)                         ✗ not seeded
+  t trust (folder trust · every registered repo on dots)       ✓ ~/.claude.json projects                  ✓ ~/.codex/config.toml [projects]                                     ✓ ~/.cursor/projects/<slug> marker
+  nosleep (hold sleep while an agent works)                    ✓ caffeinate child · net bytes             ✓ net bytes                                                           ✓ net bytes
 ```
 
 Codex needs one manual step after install: its SessionStart hook (the same
@@ -210,6 +211,16 @@ never changed, `DOTFILES_NO_AGENT_MODES=1` opts a machine out, and Cursor's is l
 as cursor-agent set it. Full access means Codex runs commands unsandboxed and
 unasked: that is the point on your own machines, and a reason to read this
 paragraph before running `install.sh` on one that is not.
+
+The same step also picks a cheaper **default subagent model**, so a multi-agent
+fan-out (an ultracode workflow, a burst of Agent-tool calls, Codex's `spawn_agent`)
+does not run every helper on the flagship: Claude Code gets
+`env.CLAUDE_CODE_SUBAGENT_MODEL = "sonnet"` in `~/.claude/settings.json`, Codex gets
+`[agents] default_subagent_model = "gpt-6-sol"` in `~/.codex/config.toml`. It is only a
+default. A model named for one call (a workflow's `opts.model`, the Agent tool's
+`model`) or in an agent's own definition still wins, and your org's allowed-model
+list still applies. Change either value and it is never flipped back;
+`DOTFILES_NO_SUBAGENT_MODEL=1` opts a machine out.
 `t permissions` reports what is in sync and what is waiting,
 `t permissions --show` prints each rule's translations, `t doctor` carries the
 same line, and `DOTFILES_NO_PERMISSIONS=1` opts a machine out. The shipped list

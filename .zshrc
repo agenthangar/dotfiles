@@ -159,10 +159,12 @@ prview() {
 
 # nosleep — keep the Mac awake while an agent CLI is working and the network is up
 #
-# Usage: nosleep [-f|--forever] [--grace <secs>] [--every <secs>]
+# Usage: nosleep [-f|--forever] [-d|--dim] [--grace <secs>] [--every <secs>]
 #
 # Options:
 #   -f, --forever    hold sleep off until Ctrl-C, unconditionally (the old behaviour)
+#   -d, --dim        stay logged in: hold the display on (no idle lock), and on lid close
+#                    dim the built-in panel instead of locking (for computer-use agents)
 #   --grace <secs>   how long a signal may be absent before nosleep lets go (default 900)
 #   --every <secs>   how often the two signals are re-checked (default 30)
 #
@@ -173,7 +175,11 @@ prview() {
 # and the panel would stay lit behind the lid until the displaysleep timer; the Mac
 # keeps running throughout (not when docked to an external display: macOS never
 # slept on that lid close, so there is no lock to replace, and the closed lid is
-# simply how the Mac sits). It keeps holding only
+# simply how the Mac sits). With --dim the session stays logged in instead: the display
+# is held on for the whole run (so it never idle-sleeps into the lock), user activity is
+# declared every check (so the screensaver never starts either), and a lid close dims the
+# built-in panel to NOSLEEP_DIM_LEVEL (default 0) and restores it when the lid opens —
+# computer-use agents need an unlocked, lit session to see and click. It keeps holding only
 # while BOTH signals stay fresh: internet (an HTTPS exchange with
 # api.anthropic.com) and tokens burning — a local claude, codex or cursor-agent
 # mid-turn (Claude Code runs its own caffeinate while a turn is in flight; for
@@ -186,10 +192,11 @@ prview() {
 # For a persistent, unconditional block use `sleep-manager disable` instead.
 nosleep() {
   [[ "$1" == -h || "$1" == --help ]] && { _help_for nosleep; return 0; }
-  local forever=0 grace=900 every=30
+  local forever=0 dim=0 grace=900 every=30
   while (( $# )); do
     case $1 in
       -f|--forever) forever=1 ;;
+      -d|--dim) dim=1 ;;
       --grace) grace=${2:-}; shift ;;
       --every) every=${2:-}; shift ;;
       *) echo "nosleep: unknown option '$1' (see nosleep -h)" >&2; return 2 ;;
@@ -204,11 +211,17 @@ nosleep() {
   # is GLOBAL on purpose: the EXIT trap fires after the function's locals are
   # unwound (verified — a local pid read as empty there, leaving caffeinate running
   # and the restore firing twice).
-  typeset -g _NOSLEEP_CAF='' _NOSLEEP_DONE=0 _NOSLEEP_WHO=''
+  typeset -g _NOSLEEP_CAF='' _NOSLEEP_DONE=0 _NOSLEEP_WHO='' _NOSLEEP_BRIGHT=''
   _NOSLEEP_NET=() _NOSLEEP_NET_AT=()
   _nosleep_restore() {
     (( _NOSLEEP_DONE )) && return 0; _NOSLEEP_DONE=1
     [[ -n $_NOSLEEP_CAF ]] && kill "$_NOSLEEP_CAF" 2>/dev/null
+    # a --dim run ending behind a closed lid: put the brightness back for whoever opens it,
+    # and sleep the display — staying logged in was this run's promise, not the next one's
+    if [[ -n $_NOSLEEP_BRIGHT ]]; then
+      _nosleep_undim
+      _nosleep_lid_closed && pmset displaysleepnow 2>/dev/null
+    fi
     sudo -n pmset -a disablesleep 0 2>/dev/null || sudo pmset -a disablesleep 0
   }
   trap '_nosleep_restore' EXIT
@@ -237,8 +250,10 @@ nosleep() {
   sudo pmset -a disablesleep 1 || return 1
   # -ims, not -dimsu: -d would pin the display on and -u would wake it. System,
   # idle and disk sleep are held; the display follows pmset displaysleep, and the
-  # screen-lock delay turns that display sleep into a lock.
-  caffeinate -ims & _NOSLEEP_CAF=$!
+  # screen-lock delay turns that display sleep into a lock. --dim wants exactly the
+  # opposite (stay logged in), so it holds the display too.
+  if (( dim )); then caffeinate -dims & else caffeinate -ims & fi
+  _NOSLEEP_CAF=$!
 
   # Each signal carries the epoch it was LAST seen at; nosleep lets go when the
   # OLDER of the two falls more than $grace behind now. One failed probe (a wifi
@@ -249,19 +264,33 @@ nosleep() {
   # idle probe read as "idle for 55 years" and let go at once, grace unapplied).
   # The loop ticks every 2s for the lid (a lock that lands 30s after the lid shut
   # is no lock) and runs the two signal probes only every $every.
-  local now busy_at online_at=$EPOCHSECONDS oldest why checked_at=0 lid_was=0
+  local now busy_at online_at=$EPOCHSECONDS oldest why checked_at=0 lid_was=0 pinged_at=0
+  local lid_does='lid close locks'
+  (( dim )) && lid_does='staying logged in, lid close dims'
   if (( forever )); then
-    echo "nosleep: holding sleep off until Ctrl-C (lid close locks the screen)"
+    echo "nosleep: holding sleep off until Ctrl-C ($lid_does)"
   else
-    echo "nosleep: holding sleep off while a local agent (claude · codex · cursor-agent) is working and the network is up (grace ${grace}s, lid close locks, Ctrl-C to stop)"
+    echo "nosleep: holding sleep off while a local agent (claude · codex · cursor-agent · the Claude/ChatGPT apps) is working and the network is up (grace ${grace}s, $lid_does, Ctrl-C to stop)"
   fi
   busy_at=$online_at
   while :; do
     now=$EPOCHSECONDS
     if _nosleep_lid_closed; then
-      (( lid_was )) || { _nosleep_lock; lid_was=1; }
+      if (( ! lid_was )); then
+        if (( dim )); then _nosleep_dim; else _nosleep_lock; fi
+        lid_was=1
+      fi
     else
+      (( lid_was && dim )) && _nosleep_undim
       lid_was=0
+    fi
+    if (( dim && now - pinged_at >= every )); then
+      pinged_at=$now
+      # the display assertion holds display sleep, not the screensaver's idle timer —
+      # a user-activity ping resets that (and would relight a panel that slept anyway)
+      caffeinate -u -t 1 2>/dev/null &!
+      # auto-brightness (the ambient sensor behind a shut lid) can move the level back
+      (( lid_was )) && _nosleep_brightness "${NOSLEEP_DIM_LEVEL:-0}" >/dev/null
     fi
     if (( ! forever && now - checked_at >= every )); then
       checked_at=$now
@@ -333,6 +362,50 @@ _nosleep_lock() {
   [[ -t 1 ]] && printf '\r\e[K'                      # nosleep's status line leaves no newline
   echo "nosleep: lid closed — screen locked, display off"
 }
+# _nosleep_brightness [level] — the BUILT-IN display's brightness (0–1): prints it, and
+# with a level sets it first (prints the level it was at before). DisplayServices is the
+# private framework behind the brightness keys — no CLI ships one — called through python
+# ctypes as _nosleep_lock calls login.framework. rc 1 with no built-in display or no call.
+_nosleep_brightness() {
+  python3 - "$@" 2>/dev/null <<'PY'
+import ctypes, sys
+cg = ctypes.CDLL("/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics")
+ds = ctypes.CDLL("/System/Library/PrivateFrameworks/DisplayServices.framework/DisplayServices")
+ds.DisplayServicesSetBrightness.argtypes = [ctypes.c_uint32, ctypes.c_float]
+ids = (ctypes.c_uint32 * 16)(); n = ctypes.c_uint32()
+cg.CGGetOnlineDisplayList(16, ids, ctypes.byref(n))
+for d in ids[:n.value]:
+    if not cg.CGDisplayIsBuiltin(d):
+        continue
+    b = ctypes.c_float()
+    if ds.DisplayServicesGetBrightness(d, ctypes.byref(b)) != 0:
+        sys.exit(1)
+    if len(sys.argv) > 1 and ds.DisplayServicesSetBrightness(d, float(sys.argv[1])) != 0:
+        sys.exit(1)
+    print("%.4f" % b.value)
+    sys.exit(0)
+sys.exit(1)
+PY
+}
+# _nosleep_dim / _nosleep_undim — --dim's lid close and lid open: dim the built-in panel
+# to NOSLEEP_DIM_LEVEL remembering the level it was at (_NOSLEEP_BRIGHT, global so the
+# EXIT-trap restore sees it), then put that level back. No lock, no display sleep: the
+# session stays logged in and lit for whatever agent is driving it.
+_nosleep_dim() {
+  local was
+  was=$(_nosleep_brightness "${NOSLEEP_DIM_LEVEL:-0}") && [[ -z $_NOSLEEP_BRIGHT ]] && _NOSLEEP_BRIGHT=$was
+  [[ -t 1 ]] && printf '\r\e[K'
+  if [[ -n $was ]]; then
+    echo "nosleep: lid closed — staying logged in, display dimmed"
+  else
+    echo "nosleep: lid closed — staying logged in (could not dim the built-in display)" >&2
+  fi
+}
+_nosleep_undim() {
+  [[ -n $_NOSLEEP_BRIGHT ]] || return 0
+  _nosleep_brightness "$_NOSLEEP_BRIGHT" >/dev/null
+  _NOSLEEP_BRIGHT=''
+}
 # _nosleep_pmset_held — true while pmset's disablesleep flag is set (one ~10 ms read).
 # The flag is what keeps a CLOSED lid from sleeping the Mac; caffeinate alone holds
 # only idle sleep. It is global state that any nosleep's restore clears.
@@ -373,16 +446,25 @@ _nosleep_net_working() {
 # codex · cursor), empty for anything else: the slot seam's _dev_agent_is_proc match
 # plus cursor-agent, which never occupies a slot but burns tokens all the same. (ps
 # reports argv[0], and cursor-agent's launcher `exec -a`s its own path — verified.)
+# The desktop apps run the same agent cores from inside a bundle, and those count too
+# (their work is tokens burning like any CLI's): the ChatGPT app's Codex is
+# ChatGPT.app/…/CodexCLI.app/Contents/MacOS/codex, the Claude app's Code sessions run
+# ~/Library/Application Support/Claude/claude-code/<ver>/claude.app/Contents/MacOS/claude.
+# Any OTHER bundled binary (the apps' node helpers, Computer Use, renderers) is not an agent.
 _nosleep_agent_of_comm() {
   REPLY=''
-  if _dev_agent_is_proc "$1"; then
+  if [[ $1 == *.app/Contents/* ]]; then
+    if [[ $1 == */ChatGPT.app/Contents/* && ${1:t} == codex ]]; then REPLY=ChatGPT
+    elif [[ $1 == */Application\ Support/Claude/claude-code/* && ${1:t} == claude ]]; then REPLY='Claude app'
+    fi
+  elif _dev_agent_is_proc "$1"; then
     [[ ${1:t} == claude ]] && REPLY=claude || REPLY=codex
   elif [[ ${1:t} == cursor-agent ]]; then
     REPLY=cursor
   fi
 }
 # _nosleep_busy_at — REPLY = now when a local agent CLI is working, else 0; _NOSLEEP_WHO
-# names the agents last seen at it (the status line). Two signals, either suffices:
+# names the agents last seen at it (the status line). Three signals, any suffices:
 #   1. a `caffeinate` whose parent is `claude` — Claude Code holds a `caffeinate -i -t 300`
 #      under itself while a turn is in flight (a refcount in the binary: respawned every
 #      240 s while held, killed 30 s after the count drops to zero — so a claude reads
@@ -408,9 +490,36 @@ _nosleep_agent_of_comm() {
 # baselines written to _NOSLEEP_NET would vanish and every probe would be a first
 # sighting (the _pr_state_tag lesson). `nettop -n` is load-bearing — with name
 # resolution a probe took 5.1 s, without it 40 ms — and a process with no socket
-# gets NO row, not a zero one. A GUI bundle's agent core (the ChatGPT app ships its
-# own codex) is skipped as _dev_ps_snapshot skips it: not a session you started, and
-# its background sync is not work.
+# gets NO row, not a zero one. The desktop apps' agent cores (the ChatGPT app's codex,
+# the Claude app's claude — see _nosleep_agent_of_comm) are counted like any CLI: an
+# early version skipped every *.app/Contents binary as _dev_ps_snapshot does for t ls,
+# and nosleep let the Mac sleep under a ChatGPT/Claude app mid-task (2026-09-25). The
+# byte floor is what keeps their idle chatter out — the ChatGPT app's codex held no
+# socket at all while idle.
+#   3. a power assertion the Claude or ChatGPT APP itself holds (_nosleep_app_asserting)
+#      — the Claude app takes an Electron NoIdleSleep assertion while it works (5-min
+#      refcounted, like Claude Code's caffeinate), which covers work whose process is
+#      invisible here (Cowork runs its claude inside a VM).
+# NOSLEEP_APPS — owner name (as `pmset -g assertions` prints it) → status-line label for
+# the desktop apps whose own idle-sleep assertion reads as "working". Override or extend
+# in ~/.zshrc.local.
+typeset -gA NOSLEEP_APPS
+(( ${#NOSLEEP_APPS} )) || NOSLEEP_APPS=( Claude 'Claude app' ChatGPT ChatGPT )
+# _nosleep_app_asserting — true when a NOSLEEP_APPS app holds a system-sleep assertion
+# right now; reply = their labels. One ~10 ms `pmset -g assertions`, read from its
+# "Listed by owning process" lines: `pid 81176(Claude): [0x…] 00:03:35
+# PreventUserIdleSystemSleep named: "Electron"`. Display-only assertions (the ChatGPT
+# app's "Capturing") and user-activity pings are not work and do not count.
+_nosleep_app_asserting() {
+  local line owner; reply=()
+  while IFS= read -r line; do
+    [[ $line =~ '^[[:space:]]*pid [0-9]+\(([^)]+)\):.*(PreventUserIdleSystemSleep|PreventSystemSleep|NoIdleSleepAssertion) named' ]] || continue
+    owner=${match[1]}
+    [[ -n ${NOSLEEP_APPS[$owner]:-} ]] && reply+=("${NOSLEEP_APPS[$owner]}")
+  done < <(pmset -g assertions 2>/dev/null)
+  reply=( "${(@u)reply}" )
+  (( ${#reply} ))
+}
 typeset -gA _NOSLEEP_NET _NOSLEEP_NET_AT
 typeset -g _NOSLEEP_WHO=''
 _nosleep_busy_at() {
@@ -419,13 +528,13 @@ _nosleep_busy_at() {
     [[ $pid == <-> ]] || continue
     pcomm[$pid]=${comm:t}
     [[ ${comm:t} == caffeinate ]] && caf+=("$ppid")
-    [[ $comm == *.app/Contents/* ]] && continue
     _nosleep_agent_of_comm "$comm"
     [[ -n $REPLY ]] && { agent[$pid]=$REPLY; args+=(-p "$pid"); }
   done < <(ps -Axo pid=,ppid=,comm= 2>/dev/null)
   for ppid in "${caf[@]}"; do
-    [[ ${pcomm[$ppid]:-} == claude ]] && { who+=(claude); break; }
+    [[ ${pcomm[$ppid]:-} == claude ]] && who+=("${agent[$ppid]:-claude}")
   done
+  _nosleep_app_asserting && who+=("${reply[@]}")
   if (( ${#args} && $+commands[nettop] )); then
     local name bin bout rest cur='' key bytes
     while IFS=, read -r name bin bout rest; do

@@ -14,6 +14,7 @@ import pathlib
 import pty
 import re
 import select
+import shlex
 import shutil
 import subprocess
 import time
@@ -1178,6 +1179,21 @@ def test_zsh_nosleep_agent_of_comm(zsh):
                                 "/Users/me/.local/bin/cursor-agent=cursor", "node=", "zsh=", "cursor="]
 
 
+def test_zsh_nosleep_agent_of_comm_counts_the_desktop_apps_agents(zsh):
+    # the desktop apps run the same agent cores from inside a bundle (the paths as ps
+    # printed them, 2026-09-25) — those count; every other bundled binary does not
+    apps = [
+        ("/Applications/ChatGPT.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex", "ChatGPT"),
+        ("/Users/me/Library/Application Support/Claude/claude-code/2.1.281/claude.app/Contents/MacOS/claude", "Claude app"),
+        ("/Applications/ChatGPT.app/Contents/Resources/cua_node/bin/node", ""),
+        ("/Applications/Claude.app/Contents/Frameworks/Claude Helper.app/Contents/MacOS/Claude Helper", ""),
+        ("/Users/me/.codex/computer-use/Codex Computer Use.app/Contents/MacOS/SkyComputerUseService", ""),
+        ("/Applications/Other.app/Contents/MacOS/claude", ""),
+    ]
+    script = "; ".join(f"_nosleep_agent_of_comm {shlex.quote(c)}; echo \"[$REPLY]\"" for c, _ in apps)
+    assert zsh(script).stdout.splitlines() == [f"[{want}]" for _, want in apps]
+
+
 PMSET_STUB = r"""#!/bin/bash
 # pmset -g → the settings dump, with the flag from $FAKE_SLEEP_DISABLED
 [[ "$1" == -g ]] && { printf ' SleepDisabled\t\t%s\n sleep                10\n' "${FAKE_SLEEP_DISABLED:-0}"; exit 0; }
@@ -1226,16 +1242,18 @@ def test_zsh_nosleep_bytes_moved_since_the_last_probe(nosleep):
         '_nosleep_busy_at; echo "p4=$REPLY pids=${(k)_NOSLEEP_NET_AT} socks=${#_NOSLEEP_NET}"')
     p1, p2, p3, p4 = r.stdout.splitlines()
     assert p1 == "p1=0 who="                                        # first sighting: baselines only
-    assert int(p2.split()[0][3:]) > 1_700_000_000 and p2.endswith(" who=codex")  # 60 KB in a probe = working; 50 B = not
-    assert p3.startswith("p3=0 who=codex pids=")                    # quiet; WHO keeps the last name (status line)
+    when, who = p2[3:].split(" who=")
+    assert int(when) > 1_700_000_000                                # 60 KB in a probe = working; 50 B = not
+    assert sorted(who.split(", ")) == ["ChatGPT", "codex"]          # the ChatGPT app's codex counts (2026-09-25)
+    assert p3.startswith("p3=0 who=")                               # quiet; WHO keeps the last names (status line)
     pids, socks = p3.split("pids=")[1].split(" socks=")
-    assert sorted(pids.split()) == ["20", "30"] and socks == "2"    # both CLI agents keep their baselines
+    assert sorted(pids.split()) == ["20", "30", "40"] and socks == "3"   # every agent keeps its baselines
     assert p4 == "p4=0 pids= socks=0"                               # gone agents drop them
-    # only CLI agents were asked about: not the ChatGPT app's bundled codex (40), not
-    # node/zsh — never with name resolution (5 s a probe), and never collapsed with -P
+    # only agents were asked about — the CLIs and the ChatGPT app's bundled codex (40),
+    # not node/zsh — never with name resolution (5 s a probe), and never collapsed with -P
     # (the per-process total is not cumulative — see the next tests)
     asked = nosleep.log.read_text().splitlines()[0]
-    assert "-p 20" in asked and "-p 30" in asked and "-p 40" not in asked and "-p 50" not in asked
+    assert "-p 20" in asked and "-p 30" in asked and "-p 40" in asked and "-p 50" not in asked
     assert "-n" in asked.split() and "-P" not in asked.split()
 
 
@@ -1323,6 +1341,71 @@ def test_zsh_nosleep_lid_closed_only_when_macos_would_sleep_on_it(nosleep):
     assert not closed(("AppleClamshellCausesSleep", "No"), ("AppleClamshellState", "Yes"))   # clamshell mode
     assert not closed(("AppleClamshellCausesSleep", "Yes"), ("AppleClamshellState", "No"))   # lid open
     assert not closed()                                                                      # no lid at all
+
+
+ASSERTIONS_STUB = r"""#!/bin/bash
+# pmset -g assertions → the fixture's per-process listing ($FAKE_ASSERT)
+[[ "$1 $2" == "-g assertions" && -f "${FAKE_ASSERT:-}" ]] && cat "$FAKE_ASSERT"
+exit 0
+"""
+
+
+def test_zsh_nosleep_app_power_assertions_read_as_working(nosleep, tmp_path):
+    # the Claude app takes an Electron idle-sleep assertion while it works (pmset -g log,
+    # 2026-09-25); the ChatGPT app's "Capturing" is display-only, and a caffeinate is the
+    # CLI signal's business, not this one's
+    stub = tmp_path / "stubbin" / "pmset"
+    stub.write_text(ASSERTIONS_STUB)
+    stub.chmod(0o755)
+    listing = tmp_path / "assert.txt"
+    listing.write_text(
+        "Listed by owning process:\n"
+        "   pid 25974(caffeinate): [0x1] 02:05:39 PreventUserIdleSystemSleep named: \"caffeinate command-line tool\"  \n"
+        "   pid 53916(ChatGPT): [0x2] 00:00:03 NoDisplaySleepAssertion named: \"Capturing\"  \n")
+    nosleep.table.write_text("1 0 launchd\n")
+    probe = '_nosleep_busy_at; echo "$REPLY|$_NOSLEEP_WHO"'
+    assert nosleep(probe, FAKE_ASSERT=str(listing)).stdout.strip() == "0|"
+    listing.write_text(listing.read_text() +
+        "   pid 81176(Claude): [0x3] 00:03:35 PreventUserIdleSystemSleep named: \"Electron\"  \n")
+    when, who = nosleep(probe, FAKE_ASSERT=str(listing)).stdout.strip().split("|")
+    assert int(when) > 1_700_000_000 and who == "Claude app"
+
+
+def test_zsh_nosleep_desktop_claude_caffeinate_is_labelled_the_app(nosleep):
+    # the Claude app's Code sessions run the same binary, caffeinate child and all
+    claude = "/Users/me/Library/Application Support/Claude/claude-code/2.1.281/claude.app/Contents/MacOS/claude"
+    nosleep.table.write_text(f"1 0 launchd\n10 1 {claude}\n11 10 caffeinate\n")
+    when, who = nosleep('_nosleep_busy_at; echo "$REPLY|$_NOSLEEP_WHO"').stdout.strip().split("|")
+    assert int(when) > 1_700_000_000 and who == "Claude app"
+
+
+def test_zsh_nosleep_dim_dims_then_restores_the_builtin_panel(nosleep, tmp_path):
+    # --dim's lid close: brightness down (remembering the level it was at), no lock, no
+    # display sleep; lid open puts the level back. python3 is stubbed — the real call
+    # would dim the developer's screen mid-test.
+    stub = tmp_path / "stubbin" / "python3"
+    stub.write_text('#!/bin/bash\ncat >/dev/null\nprintf "%s\\n" "$*" >> "$DIM_LOG"\necho 0.6200\n')
+    stub.chmod(0o755)
+    log = tmp_path / "dim.log"
+    r = nosleep('_NOSLEEP_BRIGHT=""; _nosleep_dim; echo "saved=$_NOSLEEP_BRIGHT"; '
+                '_nosleep_dim; echo "saved=$_NOSLEEP_BRIGHT"; '
+                '_nosleep_undim; echo "saved=[$_NOSLEEP_BRIGHT]"',
+                DIM_LOG=str(log), NOSLEEP_DIM_LEVEL="0.05")
+    assert r.stdout.splitlines() == ["nosleep: lid closed — staying logged in, display dimmed", "saved=0.6200",
+                                     "nosleep: lid closed — staying logged in, display dimmed", "saved=0.6200",
+                                     "saved=[]"]
+    # a second dim (auto-brightness re-applied) never overwrites the level to restore
+    assert log.read_text().splitlines() == ["- 0.05", "- 0.05", "- 0.6200"]
+
+
+def test_zsh_nosleep_dim_flag_holds_the_display_and_skips_the_lock(zsh):
+    # --dim is "stay logged in": the display is held (-dims), and the lid branch dims
+    # instead of locking — pinned on the source, since the loop itself needs sudo
+    body = open(ZSHRC).read().split("\nnosleep() {", 1)[1].split("\n}\n", 1)[0]
+    assert "-d|--dim) dim=1" in body
+    assert "if (( dim )); then caffeinate -dims & else caffeinate -ims & fi" in body
+    assert "if (( dim )); then _nosleep_dim; else _nosleep_lock; fi" in body
+    assert "(( lid_was && dim )) && _nosleep_undim" in body
 
 
 # ─── t resume: the picker renders the display column, for every agent ─────────────

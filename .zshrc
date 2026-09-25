@@ -670,7 +670,7 @@ _dots_legacy_present() {
 
 # dots — update your LIVE dotfiles to origin/main and reload zsh
 #
-# Usage: dots [--dev | --relink]
+# Usage: dots [--all | --dev | --relink]
 #
 # There is ONE canonical checkout (normally ~/code/dotfiles), parked on `main`, and it
 # IS the live surface — the $HOME symlinks point straight at it. Default `dots`
@@ -685,6 +685,7 @@ _dots_legacy_present() {
 # to land and how `t resume` once vanished. Silent when nothing changed.
 #
 # Flags:
+#   --all, -a     dots here, then on every REMOTE_HOSTS host in parallel (dots-sync)
 #   --dev, -d     make the session worktree you are STANDING IN live (see below)
 #   --relink      reconcile the live symlinks now, without fetching
 #
@@ -699,6 +700,20 @@ _dots_legacy_present() {
 # flips live back to the canonical checkout. Skips brew bundle.
 dots() {
   [[ "$1" == -h || "$1" == --help ]] && { _help_for dots; return 0; }
+  # --all: the local run first (it re-sources ~/.zshrc, so what fans out is the
+  # just-updated dots-sync), then `dots` on every host. dots-sync never runs `dots
+  # --all` remotely, so the fan-out cannot echo back.
+  if [[ "$1" == --all || "$1" == -a ]]; then
+    dots
+    # if/else, not `A && B || C`: C runs when B merely returns nonzero too (SC2015),
+    # which would report a missing dots-sync every time a host was unreachable.
+    if command -v dots-sync >/dev/null 2>&1; then
+      dots-sync --hosts-only
+    else
+      print -r -- "dots --all: no dots-sync on PATH — \`dots --relink\` links it" >&2
+    fi
+    return
+  fi
 
   local g c y r0=
   if [[ -t 1 ]]; then g=$'\e[32m'; c=$'\e[36m'; y=$'\e[2m'; r0=$'\e[0m'; fi
@@ -857,6 +872,28 @@ dots() {
   _dots_tmux_apply
   source ~/.zshrc
 }
+
+# _dots_reload_if_moved — precmd: when the live checkout's `main` moved under this
+# shell (a `dots` in another terminal, a `dots --all` fan-out from another host),
+# re-source ~/.zshrc before the next prompt, so an open shell never keeps
+# running the functions of an older release. Costs one fork-free file read per
+# prompt: the loose ref git rewrites on every fast-forward. Only armed when the live
+# tree is the canonical checkout (a DIRECTORY .git) — after `dots --dev` the links
+# point into a session worktree and that shell is testing edits, not tracking main.
+# DOTS_NO_AUTORELOAD=1 in ~/.zshrc.local turns it off.
+_DOTS_REF_FILE=${${:-$HOME/.zshrc}:A:h}/.git/refs/heads/main
+[[ -L $HOME/.zshrc && -d ${_DOTS_REF_FILE%/refs/heads/main} ]] || _DOTS_REF_FILE=
+_DOTS_LOADED_REF=
+[[ -n $_DOTS_REF_FILE && -r $_DOTS_REF_FILE ]] && _DOTS_LOADED_REF=$(<$_DOTS_REF_FILE)
+_dots_reload_if_moved() {
+  [[ -z ${DOTS_NO_AUTORELOAD:-} && -n $_DOTS_REF_FILE && -r $_DOTS_REF_FILE ]] || return 0
+  local now=$(<$_DOTS_REF_FILE)
+  [[ $now == $_DOTS_LOADED_REF ]] && return 0
+  print -r -- "dots — live main moved ${_DOTS_LOADED_REF:0:7} → ${now:0:7}; reloaded ~/.zshrc" >&2
+  source ~/.zshrc
+}
+autoload -Uz add-zsh-hook
+add-zsh-hook precmd _dots_reload_if_moved
 
 # DEV_REPOS — single source of truth for the repos `dev` and the cd shortcuts
 # below both understand. Add a repo here and it gains a `dev <key>` session AND a

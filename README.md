@@ -30,7 +30,7 @@ Run `t -h` for the full verb list.
 
 | Command | What it does |
 | --- | --- |
-| `dots [--dev]` | Sync the live checkout to `origin/main` HEAD and reload zsh; `--dev` makes the session worktree you are standing in live instead ([details](#keeping-machines-in-sync)) |
+| `dots [--all\|--dev]` | Sync the live checkout to `origin/main` HEAD and reload zsh; `--all` then runs `dots` on every host too; `--dev` makes the session worktree you are standing in live instead ([details](#keeping-machines-in-sync)) |
 | `csync` | Two-way sync of Claude session history and plans, Codex rollouts, and Cursor chats across machines via iCloud Drive |
 | `sleep-manager` | Block or restore macOS sleep (`status`, `disable`, `enable`) |
 | `pii-scan` | Keep personal data out of this public repo ([details](#pii-guard)) |
@@ -93,6 +93,13 @@ adds a managed file (a new `bin/` script, a new dotfile) lands without a manual
 install — the failure it fixes was a fast-forwarded machine whose `~/.tmux.conf` link
 had simply never been made. It is offline and prints nothing unless a link changed.
 **`dots --relink`** does just that step, without fetching.
+
+**`dots --all`** does that here and then on **every host** — one `dots` per
+`REMOTE_HOSTS` entry, in parallel over ssh, one result line each (a host that is
+asleep just says `unreachable`). Run it when a PR merges: nothing polls for a merge,
+so without it the other machines answer the next cross-host verb with the previous
+release. `dots-sync --no-hosts` is the local half alone, and any shell that was
+already open re-sources itself at its next prompt once the live `main` moves.
 
 **`dots --dev`** flips the live symlinks to the **session worktree you are standing
 in**, so its in-progress edits go live for testing before they merge — useful for a

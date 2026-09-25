@@ -1,0 +1,118 @@
+#!/usr/bin/env bash
+# dots-sync — sync this machine to origin/main, then every other host.
+# Fast-forwards the canonical checkout (the tree ~/.zshrc links into) when it is on
+# main and clean, reconciles the managed links, re-sources ~/.tmux.conf into a running
+# tmux server — and, when it actually moved, runs `dots` on every REMOTE_HOSTS host in
+# parallel over ssh. Silent when nothing changed. The engine behind `dots --all`, which
+# is what a session runs once its PR lands; open shells on this machine then reload
+# themselves at their next prompt (_dots_reload_if_moved in .zshrc). No timer: nothing
+# polls, so a merge spreads when someone (or their agent) says so.
+#   --hosts-only   skip the local sync, just run `dots` on every host (dots --all)
+#   --no-hosts     sync this machine only
+#   -h, --help     this text
+
+set -uo pipefail
+
+do_local=1 do_hosts=auto
+case "${1:-}" in
+  -h|--help) sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+  --hosts-only) do_local=0 do_hosts=1 ;;
+  --no-hosts) do_hosts=0 ;;
+  "") : ;;
+  *) echo "dots-sync: unknown argument: $1 (-h for help)" >&2; exit 2 ;;
+esac
+
+T_CONFIG="${XDG_CONFIG_HOME:-$HOME/.config}/t/config.sh"
+SSH="${DOTS_SYNC_SSH:-ssh}"          # tests point it at a stub
+ts() { date '+%F %T'; }
+
+# skip <why> — the local sync declined, and said why on stderr. Always printed, never
+# deduped: every run here is one a human or their agent asked for, so silence would
+# read as "synced". (A polling timer would need the opposite — see the pr-watch lesson
+# about a skip reason logged 288 times a day.)
+skip() { echo "[$(ts)] skip: $1" >&2; return 2; }
+
+# The live tree, but ONLY when it is the canonical checkout: a `.git` DIRECTORY is what
+# distinguishes the primary from a linked worktree (install.sh's resolve_primary rule).
+# After `dots --dev` the links point into a session worktree — someone is testing
+# in-progress edits there, and pulling main under them is exactly wrong.
+live_primary() {
+  local z="$HOME/.zshrc" d
+  [[ -L "$z" ]] || return 1
+  d=$(cd "$(dirname "$(readlink "$z")")" 2>/dev/null && pwd -P) || return 1
+  d=$(git -C "$d" rev-parse --show-toplevel 2>/dev/null) || return 1
+  [[ -d "$d/.git" ]] || return 1
+  printf '%s\n' "$d"
+}
+
+# sync_local — 0 = moved, 1 = nothing to do, 2 = skipped (said why on stderr).
+# Deliberately NARROWER than `dots`: it never repairs a layout (off-main, legacy
+# two-tree, --dev) — those want a human, and plain `dots` handles them — and it never
+# touches a dirty tree. The gates are the same ones dots' fast-forward has.
+sync_local() {
+  local p before after out
+  p=$(live_primary) || { skip "live tree is not the canonical checkout (dots --dev?)"; return; }
+  [[ "$(git -C "$p" symbolic-ref --short -q HEAD)" == main ]] \
+    || { skip "$p is not on main (run dots)"; return; }
+  git -C "$p" fetch -q origin main 2>/dev/null || return 1   # offline: nothing to do
+  before=$(git -C "$p" rev-parse HEAD)
+  [[ "$before" == "$(git -C "$p" rev-parse origin/main)" ]] && return 1
+  git -C "$p" diff --quiet HEAD 2>/dev/null \
+    || { skip "$p has local edits — it is the live surface (run dots)"; return; }
+  git -C "$p" merge -q --ff-only origin/main >/dev/null 2>&1 \
+    || { skip "$p cannot fast-forward origin/main"; return; }
+  after=$(git -C "$p" rev-parse HEAD)
+  echo "[$(ts)] main ${before:0:7} → ${after:0:7}"
+  # Same capability guard as _dots_relink: an install.sh without links-only would run
+  # the FULL install (brew bundle, the PII branch that deletes the denylist).
+  if grep -q 'DOTFILES_LINKS_ONLY' "$p/install.sh" 2>/dev/null; then
+    out=$(DOTFILES_LINKS_ONLY=1 "$p/install.sh" 2>&1) || echo "[$(ts)] ⚠ relink failed" >&2
+    [[ -n "$out" ]] && printf '%s\n' "$out"
+  fi
+  if [[ -z "${DOTFILES_NO_TMUX:-}" && -r "$HOME/.tmux.conf" ]] && command -v tmux >/dev/null 2>&1 \
+     && tmux has-session 2>/dev/null; then
+    tmux source-file "$HOME/.tmux.conf" 2>/dev/null || true
+  fi
+  return 0
+}
+
+# fan_out — `dots` on every REMOTE_HOSTS host, in parallel. The far side runs its own
+# plain `dots` (every host has one, however stale — which is also what bootstraps a
+# host that predates this script), and `dots` never fans out, so a host can never bounce
+# the sync back at us. Hosts come from the t config bridge (never sourced — the
+# cursor-beam rule). One line per host, and a dead host never fails the run.
+fan_out() {
+  [[ -r "$T_CONFIG" ]] || return 0
+  local tmp line key target rc first
+  tmp=$(mktemp -d "${TMPDIR:-/tmp}/dots-sync.XXXXXX") || return 1
+  local -a keys=()
+  while IFS= read -r line; do
+    key=${line#REMOTE_HOSTS[}; key=${key%%]*}; target=${line#*]=}
+    [[ -n "$key" && -n "$target" ]] || continue
+    keys+=("$key")
+    ( "$SSH" -o ConnectTimeout=5 -o BatchMode=yes "$target" "zsh -lic dots" \
+        >"$tmp/$key.out" 2>&1 </dev/null; echo $? >"$tmp/$key.rc" ) &
+  done < <(grep '^REMOTE_HOSTS\[' "$T_CONFIG")
+  wait
+  for key in "${keys[@]+"${keys[@]}"}"; do
+    rc=$(cat "$tmp/$key.rc" 2>/dev/null || echo 255)
+    # the dots summary line (✓ … / dots — …); zsh -lic prepends login noise
+    first=$(grep -m1 -E '^(✓|dots)' "$tmp/$key.out" 2>/dev/null)
+    case "$rc" in
+      0)   echo "[$(ts)] $key: ${first:-dots ran}" ;;
+      255) echo "[$(ts)] $key: unreachable" ;;
+      127) echo "[$(ts)] $key: no dots there (run install.sh on it)" ;;
+      *)   echo "[$(ts)] $key: dots failed (rc $rc): ${first:-$(tail -1 "$tmp/$key.out" 2>/dev/null)}" ;;
+    esac
+  done
+  rm -rf "$tmp"
+}
+
+moved=1
+if (( do_local )); then
+  sync_local; moved=$?
+fi
+if [[ "$do_hosts" == 1 ]] || { [[ "$do_hosts" == auto ]] && (( moved == 0 )); }; then
+  fan_out
+fi
+exit 0

@@ -968,6 +968,19 @@ def test_zsh_attach_fg_disambiguates_several_tmux_rows(zsh, tmp_path):
     assert "attach-session -t pr-api-2" in zsh.log.read_text().splitlines()
 
 
+def test_zsh_open_rejects_an_unknown_flag_instead_of_naming_a_slot_after_it(zsh):
+    """`t open dot --news` (a typo of --new) once became slot "--news": a live session
+    dev-dot---news with a worktree and branch named after the typo. An unknown flag must
+    stop before any tmux / git work, and the real flags must still pass."""
+    for cmd in ("t open api --news", "t open --bogus", "t open api 3 --nwe"):
+        r = zsh(f"{cmd}; echo rc=$?")
+        assert "rc=2" in r.stdout, (cmd, r.stdout, r.stderr)
+        assert "unknown flag" in r.stderr, (cmd, r.stderr)
+    assert not zsh.log.exists() or "new-session" not in zsh.log.read_text()
+    r = zsh("_t_dev list --all; echo rc=$?")
+    assert "unknown flag" not in r.stderr, r.stderr
+
+
 def test_zsh_open_fg_attaches_before_it_adopts(zsh, tmp_path):
     """Order matters: `t open` must not stop-and-move a session it could have attached.
     With a tmux session the row is attached; without one the same handle falls through to

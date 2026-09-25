@@ -3582,6 +3582,12 @@ _t_dev() {
       -a|--all)          all=1 ;;
       --codex)           agent_over=codex ;;
       --claude)          agent_over=claude ;;
+      # An unknown flag is an error, never a positional: `t open dot --news` (a typo of
+      # --new) once became slot "--news" — a real session dev-dot---news with its own
+      # worktree .../dotfiles/--news and branch dev/dotfiles---news.
+      -*)
+        echo "t open: unknown flag '$arg' (flags: --new --fg --here -r --host <h> --codex --claude)" >&2
+        return 2 ;;
       *)                 pos+=("$arg") ;;
     esac
   done

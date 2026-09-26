@@ -1412,13 +1412,14 @@ def test_zsh_nosleep_dim_dims_then_restores_the_builtin_panel(nosleep, tmp_path)
 
 
 def test_zsh_nosleep_dim_flag_holds_the_display_and_skips_the_lock(zsh):
-    # --dim is "stay logged in": the display is held (-dims), and the lid branch dims
-    # instead of locking — pinned on the source, since the loop itself needs sudo
+    # --dim is "stay logged in behind the lid too": the lid branch dims instead of
+    # dropping the display hold and locking, and the lid-open branch undims — pinned on
+    # the source, since the loop itself needs sudo
     body = open(ZSHRC).read().split("\nnosleep() {", 1)[1].split("\n}\n", 1)[0]
     assert "-d|--dim) dim=1" in body
-    assert "if (( dim )); then caffeinate -dims & else caffeinate -ims & fi" in body
-    assert "if (( dim )); then _nosleep_dim; else _nosleep_lock; fi" in body
-    assert "(( lid_was && dim )) && _nosleep_undim" in body
+    assert "if (( dim )); then _nosleep_dim; else _nosleep_hold -ims; _nosleep_lock; fi" in body
+    assert "if (( dim )); then _nosleep_undim; else _nosleep_hold -dims; fi" in body
+    assert "(( (dim || ! lid_was) && now - pinged_at >= every ))" in body
 
 
 # ─── t resume: the picker renders the display column, for every agent ─────────────
@@ -1547,3 +1548,21 @@ def test_zsh_resume_host_lands_the_pick_on_that_host(zsh, tmp_path):
     assert "send-keys" not in zsh.log.read_text()           # nothing resumed here
     r = zsh("_t_resume api 3 --host; echo rc=$?")
     assert "rc=1" in r.stdout and "--host takes a host" in r.stderr
+
+
+def test_zsh_nosleep_hold_swaps_the_caffeinate(nosleep, tmp_path):
+    # "display should stay on unless the lid is closed" (2026-09-25): nosleep runs its
+    # caffeinate with -dims while the lid is open and swaps to -ims on a lid close, so
+    # each swap must stop the previous hold and keep the new pid for the restore
+    stub = tmp_path / "stubbin" / "caffeinate"
+    stub.write_text('#!/bin/bash\nprintf "%s\\n" "$*" >> "$CAF_LOG"\nexec sleep 30\n')
+    stub.chmod(0o755)
+    log = tmp_path / "caf.log"
+    r = nosleep('setopt nomonitor; _NOSLEEP_CAF=""; _nosleep_hold -dims; a=$_NOSLEEP_CAF; sleep 0.3; '
+                '_nosleep_hold -ims; b=$_NOSLEEP_CAF; sleep 0.3; '
+                'kill -0 $a 2>/dev/null && echo a-alive || echo a-gone; '
+                'kill -0 $b 2>/dev/null && echo b-alive; kill $b', CAF_LOG=str(log))
+    assert r.stdout.split() == ["a-gone", "b-alive"]
+    assert log.read_text().splitlines() == ["-dims", "-ims"]
+    body = open(ZSHRC).read().split("\nnosleep() {", 1)[1].split("\n}\n", 1)[0]
+    assert "_nosleep_hold -dims" in body and "_nosleep_hold -ims; _nosleep_lock" in body

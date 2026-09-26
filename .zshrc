@@ -163,21 +163,20 @@ prview() {
 #
 # Options:
 #   -f, --forever    hold sleep off until Ctrl-C, unconditionally (the old behaviour)
-#   -d, --dim        stay logged in: hold the display on (no idle lock), and on lid close
-#                    dim the built-in panel instead of locking (for computer-use agents)
+#   -d, --dim        stay logged in with the lid shut too: on lid close dim the built-in
+#                    panel instead of locking (for computer-use agents)
 #   --grace <secs>   how long a signal may be absent before nosleep lets go (default 900)
 #   --every <secs>   how often the two signals are re-checked (default 30)
 #
-# Blocks SYSTEM sleep via `pmset disablesleep 1` + a background caffeinate, while
-# the display still dims and sleeps on its own schedule (that is what locks the Mac
-# at a desk), and LOCKS the screen and turns the display OFF the moment the lid
-# closes — with sleep disabled a closed lid no longer sleeps, so it no longer locks,
+# Blocks SYSTEM sleep via `pmset disablesleep 1` + a background caffeinate, and holds
+# the DISPLAY on while the lid is open (no idle dim, sleep or screensaver — the screen
+# stays on for as long as nosleep runs), then LOCKS the screen and turns the display
+# OFF the moment the lid closes — with sleep disabled a closed lid no longer sleeps, so it no longer locks,
 # and the panel would stay lit behind the lid until the displaysleep timer; the Mac
 # keeps running throughout (not when docked to an external display: macOS never
 # slept on that lid close, so there is no lock to replace, and the closed lid is
-# simply how the Mac sits). With --dim the session stays logged in instead: the display
-# is held on for the whole run (so it never idle-sleeps into the lock), user activity is
-# declared every check (so the screensaver never starts either), and a lid close dims the
+# simply how the Mac sits). With --dim the session stays logged in behind the lid too:
+# the display hold and the user-activity ping carry on while it is shut, and a lid close dims the
 # built-in panel to NOSLEEP_DIM_LEVEL (default 0) and restores it when the lid opens —
 # computer-use agents need an unlocked, lit session to see and click. It keeps holding only
 # while BOTH signals stay fresh: internet (an HTTPS exchange with
@@ -248,12 +247,11 @@ nosleep() {
   # as an orphan to the sweep above.
   setopt localoptions nomonitor
   sudo pmset -a disablesleep 1 || return 1
-  # -ims, not -dimsu: -d would pin the display on and -u would wake it. System,
-  # idle and disk sleep are held; the display follows pmset displaysleep, and the
-  # screen-lock delay turns that display sleep into a lock. --dim wants exactly the
-  # opposite (stay logged in), so it holds the display too.
-  if (( dim )); then caffeinate -dims & else caffeinate -ims & fi
-  _NOSLEEP_CAF=$!
+  # The display is held on while the lid is open (-dims) — "the screen stays on unless
+  # the lid is closed" (2026-09-25: the old -ims let pmset's 10-min battery displaysleep
+  # blank the screen mid-turn). A lid close swaps to -ims so the display assertion never
+  # fights _nosleep_lock's display sleep behind the lid; --dim keeps -dims throughout.
+  _nosleep_hold -dims
 
   # Each signal carries the epoch it was LAST seen at; nosleep lets go when the
   # OLDER of the two falls more than $grace behind now. One failed probe (a wifi
@@ -265,7 +263,7 @@ nosleep() {
   # The loop ticks every 2s for the lid (a lock that lands 30s after the lid shut
   # is no lock) and runs the two signal probes only every $every.
   local now busy_at online_at=$EPOCHSECONDS oldest why checked_at=0 lid_was=0 pinged_at=0
-  local lid_does='lid close locks'
+  local lid_does='display held on, lid close locks'
   (( dim )) && lid_does='staying logged in, lid close dims'
   if (( forever )); then
     echo "nosleep: holding sleep off until Ctrl-C ($lid_does)"
@@ -277,14 +275,18 @@ nosleep() {
     now=$EPOCHSECONDS
     if _nosleep_lid_closed; then
       if (( ! lid_was )); then
-        if (( dim )); then _nosleep_dim; else _nosleep_lock; fi
+        if (( dim )); then _nosleep_dim; else _nosleep_hold -ims; _nosleep_lock; fi
         lid_was=1
       fi
     else
-      (( lid_was && dim )) && _nosleep_undim
+      if (( lid_was )); then
+        if (( dim )); then _nosleep_undim; else _nosleep_hold -dims; fi
+      fi
       lid_was=0
     fi
-    if (( dim && now - pinged_at >= every )); then
+    # the ping runs while the display is meant to be on: lid open, or any time under --dim
+    # (behind a shut lid a user-activity ping would relight the panel _nosleep_lock slept)
+    if (( (dim || ! lid_was) && now - pinged_at >= every )); then
       pinged_at=$now
       # the display assertion holds display sleep, not the screensaver's idle timer —
       # a user-activity ping resets that (and would relight a panel that slept anyway)
@@ -329,6 +331,14 @@ nosleep() {
     fi
     sleep 2
   done
+}
+# _nosleep_hold <caffeinate flags> — (re)start nosleep's own caffeinate with these flags,
+# stopping the previous one; its pid lives in the global _NOSLEEP_CAF for the restore.
+# The gap between the kill and the start is covered by the pmset disablesleep flag.
+_nosleep_hold() {
+  [[ -n $_NOSLEEP_CAF ]] && kill "$_NOSLEEP_CAF" 2>/dev/null
+  caffeinate "$1" &
+  _NOSLEEP_CAF=$!
 }
 # _nosleep_lid_closed — true while the lid is shut AND macOS would sleep on that closure
 # (both keys sit on IOPMrootDomain: one ~10ms ioreg). AppleClamshellCausesSleep is the

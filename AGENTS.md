@@ -6,6 +6,12 @@ Guidance for AI agents working in this repository.
 
 Personal macOS dotfiles: zsh config, shell utilities, and Claude Code session tooling (`t`). There is no web app, build system, or package manager lockfile. See `CLAUDE.md` and `README.md` for architecture details.
 
+## Git workflow (all agents)
+
+Work in a per-session worktree on `dev/<repo>-<slot>` (`t open <repo>`), or a `cursor/*` feature branch for cloud agents. `main` is protected via PR — and it is checked out in the ONE canonical clone, which is the live surface, so never commit there. Pre-commit runs `pii-scan --staged` (fails open without denylist; fail-closed when `PII_SCRUB_RULES` is configured).
+
+When a change is ready, commit, push, and open a PR to `main`. **Always enable squash auto-merge immediately after opening a PR** with `gh pr merge <number> --auto --squash`; no additional user confirmation is needed. After opening or pushing more commits, verify `gh pr view <number> --json state,autoMergeRequest,mergeable,mergeStateStatus`: the PR must either be merged already or have auto-merge enabled. Resolve conflicts and re-enable auto-merge if needed. Monitor checks through merge and fix failures; do not leave a ready PR waiting for a manual merge. Once merged, run `zsh -lic 'dots --all'` to update the live checkout and configured remote hosts.
+
 ## Cursor Cloud specific instructions
 
 ### Environment shape
@@ -61,10 +67,6 @@ Docker is started by `./scripts/cloud-docker-ready.sh` (wired in `.cursor/enviro
 ### Editing shell files
 
 After changing `.zshrc` or a `bin/` script, validate by sourcing or running it. For `bin/t`: compile to `/tmp` so `__pycache__/` is never committed. There is no eslint/ruff step.
-
-### Git workflow
-
-Work in a per-session worktree on `dev/<repo>-<slot>` (`t open <repo>`), or a `cursor/*` feature branch for cloud agents. `main` is protected via PR — and it is checked out in the ONE canonical clone, which is the live surface, so never commit there. Pre-commit runs `pii-scan --staged` (fails open without denylist; fail-closed when `PII_SCRUB_RULES` is configured).
 
 ### Services
 

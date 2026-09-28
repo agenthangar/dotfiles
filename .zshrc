@@ -157,7 +157,7 @@ prview() {
   '
 }
 
-# nosleep — keep the Mac awake while an agent CLI is working and the network is up
+# nosleep — keep the Mac awake while a local agent is working and the network is up
 #
 # Usage: nosleep [-f|--forever] [-d|--dim] [--grace <secs>] [--every <secs>]
 #
@@ -180,11 +180,13 @@ prview() {
 # built-in panel to NOSLEEP_DIM_LEVEL (default 0) and restores it when the lid opens —
 # computer-use agents need an unlocked, lit session to see and click. It keeps holding only
 # while BOTH signals stay fresh: internet (an HTTPS exchange with
-# api.anthropic.com) and tokens burning — a local claude, codex or cursor-agent
-# mid-turn (Claude Code runs its own caffeinate while a turn is in flight; for
-# every agent, bytes moving on its sockets since the last check — at least
+# api.anthropic.com) and tokens burning — a local claude, codex, cursor-agent or
+# Claude/ChatGPT app mid-turn (Claude Code runs its own caffeinate while a turn is
+# in flight; for every agent, bytes moving on its sockets since the last check — at least
 # NOSLEEP_NET_MIN a probe, 48 KiB, and NOSLEEP_NET_BPS over longer gaps, 1 KiB/s,
-# both overridable in ~/.zshrc.local). Once either has been
+# both overridable in ~/.zshrc.local). Network activity needs two samples: the first
+# check records counters, and the next (after --every seconds) can detect work.
+# Sleep stays blocked while sampling. Once either signal has been
 # missing for the grace window it restores sleep and exits — so a run that finishes,
 # or a network that drops, lets the Mac sleep on its own instead of holding it awake
 # until you remember Ctrl-C.
@@ -262,7 +264,7 @@ nosleep() {
   # idle probe read as "idle for 55 years" and let go at once, grace unapplied).
   # The loop ticks every 2s for the lid (a lock that lands 30s after the lid shut
   # is no lock) and runs the two signal probes only every $every.
-  local now busy_at online_at=$EPOCHSECONDS oldest why checked_at=0 lid_was=0 pinged_at=0
+  local now busy_at online_at=$EPOCHSECONDS oldest why checked_at=0 lid_was=0 pinged_at=0 probes=0
   local lid_does='display held on, lid close locks'
   (( dim )) && lid_does='staying logged in, lid close dims'
   if (( forever )); then
@@ -310,6 +312,7 @@ nosleep() {
       fi
       _nosleep_online && online_at=$now
       _nosleep_busy_at; (( REPLY )) && busy_at=$REPLY
+      (( ++probes ))
       oldest=$(( busy_at < online_at ? busy_at : online_at ))
       if (( now - oldest > grace )); then
         (( busy_at < online_at )) && why="no local agent (claude · codex · cursor-agent) has been working for ${grace}s" || why="the network has been down for ${grace}s"
@@ -321,8 +324,12 @@ nosleep() {
       if [[ -t 1 ]]; then
         if [[ -n $_NOSLEEP_WHO ]]; then
           printf '\r\e[K  %s active %ds ago · network ok %ds ago' "$_NOSLEEP_WHO" $(( now - busy_at )) $(( now - online_at ))
+        elif (( probes == 1 )); then
+          # The first network probe only records baselines, even mid-turn. It is
+          # not evidence of idleness (and sleep is already held during sampling).
+          printf '\r\e[K  sampling agent activity (next check in %ds) · network ok %ds ago' "$every" $(( now - online_at ))
         else
-          printf '\r\e[K  no agent working yet (letting go in %ds) · network ok %ds ago' $(( grace - (now - busy_at) )) $(( now - online_at ))
+          printf '\r\e[K  no agent activity detected yet (letting go in %ds) · network ok %ds ago' $(( grace - (now - busy_at) )) $(( now - online_at ))
         fi
       fi
       # Keep the sudo timestamp warm so the restore never blocks on a password prompt

@@ -14,6 +14,7 @@ shim in `.zshrc` for verbs that must run in your shell).
 | Command | What it does |
 | --- | --- |
 | `t open <repo> [slot]` | Open or reattach a session in a per-repo detached tmux slot (`--new`, `--fg`, `--remote`, `--here`; `--codex` runs OpenAI's Codex CLI in the slot instead of Claude — `DEV_AGENT[repo]=codex` makes that the repo's default) |
+| `t app [repo] [slot]` | Move a local Codex slot into the macOS desktop app, opening the same conversation and its running web preview for annotation (`--url <url>`, `--no-preview`, `--dry-run`) |
 | `t ls [-r] [-a]` | List live sessions, optionally across every machine (`-r`) and repo (`-a`) |
 | `t cd [repo] [slot]` | `cd` this shell into a slot's worktree (bare `t cd`: fzf pick across all worktrees) |
 | `t push` / `t pop` | Move a session between a foreground terminal and a detached tmux slot — one-live-owner guarantee |
@@ -25,6 +26,22 @@ shim in `.zshrc` for verbs that must run in your shell).
 | `t mcp` | The `sessions` MCP server Claude Code spawns, so any Claude session can answer "which session is/was working on X?" from every saved transcript and the live slots. `--install` registers it (`dots` does), `--call <tool> '<json>'` runs one tool by hand |
 
 Run `t -h` for the full verb list.
+
+For example, `t app api 13` stops that slot's Codex CLI and opens its existing
+thread in the desktop app, with the slot's live dev URL in the built-in browser.
+Use **Annotation mode** to click an element or select an area and leave feedback.
+`t app api 13 --url http://localhost:5213/settings` selects a particular route;
+`--dry-run` prints the handoff link without changing anything. The worktree and
+dev server stay running, and the tmux shell stays to reserve the slot. To return
+to the terminal later, stop work in the app, then use `t pop api 13`.
+
+This requires a local Codex conversation and a recent desktop app installed in
+`/Applications` or `~/Applications` (named Codex or ChatGPT). It uses the app's
+`codex://threads/<id>?browserUrl=…` handler, verified against app version
+26.924.20706; this is an app-version-dependent interface. A stopped dev server
+opens just the conversation with a notice; start the server and rerun to add the
+preview. Claude conversations cannot be imported by this command. Bring remote
+slots here first with `t beam <repo> <slot> --here`.
 
 ## Other commands
 
@@ -173,6 +190,7 @@ support without the README saying so:
   t push / t pop                                               ✓                                          ✓                                                                     ✗ no slot
   t resume (dead slots)                                        ✓                                          ✓ (its sqlite thread index)                                           → t cursor resume
   t beam / --from (move a session)                             ✓                                          ✓ (rollout + .origin)                                                 → t cursor [id] --host / --from
+  t app (desktop + browser preview)                            ✗ Codex conversations only                 ✓ local macOS slot → same thread                                      ✗
   csync (iCloud union of transcripts)                          ✓ projects + plans                         ✓ codex-sessions                                                      ✓ cursor-chats
   SessionStart stamps (registry · opened · origin)             ✓ settings.json hook                       ✓ hooks.json (trust once at startup)                                  ✗ no hook wired
   t plan                                                       ✓                                          ✗ codex keeps no plan files (says so)                                 ✗

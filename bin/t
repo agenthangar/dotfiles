@@ -24,6 +24,7 @@ import glob
 import hashlib
 import json
 import os
+import plistlib
 import re
 import shlex
 import shutil
@@ -32,6 +33,7 @@ import stat
 import subprocess
 import sys
 import time
+from urllib.parse import urlencode, urlsplit
 
 HOME = os.path.expanduser("~")
 CONFIG = os.path.join(os.environ.get("XDG_CONFIG_HOME", os.path.join(HOME, ".config")), "t", "config.sh")
@@ -3198,6 +3200,7 @@ _AGENT_PARITY = [
     ("t push / t pop", "✓", "✓", "✗ no slot"),
     ("t resume (dead slots)", "✓", "✓ (its sqlite thread index)", "→ t cursor resume"),
     ("t beam / --from (move a session)", "✓", "✓ (rollout + .origin)", "→ t cursor [id] --host / --from"),
+    ("t app (desktop + browser preview)", "✗ Codex conversations only", "✓ local macOS slot → same thread", "✗"),
     ("csync (iCloud union of transcripts)", "✓ projects + plans", "✓ codex-sessions", "✓ cursor-chats"),
     ("SessionStart stamps (registry · opened · origin)", "✓ settings.json hook",
      "✓ hooks.json (trust once at startup)", "✗ no hook wired"),
@@ -4849,6 +4852,155 @@ def _dev_url(key, cwd):
 
 
 
+# ─── desktop handoff ──────────────────────────────────────────────────────────
+
+def _app_select(cfg, rows, repo, slot, cwd):
+    """Resolve a LOCAL tmux slot without guessing among sibling conversations."""
+    implied_repo, implied_slot = cfg.repo_of_dir(cwd)
+    if repo and repo.isdigit() and slot is None:
+        repo, slot = None, repo
+    if repo is None:
+        repo = implied_repo
+        slot = slot or implied_slot
+    if repo not in cfg.repos:
+        raise ValueError("name a registered repo: t app <repo> <slot>")
+    if slot and not slot.isdigit():
+        raise ValueError("slot must be a number: t app <repo> <slot>")
+    aliases = {k for k, d in cfg.repos.items() if d == cfg.repos[repo]}
+    candidates = []
+    for row in rows:
+        alias, _, number = row["slot"].rpartition("-")
+        if (row["host"] == "local" and alias in aliases and number.isdigit()
+                and (not slot or number == slot)):
+            candidates.append(row)
+    if not candidates:
+        raise ValueError(f"no local slot for {repo}{' ' + slot if slot else ''}; "
+                         "check t ls -r, then t beam <repo> <slot> --here if it is remote")
+    if len(candidates) != 1:
+        choices = ", ".join(r["slot"] for r in candidates)
+        raise ValueError(f"choose a slot: t app {repo} <slot> ({choices})")
+    row = candidates[0]
+    if row["agent"] != "codex":
+        raise ValueError(f"{row['slot']} runs {row['agent']}; the Codex app can resume "
+                         "Codex conversations only (t open <repo> --codex starts one)")
+    if row["context"] == "idle" or not re.fullmatch(
+            r"[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}", row["sid"]):
+        raise ValueError(f"{row['slot']} has no recorded Codex conversation; "
+                         "send a message in the CLI first and check t doctor")
+    return row
+
+
+def _app_link(sid, url=None):
+    """Installed desktop app's threads deep link (verified on 26.924.20706).
+
+    browserUrl opens a browser tab alongside the EXISTING thread. codex app PATH
+    only selects a workspace. No prompt is sent and no new thread is created.
+    The deep-link contract is app-version dependent, not a documented CLI flag.
+    """
+    if url is not None:
+        try:
+            parsed = urlsplit(url)
+            valid = (url == url.strip() and not any(c.isspace() for c in url)
+                     and parsed.scheme in ("http", "https") and parsed.hostname
+                     and parsed.username is None and parsed.password is None)
+            parsed.port  # rejects malformed/out-of-range ports too
+        except ValueError:
+            valid = False
+        if not valid:
+            raise ValueError("--url must be an http:// or https:// URL without credentials")
+    return "codex://threads/" + sid + ("?" + urlencode({"browserUrl": url}) if url else "")
+
+
+def _app_bundle():
+    """Find the installed app before interrupting a CLI; the app was renamed."""
+    candidates = [os.path.join(root, name + ".app")
+                  for root in ("/Applications", os.path.join(HOME, "Applications"))
+                  for name in ("ChatGPT", "Codex")]
+    for bundle in candidates:
+        try:
+            with open(os.path.join(bundle, "Contents", "Info.plist"), "rb") as f:
+                if plistlib.load(f).get("CFBundleIdentifier") == "com.openai.codex":
+                    return bundle
+        except (OSError, ValueError, plistlib.InvalidFileException):
+            continue
+    return None
+
+
+def _app_stop_cli(row):
+    """Revalidate the owner, stop only its agent, and wait before opening the app.
+
+    Keep the tmux shell: it reserves the worktree slot while the app uses it. In
+    particular do NOT use t kill, which also stops the preview's dev server.
+    Refuse when invoked from the very agent being moved (it would kill this tool).
+    """
+    session, sid, cwd = (shlex.quote(s) for s in ("dev-" + row["slot"], row["sid"], row["cwd"]))
+    return _run(["zsh", "-lic", ZSH_PRELUDE + f'''
+session={session}; expected_sid={sid}; expected_cwd={cwd}
+tmux has-session -t "=$session" 2>/dev/null || exit 1
+actual_cwd=$(tmux display-message -p -t "=$session" '#{{session_path}}')
+[[ $actual_cwd == $expected_cwd && $(_dev_agent_of_session "$session") == codex &&
+   $(_dev_session_sid "$session" "$actual_cwd") == $expected_sid ]] || {{
+  print -u2 -- 'The slot changed while preparing the handoff; run t app again.'; exit 1
+}}
+cpid=$(_dev_session_claude_pid "$session")
+[[ -n $cpid ]] || exit 0
+up=$PPID
+while [[ -n $up && $up != 0 && $up != 1 ]]; do
+  [[ $up == $cpid ]] && {{
+    print -u2 -- 'Run t app from a separate terminal, outside the session being moved.'; exit 1
+  }}
+  up=$(ps -o ppid= -p "$up" 2>/dev/null); up=${{up//[[:space:]]/}}
+done
+kill -TERM "$cpid" || exit 1
+for attempt in {{1..100}}; do
+  kill -0 "$cpid" 2>/dev/null || exit 0
+  sleep 0.05
+done
+print -u2 -- 'Codex CLI has not exited; the app was not opened. Wait and run t app again.'
+exit 1
+'''], timeout=15)
+
+
+def cmd_app(cfg, args):
+    try:
+        # Validate explicit URLs before scanning or changing any session.
+        if args.url is not None:
+            _app_link("", args.url)
+        row = _app_select(cfg, _parse_rows(zsh_capture("_dev_session_rows")),
+                          args.repo, args.slot, os.getcwd())
+        if not os.path.isdir(row["cwd"]):
+            raise ValueError(f"the session's worktree is missing: {row['cwd']}")
+        url = None if args.no_preview else args.url or _dev_url(row["slot"], row["cwd"])
+        link = _app_link(row["sid"], url)
+        print(f"{row['slot']} → Codex app · thread {row['sid']}")
+        if url:
+            print(f"Preview: {url} (use Annotation mode in the app to leave comments)")
+        elif not args.no_preview:
+            print("No running preview found; start the slot's dev server and rerun, or pass --url.")
+        if args.dry_run:
+            print("Would stop this slot's Codex CLI, keep its worktree/dev server, and open:")
+            print(link)
+            return 0
+        if sys.platform != "darwin":
+            raise ValueError("desktop handoff currently requires macOS; run t app on your desktop")
+        bundle = _app_bundle()
+        if not bundle:
+            raise ValueError("install the Codex desktop app in /Applications or ~/Applications first")
+        stopped = _app_stop_cli(row)
+        if stopped.returncode:
+            raise ValueError(stopped.stderr.strip() or "could not stop the CLI; the app was not opened")
+        result = _run(["open", "-a", bundle, link], timeout=15)
+        if result.returncode:
+            recovery = shlex.join(["codex", "resume", row["sid"]])
+            raise ValueError(f"could not open the app: {result.stderr.strip()}. "
+                             f"To resume in a terminal: cd {shlex.quote(row['cwd'])} && {recovery}")
+        print("Sent to the desktop app; the tmux shell keeps this worktree slot reserved.")
+        return 0
+    except ValueError as e:
+        print(f"t app: {e}", file=sys.stderr)
+        return 1
+
+
 # ─── mcp — which session is working on what ───────────────────────────────────
 #
 # `t mcp` is a stdio MCP server Claude Code spawns (registered at user scope as
@@ -5972,6 +6124,7 @@ examples:
   t resume api 3          revive dev-api-3's last conversation after it was closed
   t cd ff 5               cd this shell into ff's slot-5 worktree (bare t cd: picker)
   t beam api --host mini  send a session to 'mini' and resume it there
+  t app api 3             move a Codex slot into the desktop app with its web preview
   t find "auth refactor"  search saved sessions, then resume the pick
   t mcp --call find_sessions '{"query":"accounts redesign"}'
                           ask the sessions MCP by hand (Claude calls it for you)
@@ -6007,6 +6160,23 @@ Run `t <verb> -h` for a verb's own flags.""")
     ag = sp.add_mutually_exclusive_group()
     ag.add_argument("--codex", action="store_true", help="run OpenAI Codex CLI in a FRESH slot (default: DEV_AGENT[repo] / DEV_AGENT_DEFAULT, claude)")
     ag.add_argument("--claude", action="store_true", help="run Claude Code in a fresh slot even if the repo defaults to codex")
+
+    sp = sub.add_parser("app", help="move a local Codex slot into the desktop app with its preview",
+        description="Stop a local slot's Codex CLI and open the SAME conversation in the "
+            "Codex desktop app on macOS, with its running web preview in the built-in browser. "
+            "Use Annotation mode there to leave comments. The tmux shell stays to reserve "
+            "the slot; the worktree and dev server keep running. A lone number means the "
+            "cwd repo; bare `t app` uses the cwd worktree's slot, or the repo's only slot. "
+            "Several slots require an explicit number. Claude conversations cannot be "
+            "converted. Remote slots must be brought here first with `t beam … --here`. "
+            "The browser deep link requires a recent desktop app. Run from a separate "
+            "terminal if the command would stop the agent executing it.")
+    sp.add_argument("repo", nargs="?", help="DEV_REPOS key; defaults to the cwd repo")
+    sp.add_argument("slot", nargs="?", help="local slot number")
+    preview = sp.add_mutually_exclusive_group()
+    preview.add_argument("--url", help="preview URL/route (default: the slot's live dev URL)")
+    preview.add_argument("--no-preview", action="store_true", help="open only the conversation")
+    sp.add_argument("--dry-run", action="store_true", help="show the handoff link without stopping or opening anything")
 
     sp = sub.add_parser("ls", help="list dev sessions (attached + active context)",
         description="List live Claude dev sessions: whether each is attached, and whether it "
@@ -6349,6 +6519,7 @@ IMPLEMENTED = {
     "land": cmd_land, "kill-owner": cmd_kill_owner, "cursor": cmd_cursor,
     "doctor": cmd_doctor, "mcp": cmd_mcp, "new": cmd_new, "new-land": cmd_new_land,
     "install": cmd_install, "permissions": cmd_permissions, "trust": cmd_trust,
+    "app": cmd_app,
 }
 
 

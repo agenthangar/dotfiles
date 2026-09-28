@@ -7149,12 +7149,18 @@ alias h=help   # `h` is a shorthand for `help`
 # key for `on`), and slot/flags after. Pulls live from the ${(k)DEV_REPOS} /
 # ${(k)REMOTE_HOSTS} arrays so it stays current with ~/.zshrc.local.
 _t() {
-  local -a verbs=(open ls kill push pop resume beam read plan paste find on cursor setup new install permissions trust)
+  local -a verbs=(open app ls kill push pop resume beam read plan paste find on cursor setup new install permissions trust)
   if (( CURRENT == 2 )); then
     _describe -t verbs 't verb' verbs
     return
   fi
   case ${words[2]} in
+    app)
+      if [[ ${words[CURRENT-1]} == --url ]]; then _message 'preview URL'
+      elif [[ ${words[CURRENT]} == -* ]]; then _values 'flag' --url --no-preview --dry-run -h --help
+      elif (( CURRENT == 3 )); then _values 'repo' ${(k)DEV_REPOS}
+      elif (( CURRENT == 4 )); then _message 'local slot number'
+      else _values 'flag' --url --no-preview --dry-run -h --help; fi ;;
     cursor)
       if (( CURRENT == 3 )); then _values 'chat / action' ls resume -p --from --host
       else _values 'flag' --host --from -p --pick -a --attach -h --help; fi ;;

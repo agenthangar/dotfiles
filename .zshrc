@@ -6980,12 +6980,15 @@ alias h=help   # `h` is a shorthand for `help`
 # key for `on`), and slot/flags after. Pulls live from the ${(k)DEV_REPOS} /
 # ${(k)REMOTE_HOSTS} arrays so it stays current with ~/.zshrc.local.
 _t() {
-  local -a verbs=(open ls kill push pop resume beam read plan paste find on cursor setup new install permissions trust)
+  local -a verbs=(open ls phone kill push pop resume beam read plan paste find on cursor setup new install permissions trust)
   if (( CURRENT == 2 )); then
     _describe -t verbs 't verb' verbs
     return
   fi
   case ${words[2]} in
+    phone)
+      if [[ ${words[CURRENT-1]} == --client ]]; then _message 'phone profile name'
+      else _values 'flag' --client --pick -h --help; fi ;;
     cursor)
       if (( CURRENT == 3 )); then _values 'chat / action' ls resume -p --from --host
       else _values 'flag' --host --from -p --pick -a --attach -h --help; fi ;;

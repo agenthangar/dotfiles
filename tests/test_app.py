@@ -1,10 +1,12 @@
 """Desktop handoff: exact conversation, URL encoding, and stop-before-open failures."""
 
 import io
+import os
 import plistlib
 import shlex
 import shutil
 import subprocess
+import uuid
 from urllib.parse import parse_qs, urlsplit
 
 import pytest
@@ -234,3 +236,40 @@ sleep() {{ :; }}
     else:
         assert signals == []
 
+
+def test_app_stop_revalidates_directory_with_real_tmux(t_mod, app_slot, monkeypatch, tmp_path):
+    """Regression: =session is a session target, but display-message needs =session:.
+
+    The old mocked tmux always returned the cwd and concealed this failure. Keep
+    tmux real here, including an active decoy session in a different directory;
+    only the Codex probes are stubbed. No real agent is needed or signaled.
+    """
+    if not shutil.which("tmux") or not shutil.which("zsh"):
+        pytest.skip("tmux and zsh required")
+    _, row = app_slot
+    socket = "t-app-" + uuid.uuid4().hex
+    tmux = [shutil.which("tmux"), "-L", socket, "-f", os.devnull]
+    env = {"PATH": os.environ["PATH"], "HOME": str(tmp_path), "TERM": "xterm-256color"}
+    session = "dev-" + row["slot"]
+    prelude = f'''
+tmux() {{ command {shlex.join(tmux)} "$@"; }}
+_dev_agent_of_session() {{ print codex; }}
+_dev_session_sid() {{
+  [[ $1 == {shlex.quote(session)} && $2 == {shlex.quote(row['cwd'])} ]] && print {SID}
+}}
+_dev_session_claude_pid() {{ return 1; }}
+kill() {{ print -u2 'unexpected signal'; return 1; }}
+'''
+    def run(argv, **kwargs):
+        return subprocess.run(["zsh", "-f", "-c", prelude + argv[-1]],
+                              env=env, capture_output=True, text=True, timeout=10)
+    monkeypatch.setattr(t_mod, "_run", run)
+    try:
+        subprocess.run(tmux + ["new-session", "-d", "-s", session, "-c", row["cwd"], "sleep 60"],
+                       env=env, capture_output=True, text=True, check=True)
+        subprocess.run(tmux + ["new-session", "-d", "-s", session + "0", "-c", str(tmp_path), "sleep 60"],
+                       env=env, capture_output=True, text=True, check=True)
+        result = t_mod._app_stop_cli(row)
+        assert result.returncode == 0, result.stderr
+    finally:
+        subprocess.run(tmux + ["kill-server"], env=env, capture_output=True)

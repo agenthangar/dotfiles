@@ -278,3 +278,31 @@ def test_real_phone_reconnects_after_pty_loss_without_restarting_agents(phone_se
     assert s.tmux("list-panes", "-a", "-F", "#{session_name}|#{pane_pid}").stdout == pane_pids
     assert json.loads((state / "profiles" / "phone-1.json").read_text())["sid"] == "sid-b"
     assert s.no_agent_input()
+
+
+def test_reconnect_excludes_remembered_task_retained_as_a_dead_pane(phone_server):
+    s = phone_server
+    s.use_real_phone()
+    first = s.phone("phone-1")
+    s.await_screen(first, b"Task B")
+    os.write(first["master"], b"2")
+    eventually(lambda: s.locations().get(first["tty"]) == "dev-b-1")
+    for key in ("master", "slave"):
+        os.close(first[key])
+        first[key] = None
+    first["process"].wait(timeout=5)
+
+    # t app keeps its completed pane visible. Its tmux session still exists,
+    # but reconnect must offer the remaining running tasks instead of that pane.
+    s.tmux("set-option", "-w", "-t", "dev-b-1", "remain-on-exit", "on")
+    s.tmux("respawn-pane", "-k", "-t", "dev-b-1", "exit 0")
+    eventually(lambda: s.tmux("display-message", "-p", "-t", "dev-b-1",
+                               "#{pane_dead}").stdout.strip() == "1")
+    second = s.phone("phone-1")
+    screen = s.await_screen(second, b"Task A")
+    assert b"previous session is no longer running" in screen
+    assert b"Task B" not in screen
+    assert not s.locations()
+    os.write(second["master"], b"1")
+    eventually(lambda: s.locations().get(second["tty"]) == "dev-a-1")
+    assert s.tmux("display-message", "-p", "-t", "dev-b-1", "#{pane_dead}").stdout.strip() == "1"

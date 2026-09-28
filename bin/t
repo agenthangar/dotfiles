@@ -3084,10 +3084,10 @@ def _phone_tmux(*args):  # pragma: no cover — exercised against an isolated tm
 
 
 def _phone_snapshot():  # pragma: no cover — tmux format/transport, tested end to end
-    fields = ("id", "name", "created", "server", "socket", "cwd", "stamp")
+    fields = ("id", "name", "created", "server", "socket", "cwd", "stamp", "dead")
     fmt = "\t".join("#{%s}" % f for f in
                     ("session_id", "session_name", "session_created", "pid", "socket_path",
-                     "session_path", "CLAUDE_RESUME_ID"))
+                     "session_path", "CLAUDE_RESUME_ID", "pane_dead"))
     result = _phone_tmux("list-sessions", "-F", fmt)
     if result.returncode:
         # A stopped server is an empty session list, not an invitation to start one.
@@ -3097,7 +3097,8 @@ def _phone_snapshot():  # pragma: no cover — tmux format/transport, tested end
     rows = []
     for line in result.stdout.splitlines():
         parts = line.split("\t")
-        if len(parts) == len(fields) and re.fullmatch(r"dev-.+-[0-9]+", parts[1]):
+        if (len(parts) == len(fields) and parts[-1] == "0"
+                and re.fullmatch(r"dev-.+-[0-9]+", parts[1])):
             rows.append(dict(zip(fields, parts)))
     return rows
 

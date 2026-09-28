@@ -34,6 +34,7 @@ if [[ "$1" == -Axo ]]; then
   exit 0
 fi
 pid="${@: -1}"
+if [[ "$2" == lstart= && -n "${FAKE_START:-}" ]]; then echo "$FAKE_START"; exit 0; fi
 while read -r p pp c; do
   if [[ "$p" == "$pid" ]]; then
     case "$2" in comm=) echo "$c" ;; ppid=) echo "$pp" ;; esac
@@ -219,7 +220,9 @@ case "$1" in
     exit 0 ;;
   capture-pane)     [[ -n "${FAKE_PANE:-}" ]] && printf '%s\n' "$FAKE_PANE" ;;
   has-session)      [[ -n "${FAKE_HAS_SESSION:-}" ]] || exit 1 ;;
-  list-sessions)    [[ -n "${FAKE_SESSIONS:-}" ]] && printf '%s\n' $FAKE_SESSIONS ;;
+  list-sessions)
+    if [[ -n "${FAKE_SESSION_ROWS:-}" ]]; then printf '%s\n' "$FAKE_SESSION_ROWS"
+    elif [[ -n "${FAKE_SESSIONS:-}" ]]; then printf '%s\n' $FAKE_SESSIONS; fi ;;
   display-message)  [[ -n "${FAKE_SESSION_PATH:-}" && "$*" == *session_path* ]] && echo "$FAKE_SESSION_PATH" ;;
   list-panes)       [[ -n "${FAKE_PANES:-}" ]] && printf '%s\n' "$FAKE_PANES" ;;
 esac
@@ -398,13 +401,15 @@ def test_zsh_agent_of_session_reads_the_stamp_when_no_process(zsh):
 
 
 def test_zsh_agent_at_welcome(zsh):
-    # claude: the Welcome back banner; codex: "no thread stamped yet" — codex mints its
-    # thread (and fires the hook) at the first prompt, and its banner stays on screen
-    # through a short exchange, so pane text would read a real conversation as idle
+    # A Codex banner can remain visible after a real exchange; validate the stamp
+    # against its transcript, rather than trusting either the banner or a stale id.
     assert zsh("_dev_agent_at_welcome claude s; echo rc=$?", FAKE_PANE="Welcome back!").stdout.strip() == "rc=0"
     assert zsh("_dev_agent_at_welcome claude s; echo rc=$?", FAKE_PANE="> fix the bug").stdout.strip() == "rc=1"
     assert zsh("_dev_agent_at_welcome codex s; echo rc=$?", FAKE_PANE="OpenAI Codex (v0.154.0)").stdout.strip() == "rc=0"
-    assert zsh("_dev_agent_at_welcome codex s; echo rc=$?", FAKE_RESUME_ID="thr_1",
+    assert zsh("_dev_agent_at_welcome codex s; echo rc=$?", FAKE_RESUME_ID=SID,
+               FAKE_DEV_AGENT="codex").stdout.strip() == "rc=0"
+    _codex_home(zsh, [(SID, "/work", "prompt", 100, 0, None)])
+    assert zsh("_dev_agent_at_welcome codex s; echo rc=$?", FAKE_RESUME_ID=SID, FAKE_DEV_AGENT="codex",
                FAKE_PANE="OpenAI Codex (v0.154.0)").stdout.strip() == "rc=1"
 
 
@@ -572,7 +577,9 @@ def _codex_home(zsh, threads, scan_cwd=False):
             text = text.replace("/Users/me/code/.worktrees/api/3", cwd)
         if source != "cli":
             assert text.count('"source": "cli"') == 1
-            text = text.replace('"source": "cli"', f'"source": {source}, "thread_source": "subagent"')
+            replacement = (f'"source": {source}, "thread_source": "subagent"'
+                           if '"subagent"' in source else f'"source": {json.dumps(source)}')
+            text = text.replace('"source": "cli"', replacement)
         p.write_text(text)
         paths[sid] = p
         db.execute("insert into threads values (?,?,?,?,?,?,?,?,?,?,?,?,?)",
@@ -581,6 +588,60 @@ def _codex_home(zsh, threads, scan_cwd=False):
     db.commit()
     db.close()
     return paths
+
+
+@pytest.mark.parametrize("scenario,active", [
+    ("current", True), ("resumed", True), ("old", False), ("ambiguous", False),
+    ("subagent", False), ("archived", False), ("empty", False),
+    ("missing_rollout", False), ("missing_start", False), ("broken_index", False),
+])
+def test_zsh_codex_unstamped_rows_use_recent_conversation_evidence(zsh, scenario, active):
+    """An unfired hook must not hide a real conversation, but the display fallback
+    must not resurrect old slots or invent a targeting id for beam/app."""
+    import sqlite3
+    wt = f"{zsh.home}/code/.worktrees/api/3"
+    started = "Mon Sep 28 12:00:00 2026"
+    epoch = int(time.mktime(time.strptime(started, "%a %b %d %H:%M:%S %Y")))
+    updated = epoch - 1 if scenario == "old" else epoch + 10
+    source = SUBAGENT_SOURCE if scenario == "subagent" else "vscode"
+    threads = [(SID, wt, "" if scenario == "empty" else "prompt", updated,
+                int(scenario == "archived"), "Configure default tool", source)]
+    if scenario == "ambiguous":
+        threads.append(("aaaaaaaa-0000-0000-0000-000000000002", wt, "other", updated, 0, None))
+    paths = _codex_home(zsh, threads)
+    db = zsh.home / ".codex" / "state_5.sqlite"
+    if scenario == "resumed":
+        with sqlite3.connect(db) as c:
+            c.execute("update threads set created_at=?", (epoch - 1000,))
+        c.close()
+    if scenario == "missing_rollout":
+        paths[SID].unlink()
+    if scenario == "broken_index":
+        db.write_text("not a database")
+    # Real row generation/title parsing; only the OS's live-process probes and PR
+    # network refresh are replaced. The tmux stamp and pid registry are both absent.
+    r = zsh('_dev_session_claude_pid() { print 4242; }; '
+            '_dev_session_has_claude() { return 0; }; '
+            '_dev_fg_rows() { :; }; _pr_state_tag() { REPLY=; }; _pr_state_flush() { :; }; '
+            '_dev_session_rows',
+            FAKE_START="" if scenario == "missing_start" else started,
+            FAKE_DEV_AGENT="codex", FAKE_SESSION_ROWS=f"dev-api-3\t{wt}\tattached",
+            FAKE_PANE="OpenAI Codex (v0.158.0)")
+    assert r.returncode == 0 and not r.stderr, r.stderr
+    row = r.stdout.strip().split("\t")
+    assert row == ["-", wt, "api-3", "attached", "active" if active else "idle",
+                   "Configure default tool" if active else "(idle — no conversation)", "codex"]
+    assert not any("set-environment" in line for line in zsh.log.read_text().splitlines())
+
+
+def test_zsh_codex_registry_alone_marks_a_conversation_active(zsh):
+    wt = f"{zsh.home}/code/.worktrees/api/3"
+    reg = zsh.home / ".cache" / "claude-sessions"
+    reg.mkdir(parents=True)
+    (reg / "4242").write_text(f"{SID}\t{wt}\n")
+    r = zsh(f'_dev_session_claude_pid() {{ print 4242; }}; '
+            f'_dev_agent_at_welcome codex s {wt}; echo rc=$?')
+    assert r.stdout.strip() == "rc=1"
 
 
 def test_zsh_codex_threads_for_cwd_orders_and_filters(zsh):

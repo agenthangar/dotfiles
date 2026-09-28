@@ -203,6 +203,10 @@ transcripts), `t pop`/`t push` move it with `codex resume`, and `t resume` lists
 a dead codex slot's conversations from Codex's own thread index, marked `⬡` in
 the picker. Codex mints its thread id at the first prompt (there is no
 `--session-id`), so an untouched codex slot reads as idle until you type.
+If its SessionStart hook never fires, `t ls` can still show the title and active
+context from a single conversation in the slot's directory updated since the
+running process started. This display fallback does not assign a session ID;
+commands that move a conversation still require its recorded identity.
 Across machines, `t beam` ships a codex slot's rollout (and its origin stamp)
 with its date path intact and `csync` mirrors `~/.codex/sessions` to iCloud as
 `codex-sessions` — Codex indexes a copied-in rollout on the first resume, so only

@@ -5376,7 +5376,8 @@ def _app_stop_cli(row):
     return _run(["zsh", "-lic", ZSH_PRELUDE + f'''
 session={session}; expected_sid={sid}; expected_cwd={cwd}
 tmux has-session -t "=$session" 2>/dev/null || exit 1
-actual_cwd=$(tmux display-message -p -t "=$session" '#{{session_path}}')
+# display-message takes a pane target; ':' selects the exact session's active pane.
+actual_cwd=$(tmux display-message -p -t "=$session:" '#{{session_path}}')
 [[ $actual_cwd == $expected_cwd && $(_dev_agent_of_session "$session") == codex &&
    $(_dev_session_sid "$session" "$actual_cwd") == $expected_sid ]] || {{
   print -u2 -- 'The slot changed while preparing the handoff; run t app again.'; exit 1

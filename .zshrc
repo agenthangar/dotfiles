@@ -1038,16 +1038,19 @@ _dev_agent_new_cmd() {
 _dev_agent_resume_cmd() {
   case "$1" in codex) print -r -- "codex resume $2" ;; *) print -r -- "claude -r $2" ;; esac
 }
-# _dev_agent_at_welcome <agent> <session> — "live but no conversation yet", per agent.
-# claude: the 'Welcome back' banner (_dev_session_at_welcome). codex: whether a thread
-# has been STAMPED on the session — codex mints its thread id (and fires SessionStart,
-# so the hook's CLAUDE_RESUME_ID lands) at the FIRST prompt, not at launch, so an
-# unstamped codex pane is exactly one with nothing typed yet. Pane text was rejected:
-# codex's boxed `>_ OpenAI Codex (v…)` banner stays visible through a short exchange,
-# which read a real conversation as idle.
+# _dev_agent_at_welcome <agent> <session> [cwd] — live but no conversation yet.
+# claude: the 'Welcome back' banner (_dev_session_at_welcome). codex: a recorded id
+# OR recent conversation evidence from its index. A missing SessionStart stamp is
+# not proof of an empty conversation (untrusted/disabled hooks never stamp). Its
+# boxed startup banner also stays visible through a short exchange.
 _dev_agent_at_welcome() {
+  local dir sid
   case "$1" in
-    codex) [[ -z $(tmux show-environment -t "$2" CLAUDE_RESUME_ID 2>/dev/null | cut -d= -f2) ]] ;;
+    codex)
+      dir=${3:-$(tmux display-message -p -t "$2" '#{session_path}' 2>/dev/null)}
+      sid=$(_dev_session_sid "$2" "$dir")
+      [[ -n $sid ]] && return 1
+      [[ -z $(_codex_live_transcript "$dir" "$(_dev_session_claude_pid "$2")") ]] ;;
     *)     _dev_session_at_welcome "$2" ;;
   esac
 }
@@ -1115,6 +1118,32 @@ PY
 _codex_threads_for_cwd() { _codex_threads cwd "$1" }
 # _codex_thread_lookup <sid> — one row for a thread id (empty if unknown).
 _codex_thread_lookup()   { _codex_threads sid "$1" }
+
+# _codex_live_transcript <cwd> <pid> — display-only fallback when a live Codex never
+# fired SessionStart. Require one nonempty, non-subagent thread in this exact cwd
+# updated during this process's lifetime. Old conversations in a reused slot and
+# ambiguous candidates must not turn a fresh welcome screen into an active row.
+# This is evidence for a title/context, NOT an authoritative pid→sid mapping: never
+# use it in _dev_session_sid or stamp it into tmux (beam/app act on those ids).
+_codex_live_transcript() {
+  local db start
+  [[ -n $1 && $2 == <-> ]] || return 0
+  db=$(_codex_db); [[ -r $db ]] || return 0
+  start=$(LC_ALL=C ps -o lstart= -p "$2" 2>/dev/null) || return 0
+  python3 - "$db" "$1" "$start" <<'PY' 2>/dev/null
+import datetime, os, sqlite3, sys
+try:
+    start = datetime.datetime.strptime(sys.argv[3].strip(), '%a %b %d %H:%M:%S %Y').timestamp()
+    c = sqlite3.connect('file:%s?mode=ro' % sys.argv[1], uri=True, timeout=0.5)
+    rows = c.execute("select rollout_path from threads where archived=0 and cwd=? "
+                     "and updated_at>=? and instr(source, '\"subagent\"')=0 "
+                     "and trim(first_user_message)<>'' limit 2", (sys.argv[2], start)).fetchall()
+    if len(rows) == 1 and os.path.isfile(rows[0][0]):
+        print(rows[0][0])
+except (OSError, ValueError, sqlite3.Error):
+    pass
+PY
+}
 
 # _dev_transcript_agent <path> — which agent wrote this transcript, from its name
 # (a codex rollout is `rollout-…`; everything else is a claude <sid>.jsonl).
@@ -2546,9 +2575,7 @@ _dev_session_summary() {
     tx=$(_dev_agent_transcript "$agent" "$sid" "$dir") && { _transcript_title "$tx"; return 0; }
   fi
   if [[ $agent == codex ]]; then
-    # no birthtime heuristic for codex: its sqlite row names the newest thread in
-    # this dir directly
-    tx=$(_dev_agent_transcripts_for_cwd codex "$dir" | head -1)
+    tx=$(_codex_live_transcript "$dir" "$(_dev_session_claude_pid "$session")")
     [[ -n $tx ]] && _transcript_title "$tx"
     return 0
   fi
@@ -3114,7 +3141,7 @@ _dev_session_rows() {
     # not the raw CLAUDE_RESUME_ID stamp, which a reused slot can carry stale from a
     # prior (even cross-repo) occupant; this is the targeting id callers act on.
     sid=$(_dev_session_sid "$s" "$dir")
-    # `-` sentinel for an unstamped slot (idle / no conversation): keeps every
+    # `-` sentinel when the slot's conversation id is unknown: keeps every
     # field non-empty so a tab is never a *leading/consecutive* IFS-whitespace
     # delimiter that `read` would collapse, sliding the columns. It also keeps the
     # rows[] records below splittable with (ps:\t:).
@@ -3122,7 +3149,7 @@ _dev_session_rows() {
     tx=()
     if ! _dev_session_has_claude "$s"; then
       context=none
-    elif _dev_agent_at_welcome "$agent" "$s"; then
+    elif _dev_agent_at_welcome "$agent" "$s" "$dir"; then
       context=idle
     else
       context=active
@@ -3135,9 +3162,8 @@ _dev_session_rows() {
       if [[ $agent == claude ]]; then
         [[ $sid != - ]] && tx=( "$HOME/.claude/projects/${dir//[^A-Za-z0-9]/-}/$sid".jsonl(N) )
       else
-        # codex: the locator (hook cache / sqlite / glob) for a known id, else the
-        # newest thread recorded in this dir — same batch, same cache
-        tx=( $(_dev_agent_transcript codex "$sid" "$dir" 2>/dev/null || _dev_agent_transcripts_for_cwd codex "$dir" | head -1) )
+        # A fallback title never upgrades the row's unknown targeting id.
+        tx=( "$(_dev_agent_transcript codex "$sid" "$dir" 2>/dev/null || _codex_live_transcript "$dir" "$(_dev_session_claude_pid "$s")")" )
       fi
     fi
     rows+=("$sid"$'\t'"$dir"$'\t'"$short"$'\t'"$state"$'\t'"$context"$'\t'"$agent")

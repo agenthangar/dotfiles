@@ -163,19 +163,35 @@ registered repo is trusted by default: `dots` runs `t trust --all -q`, and `t se
 refused, `t trust --status` reports without writing, `t doctor` carries the same
 line, and `DOTFILES_NO_TRUST=1` opts a machine out of the automatic paths.
 
-**`t config`** opens an arrow-key menu to choose the default tool (Claude or Codex)
-and a separate model for each. Pick a Claude alias, a model from Codex's local
-model list, or enter a custom model ID. “Use tool's own default” removes the `t`
-model override. Choose **Save changes** to persist your choices in a managed block
-in `~/.zshrc.local`; `q`/Esc or Cancel leaves the file untouched. `t config --show`
-prints the current defaults, including any repo tool overrides.
+**`t config`** is the local settings hub, with an arrow-key menu for:
 
-These settings apply to **new `t open` sessions** on this machine, including
-`--fg`, and take effect in the calling shell after saving. Existing and resumed
-conversations retain their model. `DEV_AGENT[repo]` and `--claude`/`--codex` still
-override the global tool; `DEV_MODEL[claude]` and `DEV_MODEL[codex]` hold each tool's
-model choice. Run `t config` on each host to choose its defaults. Cursor remains
-available through `t cursor`; it does not support dev slots.
+- **Tools and models:** choose Claude or Codex as the default tool, with a separate
+  model for each. Pick a Claude alias, a model from Codex's local list, a custom
+  model ID, or “Use tool's own default”.
+- **Hosts:** add or edit SSH targets, remove retired hosts, and choose the default
+  beam destination. Removing a host stops `dots --all` and other host fan-outs
+  from trying it; reachability alone never removes a host. A removed host's beam
+  default and legacy host seed are cleared when they refer to it.
+- **Repos:** register a path, change a repo's tool, branch or worktree overrides,
+  or unregister it. Unregistering keeps its files, worktrees and sessions.
+  `t setup` remains available for automatic repo/SSH-host discovery and onboarding.
+- **Worktree defaults:** enable or disable worktrees, choose their root directory,
+  and set the fallback branch for shared-tree repos. Existing worktrees are not moved.
+- **All custom settings:** open `~/.zshrc.local` in `$VISUAL` / `$EDITOR` (or `vi`).
+  `t config --edit` opens the editor directly and checks shell syntax before reload.
+
+Choose **Save changes** to review and apply the pending menu edits. Cancel leaves
+that file untouched. Only the managed settings block is rewritten; custom shell
+outside it is preserved. Removed registrations are explicitly unset, including
+in the calling shell, so their generated shortcuts disappear immediately too.
+`t config --show` prints current settings without opening the menu.
+
+Tool and model defaults apply to **new `t open` sessions**, including `--fg`.
+Existing/resumed conversations keep their normal behavior. `DEV_AGENT[repo]` and
+`--claude`/`--codex` still override the global tool; `DEV_MODEL[claude]` and
+`DEV_MODEL[codex]` hold each tool's model choice. Settings are per machine: run
+`t config` on each host to configure it. Cursor remains available through
+`t cursor`; it does not support dev slots.
 
 A dev slot runs either agent: `t open <repo> --codex` starts Codex CLI in a fresh
 slot (`--claude` forces Claude), `DEV_AGENT[repo]=codex` in `~/.zshrc.local` makes

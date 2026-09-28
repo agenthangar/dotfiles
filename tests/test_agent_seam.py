@@ -500,6 +500,36 @@ def test_zsh_t_config_reloads_same_size_atomic_save(zsh, tmp_path):
     assert "RELOADED" not in zsh("t config --show").stdout
 
 
+def test_zsh_t_config_removes_hosts_repos_and_shortcuts_immediately(zsh, tmp_path):
+    local = zsh.home / ".zshrc.local"
+    local.write_text(local.read_text() + "REMOTE_HOSTS[retired]=old.example\n"
+                     "TBEAM_HOST=old.example\nMINI_HOST=old.example\n")
+    (zsh.home / ".zshrc").symlink_to(ZSHRC)
+    stub = tmp_path / "stubbin" / "t"
+    stub.write_text("#!/bin/sh\ncat >> \"$HOME/.zshrc.local\" <<'EOF'\n"
+                    "unset 'REMOTE_HOSTS[retired]'\nunset 'DEV_REPOS[web]'\n"
+                    "unset TBEAM_HOST\nunset MINI_HOST\nEOF\n")
+    stub.chmod(0o755)
+    r = zsh('t config >/dev/null; echo hosts=${#REMOTE_HOSTS}; '
+            'echo beam=${TBEAM_HOST:-none}; (( $+functions[retired] )) && echo stale-host; '
+            '(( $+aliases[web] )) && echo stale-repo; '
+            'cat $HOME/.config/t/config.sh')
+    assert r.returncode == 0, r.stderr
+    assert "hosts=0" in r.stdout and "beam=none" in r.stdout
+    assert "stale-" not in r.stdout and "REMOTE_HOSTS[" not in r.stdout and "DEV_REPOS[web]" not in r.stdout
+    # No legacy MINI_HOST/TBEAM_HOST seed may bring a removed host back next login.
+    assert zsh('echo hosts=${#REMOTE_HOSTS}').stdout.strip() == "hosts=0"
+
+
+def test_zsh_config_editor_failure_does_not_reload(zsh, tmp_path):
+    stub = tmp_path / "stubbin" / "t"
+    stub.write_text("#!/bin/sh\necho 'unfinished edit' >> \"$HOME/.zshrc.local\"\nexit 1\n")
+    stub.chmod(0o755)
+    (zsh.home / ".zshrc").write_text("echo RELOADED\n")
+    r = zsh("t config --edit; echo rc=$?")
+    assert "rc=1" in r.stdout and "RELOADED" not in r.stdout
+
+
 # ─── codex conversations: the thread store, the locators, titles, self-id, wrappers ──
 
 FIXTURE_ROLLOUT = REPO_ROOT / "tests" / "fixtures" / "codex_rollout.jsonl"

@@ -1692,7 +1692,7 @@ _dev_repo_prepare() {
 
 # Generate a cd shortcut per repo: each key jumps straight to its dir.
 for _repo in ${(k)DEV_REPOS}; do
-  alias "$_repo"="cd ${DEV_REPOS[$_repo]}"
+  alias "$_repo"="cd ${(q)DEV_REPOS[$_repo]}"
 done
 unset _repo
 
@@ -1732,6 +1732,8 @@ _t_sync_config() {
     for k in ${(k)DEV_AGENT};     do print -r -- "DEV_AGENT[$k]=${(q)DEV_AGENT[$k]}"; done
     for k in ${(k)DEV_MODEL};     do print -r -- "DEV_MODEL[$k]=${(q)DEV_MODEL[$k]}"; done
     print -r -- "DEV_AGENT_DEFAULT=${(q)DEV_AGENT_DEFAULT}"
+    print -r -- "TBEAM_HOST=${(q)TBEAM_HOST}"
+    print -r -- "MINI_HOST=${(q)MINI_HOST}"
     print -r -- "DEV_BRANCH=${(q)DEV_BRANCH}"
     print -r -- "DEV_WORKTREE_ROOT=${(q)DEV_WORKTREE_ROOT}"
     print -r -- "DEV_WORKTREE_DEFAULT=${(q)DEV_WORKTREE_DEFAULT}"
@@ -6861,15 +6863,25 @@ t() {
 }
 
 # _t_install <verb> — install/config through the bin, reload iff ~/.zshrc.local changed
-# (see the shim arm above). Inode catches t config's atomic same-size replacements;
-# mtime/size catch t install's appends. zstat, not stat: the portability convention.
+# Compare content too: an editor can save the same size inside one clock tick.
 _t_install() {
-  local -A before after
-  zstat -H before ~/.zshrc.local 2>/dev/null
+  local before= after= verb="$1"
+  [[ -f ~/.zshrc.local ]] && before=$(<~/.zshrc.local)
   T_SETUP_SHIM=1 command t "$@"
   local rc=$?
-  zstat -H after ~/.zshrc.local 2>/dev/null
-  [[ "${after[inode]:-}:${after[mtime]:-}:${after[size]:-}" == "${before[inode]:-}:${before[mtime]:-}:${before[size]:-}" ]] || source ~/.zshrc
+  [[ -f ~/.zshrc.local ]] && after=$(<~/.zshrc.local)
+  if [[ $before != $after && ( $verb != config || $rc == 0 ) ]]; then
+    if [[ $verb == config ]]; then
+      # A removed registration must disappear from this shell as well as the next
+      # one. Rebuild only the known local settings and their generated shortcuts.
+      local key
+      for key in ${(k)DEV_REPOS}; do unalias "$key" 2>/dev/null; done
+      for key in ${(k)REMOTE_HOSTS}; do unfunction "$key" 2>/dev/null; done
+      DEV_REPOS=() DEV_BRANCHES=() REMOTE_HOSTS=() DEV_WORKTREE=() DEV_AGENT=() DEV_MODEL=()
+      unset DEV_AGENT_DEFAULT DEV_BRANCH DEV_WORKTREE_ROOT DEV_WORKTREE_DEFAULT TBEAM_HOST MINI_HOST
+    fi
+    source ~/.zshrc
+  fi
   return $rc
 }
 
@@ -7191,7 +7203,7 @@ _t() {
       if [[ ${words[CURRENT]} == -* ]]; then _values 'flag' --hosts --no-hosts --dry-run -h --help
       else _files -/; fi ;;   # scan-dir arguments
     config)
-      _values 'flag' --show -h --help ;;
+      _values 'flag' --show --edit -h --help ;;
     new)
       if (( CURRENT == 3 )) && [[ ${words[CURRENT]} != -* ]]; then _message 'repo name'
       else _values 'flag' --owner --public --private --alias --hosts --no-hosts -y --yes --dry-run -h --help; fi ;;

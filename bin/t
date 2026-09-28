@@ -20,6 +20,7 @@
 
 import argparse
 import calendar
+import copy
 import glob
 import hashlib
 import json
@@ -62,7 +63,7 @@ ZSH_PRELUDE = "setopt no_monitor no_notify 2>/dev/null; "
 
 _CFG_LINE = re.compile(
     r"^(DEV_REPOS|DEV_BRANCHES|REMOTE_HOSTS|DEV_WORKTREE|DEV_AGENT|DEV_MODEL)\[([^\]]+)\]=(.*)$"
-    r"|^(DEV_BRANCH|DEV_WORKTREE_ROOT|DEV_WORKTREE_DEFAULT|DEV_AGENT_DEFAULT)=(.*)$")
+    r"|^(DEV_BRANCH|DEV_WORKTREE_ROOT|DEV_WORKTREE_DEFAULT|DEV_AGENT_DEFAULT|TBEAM_HOST|MINI_HOST)=(.*)$")
 
 AGENTS = ("claude", "codex")   # the closed set a dev slot can run (the zsh _dev_agent_valid twin)
 
@@ -91,6 +92,8 @@ class Config:
         self.agents = {}     # alias -> claude|codex (DEV_AGENT[alias])
         self.agent_default = "claude"
         self.models = {}     # agent -> model for NEW sessions; empty defers to the CLI
+        self.beam_host = ""
+        self.mini_host = ""  # legacy host seed; cleared if its host is removed
         self._load()
 
     def _load(self):
@@ -116,6 +119,10 @@ class Config:
                 self.worktree_default = _unquote(m.group(5))
             elif m.group(4) == "DEV_AGENT_DEFAULT":
                 self.agent_default = _unquote(m.group(5))
+            elif m.group(4) == "TBEAM_HOST":
+                self.beam_host = _unquote(m.group(5))
+            elif m.group(4) == "MINI_HOST":
+                self.mini_host = _unquote(m.group(5))
 
     def agent_for(self, alias, override=None):
         """The agent a NEW slot of `alias` runs — the Python twin of zsh _dev_agent_for:
@@ -798,6 +805,17 @@ def _local_entries(text):
     (still-quoted) values."""
     repos, hosts, tbeam = {}, {}, False
     for line in text.splitlines():
+        # `t config` masks registrations without rewriting arbitrary user shell.
+        # A later `t setup` must see those removals, too.
+        removed = _config_unset_key(line.strip())
+        if removed:
+            if removed == "TBEAM_HOST":
+                tbeam = False
+            else:
+                m = _CFG_LINE.match(removed + "=")
+                if m and m.group(1) in ("DEV_REPOS", "REMOTE_HOSTS"):
+                    (repos if m.group(1) == "DEV_REPOS" else hosts).pop(m.group(2), None)
+            continue
         if _TBEAM_LINE.match(line):
             tbeam = True
             continue
@@ -1099,30 +1117,98 @@ _CONFIG_END = "# <<< t config defaults <<<"
 _MODEL_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/@+\[\]-]*\Z")
 
 
-def _config_text(text, agent, models):
-    """Replace only our marked block, placing it last so earlier defaults lose.
-    Never parse or rewrite the user's arbitrary shell. Empty model assignments
-    also clear the live array on a shell reload (unset lines would not)."""
-    if agent not in AGENTS:
+_CONFIG_ARRAYS = {"DEV_REPOS": "repos", "REMOTE_HOSTS": "hosts", "DEV_BRANCHES": "branches",
+                  "DEV_AGENT": "agents", "DEV_WORKTREE": "worktree", "DEV_MODEL": "models"}
+_CONFIG_SCALARS = {"DEV_AGENT_DEFAULT": "agent_default", "DEV_BRANCH": "branch",
+                   "DEV_WORKTREE_ROOT": "worktree_root", "DEV_WORKTREE_DEFAULT": "worktree_default",
+                   "TBEAM_HOST": "beam_host", "MINI_HOST": "mini_host"}
+_CONFIG_ALIAS = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.-]*\Z")
+
+
+def _config_state(cfg):
+    state = {key: getattr(cfg, attr) for key, attr in _CONFIG_SCALARS.items()}
+    for arr, attr in _CONFIG_ARRAYS.items():
+        state.update({f"{arr}[{key}]": value for key, value in getattr(cfg, attr).items()})
+    return state
+
+
+def _config_diff(before, after):
+    return {key: after.get(key) for key in sorted(before.keys() | after.keys())
+            if before.get(key) != after.get(key)}
+
+
+def _config_unset_key(line):
+    try:
+        words = shlex.split(line)
+    except ValueError:
+        return None
+    return words[1] if len(words) == 2 and words[0] == "unset" else None
+
+
+def _config_assignment(key, value):
+    """Only our known keys may become shell assignments; every value is quoted."""
+    m = _CFG_LINE.fullmatch(key + "=")
+    if not m or (m.group(1) and not _CONFIG_ALIAS.fullmatch(m.group(2))):
+        raise ValueError(f"unsupported setting {key!r}; use Open local config in editor")
+    if value is None or (key in ("TBEAM_HOST", "MINI_HOST") and not value):
+        return "unset " + shlex.quote(key)
+    if not isinstance(value, str) or any(ord(c) < 32 or ord(c) == 127 for c in value):
+        raise ValueError("settings must be a single line without control characters")
+    if (key == "DEV_AGENT_DEFAULT" or key.startswith("DEV_AGENT[")) and value not in AGENTS:
         raise ValueError("choose claude or codex")
-    for model in models.values():
-        if model and not _MODEL_ID.fullmatch(model):
-            raise ValueError("model IDs must contain no spaces or shell commands")
+    if key.startswith("DEV_MODEL[") and value and not _MODEL_ID.fullmatch(value):
+        raise ValueError("model IDs must contain no spaces or shell commands")
+    prefix = "export " if key == "TBEAM_HOST" else ""
+    return f"{prefix}{key}={shlex.quote(value)}"
+
+
+def _config_text(text, changes, effective=None):
+    """Update a small overlay at EOF; leave arbitrary user shell byte-for-byte.
+    Explicit unsets keep removed hosts/repos gone after a reload. Retain earlier
+    managed choices, reconciling them with any later t setup registrations."""
     lines = text.splitlines(keepends=True)
     starts = [i for i, line in enumerate(lines) if line.rstrip("\r\n") == _CONFIG_BEGIN]
     ends = [i for i, line in enumerate(lines) if line.rstrip("\r\n") == _CONFIG_END]
+    settings = {}
     if starts or ends:
         if len(starts) != 1 or len(ends) != 1 or starts[0] >= ends[0]:
             raise ValueError("malformed t config defaults block in ~/.zshrc.local; repair its markers first")
+        for line in lines[starts[0] + 1:ends[0]]:
+            raw = line.strip()
+            if not raw or raw.startswith("#"):
+                continue
+            removed = _config_unset_key(raw)
+            match = _CFG_LINE.fullmatch(raw.removeprefix("export "))
+            if removed:
+                key, value = removed, None
+            elif match:
+                key = (f"{match.group(1)}[{match.group(2)}]" if match.group(1) else match.group(4))
+                value = _unquote(match.group(3) if match.group(1) else match.group(5))
+            else:
+                raise ValueError("custom shell inside the t config block; move it outside the markers first")
+            settings[key] = effective.get(key) if effective is not None else value
         del lines[starts[0]:ends[0] + 1]
+    settings.update(changes)
+    assignments = [_config_assignment(key, value) for key, value in sorted(settings.items())]
     body = "".join(lines)
     if body and not body.endswith("\n"):
         body += "\n"
     if body and not body.endswith("\n\n"):
         body += "\n"
-    block = [_CONFIG_BEGIN, f"DEV_AGENT_DEFAULT={shlex.quote(agent)}"]
-    block += [f"DEV_MODEL[{a}]={shlex.quote(models.get(a, ''))}" for a in AGENTS]
-    return body + "\n".join(block + [_CONFIG_END, ""])
+    return body + "\n".join([_CONFIG_BEGIN, *assignments, _CONFIG_END, ""])
+
+
+def _config_remove_host(cfg, alias):
+    target = cfg.hosts.pop(alias)
+    if cfg.beam_host in (alias, target) or not cfg.hosts:
+        cfg.beam_host = ""
+    if cfg.mini_host in (alias, target) or not cfg.hosts:
+        cfg.mini_host = ""
+
+
+def _config_remove_repo(cfg, alias):
+    for attr in ("repos", "agents", "branches", "worktree"):
+        getattr(cfg, attr).pop(alias, None)
 
 
 def _config_read(path):
@@ -1188,81 +1274,258 @@ def _config_summary(agent, models, overrides):
     return lines
 
 
+def _config_input(ui, label, current="", kind="text"):
+    value = ui.cooked_input(f"│  {label} (blank cancels) → ", prefill=current)
+    if not value:
+        return None
+    if any(ord(c) < 32 or ord(c) == 127 for c in value):
+        ui.done("invalid", "Enter a single line without control characters.")
+        return None
+    if kind == "alias" and not _CONFIG_ALIAS.fullmatch(value):
+        ui.done("invalid", "Use letters, numbers, dots, underscores or hyphens for the alias.")
+        return None
+    if kind == "host" and (not _BARE_HOST.fullmatch(value) or value.startswith("-")):
+        ui.done("invalid", "Use an SSH host name, address or user@host.")
+        return None
+    if kind == "path":
+        value = os.path.expanduser(value.replace("$HOME", HOME))
+        if not os.path.isabs(value):
+            ui.done("invalid", "Use an absolute path or ~/path.")
+            return None
+    return value
+
+
+def _config_hosts(ui, cfg):
+    while True:
+        rows = [(h, f"{h}  {target}") for h, target in sorted(cfg.hosts.items())]
+        rows += [("__add__", "+ Add host"), ("__back__", "Back")]
+        host = ui.pick("Hosts · removal unregisters; it never contacts the host", rows)
+        if host in (None, "__back__"):
+            return
+        if host == "__add__":
+            alias = _config_input(ui, "host alias", kind="alias")
+            if alias is None:
+                continue
+            if alias in cfg.hosts or alias in ("__add__", "__back__"):
+                ui.done("invalid", "That alias is already in use or reserved.")
+                continue
+            target = _config_input(ui, "SSH target", kind="host")
+            if target is not None:
+                cfg.hosts[alias] = target
+            continue
+        action = ui.pick(f"Host {host}", [("target", f"SSH target: {cfg.hosts[host]}"),
+                          ("beam", "Use as default beam host"), ("remove", "Remove host"),
+                          ("back", "Back")])
+        if action == "remove":
+            _config_remove_host(cfg, host)
+            ui.done("removed", f"{host} (pending Save changes)")
+        elif action == "beam":
+            cfg.beam_host = cfg.hosts[host]
+        elif action == "target":
+            old = cfg.hosts[host]
+            target = _config_input(ui, "SSH target", old, "host")
+            if target is not None:
+                cfg.hosts[host] = target
+                if cfg.beam_host == old:
+                    cfg.beam_host = target
+                if cfg.mini_host == old:
+                    cfg.mini_host = target
+
+
+def _config_repos(ui, cfg):
+    while True:
+        rows = [(r, f"{r}  {_tilde(path)}") for r, path in sorted(cfg.repos.items())]
+        rows += [("__add__", "+ Register repo"), ("__back__", "Back")]
+        repo = ui.pick("Repos · unregistering keeps files and sessions", rows)
+        if repo in (None, "__back__"):
+            return
+        if repo == "__add__":
+            alias = _config_input(ui, "repo alias", kind="alias")
+            if alias is None:
+                continue
+            if alias in cfg.repos or alias in ("__add__", "__back__"):
+                ui.done("invalid", "That alias is already in use or reserved.")
+                continue
+            repo_path = _config_input(ui, "repo path", kind="path")
+            if repo_path is not None:
+                cfg.repos[alias] = repo_path
+            continue
+        action = ui.pick(f"Repo {repo}", [
+            ("path", f"Path: {_tilde(cfg.repos[repo])}"),
+            ("tool", f"Tool: {cfg.agents.get(repo) or 'inherit global default'}"),
+            ("branch", f"Shared-tree branch: {cfg.branches.get(repo) or 'inherit global default'}"),
+            ("worktree", f"Worktrees: {cfg.worktree.get(repo) or 'inherit global default'}"),
+            ("remove", "Unregister repo (keep files and sessions)"), ("back", "Back")])
+        if action == "remove":
+            _config_remove_repo(cfg, repo)
+        elif action == "path":
+            value = _config_input(ui, "repo path", cfg.repos[repo], "path")
+            if value is not None:
+                cfg.repos[repo] = value
+        elif action in ("tool", "worktree", "branch"):
+            attr = {"tool": "agents", "worktree": "worktree", "branch": "branches"}[action]
+            options = [("", "Inherit global default")]
+            options += ([(a, a) for a in AGENTS] if action == "tool" else
+                        [("1", "Enabled"), ("0", "Disabled (shared tree)")] if action == "worktree" else
+                        [("custom", "Set branch")])
+            value = ui.pick(f"{repo} {action}", options)
+            if value == "custom":
+                value = _config_input(ui, "branch", cfg.branches.get(repo, ""))
+            if value == "":
+                getattr(cfg, attr).pop(repo, None)
+            elif value is not None:
+                getattr(cfg, attr)[repo] = value
+
+
+def _config_worktrees(ui, cfg):
+    while True:
+        action = ui.pick("Worktree defaults · existing worktrees are not moved", [
+            ("enabled", f"Worktrees enabled: {cfg.worktree_default}"),
+            ("root", f"Worktree root: {_tilde(cfg.worktree_root)}"),
+            ("branch", f"Shared-tree fallback branch: {cfg.branch}"), ("back", "Back")])
+        if action in (None, "back"):
+            return
+        if action == "enabled":
+            value = ui.pick("Default worktree mode", [("1", "Enabled"), ("0", "Disabled (shared tree)")])
+            if value is not None:
+                cfg.worktree_default = value
+        else:
+            attr = "worktree_root" if action == "root" else "branch"
+            value = _config_input(ui, action, getattr(cfg, attr), "path" if action == "root" else "text")
+            if value is not None:
+                setattr(cfg, attr, value)
+
+
 def _config_wizard(cfg, cache):
     ui = _RailUI()
-    agent, models = cfg.agent_default, {a: cfg.models.get(a, "") for a in AGENTS}
-    ui.out.write("┌  t config · defaults for new sessions on this machine\n")
-    if cfg.agents:
-        ui.out.write("│  Repo tool overrides still apply; t config --show lists them.\n")
+    edited = copy.deepcopy(cfg)
+    initial = _config_state(cfg)
+    ui.out.write("┌  t config · local settings · nothing written until Save changes\n")
     ui.raw()
     try:
         while True:
-            rows = [("tool", f"Default tool     {agent}")]
-            rows += [(a, f"{a} model    {models[a] or 'tool default'}") for a in AGENTS]
-            rows += [("save", "Save changes"), ("cancel", "Cancel")]
-            choice = ui.pick("Session defaults", rows)
+            rows = [("tool", f"Default tool     {edited.agent_default}")]
+            rows += [(a, f"{a} model    {edited.models.get(a) or 'tool default'}") for a in AGENTS]
+            rows += [("hosts", f"Hosts ({len(edited.hosts)}) · add, edit, remove"),
+                     ("repos", f"Repos ({len(edited.repos)}) · paths and overrides"),
+                     ("beam", f"Default beam host: {edited.beam_host or 'none'}"),
+                     ("worktrees", "Worktree and branch defaults"),
+                     ("edit", "Open local config in editor (all settings)"),
+                     ("save", "Save changes"), ("cancel", "Cancel")]
+            choice = ui.pick("Local settings", rows)
             if choice in (None, "cancel"):
                 ui.done("cancelled", "nothing written")
                 return None
+            if choice == "edit":
+                if _config_diff(initial, _config_state(edited)):
+                    ui.done("pending", "Save or cancel your menu changes before opening the editor.")
+                    continue
+                return "edit"
             if choice == "save":
-                # Validate manual config values as well as anything typed in this UI.
+                changes = _config_diff(initial, _config_state(edited))
                 try:
-                    _config_text("", agent, models)
+                    lines = [_config_assignment(k, v) for k, v in changes.items()]
                 except ValueError as exc:
                     ui.done("invalid", str(exc))
                     continue
-                ui.commit(_config_summary(agent, models, cfg.agents))
-                return agent, models
-            if choice == "tool":
-                tools = [(a, f"{a}" + ("" if shutil.which(a) else f" (install with t install {a})"))
-                         for a in AGENTS]
-                picked = ui.pick("Default tool", tools,
-                                 default=AGENTS.index(agent) if agent in AGENTS else 0)
+                if changes:
+                    answer = ui.page("Review local settings", lines, ("y", "n", "q", "esc", "abort"),
+                                     keys="y save · n back · q cancel")
+                    if answer == "n":
+                        continue
+                    if answer != "y":
+                        ui.done("cancelled", "nothing written")
+                        return None
+                return edited
+            if choice == "hosts":
+                _config_hosts(ui, edited)
+            elif choice == "repos":
+                _config_repos(ui, edited)
+            elif choice == "worktrees":
+                _config_worktrees(ui, edited)
+            elif choice == "beam":
+                options = [("", "No default (choose when beaming)")]
+                options += [(h, f"{h}  {target}") for h, target in sorted(edited.hosts.items())]
+                picked = ui.pick("Default beam host", options)
                 if picked is not None:
-                    agent = picked
-                continue
-            options = _config_model_rows(choice, models[choice], cache)
-            picked = ui.pick(f"{choice} model", options,
-                             default=next(i for i, row in enumerate(options) if row[0] == models[choice]))
-            if picked == "__custom__":
-                picked = ui.cooked_input("│  model ID (blank cancels) → ")
-                if not picked:
-                    continue
-                if not _MODEL_ID.fullmatch(picked):
-                    ui.done("invalid", "Enter a model ID without spaces or shell commands.")
-                    continue
-            if picked is not None:
-                models[choice] = picked
+                    edited.beam_host = edited.hosts.get(picked, "")
+            elif choice == "tool":
+                options = [(a, f"{a}" + ("" if shutil.which(a) else f" (install with t install {a})"))
+                           for a in AGENTS]
+                picked = ui.pick("Default tool (repo overrides still win)", options,
+                                 default=AGENTS.index(edited.agent_default) if edited.agent_default in AGENTS else 0)
+                if picked is not None:
+                    edited.agent_default = picked
+            else:
+                current = edited.models.get(choice, "")
+                options = _config_model_rows(choice, current, cache)
+                picked = ui.pick(f"{choice} model", options,
+                                 default=next(i for i, row in enumerate(options) if row[0] == current))
+                if picked == "__custom__":
+                    picked = _config_input(ui, "model ID")
+                    if picked is None:
+                        continue
+                    if not _MODEL_ID.fullmatch(picked):
+                        ui.done("invalid", "Enter a model ID without spaces or shell commands.")
+                        continue
+                if picked is not None:
+                    edited.models[choice] = picked
     finally:
         ui.restore()
+
+
+def _config_editor():
+    command = os.environ.get("VISUAL") or os.environ.get("EDITOR") or "vi"
+    argv = shlex.split(command)
+    if not argv:
+        raise ValueError("set VISUAL or EDITOR to an editor command")
+    rc = subprocess.call([*argv, ZSHRC_LOCAL])
+    if rc:
+        return rc
+    # Keep an incomplete edit from being sourced into the calling shell.
+    return subprocess.call(["zsh", "-n", ZSHRC_LOCAL])
 
 
 def cmd_config(cfg, args):
     if args.show:
         print("\n".join(_config_summary(cfg.agent_default, cfg.models, cfg.agents)))
+        print(f"Default beam host: {cfg.beam_host or 'none'}")
+        print(f"Worktrees: {cfg.worktree_default} · root: {cfg.worktree_root} · shared-tree branch: {cfg.branch}")
+        for alias, target in sorted(cfg.hosts.items()):
+            print(f"Host {alias}: {target}")
+        for alias, repo_path in sorted(cfg.repos.items()):
+            print(f"Repo {alias}: {repo_path} · tool: {cfg.agents.get(alias) or 'inherit'} · "
+                  f"branch: {cfg.branches.get(alias) or 'inherit'} · worktrees: {cfg.worktree.get(alias) or 'inherit'}")
         return 0
     if not sys.stdin.isatty() or not sys.stdout.isatty():
-        print("t config: open this menu in a terminal; t config --show prints current defaults",
+        print("t config: open this menu in a terminal; t config --show prints current settings",
               file=sys.stderr)
         return 1
     try:
         before = _config_read(ZSHRC_LOCAL)
-        result = _config_wizard(cfg, _config_codex_cache())
+        result = "edit" if getattr(args, "edit", False) else _config_wizard(cfg, _config_codex_cache())
         if result is None:
             return 0
-        agent, models = result
-        if agent == cfg.agent_default and all(models[a] == cfg.models.get(a, "") for a in AGENTS):
-            print("Defaults unchanged — nothing written")
-            return 0
-        after = _config_text(before, agent, models)
-        _config_write(ZSHRC_LOCAL, before, after)
+        if result == "edit":
+            rc = _config_editor()
+            if rc:
+                print("t config: editor or syntax check failed; local config was not reloaded", file=sys.stderr)
+                return rc
+        else:
+            current = _config_state(cfg)
+            changes = _config_diff(current, _config_state(result))
+            if not changes:
+                print("Settings unchanged — nothing written")
+                return 0
+            after = _config_text(before, changes, current)
+            _config_write(ZSHRC_LOCAL, before, after)
     except (OSError, ValueError) as exc:
         print(f"t config: {exc}", file=sys.stderr)
         return 1
     zsh_capture("_t_sync_config")
-    print("✓ saved defaults to ~/.zshrc.local")
+    print("✓ saved local settings to ~/.zshrc.local")
     if not os.environ.get("T_SETUP_SHIM"):
-        print("run `source ~/.zshrc` (or open a new shell) to use these defaults")
+        print("run `source ~/.zshrc` (or open a new shell) to use these settings")
     return 0
 
 
@@ -6524,13 +6787,17 @@ Run `t <verb> -h` for a verb's own flags.""")
     sp.add_argument("host", help="$REMOTE_HOSTS key, or a literal ssh target")
     sp.add_argument("rest", nargs=argparse.REMAINDER, help="command to run (omit for an interactive shell)")
 
-    sp = sub.add_parser("config", help="choose the default tool and models in a terminal menu",
-        description="Arrow-key menu for this machine's new t sessions: choose claude or codex "
-            "and a separate model for each tool. Models can use the tool's own default, "
-            "a suggested alias/locally cached Codex model, or a custom ID. Save changes "
-            "writes a managed block in ~/.zshrc.local; q/Esc cancels. Repo DEV_AGENT "
-            "overrides and --claude/--codex still win. Resumed conversations keep their model.")
-    sp.add_argument("--show", action="store_true", help="print current defaults without opening the menu")
+    sp = sub.add_parser("config", help="manage local settings: tools, models, repos and hosts",
+        description="Arrow-key settings hub for this machine: default tool and per-tool models; "
+            "add, edit or remove hosts; register or unregister repos and set their tool, branch "
+            "and worktree overrides; choose the default beam host and worktree defaults. "
+            "Save changes reviews then writes a managed block in ~/.zshrc.local. Removed "
+            "hosts stop participating in dots --all; unregistering repos keeps their files "
+            "and sessions. Tool/model defaults apply to fresh tmux and --fg sessions only. "
+            "Open local config in editor covers all custom shell settings (VISUAL/EDITOR, else vi).")
+    cg = sp.add_mutually_exclusive_group()
+    cg.add_argument("--show", action="store_true", help="print current settings without opening the menu")
+    cg.add_argument("--edit", action="store_true", help="open ~/.zshrc.local in VISUAL/EDITOR directly")
 
     sp = sub.add_parser("setup", help="register local repos and ssh hosts in ~/.zshrc.local",
         description="Interactive onboarding for this machine's per-machine config: a stepped "

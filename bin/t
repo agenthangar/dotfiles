@@ -5365,10 +5365,39 @@ def _app_bundle():
     return None
 
 
+def _app_preview_path(row):
+    return os.path.join(_cache_root(), "app-previews", row["sid"] + ".json")
+
+
+def _app_preview_url(row):
+    """Reuse this thread's chosen page, including its path, query, and hash.
+
+    A server port tells us the origin, not which page the user is reviewing.
+    --url selects that page explicitly; unrelated transcript URLs are not evidence.
+    A moved thread must choose again so it cannot inherit another slot's server.
+    """
+    try:
+        with open(_app_preview_path(row), encoding="utf-8") as f:
+            saved = json.load(f)
+        if isinstance(saved, dict) and saved.get("cwd") == row["cwd"]:
+            url = saved.get("url")
+            if isinstance(url, str):
+                _app_link(row["sid"], url)  # same validation as an explicit --url
+                return url
+    except (OSError, ValueError):
+        pass
+    return _dev_url(row["slot"], row["cwd"])
+
+
+def _app_remember_preview(row, url):
+    _app_link(row["sid"], url)
+    _index_save(_app_preview_path(row), {"cwd": row["cwd"], "url": url})
+
+
 def _app_stop_cli(row):
     """Revalidate the owner, stop only its agent, and wait before opening the app.
 
-    Keep the tmux shell: it reserves the worktree slot while the app uses it. In
+    Keep the tmux slot: it reserves the worktree while the app uses it. In
     particular do NOT use t kill, which also stops the preview's dev server.
     Refuse when invoked from the very agent being moved (it would kill this tool).
     """
@@ -5391,6 +5420,9 @@ while [[ -n $up && $up != 0 && $up != 1 ]]; do
   }}
   up=$(ps -o ppid= -p "$up" 2>/dev/null); up=${{up//[[:space:]]/}}
 done
+# Some slots exec Codex as the pane process, with no shell to return to. Keep
+# that pane after exit too, or the session and its conversation stamp disappear.
+tmux set-option -p -t "=$session:" remain-on-exit on || exit 1
 kill -TERM "$cpid" || exit 1
 for attempt in {{1..100}}; do
   kill -0 "$cpid" 2>/dev/null || exit 0
@@ -5410,7 +5442,7 @@ def cmd_app(cfg, args):
                           args.repo, args.slot, os.getcwd())
         if not os.path.isdir(row["cwd"]):
             raise ValueError(f"the session's worktree is missing: {row['cwd']}")
-        url = None if args.no_preview else args.url or _dev_url(row["slot"], row["cwd"])
+        url = None if args.no_preview else args.url or _app_preview_url(row)
         link = _app_link(row["sid"], url)
         print(f"{row['slot']} → Codex app · thread {row['sid']}")
         if url:
@@ -5434,7 +5466,9 @@ def cmd_app(cfg, args):
             recovery = shlex.join(["codex", "resume", row["sid"]])
             raise ValueError(f"could not open the app: {result.stderr.strip()}. "
                              f"To resume in a terminal: cd {shlex.quote(row['cwd'])} && {recovery}")
-        print("Sent to the desktop app; the tmux shell keeps this worktree slot reserved.")
+        if url:
+            _app_remember_preview(row, url)
+        print("Sent to the desktop app; tmux keeps this worktree slot reserved.")
         return 0
     except ValueError as e:
         print(f"t app: {e}", file=sys.stderr)
@@ -6604,8 +6638,8 @@ Run `t <verb> -h` for a verb's own flags.""")
     sp = sub.add_parser("app", help="move a local Codex slot into the desktop app with its preview",
         description="Stop a local slot's Codex CLI and open the SAME conversation in the "
             "Codex desktop app on macOS, with its running web preview in the built-in browser. "
-            "Use Annotation mode there to leave comments. The tmux shell stays to reserve "
-            "the slot; the worktree and dev server keep running. A lone number means the "
+            "Use Annotation mode there to leave comments. The tmux slot stays reserved, "
+            "and the worktree and dev server keep running. A lone number means the "
             "cwd repo; bare `t app` uses the cwd worktree's slot, or the repo's only slot. "
             "Several slots require an explicit number. Claude conversations cannot be "
             "converted. Remote slots must be brought here first with `t beam … --here`. "
@@ -6614,7 +6648,7 @@ Run `t <verb> -h` for a verb's own flags.""")
     sp.add_argument("repo", nargs="?", help="DEV_REPOS key; defaults to the cwd repo")
     sp.add_argument("slot", nargs="?", help="local slot number")
     preview = sp.add_mutually_exclusive_group()
-    preview.add_argument("--url", help="preview URL/route (default: the slot's live dev URL)")
+    preview.add_argument("--url", help="preview page to open and remember for this thread (default: remembered URL, then slot's live dev URL)")
     preview.add_argument("--no-preview", action="store_true", help="open only the conversation")
     sp.add_argument("--dry-run", action="store_true", help="show the handoff link without stopping or opening anything")
 

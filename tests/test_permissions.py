@@ -267,24 +267,24 @@ def test_perm_sync_codex_carries_the_network_line(t_mod, tmp_path):
     home = tmp_path
     (home / ".codex").mkdir()
     (home / ".codex" / "config.toml").write_text('model = "gpt-6"\n')
-    reps = t_mod._perm_sync(str(home), ALLOW, RETIRE, which=lambda n: None, modes=False)
+    reps = t_mod._perm_sync(str(home), ALLOW, RETIRE, which=lambda n: None, modes=False, subagent=False)
     rep = reps["codex"]
     assert rep["state"] == "pending" and rep["network"] == "pending"
     assert rep["add"][-1] == "config.toml: [sandbox_workspace_write] network_access = true"
     assert "3 to add" in t_mod._perm_line("codex", rep) and t_mod._perm_short("codex", rep) == "codex 3 to add, 0 to retire"
-    reps = t_mod._perm_sync(str(home), ALLOW, RETIRE, apply=True, which=lambda n: None, modes=False)
+    reps = t_mod._perm_sync(str(home), ALLOW, RETIRE, apply=True, which=lambda n: None, modes=False, subagent=False)
     assert reps["codex"]["state"] == "applied" and reps["codex"]["network"] == "applied"
     assert (home / ".codex" / "config.toml").read_text().startswith('model = "gpt-6"\n')
     assert "network_access = true" in (home / ".codex" / "config.toml").read_text()
-    reps = t_mod._perm_sync(str(home), ALLOW, RETIRE, which=lambda n: None, modes=False)
+    reps = t_mod._perm_sync(str(home), ALLOW, RETIRE, which=lambda n: None, modes=False, subagent=False)
     assert reps["codex"]["state"] == "synced" and reps["codex"]["network"] == "synced"
     # rules in sync, only the network line waiting → still a pending codex
     (home / ".codex" / "config.toml").write_text('model = "gpt-6"\n')
-    rep = t_mod._perm_sync(str(home), ALLOW, RETIRE, which=lambda n: None, modes=False)["codex"]
+    rep = t_mod._perm_sync(str(home), ALLOW, RETIRE, which=lambda n: None, modes=False, subagent=False)["codex"]
     assert rep["state"] == "pending" and rep["add"] == ["config.toml: [sandbox_workspace_write] network_access = true"]
     # an unreadable config.toml is said, and the rules half still syncs
     (home / ".codex" / "config.toml").write_bytes(b"\xff\xfe")
-    rep = t_mod._perm_sync(str(home), ALLOW, RETIRE, apply=True, which=lambda n: None, modes=False)["codex"]
+    rep = t_mod._perm_sync(str(home), ALLOW, RETIRE, apply=True, which=lambda n: None, modes=False, subagent=False)["codex"]
     assert rep["state"] == "synced" and rep["network"] is None
     assert "config.toml unreadable" in t_mod._perm_line("codex", rep)
 
@@ -382,7 +382,7 @@ def test_perm_sync_seeds_both_default_modes_and_can_be_told_not_to(t_mod, tmp_pa
     (home / ".claude" / "settings.json").write_text(json.dumps({"permissions": {"allow": list(ALLOW)}}))
     (home / ".codex").mkdir()
     (home / ".codex" / "config.toml").write_text('model = "gpt-6"\n')
-    off = t_mod._perm_sync(str(home), ALLOW, RETIRE, which=lambda n: None, modes=False)
+    off = t_mod._perm_sync(str(home), ALLOW, RETIRE, which=lambda n: None, modes=False, subagent=False)
     assert "mode" not in off["claude"] and "mode" not in off["codex"] and off["claude"]["state"] == "synced"
     reps = t_mod._perm_sync(str(home), ALLOW, RETIRE, apply=True, which=lambda n: None)
     assert reps["claude"]["mode"] == "applied" and reps["codex"]["mode"] == "applied"
@@ -444,13 +444,13 @@ def test_perm_sync_reports_every_agent(t_mod, tmp_path):
     (home / ".claude" / "settings.json").write_text(json.dumps({"permissions": {"allow": []}}))
     (home / ".cursor").mkdir()
     (home / ".cursor" / "cli-config.json").write_text(json.dumps({"permissions": {"allow": ["Shell(ls)"]}}))
-    reps = t_mod._perm_sync(str(home), ALLOW, RETIRE, which=lambda n: None, modes=False)
+    reps = t_mod._perm_sync(str(home), ALLOW, RETIRE, which=lambda n: None, modes=False, subagent=False)
     assert reps["codex"]["state"] == "absent" and reps["codex"]["path"] is None
     assert reps["claude"]["state"] == "pending" and reps["claude"]["add"] == ALLOW
     assert reps["cursor"]["state"] == "pending" and reps["cursor"]["add"] == ["Shell(gh pr)", "Shell(npx playwright)"]
-    reps = t_mod._perm_sync(str(home), ALLOW, RETIRE, apply=True, which=lambda n: None, modes=False)
+    reps = t_mod._perm_sync(str(home), ALLOW, RETIRE, apply=True, which=lambda n: None, modes=False, subagent=False)
     assert {a: r["state"] for a, r in reps.items()} == {"claude": "applied", "codex": "absent", "cursor": "applied"}
-    reps = t_mod._perm_sync(str(home), ALLOW, RETIRE, which=lambda n: None, modes=False)
+    reps = t_mod._perm_sync(str(home), ALLOW, RETIRE, which=lambda n: None, modes=False, subagent=False)
     assert {a: r["state"] for a, r in reps.items()} == {"claude": "synced", "codex": "absent", "cursor": "synced"}
     assert "3 to add" not in t_mod._perm_line("claude", reps["claude"])
     assert t_mod._perm_short("codex", reps["codex"]) == "codex not installed"
@@ -686,3 +686,106 @@ def test_perm_root_is_the_checkout_holding_bin_t(t_mod):
     assert pathlib.Path(t_mod._perm_root()) == REPO_ROOT
     allow, retire = t_mod._perm_lists(t_mod._perm_root())
     assert allow and retire
+
+
+# ─── the default subagent model ────────────────────────────────────────────────
+
+CLAUDE_SUB = ("CLAUDE_CODE_SUBAGENT_MODEL", "sonnet")
+
+
+@pytest.mark.parametrize("data, seed", [
+    ({}, True),                                                    # no env block at all
+    ({"env": {"FOO": "1"}}, True),                                 # a block without the key
+    ({"env": {"CLAUDE_CODE_SUBAGENT_MODEL": "haiku"}}, False),     # a hand-picked model
+    ({"env": {"CLAUDE_CODE_SUBAGENT_MODEL": "inherit"}}, False),   # "inherit" is a choice too
+    ({"env": {"CLAUDE_CODE_SUBAGENT_MODEL": ""}}, False),
+    ({"env": ["not", "an", "object"]}, False),                     # foreign-shaped: left alone
+])
+def test_perm_claude_subagent_plan(t_mod, data, seed):
+    assert t_mod._perm_claude_subagent_plan(data, CLAUDE_SUB) is seed
+
+
+def test_perm_json_sync_seeds_the_claude_subagent_model_once(t_mod, tmp_path):
+    p = tmp_path / "settings.json"
+    p.write_text(json.dumps({"permissions": {"allow": list(ALLOW)}, "env": {"FOO": "1"}, "model": "opus"}))
+    rep = t_mod._perm_json_sync(str(p), ALLOW, [], subagent=CLAUDE_SUB)
+    assert rep["state"] == "pending" and rep["subagent"] == "pending"
+    assert rep["add"] == ['settings.json: env.CLAUDE_CODE_SUBAGENT_MODEL = "sonnet"']
+    rep = t_mod._perm_json_sync(str(p), ALLOW, [], apply=True, subagent=CLAUDE_SUB)
+    assert rep["subagent"] == "applied"
+    data = json.loads(p.read_text())
+    assert data["env"] == {"FOO": "1", "CLAUDE_CODE_SUBAGENT_MODEL": "sonnet"} and data["model"] == "opus"
+    assert t_mod._perm_json_sync(str(p), ALLOW, [], apply=True, subagent=CLAUDE_SUB)["subagent"] == "synced"
+    # a hand change is never flipped back
+    data["env"]["CLAUDE_CODE_SUBAGENT_MODEL"] = "inherit"
+    p.write_text(json.dumps(data))
+    rep = t_mod._perm_json_sync(str(p), ALLOW, [], apply=True, subagent=CLAUDE_SUB)
+    assert rep["state"] == "synced" and json.loads(p.read_text())["env"]["CLAUDE_CODE_SUBAGENT_MODEL"] == "inherit"
+    # without subagent= (cursor) the env block is never grown
+    q = tmp_path / "cli-config.json"
+    q.write_text(json.dumps({"permissions": {"allow": []}}))
+    t_mod._perm_json_sync(str(q), ["Shell(ls)"], [], apply=True)
+    assert "env" not in json.loads(q.read_text())
+
+
+@pytest.mark.parametrize("have, expect", [
+    ("", "append"),
+    ('model = "gpt-6-astra"\n', "append"),
+    ('model = "x"\n\n[agents]\nmax_depth = 2\n', "insert"),
+    ('[agents]\ndefault_subagent_model = "gpt-6-luna"\n', None),   # a hand-picked model
+    ('agents.default_subagent_model = "gpt-6-luna"\n', None),      # dotted
+    ('agents = { max_depth = 2 }\n', None),                        # inline table: cannot extend
+])
+def test_perm_codex_subagent_plan(t_mod, have, expect):
+    out = t_mod._perm_codex_subagent_plan(have)
+    if expect is None:
+        assert out is None
+        return
+    tomllib = pytest.importorskip("tomllib")
+    data = tomllib.loads(out)
+    assert data["agents"]["default_subagent_model"] == "gpt-6-sol"
+    if expect == "insert":
+        assert data["agents"]["max_depth"] == 2 and out.count("[agents]") == 1
+    else:
+        assert out.startswith(have.rstrip("\n"))
+
+
+def test_perm_sync_seeds_both_subagent_models_and_can_be_told_not_to(t_mod, tmp_path):
+    home = tmp_path
+    (home / ".claude").mkdir()
+    (home / ".claude" / "settings.json").write_text(json.dumps({"permissions": {"allow": list(ALLOW)}}))
+    (home / ".codex").mkdir()
+    (home / ".codex" / "config.toml").write_text('model = "gpt-6-astra"\n')
+    off = t_mod._perm_sync(str(home), ALLOW, RETIRE, which=lambda n: None, modes=False, subagent=False)
+    assert "subagent" not in off["claude"] and "subagent" not in off["codex"]
+    reps = t_mod._perm_sync(str(home), ALLOW, RETIRE, apply=True, which=lambda n: None, modes=False)
+    assert reps["claude"]["subagent"] == "applied" and reps["codex"]["subagent"] == "applied"
+    assert json.loads((home / ".claude" / "settings.json").read_text())["env"] == {"CLAUDE_CODE_SUBAGENT_MODEL": "sonnet"}
+    assert '[agents]\ndefault_subagent_model = "gpt-6-sol"' in (home / ".codex" / "config.toml").read_text()
+    reps = t_mod._perm_sync(str(home), ALLOW, RETIRE, which=lambda n: None, modes=False)
+    assert {a: r["state"] for a, r in reps.items()} == {"claude": "synced", "codex": "synced", "cursor": "absent"}
+
+
+def test_cmd_permissions_apply_says_which_subagent_model_it_seeded(t_mod, tmp_path, monkeypatch, capsys):
+    import argparse
+    home = tmp_path
+    (home / ".claude").mkdir()
+    (home / ".claude" / "settings.json").write_text(json.dumps({"permissions": {"allow": []}}))
+    (home / ".codex").mkdir()
+    (home / ".codex" / "config.toml").write_text("")
+    monkeypatch.setattr(t_mod, "HOME", str(home))
+    monkeypatch.setattr(t_mod, "_perm_root", lambda: str(REPO_ROOT))
+    monkeypatch.setenv("DOTFILES_NO_AGENT_MODES", "1")
+    monkeypatch.setenv("DOTFILES_NO_SUBAGENT_MODEL", "1")
+    ns = argparse.Namespace(apply=True, show=False)
+    assert t_mod.cmd_permissions(None, ns) == 0
+    assert "subagent" not in capsys.readouterr().out
+    monkeypatch.delenv("DOTFILES_NO_SUBAGENT_MODEL")
+    assert t_mod.cmd_permissions(None, ns) == 0
+    out = capsys.readouterr().out
+    assert 'permissions: claude — default subagent model: env.CLAUDE_CODE_SUBAGENT_MODEL = "sonnet"' in out
+    assert 'permissions: codex — default subagent model: [agents] default_subagent_model = "gpt-6-sol"' in out
+    assert "added 0" not in out
+    assert t_mod.cmd_permissions(None, ns) == 0 and capsys.readouterr().out == ""
+    assert t_mod.cmd_permissions(None, argparse.Namespace(apply=False, show=True)) == 0
+    assert "DOTFILES_NO_SUBAGENT_MODEL=1 opts out" in capsys.readouterr().out

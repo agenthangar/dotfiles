@@ -14,6 +14,7 @@ shim in `.zshrc` for verbs that must run in your shell).
 | Command | What it does |
 | --- | --- |
 | `t open <repo> [slot]` | Open or reattach a session in a per-repo detached tmux slot (`--new`, `--fg`, `--remote`, `--here`; `--codex` runs OpenAI's Codex CLI in the slot instead of Claude — `DEV_AGENT[repo]=codex` makes that the repo's default) |
+| `t app [repo] [slot]` | Move a local Codex slot into the macOS desktop app, opening the same conversation and its running web preview for annotation (`--url <url>`, `--no-preview`, `--dry-run`) |
 | `t ls [-r] [-a]` | List live sessions, optionally across every machine (`-r`) and repo (`-a`) |
 | `t phone [--client NAME] [--pick]` | Reconnect to your last live session on this machine; F1 opens a compact session picker ([phone setup](#phone-access-with-termius)) |
 | `t cd [repo] [slot]` | `cd` this shell into a slot's worktree (bare `t cd`: fzf pick across all worktrees) |
@@ -26,6 +27,29 @@ shim in `.zshrc` for verbs that must run in your shell).
 | `t mcp` | The `sessions` MCP server Claude Code spawns, so any Claude session can answer "which session is/was working on X?" from every saved transcript and the live slots. `--install` registers it (`dots` does), `--call <tool> '<json>'` runs one tool by hand |
 
 Run `t -h` for the full verb list.
+
+For example, `t app api 13` stops that slot's Codex CLI and opens its existing
+thread in the desktop app, with the slot's live dev URL in the built-in browser.
+Use **Annotation mode** to click an element or select an area and leave feedback.
+`t app api 13 --url 'http://localhost:5213/#budget'` selects a particular page
+and remembers its full URL for that conversation. Later `t app api 13` opens
+that page again, including its query and hash. With no remembered page it uses
+the server's root URL; it cannot infer the current browser page from the chat topic.
+The choice is cached locally under `~/.cache/claude-sessions/app-previews/` and
+is ignored if the conversation moves to a different worktree.
+`--dry-run` prints the handoff link without changing anything. The worktree and
+dev server stay running, and tmux keeps the slot reserved even when Codex was
+the pane's main process (the exited pane remains). To return
+to the terminal later, stop work in the app, then use `t pop api 13`.
+
+This requires a local Codex conversation and a recent desktop app installed in
+`/Applications` or `~/Applications` (named Codex or ChatGPT). It uses the app's
+`codex://threads/<id>?browserUrl=…` handler, verified against app version
+26.924.20706; this is an app-version-dependent interface. Without an explicit or
+remembered URL, a stopped dev server opens just the conversation with a notice;
+start the server and rerun to add the preview. Claude conversations cannot be
+imported by this command. Bring remote
+slots here first with `t beam <repo> <slot> --here`.
 
 ## Phone access with Termius
 
@@ -70,7 +94,7 @@ from their exact execution point.
 
 | Command | What it does |
 | --- | --- |
-| `dots [--dev]` | Sync the live checkout to `origin/main` HEAD and reload zsh; `--dev` makes the session worktree you are standing in live instead ([details](#keeping-machines-in-sync)) |
+| `dots [--all\|--dev]` | Sync the live checkout to `origin/main` HEAD and reload zsh; `--all` then runs `dots` on every host too; `--dev` makes the session worktree you are standing in live instead ([details](#keeping-machines-in-sync)) |
 | `csync` | Two-way sync of Claude session history and plans, Codex rollouts, and Cursor chats across machines via iCloud Drive |
 | `sleep-manager` | Block or restore macOS sleep (`status`, `disable`, `enable`) |
 | `pii-scan` | Keep personal data out of this public repo ([details](#pii-guard)) |
@@ -134,6 +158,13 @@ install — the failure it fixes was a fast-forwarded machine whose `~/.tmux.con
 had simply never been made. It is offline and prints nothing unless a link changed.
 **`dots --relink`** does just that step, without fetching.
 
+**`dots --all`** does that here and then on **every host** — one `dots` per
+`REMOTE_HOSTS` entry, in parallel over ssh, one result line each (a host that is
+asleep just says `unreachable`). Run it when a PR merges: nothing polls for a merge,
+so without it the other machines answer the next cross-host verb with the previous
+release. `dots-sync --no-hosts` is the local half alone, and any shell that was
+already open re-sources itself at its next prompt once the live `main` moves.
+
 **`dots --dev`** flips the live symlinks to the **session worktree you are standing
 in**, so its in-progress edits go live for testing before they merge — useful for a
 new `bin/` script that needs a fresh symlink. `cd` into the worktree
@@ -179,6 +210,36 @@ registered repo is trusted by default: `dots` runs `t trust --all -q`, and `t se
 refused, `t trust --status` reports without writing, `t doctor` carries the same
 line, and `DOTFILES_NO_TRUST=1` opts a machine out of the automatic paths.
 
+**`t config`** is the local settings hub, with an arrow-key menu for:
+
+- **Tools and models:** choose Claude or Codex as the default tool, with a separate
+  model for each. Pick a Claude alias, a model from Codex's local list, a custom
+  model ID, or “Use tool's own default”.
+- **Hosts:** add or edit SSH targets, remove retired hosts, and choose the default
+  beam destination. Removing a host stops `dots --all` and other host fan-outs
+  from trying it; reachability alone never removes a host. A removed host's beam
+  default and legacy host seed are cleared when they refer to it.
+- **Repos:** register a path, change a repo's tool, branch or worktree overrides,
+  or unregister it. Unregistering keeps its files, worktrees and sessions.
+  `t setup` remains available for automatic repo/SSH-host discovery and onboarding.
+- **Worktree defaults:** enable or disable worktrees, choose their root directory,
+  and set the fallback branch for shared-tree repos. Existing worktrees are not moved.
+- **All custom settings:** open `~/.zshrc.local` in `$VISUAL` / `$EDITOR` (or `vi`).
+  `t config --edit` opens the editor directly and checks shell syntax before reload.
+
+Choose **Save changes** to review and apply the pending menu edits. Cancel leaves
+that file untouched. Only the managed settings block is rewritten; custom shell
+outside it is preserved. Removed registrations are explicitly unset, including
+in the calling shell, so their generated shortcuts disappear immediately too.
+`t config --show` prints current settings without opening the menu.
+
+Tool and model defaults apply to **new `t open` sessions**, including `--fg`.
+Existing/resumed conversations keep their normal behavior. `DEV_AGENT[repo]` and
+`--claude`/`--codex` still override the global tool; `DEV_MODEL[claude]` and
+`DEV_MODEL[codex]` hold each tool's model choice. Settings are per machine: run
+`t config` on each host to configure it. Cursor remains available through
+`t cursor`; it does not support dev slots.
+
 A dev slot runs either agent: `t open <repo> --codex` starts Codex CLI in a fresh
 slot (`--claude` forces Claude), `DEV_AGENT[repo]=codex` in `~/.zshrc.local` makes
 it a repo's default and `DEV_AGENT_DEFAULT` the global one. `t ls` marks a codex
@@ -189,6 +250,10 @@ transcripts), `t pop`/`t push` move it with `codex resume`, and `t resume` lists
 a dead codex slot's conversations from Codex's own thread index, marked `⬡` in
 the picker. Codex mints its thread id at the first prompt (there is no
 `--session-id`), so an untouched codex slot reads as idle until you type.
+If its SessionStart hook never fires, `t ls` can still show the title and active
+context from a single conversation in the slot's directory updated since the
+running process started. This display fallback does not assign a session ID;
+commands that move a conversation still require its recorded identity.
 Across machines, `t beam` ships a codex slot's rollout (and its origin stamp)
 with its date path intact and `csync` mirrors `~/.codex/sessions` to iCloud as
 `codex-sessions` — Codex indexes a copied-in rollout on the first resume, so only
@@ -199,23 +264,25 @@ Not every verb supports every agent yet. The matrix below is **generated from
 support without the README saying so:
 
 ```text
-  surface                                                      ✱ claude                          ⬡ codex                                                               ◆ cursor
-  -----------------------------------------------------------  --------------------------------  --------------------------------------------------------------------  -------------------------------------------------
-  t install (install · login · update · reinstall)             ✓                                 ✓                                                                     ✓
-  dev slots: t open / ls / kill / read / paste                 ✓                                 ✓ t open --codex · DEV_AGENT                                          ✗ no slot — t cursor ls
-  t push / t pop                                               ✓                                 ✓                                                                     ✗ no slot
-  t resume (dead slots)                                        ✓                                 ✓ (its sqlite thread index)                                           → t cursor resume
-  t beam / --from (move a session)                             ✓                                 ✓ (rollout + .origin)                                                 → t cursor [id] --host / --from
-  csync (iCloud union of transcripts)                          ✓ projects + plans                ✓ codex-sessions                                                      ✓ cursor-chats
-  SessionStart stamps (registry · opened · origin)             ✓ settings.json hook              ✓ hooks.json (trust once at startup)                                  ✗ no hook wired
-  t plan                                                       ✓                                 ✗ codex keeps no plan files (says so)                                 ✗
-  /tpush · /tpop slash commands                                ✓ ~/.claude/commands              ✓ ~/.codex/prompts                                                    ✗
-  t find / t mcp (transcript search)                           ✓                                 ✗ claude transcripts only                                             ✗
-  t doctor agent row (version · login · hook)                  ✓                                 ✓                                                                     ✓ version · login
-  permissions (agents/permissions.allow, synced by dots)       ✓ ~/.claude/settings.json         ✓ ~/.codex/rules/dotfiles.rules (argv prefixes) · sandbox network on  ✓ ~/.cursor/cli-config.json (argv + env prefixes)
-  default permission mode (seeded when the config names none)  ✓ auto (permissions.defaultMode)  ✓ full access (approval never · danger-full-access)                   ✗ left as cursor-agent set it
-  t trust (folder trust · every registered repo on dots)       ✓ ~/.claude.json projects         ✓ ~/.codex/config.toml [projects]                                     ✓ ~/.cursor/projects/<slug> marker
-  nosleep (hold sleep while an agent works)                    ✓ caffeinate child · net bytes    ✓ net bytes                                                           ✓ net bytes
+  surface                                                      ✱ claude                                   ⬡ codex                                                               ◆ cursor
+  -----------------------------------------------------------  -----------------------------------------  --------------------------------------------------------------------  -------------------------------------------------
+  t install (install · login · update · reinstall)             ✓                                          ✓                                                                     ✓
+  dev slots: t open / ls / kill / read / paste                 ✓                                          ✓ t open --codex · DEV_AGENT                                          ✗ no slot — t cursor ls
+  t push / t pop                                               ✓                                          ✓                                                                     ✗ no slot
+  t resume (dead slots)                                        ✓                                          ✓ (its sqlite thread index)                                           → t cursor resume
+  t beam / --from (move a session)                             ✓                                          ✓ (rollout + .origin)                                                 → t cursor [id] --host / --from
+  t app (desktop + browser preview)                            ✗ Codex conversations only                 ✓ local macOS slot → same thread                                      ✗
+  csync (iCloud union of transcripts)                          ✓ projects + plans                         ✓ codex-sessions                                                      ✓ cursor-chats
+  SessionStart stamps (registry · opened · origin)             ✓ settings.json hook                       ✓ hooks.json (trust once at startup)                                  ✗ no hook wired
+  t plan                                                       ✓                                          ✗ codex keeps no plan files (says so)                                 ✗
+  /tpush · /tpop slash commands                                ✓ ~/.claude/commands                       ✓ ~/.codex/prompts                                                    ✗
+  t find / t mcp (transcript search)                           ✓                                          ✗ claude transcripts only                                             ✗
+  t doctor agent row (version · login · hook)                  ✓                                          ✓                                                                     ✓ version · login
+  permissions (agents/permissions.allow, synced by dots)       ✓ ~/.claude/settings.json                  ✓ ~/.codex/rules/dotfiles.rules (argv prefixes) · sandbox network on  ✓ ~/.cursor/cli-config.json (argv + env prefixes)
+  default permission mode (seeded when the config names none)  ✓ auto (permissions.defaultMode)           ✓ full access (approval never · danger-full-access)                   ✗ left as cursor-agent set it
+  default subagent model (seeded when the config names none)   ✓ sonnet (env.CLAUDE_CODE_SUBAGENT_MODEL)  ✓ gpt-6-sol ([agents] default_subagent_model)                         ✗ not seeded
+  t trust (folder trust · every registered repo on dots)       ✓ ~/.claude.json projects                  ✓ ~/.codex/config.toml [projects]                                     ✓ ~/.cursor/projects/<slug> marker
+  nosleep (hold sleep while an agent works)                    ✓ caffeinate child · net bytes             ✓ net bytes                                                           ✓ net bytes
 ```
 
 Codex needs one manual step after install: its SessionStart hook (the same
@@ -250,6 +317,16 @@ never changed, `DOTFILES_NO_AGENT_MODES=1` opts a machine out, and Cursor's is l
 as cursor-agent set it. Full access means Codex runs commands unsandboxed and
 unasked: that is the point on your own machines, and a reason to read this
 paragraph before running `install.sh` on one that is not.
+
+The same step also picks a cheaper **default subagent model**, so a multi-agent
+fan-out (an ultracode workflow, a burst of Agent-tool calls, Codex's `spawn_agent`)
+does not run every helper on the flagship: Claude Code gets
+`env.CLAUDE_CODE_SUBAGENT_MODEL = "sonnet"` in `~/.claude/settings.json`, Codex gets
+`[agents] default_subagent_model = "gpt-6-sol"` in `~/.codex/config.toml`. It is only a
+default. A model named for one call (a workflow's `opts.model`, the Agent tool's
+`model`) or in an agent's own definition still wins, and your org's allowed-model
+list still applies. Change either value and it is never flipped back;
+`DOTFILES_NO_SUBAGENT_MODEL=1` opts a machine out.
 `t permissions` reports what is in sync and what is waiting,
 `t permissions --show` prints each rule's translations, `t doctor` carries the
 same line, and `DOTFILES_NO_PERMISSIONS=1` opts a machine out. The shipped list

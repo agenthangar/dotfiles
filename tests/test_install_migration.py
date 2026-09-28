@@ -23,7 +23,7 @@ INSTALL_SH = REPO_ROOT / "install.sh"
 # migration cares about paths and git state, never file contents.
 STUB_BINS = [
     "sleep-manager", "csync", "cursor-beam", "pii-scan",
-    "claude-stamp-tmux", "t",
+    "claude-stamp-tmux", "t", "dots-sync",
 ]
 
 

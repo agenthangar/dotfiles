@@ -41,6 +41,12 @@ exclude_lines = [
     "def _setup_prompt_flow\\(",
     "def _prompt\\(",
     "def _confirm\\(",
+    "def _config_wizard\\(",
+    "def _config_input\\(",
+    "def _config_hosts\\(",
+    "def _config_repos\\(",
+    "def _config_worktrees\\(",
+    "def _config_editor\\(",
     # bin/t `t new` subprocess / ssh / wizard glue (the pure _new_* helpers are tested)
     "def _run\\(",
     "class _RailUI",

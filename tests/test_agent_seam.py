@@ -14,6 +14,7 @@ import pathlib
 import pty
 import re
 import select
+import shlex
 import shutil
 import subprocess
 import time
@@ -33,6 +34,7 @@ if [[ "$1" == -Axo ]]; then
   exit 0
 fi
 pid="${@: -1}"
+if [[ "$2" == lstart= && -n "${FAKE_START:-}" ]]; then echo "$FAKE_START"; exit 0; fi
 while read -r p pp c; do
   if [[ "$p" == "$pid" ]]; then
     case "$2" in comm=) echo "$c" ;; ppid=) echo "$pp" ;; esac
@@ -218,7 +220,9 @@ case "$1" in
     exit 0 ;;
   capture-pane)     [[ -n "${FAKE_PANE:-}" ]] && printf '%s\n' "$FAKE_PANE" ;;
   has-session)      [[ -n "${FAKE_HAS_SESSION:-}" ]] || exit 1 ;;
-  list-sessions)    [[ -n "${FAKE_SESSIONS:-}" ]] && printf '%s\n' $FAKE_SESSIONS ;;
+  list-sessions)
+    if [[ -n "${FAKE_SESSION_ROWS:-}" ]]; then printf '%s\n' "$FAKE_SESSION_ROWS"
+    elif [[ -n "${FAKE_SESSIONS:-}" ]]; then printf '%s\n' $FAKE_SESSIONS; fi ;;
   display-message)  [[ -n "${FAKE_SESSION_PATH:-}" && "$*" == *session_path* ]] && echo "$FAKE_SESSION_PATH" ;;
   list-panes)       [[ -n "${FAKE_PANES:-}" ]] && printf '%s\n' "$FAKE_PANES" ;;
 esac
@@ -397,13 +401,15 @@ def test_zsh_agent_of_session_reads_the_stamp_when_no_process(zsh):
 
 
 def test_zsh_agent_at_welcome(zsh):
-    # claude: the Welcome back banner; codex: "no thread stamped yet" — codex mints its
-    # thread (and fires the hook) at the first prompt, and its banner stays on screen
-    # through a short exchange, so pane text would read a real conversation as idle
+    # A Codex banner can remain visible after a real exchange; validate the stamp
+    # against its transcript, rather than trusting either the banner or a stale id.
     assert zsh("_dev_agent_at_welcome claude s; echo rc=$?", FAKE_PANE="Welcome back!").stdout.strip() == "rc=0"
     assert zsh("_dev_agent_at_welcome claude s; echo rc=$?", FAKE_PANE="> fix the bug").stdout.strip() == "rc=1"
     assert zsh("_dev_agent_at_welcome codex s; echo rc=$?", FAKE_PANE="OpenAI Codex (v0.154.0)").stdout.strip() == "rc=0"
-    assert zsh("_dev_agent_at_welcome codex s; echo rc=$?", FAKE_RESUME_ID="thr_1",
+    assert zsh("_dev_agent_at_welcome codex s; echo rc=$?", FAKE_RESUME_ID=SID,
+               FAKE_DEV_AGENT="codex").stdout.strip() == "rc=0"
+    _codex_home(zsh, [(SID, "/work", "prompt", 100, 0, None)])
+    assert zsh("_dev_agent_at_welcome codex s; echo rc=$?", FAKE_RESUME_ID=SID, FAKE_DEV_AGENT="codex",
                FAKE_PANE="OpenAI Codex (v0.154.0)").stdout.strip() == "rc=1"
 
 
@@ -442,6 +448,91 @@ def test_zsh_sync_config_emits_the_agent_keys(zsh):
     lines = r.stdout.splitlines()
     assert "DEV_AGENT[api]=codex" in lines
     assert "DEV_AGENT_DEFAULT=claude" in lines
+
+
+def test_zsh_model_defaults_reach_new_tmux_sessions_and_not_resumes(zsh):
+    r = zsh("DEV_MODEL[claude]=sonnet; DEV_MODEL[codex]=local/model; "
+            "_dev_new_session dev-api-3 $HOME/code/api dev/x 1 codex; "
+            "_dev_new_session dev-web-4 $HOME/code/web dev/x 1 claude; "
+            "_dev_resume_session dev-api-5 $HOME/code/api thread-id codex")
+    assert r.returncode == 0, r.stderr
+    lines = zsh.log.read_text().splitlines()
+    assert "send-keys -t dev-api-3 codex --model local/model; exit Enter" in lines
+    assert any("claude --session-id " in line and " --model sonnet; exit Enter" in line for line in lines)
+    assert "send-keys -t dev-api-5 codex resume thread-id; exit Enter" in lines
+
+
+@pytest.mark.parametrize("agent", ["claude", "codex"])
+def test_zsh_foreground_uses_the_selected_tools_model(zsh, agent):
+    (zsh.home / "code" / "web").mkdir(parents=True)
+    r = zsh(f"DEV_AGENT_DEFAULT={agent}; DEV_MODEL[{agent}]='model[1m]'; "
+            "DEV_WORKTREE[web]=0; _dev_repo_prepare() { :; }; "
+            f"{agent}() {{ print -rl -- ARG \"$@\"; }}; "
+            "_t_dev web new --fg")
+    assert r.returncode == 0, r.stderr
+    assert r.stdout.endswith("ARG\n--model\nmodel[1m]\n"), r.stdout
+
+
+def test_zsh_model_shell_quoting_and_config_bridge(zsh):
+    model = 'model; touch "$HOME/should-not-exist"'
+    # Direct manual config edits bypass the menu's ID validation. Quote those too.
+    r = zsh("DEV_MODEL[codex]='" + model + "'; "
+            "codex() { print -rl -- \"$@\"; }; eval \"$(_dev_agent_new_cmd codex)\"; "
+            "rm -f $HOME/.config/t/config.sh; _t_sync_config; "
+            "cat $HOME/.config/t/config.sh")
+    assert r.returncode == 0, r.stderr
+    assert r.stdout.startswith("--model\n" + model + "\n")
+    assert "DEV_MODEL[codex]=" in r.stdout
+    assert not (zsh.home / "should-not-exist").exists()
+
+
+def test_zsh_t_config_reloads_same_size_atomic_save(zsh, tmp_path):
+    stub = tmp_path / "stubbin" / "t"
+    stub.write_text("#!/usr/bin/env python3\n"
+                    "import os, pathlib, sys\n"
+                    "p = pathlib.Path.home() / '.zshrc.local'\n"
+                    "if '--show' not in sys.argv:\n"
+                    "    q = p.with_suffix('.tmp')\n"
+                    "    q.write_text(p.read_text().replace('sonnet', 'opus  '))\n"
+                    "    os.utime(q, ns=(p.stat().st_atime_ns, p.stat().st_mtime_ns))\n"
+                    "    q.replace(p)\n")
+    stub.chmod(0o755)
+    local = zsh.home / ".zshrc.local"
+    local.write_text(local.read_text() + "DEV_MODEL[claude]=sonnet\n")
+    (zsh.home / ".zshrc").write_text('source "$HOME/.zshrc.local"\necho RELOADED\n')
+    r = zsh('t config; echo model=$DEV_MODEL[claude]')
+    assert "RELOADED" in r.stdout and "model=opus" in r.stdout
+    assert "RELOADED" not in zsh("t config --show").stdout
+
+
+def test_zsh_t_config_removes_hosts_repos_and_shortcuts_immediately(zsh, tmp_path):
+    local = zsh.home / ".zshrc.local"
+    local.write_text(local.read_text() + "REMOTE_HOSTS[retired]=old.example\n"
+                     "TBEAM_HOST=old.example\nMINI_HOST=old.example\n")
+    (zsh.home / ".zshrc").symlink_to(ZSHRC)
+    stub = tmp_path / "stubbin" / "t"
+    stub.write_text("#!/bin/sh\ncat >> \"$HOME/.zshrc.local\" <<'EOF'\n"
+                    "unset 'REMOTE_HOSTS[retired]'\nunset 'DEV_REPOS[web]'\n"
+                    "unset TBEAM_HOST\nunset MINI_HOST\nEOF\n")
+    stub.chmod(0o755)
+    r = zsh('t config >/dev/null; echo hosts=${#REMOTE_HOSTS}; '
+            'echo beam=${TBEAM_HOST:-none}; (( $+functions[retired] )) && echo stale-host; '
+            '(( $+aliases[web] )) && echo stale-repo; '
+            'cat $HOME/.config/t/config.sh')
+    assert r.returncode == 0, r.stderr
+    assert "hosts=0" in r.stdout and "beam=none" in r.stdout
+    assert "stale-" not in r.stdout and "REMOTE_HOSTS[" not in r.stdout and "DEV_REPOS[web]" not in r.stdout
+    # No legacy MINI_HOST/TBEAM_HOST seed may bring a removed host back next login.
+    assert zsh('echo hosts=${#REMOTE_HOSTS}').stdout.strip() == "hosts=0"
+
+
+def test_zsh_config_editor_failure_does_not_reload(zsh, tmp_path):
+    stub = tmp_path / "stubbin" / "t"
+    stub.write_text("#!/bin/sh\necho 'unfinished edit' >> \"$HOME/.zshrc.local\"\nexit 1\n")
+    stub.chmod(0o755)
+    (zsh.home / ".zshrc").write_text("echo RELOADED\n")
+    r = zsh("t config --edit; echo rc=$?")
+    assert "rc=1" in r.stdout and "RELOADED" not in r.stdout
 
 
 # ─── codex conversations: the thread store, the locators, titles, self-id, wrappers ──
@@ -486,7 +577,9 @@ def _codex_home(zsh, threads, scan_cwd=False):
             text = text.replace("/Users/me/code/.worktrees/api/3", cwd)
         if source != "cli":
             assert text.count('"source": "cli"') == 1
-            text = text.replace('"source": "cli"', f'"source": {source}, "thread_source": "subagent"')
+            replacement = (f'"source": {source}, "thread_source": "subagent"'
+                           if '"subagent"' in source else f'"source": {json.dumps(source)}')
+            text = text.replace('"source": "cli"', replacement)
         p.write_text(text)
         paths[sid] = p
         db.execute("insert into threads values (?,?,?,?,?,?,?,?,?,?,?,?,?)",
@@ -495,6 +588,60 @@ def _codex_home(zsh, threads, scan_cwd=False):
     db.commit()
     db.close()
     return paths
+
+
+@pytest.mark.parametrize("scenario,active", [
+    ("current", True), ("resumed", True), ("old", False), ("ambiguous", False),
+    ("subagent", False), ("archived", False), ("empty", False),
+    ("missing_rollout", False), ("missing_start", False), ("broken_index", False),
+])
+def test_zsh_codex_unstamped_rows_use_recent_conversation_evidence(zsh, scenario, active):
+    """An unfired hook must not hide a real conversation, but the display fallback
+    must not resurrect old slots or invent a targeting id for beam/app."""
+    import sqlite3
+    wt = f"{zsh.home}/code/.worktrees/api/3"
+    started = "Mon Sep 28 12:00:00 2026"
+    epoch = int(time.mktime(time.strptime(started, "%a %b %d %H:%M:%S %Y")))
+    updated = epoch - 1 if scenario == "old" else epoch + 10
+    source = SUBAGENT_SOURCE if scenario == "subagent" else "vscode"
+    threads = [(SID, wt, "" if scenario == "empty" else "prompt", updated,
+                int(scenario == "archived"), "Configure default tool", source)]
+    if scenario == "ambiguous":
+        threads.append(("aaaaaaaa-0000-0000-0000-000000000002", wt, "other", updated, 0, None))
+    paths = _codex_home(zsh, threads)
+    db = zsh.home / ".codex" / "state_5.sqlite"
+    if scenario == "resumed":
+        with sqlite3.connect(db) as c:
+            c.execute("update threads set created_at=?", (epoch - 1000,))
+        c.close()
+    if scenario == "missing_rollout":
+        paths[SID].unlink()
+    if scenario == "broken_index":
+        db.write_text("not a database")
+    # Real row generation/title parsing; only the OS's live-process probes and PR
+    # network refresh are replaced. The tmux stamp and pid registry are both absent.
+    r = zsh('_dev_session_claude_pid() { print 4242; }; '
+            '_dev_session_has_claude() { return 0; }; '
+            '_dev_fg_rows() { :; }; _pr_state_tag() { REPLY=; }; _pr_state_flush() { :; }; '
+            '_dev_session_rows',
+            FAKE_START="" if scenario == "missing_start" else started,
+            FAKE_DEV_AGENT="codex", FAKE_SESSION_ROWS=f"dev-api-3\t{wt}\tattached",
+            FAKE_PANE="OpenAI Codex (v0.158.0)")
+    assert r.returncode == 0 and not r.stderr, r.stderr
+    row = r.stdout.strip().split("\t")
+    assert row == ["-", wt, "api-3", "attached", "active" if active else "idle",
+                   "Configure default tool" if active else "(idle — no conversation)", "codex"]
+    assert not any("set-environment" in line for line in zsh.log.read_text().splitlines())
+
+
+def test_zsh_codex_registry_alone_marks_a_conversation_active(zsh):
+    wt = f"{zsh.home}/code/.worktrees/api/3"
+    reg = zsh.home / ".cache" / "claude-sessions"
+    reg.mkdir(parents=True)
+    (reg / "4242").write_text(f"{SID}\t{wt}\n")
+    r = zsh(f'_dev_session_claude_pid() {{ print 4242; }}; '
+            f'_dev_agent_at_welcome codex s {wt}; echo rc=$?')
+    assert r.stdout.strip() == "rc=1"
 
 
 def test_zsh_codex_threads_for_cwd_orders_and_filters(zsh):
@@ -967,6 +1114,19 @@ def test_zsh_attach_fg_disambiguates_several_tmux_rows(zsh, tmp_path):
     assert "attach-session -t pr-api-2" in zsh.log.read_text().splitlines()
 
 
+def test_zsh_open_rejects_an_unknown_flag_instead_of_naming_a_slot_after_it(zsh):
+    """`t open dot --news` (a typo of --new) once became slot "--news": a live session
+    dev-dot---news with a worktree and branch named after the typo. An unknown flag must
+    stop before any tmux / git work, and the real flags must still pass."""
+    for cmd in ("t open api --news", "t open --bogus", "t open api 3 --nwe"):
+        r = zsh(f"{cmd}; echo rc=$?")
+        assert "rc=2" in r.stdout, (cmd, r.stdout, r.stderr)
+        assert "unknown flag" in r.stderr, (cmd, r.stderr)
+    assert not zsh.log.exists() or "new-session" not in zsh.log.read_text()
+    r = zsh("_t_dev list --all; echo rc=$?")
+    assert "unknown flag" not in r.stderr, r.stderr
+
+
 def test_zsh_open_fg_attaches_before_it_adopts(zsh, tmp_path):
     """Order matters: `t open` must not stop-and-move a session it could have attached.
     With a tmux session the row is attached; without one the same handle falls through to
@@ -1178,6 +1338,21 @@ def test_zsh_nosleep_agent_of_comm(zsh):
                                 "/Users/me/.local/bin/cursor-agent=cursor", "node=", "zsh=", "cursor="]
 
 
+def test_zsh_nosleep_agent_of_comm_counts_the_desktop_apps_agents(zsh):
+    # the desktop apps run the same agent cores from inside a bundle (the paths as ps
+    # printed them, 2026-09-25) — those count; every other bundled binary does not
+    apps = [
+        ("/Applications/ChatGPT.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex", "ChatGPT"),
+        ("/Users/me/Library/Application Support/Claude/claude-code/2.1.281/claude.app/Contents/MacOS/claude", "Claude app"),
+        ("/Applications/ChatGPT.app/Contents/Resources/cua_node/bin/node", ""),
+        ("/Applications/Claude.app/Contents/Frameworks/Claude Helper.app/Contents/MacOS/Claude Helper", ""),
+        ("/Users/me/.codex/computer-use/Codex Computer Use.app/Contents/MacOS/SkyComputerUseService", ""),
+        ("/Applications/Other.app/Contents/MacOS/claude", ""),
+    ]
+    script = "; ".join(f"_nosleep_agent_of_comm {shlex.quote(c)}; echo \"[$REPLY]\"" for c, _ in apps)
+    assert zsh(script).stdout.splitlines() == [f"[{want}]" for _, want in apps]
+
+
 PMSET_STUB = r"""#!/bin/bash
 # pmset -g → the settings dump, with the flag from $FAKE_SLEEP_DISABLED
 [[ "$1" == -g ]] && { printf ' SleepDisabled\t\t%s\n sleep                10\n' "${FAKE_SLEEP_DISABLED:-0}"; exit 0; }
@@ -1226,16 +1401,18 @@ def test_zsh_nosleep_bytes_moved_since_the_last_probe(nosleep):
         '_nosleep_busy_at; echo "p4=$REPLY pids=${(k)_NOSLEEP_NET_AT} socks=${#_NOSLEEP_NET}"')
     p1, p2, p3, p4 = r.stdout.splitlines()
     assert p1 == "p1=0 who="                                        # first sighting: baselines only
-    assert int(p2.split()[0][3:]) > 1_700_000_000 and p2.endswith(" who=codex")  # 60 KB in a probe = working; 50 B = not
-    assert p3.startswith("p3=0 who=codex pids=")                    # quiet; WHO keeps the last name (status line)
+    when, who = p2[3:].split(" who=")
+    assert int(when) > 1_700_000_000                                # 60 KB in a probe = working; 50 B = not
+    assert sorted(who.split(", ")) == ["ChatGPT", "codex"]          # the ChatGPT app's codex counts (2026-09-25)
+    assert p3.startswith("p3=0 who=")                               # quiet; WHO keeps the last names (status line)
     pids, socks = p3.split("pids=")[1].split(" socks=")
-    assert sorted(pids.split()) == ["20", "30"] and socks == "2"    # both CLI agents keep their baselines
+    assert sorted(pids.split()) == ["20", "30", "40"] and socks == "3"   # every agent keeps its baselines
     assert p4 == "p4=0 pids= socks=0"                               # gone agents drop them
-    # only CLI agents were asked about: not the ChatGPT app's bundled codex (40), not
-    # node/zsh — never with name resolution (5 s a probe), and never collapsed with -P
+    # only agents were asked about — the CLIs and the ChatGPT app's bundled codex (40),
+    # not node/zsh — never with name resolution (5 s a probe), and never collapsed with -P
     # (the per-process total is not cumulative — see the next tests)
     asked = nosleep.log.read_text().splitlines()[0]
-    assert "-p 20" in asked and "-p 30" in asked and "-p 40" not in asked and "-p 50" not in asked
+    assert "-p 20" in asked and "-p 30" in asked and "-p 40" in asked and "-p 50" not in asked
     assert "-n" in asked.split() and "-P" not in asked.split()
 
 
@@ -1323,6 +1500,72 @@ def test_zsh_nosleep_lid_closed_only_when_macos_would_sleep_on_it(nosleep):
     assert not closed(("AppleClamshellCausesSleep", "No"), ("AppleClamshellState", "Yes"))   # clamshell mode
     assert not closed(("AppleClamshellCausesSleep", "Yes"), ("AppleClamshellState", "No"))   # lid open
     assert not closed()                                                                      # no lid at all
+
+
+ASSERTIONS_STUB = r"""#!/bin/bash
+# pmset -g assertions → the fixture's per-process listing ($FAKE_ASSERT)
+[[ "$1 $2" == "-g assertions" && -f "${FAKE_ASSERT:-}" ]] && cat "$FAKE_ASSERT"
+exit 0
+"""
+
+
+def test_zsh_nosleep_app_power_assertions_read_as_working(nosleep, tmp_path):
+    # the Claude app takes an Electron idle-sleep assertion while it works (pmset -g log,
+    # 2026-09-25); the ChatGPT app's "Capturing" is display-only, and a caffeinate is the
+    # CLI signal's business, not this one's
+    stub = tmp_path / "stubbin" / "pmset"
+    stub.write_text(ASSERTIONS_STUB)
+    stub.chmod(0o755)
+    listing = tmp_path / "assert.txt"
+    listing.write_text(
+        "Listed by owning process:\n"
+        "   pid 25974(caffeinate): [0x1] 02:05:39 PreventUserIdleSystemSleep named: \"caffeinate command-line tool\"  \n"
+        "   pid 53916(ChatGPT): [0x2] 00:00:03 NoDisplaySleepAssertion named: \"Capturing\"  \n")
+    nosleep.table.write_text("1 0 launchd\n")
+    probe = '_nosleep_busy_at; echo "$REPLY|$_NOSLEEP_WHO"'
+    assert nosleep(probe, FAKE_ASSERT=str(listing)).stdout.strip() == "0|"
+    listing.write_text(listing.read_text() +
+        "   pid 81176(Claude): [0x3] 00:03:35 PreventUserIdleSystemSleep named: \"Electron\"  \n")
+    when, who = nosleep(probe, FAKE_ASSERT=str(listing)).stdout.strip().split("|")
+    assert int(when) > 1_700_000_000 and who == "Claude app"
+
+
+def test_zsh_nosleep_desktop_claude_caffeinate_is_labelled_the_app(nosleep):
+    # the Claude app's Code sessions run the same binary, caffeinate child and all
+    claude = "/Users/me/Library/Application Support/Claude/claude-code/2.1.281/claude.app/Contents/MacOS/claude"
+    nosleep.table.write_text(f"1 0 launchd\n10 1 {claude}\n11 10 caffeinate\n")
+    when, who = nosleep('_nosleep_busy_at; echo "$REPLY|$_NOSLEEP_WHO"').stdout.strip().split("|")
+    assert int(when) > 1_700_000_000 and who == "Claude app"
+
+
+def test_zsh_nosleep_dim_dims_then_restores_the_builtin_panel(nosleep, tmp_path):
+    # --dim's lid close: brightness down (remembering the level it was at), no lock, no
+    # display sleep; lid open puts the level back. python3 is stubbed — the real call
+    # would dim the developer's screen mid-test.
+    stub = tmp_path / "stubbin" / "python3"
+    stub.write_text('#!/bin/bash\ncat >/dev/null\nprintf "%s\\n" "$*" >> "$DIM_LOG"\necho 0.6200\n')
+    stub.chmod(0o755)
+    log = tmp_path / "dim.log"
+    r = nosleep('_NOSLEEP_BRIGHT=""; _nosleep_dim; echo "saved=$_NOSLEEP_BRIGHT"; '
+                '_nosleep_dim; echo "saved=$_NOSLEEP_BRIGHT"; '
+                '_nosleep_undim; echo "saved=[$_NOSLEEP_BRIGHT]"',
+                DIM_LOG=str(log), NOSLEEP_DIM_LEVEL="0.05")
+    assert r.stdout.splitlines() == ["nosleep: lid closed — staying logged in, display dimmed", "saved=0.6200",
+                                     "nosleep: lid closed — staying logged in, display dimmed", "saved=0.6200",
+                                     "saved=[]"]
+    # a second dim (auto-brightness re-applied) never overwrites the level to restore
+    assert log.read_text().splitlines() == ["- 0.05", "- 0.05", "- 0.6200"]
+
+
+def test_zsh_nosleep_dim_flag_holds_the_display_and_skips_the_lock(zsh):
+    # --dim is "stay logged in behind the lid too": the lid branch dims instead of
+    # dropping the display hold and locking, and the lid-open branch undims — pinned on
+    # the source, since the loop itself needs sudo
+    body = open(ZSHRC).read().split("\nnosleep() {", 1)[1].split("\n}\n", 1)[0]
+    assert "-d|--dim) dim=1" in body
+    assert "if (( dim )); then _nosleep_dim; else _nosleep_hold -ims; _nosleep_lock; fi" in body
+    assert "if (( dim )); then _nosleep_undim; else _nosleep_hold -dims; fi" in body
+    assert "(( (dim || ! lid_was) && now - pinged_at >= every ))" in body
 
 
 # ─── t resume: the picker renders the display column, for every agent ─────────────
@@ -1451,3 +1694,21 @@ def test_zsh_resume_host_lands_the_pick_on_that_host(zsh, tmp_path):
     assert "send-keys" not in zsh.log.read_text()           # nothing resumed here
     r = zsh("_t_resume api 3 --host; echo rc=$?")
     assert "rc=1" in r.stdout and "--host takes a host" in r.stderr
+
+
+def test_zsh_nosleep_hold_swaps_the_caffeinate(nosleep, tmp_path):
+    # "display should stay on unless the lid is closed" (2026-09-25): nosleep runs its
+    # caffeinate with -dims while the lid is open and swaps to -ims on a lid close, so
+    # each swap must stop the previous hold and keep the new pid for the restore
+    stub = tmp_path / "stubbin" / "caffeinate"
+    stub.write_text('#!/bin/bash\nprintf "%s\\n" "$*" >> "$CAF_LOG"\nexec sleep 30\n')
+    stub.chmod(0o755)
+    log = tmp_path / "caf.log"
+    r = nosleep('setopt nomonitor; _NOSLEEP_CAF=""; _nosleep_hold -dims; a=$_NOSLEEP_CAF; sleep 0.3; '
+                '_nosleep_hold -ims; b=$_NOSLEEP_CAF; sleep 0.3; '
+                'kill -0 $a 2>/dev/null && echo a-alive || echo a-gone; '
+                'kill -0 $b 2>/dev/null && echo b-alive; kill $b', CAF_LOG=str(log))
+    assert r.stdout.split() == ["a-gone", "b-alive"]
+    assert log.read_text().splitlines() == ["-dims", "-ims"]
+    body = open(ZSHRC).read().split("\nnosleep() {", 1)[1].split("\n}\n", 1)[0]
+    assert "_nosleep_hold -dims" in body and "_nosleep_hold -ims; _nosleep_lock" in body

@@ -257,6 +257,7 @@ link_all() {
     link "$LINK_SRC/bin/claude-stamp-tmux" "$HOME/bin/claude-stamp-tmux"
     link "$LINK_SRC/bin/clip-bridge"      "$HOME/bin/clip-bridge"
     link "$LINK_SRC/bin/t"                "$HOME/bin/t"
+    link "$LINK_SRC/bin/dots-sync"        "$HOME/bin/dots-sync"
     link "$LINK_SRC/claude/commands/tpush.md" "$HOME/.claude/commands/tpush.md"
     link "$LINK_SRC/claude/commands/tpop.md"  "$HOME/.claude/commands/tpop.md"
     # Codex CLI's twins of /tpush and /tpop (custom prompts: ~/.codex/prompts/<name>.md

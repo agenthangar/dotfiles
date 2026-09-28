@@ -20,10 +20,12 @@
 
 import argparse
 import calendar
+import copy
 import glob
 import hashlib
 import json
 import os
+import plistlib
 import re
 import shlex
 import shutil
@@ -31,7 +33,9 @@ import socket
 import stat
 import subprocess
 import sys
+import tempfile
 import time
+from urllib.parse import urlencode, urlsplit
 
 HOME = os.path.expanduser("~")
 CONFIG = os.path.join(os.environ.get("XDG_CONFIG_HOME", os.path.join(HOME, ".config")), "t", "config.sh")
@@ -58,8 +62,8 @@ ZSH_PRELUDE = "setopt no_monitor no_notify 2>/dev/null; "
 # ─── config ──────────────────────────────────────────────────────────────────
 
 _CFG_LINE = re.compile(
-    r"^(DEV_REPOS|DEV_BRANCHES|REMOTE_HOSTS|DEV_WORKTREE|DEV_AGENT)\[([^\]]+)\]=(.*)$"
-    r"|^(DEV_BRANCH|DEV_WORKTREE_ROOT|DEV_WORKTREE_DEFAULT|DEV_AGENT_DEFAULT)=(.*)$")
+    r"^(DEV_REPOS|DEV_BRANCHES|REMOTE_HOSTS|DEV_WORKTREE|DEV_AGENT|DEV_MODEL)\[([^\]]+)\]=(.*)$"
+    r"|^(DEV_BRANCH|DEV_WORKTREE_ROOT|DEV_WORKTREE_DEFAULT|DEV_AGENT_DEFAULT|TBEAM_HOST|MINI_HOST)=(.*)$")
 
 AGENTS = ("claude", "codex")   # the closed set a dev slot can run (the zsh _dev_agent_valid twin)
 
@@ -87,6 +91,9 @@ class Config:
         self.worktree_default = "1"
         self.agents = {}     # alias -> claude|codex (DEV_AGENT[alias])
         self.agent_default = "claude"
+        self.models = {}     # agent -> model for NEW sessions; empty defers to the CLI
+        self.beam_host = ""
+        self.mini_host = ""  # legacy host seed; cleared if its host is removed
         self._load()
 
     def _load(self):
@@ -103,7 +110,7 @@ class Config:
                 arr, key, val = m.group(1), m.group(2), _unquote(m.group(3))
                 {"DEV_REPOS": self.repos, "DEV_BRANCHES": self.branches,
                  "REMOTE_HOSTS": self.hosts, "DEV_WORKTREE": self.worktree,
-                 "DEV_AGENT": self.agents}[arr][key] = val
+                 "DEV_AGENT": self.agents, "DEV_MODEL": self.models}[arr][key] = val
             elif m.group(4) == "DEV_BRANCH":
                 self.branch = _unquote(m.group(5))
             elif m.group(4) == "DEV_WORKTREE_ROOT":
@@ -112,6 +119,10 @@ class Config:
                 self.worktree_default = _unquote(m.group(5))
             elif m.group(4) == "DEV_AGENT_DEFAULT":
                 self.agent_default = _unquote(m.group(5))
+            elif m.group(4) == "TBEAM_HOST":
+                self.beam_host = _unquote(m.group(5))
+            elif m.group(4) == "MINI_HOST":
+                self.mini_host = _unquote(m.group(5))
 
     def agent_for(self, alias, override=None):
         """The agent a NEW slot of `alias` runs — the Python twin of zsh _dev_agent_for:
@@ -794,6 +805,17 @@ def _local_entries(text):
     (still-quoted) values."""
     repos, hosts, tbeam = {}, {}, False
     for line in text.splitlines():
+        # `t config` masks registrations without rewriting arbitrary user shell.
+        # A later `t setup` must see those removals, too.
+        removed = _config_unset_key(line.strip())
+        if removed:
+            if removed == "TBEAM_HOST":
+                tbeam = False
+            else:
+                m = _CFG_LINE.match(removed + "=")
+                if m and m.group(1) in ("DEV_REPOS", "REMOTE_HOSTS"):
+                    (repos if m.group(1) == "DEV_REPOS" else hosts).pop(m.group(2), None)
+            continue
         if _TBEAM_LINE.match(line):
             tbeam = True
             continue
@@ -1086,6 +1108,425 @@ def _parse_host_entry(ent, used):
     if not _SETUP_KEY.match(alias) or alias in used:
         return None, f"'{alias}' is taken or not a valid key"
     return alias, target
+
+
+# ─── config — defaults for new sessions on this machine ────────────────────────
+
+_CONFIG_BEGIN = "# >>> t config defaults >>>"
+_CONFIG_END = "# <<< t config defaults <<<"
+_MODEL_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/@+\[\]-]*\Z")
+
+
+_CONFIG_ARRAYS = {"DEV_REPOS": "repos", "REMOTE_HOSTS": "hosts", "DEV_BRANCHES": "branches",
+                  "DEV_AGENT": "agents", "DEV_WORKTREE": "worktree", "DEV_MODEL": "models"}
+_CONFIG_SCALARS = {"DEV_AGENT_DEFAULT": "agent_default", "DEV_BRANCH": "branch",
+                   "DEV_WORKTREE_ROOT": "worktree_root", "DEV_WORKTREE_DEFAULT": "worktree_default",
+                   "TBEAM_HOST": "beam_host", "MINI_HOST": "mini_host"}
+_CONFIG_ALIAS = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.-]*\Z")
+
+
+def _config_state(cfg):
+    state = {key: getattr(cfg, attr) for key, attr in _CONFIG_SCALARS.items()}
+    for arr, attr in _CONFIG_ARRAYS.items():
+        state.update({f"{arr}[{key}]": value for key, value in getattr(cfg, attr).items()})
+    return state
+
+
+def _config_diff(before, after):
+    return {key: after.get(key) for key in sorted(before.keys() | after.keys())
+            if before.get(key) != after.get(key)}
+
+
+def _config_unset_key(line):
+    try:
+        words = shlex.split(line)
+    except ValueError:
+        return None
+    return words[1] if len(words) == 2 and words[0] == "unset" else None
+
+
+def _config_assignment(key, value):
+    """Only our known keys may become shell assignments; every value is quoted."""
+    m = _CFG_LINE.fullmatch(key + "=")
+    if not m or (m.group(1) and not _CONFIG_ALIAS.fullmatch(m.group(2))):
+        raise ValueError(f"unsupported setting {key!r}; use Open local config in editor")
+    if value is None or (key in ("TBEAM_HOST", "MINI_HOST") and not value):
+        return "unset " + shlex.quote(key)
+    if not isinstance(value, str) or any(ord(c) < 32 or ord(c) == 127 for c in value):
+        raise ValueError("settings must be a single line without control characters")
+    if (key == "DEV_AGENT_DEFAULT" or key.startswith("DEV_AGENT[")) and value not in AGENTS:
+        raise ValueError("choose claude or codex")
+    if key.startswith("DEV_MODEL[") and value and not _MODEL_ID.fullmatch(value):
+        raise ValueError("model IDs must contain no spaces or shell commands")
+    prefix = "export " if key == "TBEAM_HOST" else ""
+    return f"{prefix}{key}={shlex.quote(value)}"
+
+
+def _config_text(text, changes, effective=None):
+    """Update a small overlay at EOF; leave arbitrary user shell byte-for-byte.
+    Explicit unsets keep removed hosts/repos gone after a reload. Retain earlier
+    managed choices, reconciling them with any later t setup registrations."""
+    lines = text.splitlines(keepends=True)
+    starts = [i for i, line in enumerate(lines) if line.rstrip("\r\n") == _CONFIG_BEGIN]
+    ends = [i for i, line in enumerate(lines) if line.rstrip("\r\n") == _CONFIG_END]
+    settings = {}
+    if starts or ends:
+        if len(starts) != 1 or len(ends) != 1 or starts[0] >= ends[0]:
+            raise ValueError("malformed t config defaults block in ~/.zshrc.local; repair its markers first")
+        for line in lines[starts[0] + 1:ends[0]]:
+            raw = line.strip()
+            if not raw or raw.startswith("#"):
+                continue
+            removed = _config_unset_key(raw)
+            match = _CFG_LINE.fullmatch(raw.removeprefix("export "))
+            if removed:
+                key, value = removed, None
+            elif match:
+                key = (f"{match.group(1)}[{match.group(2)}]" if match.group(1) else match.group(4))
+                value = _unquote(match.group(3) if match.group(1) else match.group(5))
+            else:
+                raise ValueError("custom shell inside the t config block; move it outside the markers first")
+            settings[key] = effective.get(key) if effective is not None else value
+        del lines[starts[0]:ends[0] + 1]
+    settings.update(changes)
+    assignments = [_config_assignment(key, value) for key, value in sorted(settings.items())]
+    body = "".join(lines)
+    if body and not body.endswith("\n"):
+        body += "\n"
+    if body and not body.endswith("\n\n"):
+        body += "\n"
+    return body + "\n".join([_CONFIG_BEGIN, *assignments, _CONFIG_END, ""])
+
+
+def _config_remove_host(cfg, alias):
+    target = cfg.hosts.pop(alias)
+    if cfg.beam_host in (alias, target) or not cfg.hosts:
+        cfg.beam_host = ""
+    if cfg.mini_host in (alias, target) or not cfg.hosts:
+        cfg.mini_host = ""
+
+
+def _config_remove_repo(cfg, alias):
+    for attr in ("repos", "agents", "branches", "worktree"):
+        getattr(cfg, attr).pop(alias, None)
+
+
+def _config_read(path):
+    try:
+        with open(path) as fh:
+            return fh.read()
+    except FileNotFoundError:
+        return ""
+
+
+def _config_write(path, before, after):
+    """Atomic replacement, preserving a local-file symlink and its target's mode.
+    Refuse a concurrent edit rather than overwriting changes made during the UI."""
+    target = os.path.realpath(path)
+    if _config_read(target) != before:
+        raise ValueError("~/.zshrc.local changed while the menu was open; run t config again")
+    mode = stat.S_IMODE(os.stat(target).st_mode) if os.path.exists(target) else 0o600
+    tmp = None
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", dir=os.path.dirname(target),
+                                         prefix=".t-config-", delete=False) as fh:
+            tmp = fh.name
+            fh.write(after)
+            os.fchmod(fh.fileno(), mode)
+        os.replace(tmp, target)
+    finally:
+        if tmp and os.path.exists(tmp):
+            os.unlink(tmp)
+
+
+def _config_model_rows(agent, current, cache=None):
+    """Stable Claude aliases; Codex's locally discovered list, never a frozen catalog.
+    A saved custom/retired model remains selectable even when no cache lists it."""
+    values = [""]
+    if current:
+        values.append(current)
+    if agent == "claude":
+        values += ["sonnet", "opus", "haiku", "fable", "opusplan"]
+    elif isinstance(cache, dict) and isinstance(cache.get("models"), list):
+        values += [m["slug"] for m in cache["models"] if isinstance(m, dict)
+                   and m.get("visibility") == "list" and isinstance(m.get("slug"), str)
+                   and _MODEL_ID.fullmatch(m["slug"])]
+    rows = [(v, v or "Use tool's own default") for v in dict.fromkeys(values)]
+    return rows + [("__custom__", "Enter a custom model ID…")]
+
+
+def _config_codex_cache():
+    root = os.environ.get("CODEX_HOME") or os.path.join(HOME, ".codex")
+    try:
+        with open(os.path.join(root, "models_cache.json")) as fh:
+            return json.load(fh)
+    except (OSError, ValueError):
+        return None
+
+
+def _config_summary(agent, models, overrides):
+    lines = [f"Default tool: {agent}"]
+    lines += [f"{a} model: {models.get(a) or 'tool default'}" for a in AGENTS]
+    lines.append("Applies to new t sessions on this machine (tmux and --fg).")
+    if overrides:
+        lines.append("Repo tool overrides still win: " + ", ".join(
+            f"{repo}={a}" for repo, a in sorted(overrides.items())))
+    return lines
+
+
+def _config_input(ui, label, current="", kind="text"):
+    value = ui.cooked_input(f"│  {label} (blank cancels) → ", prefill=current)
+    if not value:
+        return None
+    if any(ord(c) < 32 or ord(c) == 127 for c in value):
+        ui.done("invalid", "Enter a single line without control characters.")
+        return None
+    if kind == "alias" and not _CONFIG_ALIAS.fullmatch(value):
+        ui.done("invalid", "Use letters, numbers, dots, underscores or hyphens for the alias.")
+        return None
+    if kind == "host" and (not _BARE_HOST.fullmatch(value) or value.startswith("-")):
+        ui.done("invalid", "Use an SSH host name, address or user@host.")
+        return None
+    if kind == "path":
+        value = os.path.expanduser(value.replace("$HOME", HOME))
+        if not os.path.isabs(value):
+            ui.done("invalid", "Use an absolute path or ~/path.")
+            return None
+    return value
+
+
+def _config_hosts(ui, cfg):
+    while True:
+        rows = [(h, f"{h}  {target}") for h, target in sorted(cfg.hosts.items())]
+        rows += [("__add__", "+ Add host"), ("__back__", "Back")]
+        host = ui.pick("Hosts · removal unregisters; it never contacts the host", rows)
+        if host in (None, "__back__"):
+            return
+        if host == "__add__":
+            alias = _config_input(ui, "host alias", kind="alias")
+            if alias is None:
+                continue
+            if alias in cfg.hosts or alias in ("__add__", "__back__"):
+                ui.done("invalid", "That alias is already in use or reserved.")
+                continue
+            target = _config_input(ui, "SSH target", kind="host")
+            if target is not None:
+                cfg.hosts[alias] = target
+            continue
+        action = ui.pick(f"Host {host}", [("target", f"SSH target: {cfg.hosts[host]}"),
+                          ("beam", "Use as default beam host"), ("remove", "Remove host"),
+                          ("back", "Back")])
+        if action == "remove":
+            _config_remove_host(cfg, host)
+            ui.done("removed", f"{host} (pending Save changes)")
+        elif action == "beam":
+            cfg.beam_host = cfg.hosts[host]
+        elif action == "target":
+            old = cfg.hosts[host]
+            target = _config_input(ui, "SSH target", old, "host")
+            if target is not None:
+                cfg.hosts[host] = target
+                if cfg.beam_host == old:
+                    cfg.beam_host = target
+                if cfg.mini_host == old:
+                    cfg.mini_host = target
+
+
+def _config_repos(ui, cfg):
+    while True:
+        rows = [(r, f"{r}  {_tilde(path)}") for r, path in sorted(cfg.repos.items())]
+        rows += [("__add__", "+ Register repo"), ("__back__", "Back")]
+        repo = ui.pick("Repos · unregistering keeps files and sessions", rows)
+        if repo in (None, "__back__"):
+            return
+        if repo == "__add__":
+            alias = _config_input(ui, "repo alias", kind="alias")
+            if alias is None:
+                continue
+            if alias in cfg.repos or alias in ("__add__", "__back__"):
+                ui.done("invalid", "That alias is already in use or reserved.")
+                continue
+            repo_path = _config_input(ui, "repo path", kind="path")
+            if repo_path is not None:
+                cfg.repos[alias] = repo_path
+            continue
+        action = ui.pick(f"Repo {repo}", [
+            ("path", f"Path: {_tilde(cfg.repos[repo])}"),
+            ("tool", f"Tool: {cfg.agents.get(repo) or 'inherit global default'}"),
+            ("branch", f"Shared-tree branch: {cfg.branches.get(repo) or 'inherit global default'}"),
+            ("worktree", f"Worktrees: {cfg.worktree.get(repo) or 'inherit global default'}"),
+            ("remove", "Unregister repo (keep files and sessions)"), ("back", "Back")])
+        if action == "remove":
+            _config_remove_repo(cfg, repo)
+        elif action == "path":
+            value = _config_input(ui, "repo path", cfg.repos[repo], "path")
+            if value is not None:
+                cfg.repos[repo] = value
+        elif action in ("tool", "worktree", "branch"):
+            attr = {"tool": "agents", "worktree": "worktree", "branch": "branches"}[action]
+            options = [("", "Inherit global default")]
+            options += ([(a, a) for a in AGENTS] if action == "tool" else
+                        [("1", "Enabled"), ("0", "Disabled (shared tree)")] if action == "worktree" else
+                        [("custom", "Set branch")])
+            value = ui.pick(f"{repo} {action}", options)
+            if value == "custom":
+                value = _config_input(ui, "branch", cfg.branches.get(repo, ""))
+            if value == "":
+                getattr(cfg, attr).pop(repo, None)
+            elif value is not None:
+                getattr(cfg, attr)[repo] = value
+
+
+def _config_worktrees(ui, cfg):
+    while True:
+        action = ui.pick("Worktree defaults · existing worktrees are not moved", [
+            ("enabled", f"Worktrees enabled: {cfg.worktree_default}"),
+            ("root", f"Worktree root: {_tilde(cfg.worktree_root)}"),
+            ("branch", f"Shared-tree fallback branch: {cfg.branch}"), ("back", "Back")])
+        if action in (None, "back"):
+            return
+        if action == "enabled":
+            value = ui.pick("Default worktree mode", [("1", "Enabled"), ("0", "Disabled (shared tree)")])
+            if value is not None:
+                cfg.worktree_default = value
+        else:
+            attr = "worktree_root" if action == "root" else "branch"
+            value = _config_input(ui, action, getattr(cfg, attr), "path" if action == "root" else "text")
+            if value is not None:
+                setattr(cfg, attr, value)
+
+
+def _config_wizard(cfg, cache):
+    ui = _RailUI()
+    edited = copy.deepcopy(cfg)
+    initial = _config_state(cfg)
+    ui.out.write("┌  t config · local settings · nothing written until Save changes\n")
+    ui.raw()
+    try:
+        while True:
+            rows = [("tool", f"Default tool     {edited.agent_default}")]
+            rows += [(a, f"{a} model    {edited.models.get(a) or 'tool default'}") for a in AGENTS]
+            rows += [("hosts", f"Hosts ({len(edited.hosts)}) · add, edit, remove"),
+                     ("repos", f"Repos ({len(edited.repos)}) · paths and overrides"),
+                     ("beam", f"Default beam host: {edited.beam_host or 'none'}"),
+                     ("worktrees", "Worktree and branch defaults"),
+                     ("edit", "Open local config in editor (all settings)"),
+                     ("save", "Save changes"), ("cancel", "Cancel")]
+            choice = ui.pick("Local settings", rows)
+            if choice in (None, "cancel"):
+                ui.done("cancelled", "nothing written")
+                return None
+            if choice == "edit":
+                if _config_diff(initial, _config_state(edited)):
+                    ui.done("pending", "Save or cancel your menu changes before opening the editor.")
+                    continue
+                return "edit"
+            if choice == "save":
+                changes = _config_diff(initial, _config_state(edited))
+                try:
+                    lines = [_config_assignment(k, v) for k, v in changes.items()]
+                except ValueError as exc:
+                    ui.done("invalid", str(exc))
+                    continue
+                if changes:
+                    answer = ui.page("Review local settings", lines, ("y", "n", "q", "esc", "abort"),
+                                     keys="y save · n back · q cancel")
+                    if answer == "n":
+                        continue
+                    if answer != "y":
+                        ui.done("cancelled", "nothing written")
+                        return None
+                return edited
+            if choice == "hosts":
+                _config_hosts(ui, edited)
+            elif choice == "repos":
+                _config_repos(ui, edited)
+            elif choice == "worktrees":
+                _config_worktrees(ui, edited)
+            elif choice == "beam":
+                options = [("", "No default (choose when beaming)")]
+                options += [(h, f"{h}  {target}") for h, target in sorted(edited.hosts.items())]
+                picked = ui.pick("Default beam host", options)
+                if picked is not None:
+                    edited.beam_host = edited.hosts.get(picked, "")
+            elif choice == "tool":
+                options = [(a, f"{a}" + ("" if shutil.which(a) else f" (install with t install {a})"))
+                           for a in AGENTS]
+                picked = ui.pick("Default tool (repo overrides still win)", options,
+                                 default=AGENTS.index(edited.agent_default) if edited.agent_default in AGENTS else 0)
+                if picked is not None:
+                    edited.agent_default = picked
+            else:
+                current = edited.models.get(choice, "")
+                options = _config_model_rows(choice, current, cache)
+                picked = ui.pick(f"{choice} model", options,
+                                 default=next(i for i, row in enumerate(options) if row[0] == current))
+                if picked == "__custom__":
+                    picked = _config_input(ui, "model ID")
+                    if picked is None:
+                        continue
+                    if not _MODEL_ID.fullmatch(picked):
+                        ui.done("invalid", "Enter a model ID without spaces or shell commands.")
+                        continue
+                if picked is not None:
+                    edited.models[choice] = picked
+    finally:
+        ui.restore()
+
+
+def _config_editor():
+    command = os.environ.get("VISUAL") or os.environ.get("EDITOR") or "vi"
+    argv = shlex.split(command)
+    if not argv:
+        raise ValueError("set VISUAL or EDITOR to an editor command")
+    rc = subprocess.call([*argv, ZSHRC_LOCAL])
+    if rc:
+        return rc
+    # Keep an incomplete edit from being sourced into the calling shell.
+    return subprocess.call(["zsh", "-n", ZSHRC_LOCAL])
+
+
+def cmd_config(cfg, args):
+    if args.show:
+        print("\n".join(_config_summary(cfg.agent_default, cfg.models, cfg.agents)))
+        print(f"Default beam host: {cfg.beam_host or 'none'}")
+        print(f"Worktrees: {cfg.worktree_default} · root: {cfg.worktree_root} · shared-tree branch: {cfg.branch}")
+        for alias, target in sorted(cfg.hosts.items()):
+            print(f"Host {alias}: {target}")
+        for alias, repo_path in sorted(cfg.repos.items()):
+            print(f"Repo {alias}: {repo_path} · tool: {cfg.agents.get(alias) or 'inherit'} · "
+                  f"branch: {cfg.branches.get(alias) or 'inherit'} · worktrees: {cfg.worktree.get(alias) or 'inherit'}")
+        return 0
+    if not sys.stdin.isatty() or not sys.stdout.isatty():
+        print("t config: open this menu in a terminal; t config --show prints current settings",
+              file=sys.stderr)
+        return 1
+    try:
+        before = _config_read(ZSHRC_LOCAL)
+        result = "edit" if getattr(args, "edit", False) else _config_wizard(cfg, _config_codex_cache())
+        if result is None:
+            return 0
+        if result == "edit":
+            rc = _config_editor()
+            if rc:
+                print("t config: editor or syntax check failed; local config was not reloaded", file=sys.stderr)
+                return rc
+        else:
+            current = _config_state(cfg)
+            changes = _config_diff(current, _config_state(result))
+            if not changes:
+                print("Settings unchanged — nothing written")
+                return 0
+            after = _config_text(before, changes, current)
+            _config_write(ZSHRC_LOCAL, before, after)
+    except (OSError, ValueError) as exc:
+        print(f"t config: {exc}", file=sys.stderr)
+        return 1
+    zsh_capture("_t_sync_config")
+    print("✓ saved local settings to ~/.zshrc.local")
+    if not os.environ.get("T_SETUP_SHIM"):
+        print("run `source ~/.zshrc` (or open a new shell) to use these settings")
+    return 0
 
 
 class _RailUI:
@@ -3481,6 +3922,7 @@ _AGENT_PARITY = [
     ("t push / t pop", "✓", "✓", "✗ no slot"),
     ("t resume (dead slots)", "✓", "✓ (its sqlite thread index)", "→ t cursor resume"),
     ("t beam / --from (move a session)", "✓", "✓ (rollout + .origin)", "→ t cursor [id] --host / --from"),
+    ("t app (desktop + browser preview)", "✗ Codex conversations only", "✓ local macOS slot → same thread", "✗"),
     ("csync (iCloud union of transcripts)", "✓ projects + plans", "✓ codex-sessions", "✓ cursor-chats"),
     ("SessionStart stamps (registry · opened · origin)", "✓ settings.json hook",
      "✓ hooks.json (trust once at startup)", "✗ no hook wired"),
@@ -3493,6 +3935,9 @@ _AGENT_PARITY = [
      "✓ ~/.cursor/cli-config.json (argv + env prefixes)"),
     ("default permission mode (seeded when the config names none)", "✓ auto (permissions.defaultMode)",
      "✓ full access (approval never · danger-full-access)", "✗ left as cursor-agent set it"),
+    ("default subagent model (seeded when the config names none)",
+     "✓ sonnet (env.CLAUDE_CODE_SUBAGENT_MODEL)", "✓ gpt-6-sol ([agents] default_subagent_model)",
+     "✗ not seeded"),
     ("t trust (folder trust · every registered repo on dots)", "✓ ~/.claude.json projects",
      "✓ ~/.codex/config.toml [projects]", "✓ ~/.cursor/projects/<slug> marker"),
     ("nosleep (hold sleep while an agent works)", "✓ caffeinate child · net bytes", "✓ net bytes", "✓ net bytes"),
@@ -3687,6 +4132,18 @@ _PERM_CODEX_NETWORK = "[sandbox_workspace_write]\nnetwork_access = true"
 _PERM_CLAUDE_MODE = "auto"
 _PERM_CODEX_MODE = 'approval_policy = "never"\nsandbox_mode = "danger-full-access"'
 _PERM_NO_MODES_ENV = "DOTFILES_NO_AGENT_MODES"
+# the model a SUBAGENT runs on when nothing names one — a Workflow script's agent(), an
+# Agent-tool call, a codex spawn_agent — one tier below the flagship each agent's main
+# loop runs, so an ultracode fan-out of a dozen agents does not bill a dozen flagships.
+# Config-level like the mode, add-only like the mode: a value already there, any value,
+# is a choice. claude reads it from settings.json's env block (CLAUDE_CODE_SUBAGENT_MODEL:
+# the LOWEST-priority default — a per-call model, workflow opts.model or an agent's
+# frontmatter still wins, and an org's availableModels still bounds it, all read off
+# 2.1.280); codex from [agents] default_subagent_model (0.155.1, verified live: the
+# spawned child's turn_context read gpt-6-sol under a gpt-6-astra parent).
+_PERM_CLAUDE_SUBAGENT = ("CLAUDE_CODE_SUBAGENT_MODEL", "sonnet")
+_PERM_CODEX_SUBAGENT = 'default_subagent_model = "gpt-6-sol"'
+_PERM_NO_SUBAGENT_ENV = "DOTFILES_NO_SUBAGENT_MODEL"
 _PERM_CODEX_HEADER = (
     "# Managed by dotfiles: regenerated from agents/permissions.allow by `dots`\n"
     "# (t permissions --apply). Hand edits here are overwritten — put yours in default.rules.\n")
@@ -3851,7 +4308,15 @@ def _perm_claude_mode_plan(data, mode=_PERM_CLAUDE_MODE):
     return "disable" not in (perms.get("disableAutoMode"), data.get("disableAutoMode"))
 
 
-def _perm_json_sync(path, allow, retire, apply=False, mode=None):
+def _perm_claude_subagent_plan(data, env=_PERM_CLAUDE_SUBAGENT):
+    """Would Claude's settings get env[<key>] = <model>? Only when the env block does
+    not name the key — present with ANY value (`inherit`, "") is a choice — and the
+    block, when there is one, is an object (foreign-shaped → left alone). Pure."""
+    block = data.get("env", {})
+    return isinstance(block, dict) and env[0] not in block
+
+
+def _perm_json_sync(path, allow, retire, apply=False, mode=None, subagent=None):
     """Sync one JSON permissions file — Claude's settings.json and cursor's
     cli-config.json share the permissions.allow shape. Returns {"state", "add",
     "retire"}: state "missing" (no file: install.sh's seed / the agent's first run
@@ -3862,7 +4327,10 @@ def _perm_json_sync(path, allow, retire, apply=False, mode=None):
     one pseudo-add, like codex's network line, plus rep["mode"] (its own state).
     `skipAutoPermissionPrompt` rides with it: that is the key Claude's own auto-mode
     opt-in dialog writes (read off 2.1.274's settings schema), and Claude RESETS it
-    whenever it is set without defaultMode = auto, so the two only make sense as a pair."""
+    whenever it is set without defaultMode = auto, so the two only make sense as a pair.
+
+    subagent (claude only): the (env key, model) pair to seed when the env block names
+    none — the same one-pseudo-add shape, with rep["subagent"] as its own state."""
     rep = {"state": None, "add": [], "retire": []}
     try:
         with open(path, encoding="utf-8") as fh:
@@ -3886,8 +4354,13 @@ def _perm_json_sync(path, allow, retire, apply=False, mode=None):
     if mode:
         rep["mode"] = "pending" if seed_mode else "synced"
     if seed_mode:
-        rep["add"] = added + ['settings.json: permissions.defaultMode = "%s"' % mode]
-    if not added and not removed and not seed_mode:
+        rep["add"] = rep["add"] + ['settings.json: permissions.defaultMode = "%s"' % mode]
+    seed_sub = bool(subagent) and _perm_claude_subagent_plan(data, subagent)
+    if subagent:
+        rep["subagent"] = "pending" if seed_sub else "synced"
+    if seed_sub:
+        rep["add"] = rep["add"] + ['settings.json: env.%s = "%s"' % subagent]
+    if not added and not removed and not seed_mode and not seed_sub:
         return rep
     rep["state"] = "pending"
     if apply:
@@ -3896,6 +4369,9 @@ def _perm_json_sync(path, allow, retire, apply=False, mode=None):
             perms["defaultMode"] = mode
             data.setdefault("skipAutoPermissionPrompt", True)
             rep["mode"] = "applied"
+        if seed_sub:
+            data.setdefault("env", {})[subagent[0]] = subagent[1]
+            rep["subagent"] = "applied"
         _perm_write(path, json.dumps(data, indent=2) + "\n")
         rep["state"] = "applied"
     return rep
@@ -3954,6 +4430,31 @@ def _perm_codex_network_plan(text):
     if text and not text.endswith("\n"):
         text += "\n"
     return text + ("\n" if text else "") + "[sandbox_workspace_write]\n" + line + "\n"
+
+
+_PERM_CODEX_AGENTS_HEADER = re.compile(r"^\s*\[\s*agents\s*\]\s*(#.*)?$")
+_PERM_CODEX_SUBAGENT_KEY = re.compile(r"^\s*(agents\s*\.\s*)?default_subagent_model\s*=")
+_PERM_CODEX_AGENTS_INLINE = re.compile(r"^\s*agents\s*=")
+
+
+def _perm_codex_subagent_plan(text):
+    """~/.codex/config.toml with `default_subagent_model` under [agents], or None when
+    the key is already there in any form (under the table, dotted, whatever its value)
+    or an inline `agents = {…}` table holds the table — a header cannot extend that.
+    The network plan's text surgery: under an existing [agents] header, else a new
+    table at the end."""
+    lines = text.split("\n")
+    if any(_PERM_CODEX_SUBAGENT_KEY.match(l) or _PERM_CODEX_AGENTS_INLINE.match(l)
+           for l in lines):
+        return None
+    line = _PERM_CODEX_SUBAGENT + "  # dotfiles: t permissions (change it and it is never flipped back)"
+    for i, l in enumerate(lines):
+        if _PERM_CODEX_AGENTS_HEADER.match(l):
+            lines.insert(i + 1, line)
+            return "\n".join(lines)
+    if text and not text.endswith("\n"):
+        text += "\n"
+    return text + ("\n" if text else "") + "[agents]\n" + line + "\n"
 
 
 def _perm_toml_ok(text):
@@ -4024,8 +4525,9 @@ def _perm_codex_mode_plan(text):
     return "\n".join(lines[:at] + ours + [""] + lines[at:])
 
 
-def _perm_codex_mode_sync(path, apply=False):
-    """The default-mode half of the codex report — _perm_codex_network_sync's shape."""
+def _perm_codex_half_sync(path, plan, label, apply=False):
+    """One add-only half of the codex config report — _perm_codex_network_sync's shape:
+    plan(text) -> the new text or None (nothing to do), label = the pseudo-add."""
     rep = {"state": None, "add": []}
     try:
         with open(path, encoding="utf-8") as fh:
@@ -4034,17 +4536,29 @@ def _perm_codex_mode_sync(path, apply=False):
         have = ""
     except (OSError, UnicodeDecodeError):
         return rep
-    want = _perm_codex_mode_plan(have)
+    want = plan(have)
     if want is None:
         rep["state"] = "synced"
         return rep
     if not _perm_toml_ok(want):
         return rep
-    rep.update(state="pending", add=["config.toml: " + _PERM_CODEX_MODE.replace("\n", " · ")])
+    rep.update(state="pending", add=["config.toml: " + label])
     if apply:
         _perm_write(path, want)
         rep["state"] = "applied"
     return rep
+
+
+def _perm_codex_mode_sync(path, apply=False):
+    """The default-mode half of the codex report."""
+    return _perm_codex_half_sync(path, _perm_codex_mode_plan,
+                                 _PERM_CODEX_MODE.replace("\n", " · "), apply)
+
+
+def _perm_codex_subagent_sync(path, apply=False):
+    """The subagent-model half of the codex report."""
+    return _perm_codex_half_sync(path, _perm_codex_subagent_plan,
+                                 "[agents] " + _PERM_CODEX_SUBAGENT, apply)
 
 
 def _perm_targets(home, which=shutil.which):
@@ -4061,10 +4575,12 @@ def _perm_targets(home, which=shutil.which):
     return t
 
 
-def _perm_sync(home, allow, retire, apply=False, which=shutil.which, modes=True):
+def _perm_sync(home, allow, retire, apply=False, which=shutil.which, modes=True,
+               subagent=True):
     """One report per agent — {agent: {"path", "state", "add", "retire"}}; an agent
     not on this machine reports state "absent". modes=False (DOTFILES_NO_AGENT_MODES)
-    leaves each agent's default permission mode out of it."""
+    leaves each agent's default permission mode out of it, subagent=False
+    (DOTFILES_NO_SUBAGENT_MODEL) its default subagent model."""
     targets = _perm_targets(home, which)
     out = {}
     for agent in _PERM_AGENTS:
@@ -4081,6 +4597,9 @@ def _perm_sync(home, allow, retire, apply=False, which=shutil.which, modes=True)
             if modes:
                 halves.append(_perm_codex_mode_sync(os.path.join(home, _PERM_CODEX_CONFIG), apply))
                 rep["mode"] = halves[-1]["state"]
+            if subagent:
+                halves.append(_perm_codex_subagent_sync(os.path.join(home, _PERM_CODEX_CONFIG), apply))
+                rep["subagent"] = halves[-1]["state"]
             for half in halves:
                 rep["add"] = rep["add"] + half["add"]
                 if rank.get(half["state"], -1) > rank[rep["state"]]:
@@ -4088,7 +4607,9 @@ def _perm_sync(home, allow, retire, apply=False, which=shutil.which, modes=True)
         else:
             rep = _perm_json_sync(path, _perm_translate(allow, agent),
                                   _perm_translate(retire, agent), apply,
-                                  mode=_PERM_CLAUDE_MODE if modes and agent == "claude" else None)
+                                  mode=_PERM_CLAUDE_MODE if modes and agent == "claude" else None,
+                                  subagent=(_PERM_CLAUDE_SUBAGENT if subagent and agent == "claude"
+                                            else None))
         rep["path"] = path
         out[agent] = rep
     return out
@@ -4181,9 +4702,13 @@ def cmd_permissions(cfg, args):
         print("default mode: claude permissions.defaultMode = \"%s\" · codex %s — each only "
               "when its config names no mode (%s=1 opts out)"
               % (_PERM_CLAUDE_MODE, _PERM_CODEX_MODE.replace("\n", " · "), _PERM_NO_MODES_ENV))
+        print("subagent model: claude env.%s = \"%s\" · codex [agents] %s — each only when "
+              "its config names none (%s=1 opts out)"
+              % (_PERM_CLAUDE_SUBAGENT + (_PERM_CODEX_SUBAGENT, _PERM_NO_SUBAGENT_ENV)))
         return 0
     reps = _perm_sync(HOME, allow, retire, apply=args.apply,
-                      modes=not os.environ.get(_PERM_NO_MODES_ENV))
+                      modes=not os.environ.get(_PERM_NO_MODES_ENV),
+                      subagent=not os.environ.get(_PERM_NO_SUBAGENT_ENV))
     if args.apply:
         for agent in _PERM_AGENTS:
             rep = reps[agent]
@@ -4191,7 +4716,8 @@ def cmd_permissions(cfg, args):
                 continue
             net = rep.get("network") == "applied"
             mode = rep.get("mode") == "applied"
-            added = len(rep["add"]) - net - mode
+            sub = rep.get("subagent") == "applied"
+            added = len(rep["add"]) - net - mode - sub
             if added or rep["retire"]:
                 print("permissions: %s — added %d, retired %d in %s"
                       % (agent, added, len(rep["retire"]), rep["path"].replace(HOME, "~")))
@@ -4203,6 +4729,11 @@ def cmd_permissions(cfg, args):
                     "claude": 'permissions.defaultMode = "%s" in ~/.claude/settings.json'
                               % _PERM_CLAUDE_MODE,
                     "codex": "%s in ~/.codex/config.toml" % _PERM_CODEX_MODE.replace("\n", " · "),
+                }[agent]))
+            if sub:
+                print("permissions: %s — default subagent model: %s" % (agent, {
+                    "claude": 'env.%s = "%s" in ~/.claude/settings.json' % _PERM_CLAUDE_SUBAGENT,
+                    "codex": "[agents] %s in ~/.codex/config.toml" % _PERM_CODEX_SUBAGENT,
                 }[agent]))
         return 0
     print("permissions — %s: %d rule(s), %d retired → each installed agent's own config"
@@ -4833,7 +5364,8 @@ def cmd_doctor(cfg, args):
     try:
         allow, retire = _perm_lists(_perm_root())
         perm_sync = _perm_sync(HOME, allow, retire,
-                               modes=not os.environ.get(_PERM_NO_MODES_ENV))
+                               modes=not os.environ.get(_PERM_NO_MODES_ENV),
+                               subagent=not os.environ.get(_PERM_NO_SUBAGENT_ENV))
         print("  permissions %s (%d rules — t permissions)"
               % (" · ".join(_perm_short(a, perm_sync[a]) for a in _PERM_AGENTS), len(allow)))
     except OSError:
@@ -5040,6 +5572,190 @@ def _dev_url(key, cwd):
         port = _DEV_PORT_PRIMARY
     return "http://localhost:%d" % port if _port_is_live(port) else None
 
+
+
+# ─── desktop handoff ──────────────────────────────────────────────────────────
+
+def _app_select(cfg, rows, repo, slot, cwd):
+    """Resolve a LOCAL tmux slot without guessing among sibling conversations."""
+    implied_repo, implied_slot = cfg.repo_of_dir(cwd)
+    if repo and repo.isdigit() and slot is None:
+        repo, slot = None, repo
+    if repo is None:
+        repo = implied_repo
+        slot = slot or implied_slot
+    if repo not in cfg.repos:
+        raise ValueError("name a registered repo: t app <repo> <slot>")
+    if slot and not slot.isdigit():
+        raise ValueError("slot must be a number: t app <repo> <slot>")
+    aliases = {k for k, d in cfg.repos.items() if d == cfg.repos[repo]}
+    candidates = []
+    for row in rows:
+        alias, _, number = row["slot"].rpartition("-")
+        if (row["host"] == "local" and alias in aliases and number.isdigit()
+                and (not slot or number == slot)):
+            candidates.append(row)
+    if not candidates:
+        raise ValueError(f"no local slot for {repo}{' ' + slot if slot else ''}; "
+                         "check t ls -r, then t beam <repo> <slot> --here if it is remote")
+    if len(candidates) != 1:
+        choices = ", ".join(r["slot"] for r in candidates)
+        raise ValueError(f"choose a slot: t app {repo} <slot> ({choices})")
+    row = candidates[0]
+    if row["agent"] != "codex":
+        raise ValueError(f"{row['slot']} runs {row['agent']}; the Codex app can resume "
+                         "Codex conversations only (t open <repo> --codex starts one)")
+    if row["context"] == "idle" or not re.fullmatch(
+            r"[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}", row["sid"]):
+        raise ValueError(f"{row['slot']} has no recorded Codex conversation; "
+                         "send a message in the CLI first and check t doctor")
+    return row
+
+
+def _app_link(sid, url=None):
+    """Installed desktop app's threads deep link (verified on 26.924.20706).
+
+    browserUrl opens a browser tab alongside the EXISTING thread. codex app PATH
+    only selects a workspace. No prompt is sent and no new thread is created.
+    The deep-link contract is app-version dependent, not a documented CLI flag.
+    """
+    if url is not None:
+        try:
+            parsed = urlsplit(url)
+            valid = (url == url.strip() and not any(c.isspace() for c in url)
+                     and parsed.scheme in ("http", "https") and parsed.hostname
+                     and parsed.username is None and parsed.password is None)
+            parsed.port  # rejects malformed/out-of-range ports too
+        except ValueError:
+            valid = False
+        if not valid:
+            raise ValueError("--url must be an http:// or https:// URL without credentials")
+    return "codex://threads/" + sid + ("?" + urlencode({"browserUrl": url}) if url else "")
+
+
+def _app_bundle():
+    """Find the installed app before interrupting a CLI; the app was renamed."""
+    candidates = [os.path.join(root, name + ".app")
+                  for root in ("/Applications", os.path.join(HOME, "Applications"))
+                  for name in ("ChatGPT", "Codex")]
+    for bundle in candidates:
+        try:
+            with open(os.path.join(bundle, "Contents", "Info.plist"), "rb") as f:
+                if plistlib.load(f).get("CFBundleIdentifier") == "com.openai.codex":
+                    return bundle
+        except (OSError, ValueError, plistlib.InvalidFileException):
+            continue
+    return None
+
+
+def _app_preview_path(row):
+    return os.path.join(_cache_root(), "app-previews", row["sid"] + ".json")
+
+
+def _app_preview_url(row):
+    """Reuse this thread's chosen page, including its path, query, and hash.
+
+    A server port tells us the origin, not which page the user is reviewing.
+    --url selects that page explicitly; unrelated transcript URLs are not evidence.
+    A moved thread must choose again so it cannot inherit another slot's server.
+    """
+    try:
+        with open(_app_preview_path(row), encoding="utf-8") as f:
+            saved = json.load(f)
+        if isinstance(saved, dict) and saved.get("cwd") == row["cwd"]:
+            url = saved.get("url")
+            if isinstance(url, str):
+                _app_link(row["sid"], url)  # same validation as an explicit --url
+                return url
+    except (OSError, ValueError):
+        pass
+    return _dev_url(row["slot"], row["cwd"])
+
+
+def _app_remember_preview(row, url):
+    _app_link(row["sid"], url)
+    _index_save(_app_preview_path(row), {"cwd": row["cwd"], "url": url})
+
+
+def _app_stop_cli(row):
+    """Revalidate the owner, stop only its agent, and wait before opening the app.
+
+    Keep the tmux slot: it reserves the worktree while the app uses it. In
+    particular do NOT use t kill, which also stops the preview's dev server.
+    Refuse when invoked from the very agent being moved (it would kill this tool).
+    """
+    session, sid, cwd = (shlex.quote(s) for s in ("dev-" + row["slot"], row["sid"], row["cwd"]))
+    return _run(["zsh", "-lic", ZSH_PRELUDE + f'''
+session={session}; expected_sid={sid}; expected_cwd={cwd}
+tmux has-session -t "=$session" 2>/dev/null || exit 1
+# display-message takes a pane target; ':' selects the exact session's active pane.
+actual_cwd=$(tmux display-message -p -t "=$session:" '#{{session_path}}')
+[[ $actual_cwd == $expected_cwd && $(_dev_agent_of_session "$session") == codex &&
+   $(_dev_session_sid "$session" "$actual_cwd") == $expected_sid ]] || {{
+  print -u2 -- 'The slot changed while preparing the handoff; run t app again.'; exit 1
+}}
+cpid=$(_dev_session_claude_pid "$session")
+[[ -n $cpid ]] || exit 0
+up=$PPID
+while [[ -n $up && $up != 0 && $up != 1 ]]; do
+  [[ $up == $cpid ]] && {{
+    print -u2 -- 'Run t app from a separate terminal, outside the session being moved.'; exit 1
+  }}
+  up=$(ps -o ppid= -p "$up" 2>/dev/null); up=${{up//[[:space:]]/}}
+done
+# Some slots exec Codex as the pane process, with no shell to return to. Keep
+# that pane after exit too, or the session and its conversation stamp disappear.
+tmux set-option -p -t "=$session:" remain-on-exit on || exit 1
+kill -TERM "$cpid" || exit 1
+for attempt in {{1..100}}; do
+  kill -0 "$cpid" 2>/dev/null || exit 0
+  sleep 0.05
+done
+print -u2 -- 'Codex CLI has not exited; the app was not opened. Wait and run t app again.'
+exit 1
+'''], timeout=15)
+
+
+def cmd_app(cfg, args):
+    try:
+        # Validate explicit URLs before scanning or changing any session.
+        if args.url is not None:
+            _app_link("", args.url)
+        row = _app_select(cfg, _parse_rows(zsh_capture("_dev_session_rows")),
+                          args.repo, args.slot, os.getcwd())
+        if not os.path.isdir(row["cwd"]):
+            raise ValueError(f"the session's worktree is missing: {row['cwd']}")
+        url = None if args.no_preview else args.url or _app_preview_url(row)
+        link = _app_link(row["sid"], url)
+        print(f"{row['slot']} → Codex app · thread {row['sid']}")
+        if url:
+            print(f"Preview: {url} (use Annotation mode in the app to leave comments)")
+        elif not args.no_preview:
+            print("No running preview found; start the slot's dev server and rerun, or pass --url.")
+        if args.dry_run:
+            print("Would stop this slot's Codex CLI, keep its worktree/dev server, and open:")
+            print(link)
+            return 0
+        if sys.platform != "darwin":
+            raise ValueError("desktop handoff currently requires macOS; run t app on your desktop")
+        bundle = _app_bundle()
+        if not bundle:
+            raise ValueError("install the Codex desktop app in /Applications or ~/Applications first")
+        stopped = _app_stop_cli(row)
+        if stopped.returncode:
+            raise ValueError(stopped.stderr.strip() or "could not stop the CLI; the app was not opened")
+        result = _run(["open", "-a", bundle, link], timeout=15)
+        if result.returncode:
+            recovery = shlex.join(["codex", "resume", row["sid"]])
+            raise ValueError(f"could not open the app: {result.stderr.strip()}. "
+                             f"To resume in a terminal: cd {shlex.quote(row['cwd'])} && {recovery}")
+        if url:
+            _app_remember_preview(row, url)
+        print("Sent to the desktop app; tmux keeps this worktree slot reserved.")
+        return 0
+    except ValueError as e:
+        print(f"t app: {e}", file=sys.stderr)
+        return 1
 
 
 # ─── mcp — which session is working on what ───────────────────────────────────
@@ -6166,6 +6882,7 @@ examples:
   t resume api 3          revive dev-api-3's last conversation after it was closed
   t cd ff 5               cd this shell into ff's slot-5 worktree (bare t cd: picker)
   t beam api --host mini  send a session to 'mini' and resume it there
+  t app api 3             move a Codex slot into the desktop app with its web preview
   t find "auth refactor"  search saved sessions, then resume the pick
   t mcp --call find_sessions '{"query":"accounts redesign"}'
                           ask the sessions MCP by hand (Claude calls it for you)
@@ -6215,6 +6932,23 @@ Run `t <verb> -h` for a verb's own flags.""")
     ag = sp.add_mutually_exclusive_group()
     ag.add_argument("--codex", action="store_true", help="run OpenAI Codex CLI in a FRESH slot (default: DEV_AGENT[repo] / DEV_AGENT_DEFAULT, claude)")
     ag.add_argument("--claude", action="store_true", help="run Claude Code in a fresh slot even if the repo defaults to codex")
+
+    sp = sub.add_parser("app", help="move a local Codex slot into the desktop app with its preview",
+        description="Stop a local slot's Codex CLI and open the SAME conversation in the "
+            "Codex desktop app on macOS, with its running web preview in the built-in browser. "
+            "Use Annotation mode there to leave comments. The tmux slot stays reserved, "
+            "and the worktree and dev server keep running. A lone number means the "
+            "cwd repo; bare `t app` uses the cwd worktree's slot, or the repo's only slot. "
+            "Several slots require an explicit number. Claude conversations cannot be "
+            "converted. Remote slots must be brought here first with `t beam … --here`. "
+            "The browser deep link requires a recent desktop app. Run from a separate "
+            "terminal if the command would stop the agent executing it.")
+    sp.add_argument("repo", nargs="?", help="DEV_REPOS key; defaults to the cwd repo")
+    sp.add_argument("slot", nargs="?", help="local slot number")
+    preview = sp.add_mutually_exclusive_group()
+    preview.add_argument("--url", help="preview page to open and remember for this thread (default: remembered URL, then slot's live dev URL)")
+    preview.add_argument("--no-preview", action="store_true", help="open only the conversation")
+    sp.add_argument("--dry-run", action="store_true", help="show the handoff link without stopping or opening anything")
 
     sp = sub.add_parser("ls", help="list dev sessions (attached + active context)",
         description="List live Claude dev sessions: whether each is attached, and whether it "
@@ -6386,6 +7120,18 @@ Run `t <verb> -h` for a verb's own flags.""")
     sp.add_argument("host", help="$REMOTE_HOSTS key, or a literal ssh target")
     sp.add_argument("rest", nargs=argparse.REMAINDER, help="command to run (omit for an interactive shell)")
 
+    sp = sub.add_parser("config", help="manage local settings: tools, models, repos and hosts",
+        description="Arrow-key settings hub for this machine: default tool and per-tool models; "
+            "add, edit or remove hosts; register or unregister repos and set their tool, branch "
+            "and worktree overrides; choose the default beam host and worktree defaults. "
+            "Save changes reviews then writes a managed block in ~/.zshrc.local. Removed "
+            "hosts stop participating in dots --all; unregistering repos keeps their files "
+            "and sessions. Tool/model defaults apply to fresh tmux and --fg sessions only. "
+            "Open local config in editor covers all custom shell settings (VISUAL/EDITOR, else vi).")
+    cg = sp.add_mutually_exclusive_group()
+    cg.add_argument("--show", action="store_true", help="print current settings without opening the menu")
+    cg.add_argument("--edit", action="store_true", help="open ~/.zshrc.local in VISUAL/EDITOR directly")
+
     sp = sub.add_parser("setup", help="register local repos and ssh hosts in ~/.zshrc.local",
         description="Interactive onboarding for this machine's per-machine config: a stepped "
             "inline wizard over every git checkout found under the scan dirs (default ~/code) "
@@ -6480,7 +7226,11 @@ Run `t <verb> -h` for a verb's own flags.""")
             "mode where its config names none: claude's auto mode "
             "(permissions.defaultMode) and codex's Full Access preset (approval_policy = "
             "never + sandbox_mode = danger-full-access); a mode you set yourself, any mode, "
-            "is never changed, and DOTFILES_NO_AGENT_MODES=1 opts a machine out.")
+            "is never changed, and DOTFILES_NO_AGENT_MODES=1 opts a machine out. It also seeds "
+            "the model a SUBAGENT runs on when nothing names one (a Workflow agent(), an Agent-"
+            "tool call, a codex spawn_agent): claude env.CLAUDE_CODE_SUBAGENT_MODEL = sonnet, "
+            "codex [agents] default_subagent_model = gpt-6-sol — add-only the same way, "
+            "DOTFILES_NO_SUBAGENT_MODEL=1 opts out.")
     sp.add_argument("--apply", action="store_true", help="merge the adds and retires now (what dots does)")
     sp.add_argument("--show", action="store_true", help="print every rule with its codex / cursor translation")
 
@@ -6554,6 +7304,8 @@ IMPLEMENTED = {
     "land": cmd_land, "kill-owner": cmd_kill_owner, "cursor": cmd_cursor,
     "doctor": cmd_doctor, "mcp": cmd_mcp, "new": cmd_new, "new-land": cmd_new_land,
     "install": cmd_install, "permissions": cmd_permissions, "trust": cmd_trust,
+    "app": cmd_app,
+    "config": cmd_config,
 }
 
 

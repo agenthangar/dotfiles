@@ -32,6 +32,7 @@ import socket
 import stat
 import subprocess
 import sys
+import tempfile
 import time
 from urllib.parse import urlencode, urlsplit
 
@@ -60,7 +61,7 @@ ZSH_PRELUDE = "setopt no_monitor no_notify 2>/dev/null; "
 # ─── config ──────────────────────────────────────────────────────────────────
 
 _CFG_LINE = re.compile(
-    r"^(DEV_REPOS|DEV_BRANCHES|REMOTE_HOSTS|DEV_WORKTREE|DEV_AGENT)\[([^\]]+)\]=(.*)$"
+    r"^(DEV_REPOS|DEV_BRANCHES|REMOTE_HOSTS|DEV_WORKTREE|DEV_AGENT|DEV_MODEL)\[([^\]]+)\]=(.*)$"
     r"|^(DEV_BRANCH|DEV_WORKTREE_ROOT|DEV_WORKTREE_DEFAULT|DEV_AGENT_DEFAULT)=(.*)$")
 
 AGENTS = ("claude", "codex")   # the closed set a dev slot can run (the zsh _dev_agent_valid twin)
@@ -89,6 +90,7 @@ class Config:
         self.worktree_default = "1"
         self.agents = {}     # alias -> claude|codex (DEV_AGENT[alias])
         self.agent_default = "claude"
+        self.models = {}     # agent -> model for NEW sessions; empty defers to the CLI
         self._load()
 
     def _load(self):
@@ -105,7 +107,7 @@ class Config:
                 arr, key, val = m.group(1), m.group(2), _unquote(m.group(3))
                 {"DEV_REPOS": self.repos, "DEV_BRANCHES": self.branches,
                  "REMOTE_HOSTS": self.hosts, "DEV_WORKTREE": self.worktree,
-                 "DEV_AGENT": self.agents}[arr][key] = val
+                 "DEV_AGENT": self.agents, "DEV_MODEL": self.models}[arr][key] = val
             elif m.group(4) == "DEV_BRANCH":
                 self.branch = _unquote(m.group(5))
             elif m.group(4) == "DEV_WORKTREE_ROOT":
@@ -1088,6 +1090,180 @@ def _parse_host_entry(ent, used):
     if not _SETUP_KEY.match(alias) or alias in used:
         return None, f"'{alias}' is taken or not a valid key"
     return alias, target
+
+
+# ─── config — defaults for new sessions on this machine ────────────────────────
+
+_CONFIG_BEGIN = "# >>> t config defaults >>>"
+_CONFIG_END = "# <<< t config defaults <<<"
+_MODEL_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/@+\[\]-]*\Z")
+
+
+def _config_text(text, agent, models):
+    """Replace only our marked block, placing it last so earlier defaults lose.
+    Never parse or rewrite the user's arbitrary shell. Empty model assignments
+    also clear the live array on a shell reload (unset lines would not)."""
+    if agent not in AGENTS:
+        raise ValueError("choose claude or codex")
+    for model in models.values():
+        if model and not _MODEL_ID.fullmatch(model):
+            raise ValueError("model IDs must contain no spaces or shell commands")
+    lines = text.splitlines(keepends=True)
+    starts = [i for i, line in enumerate(lines) if line.rstrip("\r\n") == _CONFIG_BEGIN]
+    ends = [i for i, line in enumerate(lines) if line.rstrip("\r\n") == _CONFIG_END]
+    if starts or ends:
+        if len(starts) != 1 or len(ends) != 1 or starts[0] >= ends[0]:
+            raise ValueError("malformed t config defaults block in ~/.zshrc.local; repair its markers first")
+        del lines[starts[0]:ends[0] + 1]
+    body = "".join(lines)
+    if body and not body.endswith("\n"):
+        body += "\n"
+    if body and not body.endswith("\n\n"):
+        body += "\n"
+    block = [_CONFIG_BEGIN, f"DEV_AGENT_DEFAULT={shlex.quote(agent)}"]
+    block += [f"DEV_MODEL[{a}]={shlex.quote(models.get(a, ''))}" for a in AGENTS]
+    return body + "\n".join(block + [_CONFIG_END, ""])
+
+
+def _config_read(path):
+    try:
+        with open(path) as fh:
+            return fh.read()
+    except FileNotFoundError:
+        return ""
+
+
+def _config_write(path, before, after):
+    """Atomic replacement, preserving a local-file symlink and its target's mode.
+    Refuse a concurrent edit rather than overwriting changes made during the UI."""
+    target = os.path.realpath(path)
+    if _config_read(target) != before:
+        raise ValueError("~/.zshrc.local changed while the menu was open; run t config again")
+    mode = stat.S_IMODE(os.stat(target).st_mode) if os.path.exists(target) else 0o600
+    tmp = None
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", dir=os.path.dirname(target),
+                                         prefix=".t-config-", delete=False) as fh:
+            tmp = fh.name
+            fh.write(after)
+            os.fchmod(fh.fileno(), mode)
+        os.replace(tmp, target)
+    finally:
+        if tmp and os.path.exists(tmp):
+            os.unlink(tmp)
+
+
+def _config_model_rows(agent, current, cache=None):
+    """Stable Claude aliases; Codex's locally discovered list, never a frozen catalog.
+    A saved custom/retired model remains selectable even when no cache lists it."""
+    values = [""]
+    if current:
+        values.append(current)
+    if agent == "claude":
+        values += ["sonnet", "opus", "haiku", "fable", "opusplan"]
+    elif isinstance(cache, dict) and isinstance(cache.get("models"), list):
+        values += [m["slug"] for m in cache["models"] if isinstance(m, dict)
+                   and m.get("visibility") == "list" and isinstance(m.get("slug"), str)
+                   and _MODEL_ID.fullmatch(m["slug"])]
+    rows = [(v, v or "Use tool's own default") for v in dict.fromkeys(values)]
+    return rows + [("__custom__", "Enter a custom model ID…")]
+
+
+def _config_codex_cache():
+    root = os.environ.get("CODEX_HOME") or os.path.join(HOME, ".codex")
+    try:
+        with open(os.path.join(root, "models_cache.json")) as fh:
+            return json.load(fh)
+    except (OSError, ValueError):
+        return None
+
+
+def _config_summary(agent, models, overrides):
+    lines = [f"Default tool: {agent}"]
+    lines += [f"{a} model: {models.get(a) or 'tool default'}" for a in AGENTS]
+    lines.append("Applies to new t sessions on this machine (tmux and --fg).")
+    if overrides:
+        lines.append("Repo tool overrides still win: " + ", ".join(
+            f"{repo}={a}" for repo, a in sorted(overrides.items())))
+    return lines
+
+
+def _config_wizard(cfg, cache):
+    ui = _RailUI()
+    agent, models = cfg.agent_default, {a: cfg.models.get(a, "") for a in AGENTS}
+    ui.out.write("┌  t config · defaults for new sessions on this machine\n")
+    if cfg.agents:
+        ui.out.write("│  Repo tool overrides still apply; t config --show lists them.\n")
+    ui.raw()
+    try:
+        while True:
+            rows = [("tool", f"Default tool     {agent}")]
+            rows += [(a, f"{a} model    {models[a] or 'tool default'}") for a in AGENTS]
+            rows += [("save", "Save changes"), ("cancel", "Cancel")]
+            choice = ui.pick("Session defaults", rows)
+            if choice in (None, "cancel"):
+                ui.done("cancelled", "nothing written")
+                return None
+            if choice == "save":
+                # Validate manual config values as well as anything typed in this UI.
+                try:
+                    _config_text("", agent, models)
+                except ValueError as exc:
+                    ui.done("invalid", str(exc))
+                    continue
+                ui.commit(_config_summary(agent, models, cfg.agents))
+                return agent, models
+            if choice == "tool":
+                tools = [(a, f"{a}" + ("" if shutil.which(a) else f" (install with t install {a})"))
+                         for a in AGENTS]
+                picked = ui.pick("Default tool", tools,
+                                 default=AGENTS.index(agent) if agent in AGENTS else 0)
+                if picked is not None:
+                    agent = picked
+                continue
+            options = _config_model_rows(choice, models[choice], cache)
+            picked = ui.pick(f"{choice} model", options,
+                             default=next(i for i, row in enumerate(options) if row[0] == models[choice]))
+            if picked == "__custom__":
+                picked = ui.cooked_input("│  model ID (blank cancels) → ")
+                if not picked:
+                    continue
+                if not _MODEL_ID.fullmatch(picked):
+                    ui.done("invalid", "Enter a model ID without spaces or shell commands.")
+                    continue
+            if picked is not None:
+                models[choice] = picked
+    finally:
+        ui.restore()
+
+
+def cmd_config(cfg, args):
+    if args.show:
+        print("\n".join(_config_summary(cfg.agent_default, cfg.models, cfg.agents)))
+        return 0
+    if not sys.stdin.isatty() or not sys.stdout.isatty():
+        print("t config: open this menu in a terminal; t config --show prints current defaults",
+              file=sys.stderr)
+        return 1
+    try:
+        before = _config_read(ZSHRC_LOCAL)
+        result = _config_wizard(cfg, _config_codex_cache())
+        if result is None:
+            return 0
+        agent, models = result
+        if agent == cfg.agent_default and all(models[a] == cfg.models.get(a, "") for a in AGENTS):
+            print("Defaults unchanged — nothing written")
+            return 0
+        after = _config_text(before, agent, models)
+        _config_write(ZSHRC_LOCAL, before, after)
+    except (OSError, ValueError) as exc:
+        print(f"t config: {exc}", file=sys.stderr)
+        return 1
+    zsh_capture("_t_sync_config")
+    print("✓ saved defaults to ~/.zshrc.local")
+    if not os.environ.get("T_SETUP_SHIM"):
+        print("run `source ~/.zshrc` (or open a new shell) to use these defaults")
+    return 0
 
 
 class _RailUI:
@@ -6348,6 +6524,14 @@ Run `t <verb> -h` for a verb's own flags.""")
     sp.add_argument("host", help="$REMOTE_HOSTS key, or a literal ssh target")
     sp.add_argument("rest", nargs=argparse.REMAINDER, help="command to run (omit for an interactive shell)")
 
+    sp = sub.add_parser("config", help="choose the default tool and models in a terminal menu",
+        description="Arrow-key menu for this machine's new t sessions: choose claude or codex "
+            "and a separate model for each tool. Models can use the tool's own default, "
+            "a suggested alias/locally cached Codex model, or a custom ID. Save changes "
+            "writes a managed block in ~/.zshrc.local; q/Esc cancels. Repo DEV_AGENT "
+            "overrides and --claude/--codex still win. Resumed conversations keep their model.")
+    sp.add_argument("--show", action="store_true", help="print current defaults without opening the menu")
+
     sp = sub.add_parser("setup", help="register local repos and ssh hosts in ~/.zshrc.local",
         description="Interactive onboarding for this machine's per-machine config: a stepped "
             "inline wizard over every git checkout found under the scan dirs (default ~/code) "
@@ -6520,6 +6704,7 @@ IMPLEMENTED = {
     "doctor": cmd_doctor, "mcp": cmd_mcp, "new": cmd_new, "new-land": cmd_new_land,
     "install": cmd_install, "permissions": cmd_permissions, "trust": cmd_trust,
     "app": cmd_app,
+    "config": cmd_config,
 }
 
 

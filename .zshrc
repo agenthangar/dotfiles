@@ -918,7 +918,7 @@ add-zsh-hook precmd _dots_reload_if_moved
 # are machine-specific, so they live in ~/.zshrc.local (not committed); this file
 # just declares the array and sources that override. See .zshrc.local.example.
 #   DEV_REPOS[api]="$HOME/code/my-api"
-typeset -gA DEV_REPOS DEV_BRANCHES REMOTE_HOSTS DEV_WORKTREE DEV_AGENT
+typeset -gA DEV_REPOS DEV_BRANCHES REMOTE_HOSTS DEV_WORKTREE DEV_AGENT DEV_MODEL
 [[ -f "$HOME/.zshrc.local" ]] && source "$HOME/.zshrc.local"
 
 # DEV_BRANCH — the global default branch `dev`/`_dev_new_session` check out (and
@@ -1025,8 +1025,14 @@ _dev_agent_check() {
   return 1
 }
 # _dev_agent_new_cmd <agent> [sid] — the pane command for a FRESH slot.
+# DEV_MODEL is keyed by agent, so switching tools never carries the other tool's model.
+# Resumes deliberately use the conversation's own model, not this new-session default.
 _dev_agent_new_cmd() {
-  case "$1" in codex) print -r -- "codex" ;; *) print -r -- "claude --session-id $2" ;; esac
+  local agent="$1" model="${DEV_MODEL[$1]:-}"
+  local -a launch_args=("$agent")
+  [[ $agent == claude && -n $2 ]] && launch_args+=(--session-id "$2")
+  [[ -n $model ]] && launch_args+=(--model "$model")
+  print -r -- "${(j: :)${(@q)launch_args}}"
 }
 # _dev_agent_resume_cmd <agent> <sid> — the pane command that resumes conversation <sid>.
 _dev_agent_resume_cmd() {
@@ -1724,6 +1730,7 @@ _t_sync_config() {
     for k in ${(k)REMOTE_HOSTS}; do print -r -- "REMOTE_HOSTS[$k]=${(q)REMOTE_HOSTS[$k]}"; done
     for k in ${(k)DEV_WORKTREE};  do print -r -- "DEV_WORKTREE[$k]=${(q)DEV_WORKTREE[$k]}"; done
     for k in ${(k)DEV_AGENT};     do print -r -- "DEV_AGENT[$k]=${(q)DEV_AGENT[$k]}"; done
+    for k in ${(k)DEV_MODEL};     do print -r -- "DEV_MODEL[$k]=${(q)DEV_MODEL[$k]}"; done
     print -r -- "DEV_AGENT_DEFAULT=${(q)DEV_AGENT_DEFAULT}"
     print -r -- "DEV_BRANCH=${(q)DEV_BRANCH}"
     print -r -- "DEV_WORKTREE_ROOT=${(q)DEV_WORKTREE_ROOT}"
@@ -3861,7 +3868,9 @@ _t_dev() {
     echo "Starting $agent in $dir (no tmux)"
     cd "$dir" || return 1
     [[ -n $skip_prepare ]] || _dev_repo_prepare "$branch"
-    "$agent"     # claude → the claude() wrapper (tpush sentinel); codex → the binary
+    local -a model_args=()
+    [[ -n ${DEV_MODEL[$agent]:-} ]] && model_args=(--model "${DEV_MODEL[$agent]}")
+    "$agent" "${model_args[@]}"   # retain the claude()/codex() wrappers (tpush sentinel)
     return
   fi
 
@@ -6839,27 +6848,28 @@ t() {
     # _t_sync_config cache go live at once (precedent: dots reloads every run).
     # T_SETUP_SHIM tells the bin to skip its "source ~/.zshrc" hint.
     setup)  T_SETUP_SHIM=1 command t setup "$@" && source ~/.zshrc ;;
+    config) _t_install config "$@" ;;
     # new writes DEV_REPOS too (the repo it just created) → the same reload.
     new)    T_SETUP_SHIM=1 command t new "$@" && source ~/.zshrc ;;
     # install can END in `t setup` (it opens it when ~/code holds repos DEV_REPOS does
     # not know yet), so it owes the same reload — but only when that setup actually
     # wrote: ~/.zshrc.local's mtime is the evidence, since install's rc says nothing
     # about it (quitting setup is not an install failure, and most runs never open it).
-    install) _t_install "$@" ;;
+    install) _t_install install "$@" ;;
     *)      command t "$verb" "$@" ;; # ls/read/plan/paste/kill/on/session-rows/land/kill-owner/new-land
   esac
 }
 
-# _t_install — `t install` through the bin, then reload iff it changed ~/.zshrc.local
-# (see the shim arm above). mtime AND size: zstat's mtime is whole seconds, and an
-# append always moves the size. zstat, not stat: the portability convention.
+# _t_install <verb> — install/config through the bin, reload iff ~/.zshrc.local changed
+# (see the shim arm above). Inode catches t config's atomic same-size replacements;
+# mtime/size catch t install's appends. zstat, not stat: the portability convention.
 _t_install() {
   local -A before after
   zstat -H before ~/.zshrc.local 2>/dev/null
-  T_SETUP_SHIM=1 command t install "$@"
+  T_SETUP_SHIM=1 command t "$@"
   local rc=$?
   zstat -H after ~/.zshrc.local 2>/dev/null
-  [[ "${after[mtime]:-}:${after[size]:-}" == "${before[mtime]:-}:${before[size]:-}" ]] || source ~/.zshrc
+  [[ "${after[inode]:-}:${after[mtime]:-}:${after[size]:-}" == "${before[inode]:-}:${before[mtime]:-}:${before[size]:-}" ]] || source ~/.zshrc
   return $rc
 }
 
@@ -7149,7 +7159,7 @@ alias h=help   # `h` is a shorthand for `help`
 # key for `on`), and slot/flags after. Pulls live from the ${(k)DEV_REPOS} /
 # ${(k)REMOTE_HOSTS} arrays so it stays current with ~/.zshrc.local.
 _t() {
-  local -a verbs=(open app ls kill push pop resume beam read plan paste find on cursor setup new install permissions trust)
+  local -a verbs=(open app ls kill push pop resume beam read plan paste find on cursor setup config new install permissions trust)
   if (( CURRENT == 2 )); then
     _describe -t verbs 't verb' verbs
     return
@@ -7180,6 +7190,8 @@ _t() {
     setup)
       if [[ ${words[CURRENT]} == -* ]]; then _values 'flag' --hosts --no-hosts --dry-run -h --help
       else _files -/; fi ;;   # scan-dir arguments
+    config)
+      _values 'flag' --show -h --help ;;
     new)
       if (( CURRENT == 3 )) && [[ ${words[CURRENT]} != -* ]]; then _message 'repo name'
       else _values 'flag' --owner --public --private --alias --hosts --no-hosts -y --yes --dry-run -h --help; fi ;;

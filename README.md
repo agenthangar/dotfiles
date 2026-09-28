@@ -163,6 +163,20 @@ registered repo is trusted by default: `dots` runs `t trust --all -q`, and `t se
 refused, `t trust --status` reports without writing, `t doctor` carries the same
 line, and `DOTFILES_NO_TRUST=1` opts a machine out of the automatic paths.
 
+**`t config`** opens an arrow-key menu to choose the default tool (Claude or Codex)
+and a separate model for each. Pick a Claude alias, a model from Codex's local
+model list, or enter a custom model ID. “Use tool's own default” removes the `t`
+model override. Choose **Save changes** to persist your choices in a managed block
+in `~/.zshrc.local`; `q`/Esc or Cancel leaves the file untouched. `t config --show`
+prints the current defaults, including any repo tool overrides.
+
+These settings apply to **new `t open` sessions** on this machine, including
+`--fg`, and take effect in the calling shell after saving. Existing and resumed
+conversations retain their model. `DEV_AGENT[repo]` and `--claude`/`--codex` still
+override the global tool; `DEV_MODEL[claude]` and `DEV_MODEL[codex]` hold each tool's
+model choice. Run `t config` on each host to choose its defaults. Cursor remains
+available through `t cursor`; it does not support dev slots.
+
 A dev slot runs either agent: `t open <repo> --codex` starts Codex CLI in a fresh
 slot (`--claude` forces Claude), `DEV_AGENT[repo]=codex` in `~/.zshrc.local` makes
 it a repo's default and `DEV_AGENT_DEFAULT` the global one. `t ls` marks a codex

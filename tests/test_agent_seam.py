@@ -445,6 +445,61 @@ def test_zsh_sync_config_emits_the_agent_keys(zsh):
     assert "DEV_AGENT_DEFAULT=claude" in lines
 
 
+def test_zsh_model_defaults_reach_new_tmux_sessions_and_not_resumes(zsh):
+    r = zsh("DEV_MODEL[claude]=sonnet; DEV_MODEL[codex]=local/model; "
+            "_dev_new_session dev-api-3 $HOME/code/api dev/x 1 codex; "
+            "_dev_new_session dev-web-4 $HOME/code/web dev/x 1 claude; "
+            "_dev_resume_session dev-api-5 $HOME/code/api thread-id codex")
+    assert r.returncode == 0, r.stderr
+    lines = zsh.log.read_text().splitlines()
+    assert "send-keys -t dev-api-3 codex --model local/model; exit Enter" in lines
+    assert any("claude --session-id " in line and " --model sonnet; exit Enter" in line for line in lines)
+    assert "send-keys -t dev-api-5 codex resume thread-id; exit Enter" in lines
+
+
+@pytest.mark.parametrize("agent", ["claude", "codex"])
+def test_zsh_foreground_uses_the_selected_tools_model(zsh, agent):
+    (zsh.home / "code" / "web").mkdir(parents=True)
+    r = zsh(f"DEV_AGENT_DEFAULT={agent}; DEV_MODEL[{agent}]='model[1m]'; "
+            "DEV_WORKTREE[web]=0; _dev_repo_prepare() { :; }; "
+            f"{agent}() {{ print -rl -- ARG \"$@\"; }}; "
+            "_t_dev web new --fg")
+    assert r.returncode == 0, r.stderr
+    assert r.stdout.endswith("ARG\n--model\nmodel[1m]\n"), r.stdout
+
+
+def test_zsh_model_shell_quoting_and_config_bridge(zsh):
+    model = 'model; touch "$HOME/should-not-exist"'
+    # Direct manual config edits bypass the menu's ID validation. Quote those too.
+    r = zsh("DEV_MODEL[codex]='" + model + "'; "
+            "codex() { print -rl -- \"$@\"; }; eval \"$(_dev_agent_new_cmd codex)\"; "
+            "rm -f $HOME/.config/t/config.sh; _t_sync_config; "
+            "cat $HOME/.config/t/config.sh")
+    assert r.returncode == 0, r.stderr
+    assert r.stdout.startswith("--model\n" + model + "\n")
+    assert "DEV_MODEL[codex]=" in r.stdout
+    assert not (zsh.home / "should-not-exist").exists()
+
+
+def test_zsh_t_config_reloads_same_size_atomic_save(zsh, tmp_path):
+    stub = tmp_path / "stubbin" / "t"
+    stub.write_text("#!/usr/bin/env python3\n"
+                    "import os, pathlib, sys\n"
+                    "p = pathlib.Path.home() / '.zshrc.local'\n"
+                    "if '--show' not in sys.argv:\n"
+                    "    q = p.with_suffix('.tmp')\n"
+                    "    q.write_text(p.read_text().replace('sonnet', 'opus  '))\n"
+                    "    os.utime(q, ns=(p.stat().st_atime_ns, p.stat().st_mtime_ns))\n"
+                    "    q.replace(p)\n")
+    stub.chmod(0o755)
+    local = zsh.home / ".zshrc.local"
+    local.write_text(local.read_text() + "DEV_MODEL[claude]=sonnet\n")
+    (zsh.home / ".zshrc").write_text('source "$HOME/.zshrc.local"\necho RELOADED\n')
+    r = zsh('t config; echo model=$DEV_MODEL[claude]')
+    assert "RELOADED" in r.stdout and "model=opus" in r.stdout
+    assert "RELOADED" not in zsh("t config --show").stdout
+
+
 # ─── codex conversations: the thread store, the locators, titles, self-id, wrappers ──
 
 FIXTURE_ROLLOUT = REPO_ROOT / "tests" / "fixtures" / "codex_rollout.jsonl"

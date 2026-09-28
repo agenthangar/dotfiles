@@ -28,6 +28,10 @@ DEV_REPOS[web]="$HOME/code/my-web"
 # / `--claude` override both for one fresh slot.
 # DEV_AGENT[myrepo]=codex
 # DEV_AGENT_DEFAULT=claude
+# `t config` opens a terminal menu for the global tool and per-tool model defaults.
+# Models apply only to NEW t sessions; empty means use that tool's own default.
+# DEV_MODEL[claude]=sonnet
+# DEV_MODEL[codex]=your-model-id
 
 # Default host for `tbeam` (teleport a Claude session to another machine).
 # Omit this to require an explicit host argument every time.

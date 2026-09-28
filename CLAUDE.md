@@ -72,7 +72,7 @@ dots --relink           # reconcile the symlinks now, no fetch (offline-safe)
 t ls [-r] [-a]          # list Claude dev sessions (-r cross-host, -a all repos)
 t open [repo] [slot]    # open/reattach (repo defaults to cwd repo; --new, --fg, --remote; --codex/--claude pick the agent of a FRESH slot); auto-attaches a remote-only slot in place
 t cd [repo] [slot]      # cd this shell into a slot's worktree (bare/one-arg: fzf pick; repo with no worktrees: its repo dir)
-t app [repo] [slot]     # move a local Codex CLI conversation into the macOS desktop app with its live preview (--url, --no-preview, --dry-run); keeps the tmux shell/worktree/dev server
+t app [repo] [slot]     # move a local Codex CLI conversation into the macOS desktop app with its preview (--url selects/remembers the page, --no-preview, --dry-run); keeps the tmux slot/worktree/dev server
 t beam [repo] [slot] --from <host>   # pull a session from another machine to here (receive); omit --from to send
 t push | t pop          # move this session into / out of a detached tmux slot
 t resume [repo] [slot] [-a] [-l] [-r] [--host h] [--days N|all]  # revive a DEAD slot's saved conversations (--host h: revive it ON h); live slots are hidden unless -l/--live (then labeled rows that attach); space multi-marks (✓) revive them all — first attaches, rest open in new terminal tabs (-a all repos, -r pull hosts' transcripts first, --days window default 30, --fg inline)

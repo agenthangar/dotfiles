@@ -1,11 +1,13 @@
 """Desktop handoff: exact conversation, URL encoding, and stop-before-open failures."""
 
 import io
+import json
 import os
 import plistlib
 import shlex
 import shutil
 import subprocess
+import time
 import uuid
 from urllib.parse import parse_qs, urlsplit
 
@@ -18,6 +20,7 @@ SID = "01234567-89ab-cdef-0123-456789abcdef"
 @pytest.fixture
 def app_slot(t_mod, tmp_path, monkeypatch):
     monkeypatch.setattr(t_mod, "CONFIG", str(tmp_path / "no-config"))
+    monkeypatch.setattr(t_mod, "_cache_root", lambda: str(tmp_path / "cache"))
     cfg = t_mod.Config()
     cfg.repos = {"api": str(tmp_path / "my-api"), "a": str(tmp_path / "my-api")}
     cfg.worktree_root = str(tmp_path / "worktrees")
@@ -151,6 +154,49 @@ def test_app_command_explicit_url_and_no_preview(t_mod, app_command):
         call("--url", "http://localhost:9000", "--no-preview")
 
 
+def test_app_command_remembers_selected_page(t_mod, app_command):
+    call, events, _ = app_command
+    budget = "http://localhost:5213/#budget"
+    assert call("--url", budget) == 0
+    events.clear()
+    assert call() == 0
+    assert events[-1][1][-1] == t_mod._app_link(SID, budget)
+
+
+@pytest.mark.parametrize("flags", [("--no-preview",), ("--url", "http://localhost:5213/#home", "--dry-run")])
+def test_app_command_does_not_forget_page_when_skipping_preview(t_mod, app_command, flags):
+    call, events, _ = app_command
+    budget = "http://localhost:5213/#budget?month=2026-09"
+    assert call("--url", budget) == 0
+    assert call(*flags) == 0
+    events.clear()
+    assert call() == 0
+    assert events[-1][1][-1] == t_mod._app_link(SID, budget)
+
+
+@pytest.mark.parametrize("saved", ["{", "[]", '{"cwd":"/other","url":"http://localhost:5299/#budget"}',
+                                   '{"url":"http://localhost:5213/#budget"}', "INVALID_URL", "MISSING_URL"])
+def test_app_preview_ignores_unusable_saved_page(t_mod, app_slot, saved):
+    _, row = app_slot
+    if saved in ("INVALID_URL", "MISSING_URL"):
+        saved = json.dumps({"cwd": row["cwd"], "url": "javascript:bad" if saved == "INVALID_URL" else None})
+    path = t_mod._app_preview_path(row)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w") as f:
+        f.write(saved)
+    # This fixture has no dev server: an unusable cache must not create a URL.
+    assert t_mod._app_preview_url(row) is None
+
+
+def test_app_preview_stays_with_its_thread_and_worktree(t_mod, app_slot):
+    _, row = app_slot
+    budget = "http://localhost:5213/#budget"
+    t_mod._app_remember_preview(row, budget)
+    assert t_mod._app_preview_url(row) == budget
+    assert t_mod._app_preview_url(dict(row, sid="different-thread")) is None
+    assert t_mod._app_preview_url(dict(row, cwd="/different/worktree")) is None
+
+
 def test_app_command_missing_preview_still_opens_thread(t_mod, app_command, monkeypatch, capsys):
     call, events, _ = app_command
     monkeypatch.setattr(t_mod, "_dev_url", lambda *a: None)
@@ -182,12 +228,15 @@ def test_app_command_failed_stop_does_not_open(t_mod, app_command, monkeypatch, 
 
 
 def test_app_command_failed_launch_gives_recovery(t_mod, app_command, monkeypatch, capsys):
-    call, events, _ = app_command
+    call, events, row = app_command
+    budget = "http://localhost:5213/#budget"
+    t_mod._app_remember_preview(row, budget)
     monkeypatch.setattr(t_mod, "_run", lambda *a, **kw:
                         subprocess.CompletedProcess([], 1, "", "launch failed"))
-    assert call() == 1
+    assert call("--url", "http://localhost:5213/#home") == 1
     assert [e[0] for e in events] == ["stop"]
     assert "codex resume " + SID in capsys.readouterr().err
+    assert t_mod._app_preview_url(row) == budget
 
 
 @pytest.mark.parametrize("scenario,ok", [
@@ -237,12 +286,14 @@ sleep() {{ :; }}
         assert signals == []
 
 
-def test_app_stop_revalidates_directory_with_real_tmux(t_mod, app_slot, monkeypatch, tmp_path):
+@pytest.mark.parametrize("stop_process", [False, True], ids=["stopped", "pane-process"])
+def test_app_stop_revalidates_directory_with_real_tmux(t_mod, app_slot, monkeypatch, tmp_path, stop_process):
     """Regression: =session is a session target, but display-message needs =session:.
 
     The old mocked tmux always returned the cwd and concealed this failure. Keep
     tmux real here, including an active decoy session in a different directory;
-    only the Codex probes are stubbed. No real agent is needed or signaled.
+    only the Codex probes are stubbed. The pane-process case stops only this
+    test's disposable sleep process and verifies that its slot remains reserved.
     """
     if not shutil.which("tmux") or not shutil.which("zsh"):
         pytest.skip("tmux and zsh required")
@@ -260,6 +311,11 @@ _dev_session_sid() {{
 _dev_session_claude_pid() {{ return 1; }}
 kill() {{ print -u2 'unexpected signal'; return 1; }}
 '''
+    if stop_process:
+        prelude += f'''
+unfunction kill
+_dev_session_claude_pid() {{ tmux display-message -p -t "=$session:" '#{{pane_pid}}'; }}
+'''
     def run(argv, **kwargs):
         return subprocess.run(["zsh", "-f", "-c", prelude + argv[-1]],
                               env=env, capture_output=True, text=True, timeout=10)
@@ -271,5 +327,15 @@ kill() {{ print -u2 'unexpected signal'; return 1; }}
                        env=env, capture_output=True, text=True, check=True)
         result = t_mod._app_stop_cli(row)
         assert result.returncode == 0, result.stderr
+        expected = row["cwd"] + ("|1" if stop_process else "|0")
+        deadline = time.monotonic() + 2
+        while True:
+            state = subprocess.run(tmux + ["display-message", "-p", "-t", "=" + session + ":",
+                                          "#{session_path}|#{pane_dead}"],
+                                   env=env, capture_output=True, text=True, check=True)
+            if state.stdout.strip() == expected or time.monotonic() >= deadline:
+                break
+            time.sleep(0.02)
+        assert state.stdout.strip() == expected, result.stderr
     finally:
         subprocess.run(tmux + ["kill-server"], env=env, capture_output=True)

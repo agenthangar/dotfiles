@@ -99,7 +99,7 @@ class Menu:
     def restore(self):
         self.restored = True
 
-    def pick(self, label, rows, default=0):
+    def pick(self, label, rows, default=0, **kwargs):
         pick = next(self.picks)
         assert pick is None or pick in dict(rows), (label, pick, rows)
         assert 0 <= default < len(rows)

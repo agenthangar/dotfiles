@@ -6,8 +6,7 @@ used to resolve through. So it is tested against a real git repo in a throwaway
 $HOME rather than by reading the code.
 
 Everything runs under tmp_path with HOME overridden, so no test touches the real
-machine. Coverage is scoped to bin/t in pyproject.toml, so these
-subprocess-driven tests do not dilute the coverage ratchet.
+machine. These subprocess-driven tests exercise the actual shell installer.
 """
 
 import os
@@ -22,8 +21,7 @@ INSTALL_SH = REPO_ROOT / "install.sh"
 # Everything install.sh links, plus the files it reads. Stand-ins are enough: the
 # migration cares about paths and git state, never file contents.
 STUB_BINS = [
-    "sleep-manager", "csync", "cursor-beam", "pii-scan",
-    "claude-stamp-tmux", "t", "dots-sync",
+    "sleep-manager", "csync", "pii-scan", "dots-sync",
 ]
 
 
@@ -100,7 +98,7 @@ def legacy(tmp_path):
     # Point $HOME at the legacy worktree, as the old install.sh did.
     (home / "bin").mkdir(exist_ok=True)
     (home / ".zshrc").symlink_to(legacy_wt / ".zshrc")
-    (home / "bin" / "t").symlink_to(legacy_wt / "bin" / "t")
+    (home / "bin" / "sleep-manager").symlink_to(legacy_wt / "bin" / "sleep-manager")
 
     return home, primary, legacy_wt
 
@@ -110,6 +108,7 @@ def run_install(cwd, home, **extra_env):
         **os.environ,
         "HOME": str(home),
         "DOTFILES_NO_BREW": "1",
+        "DOTFILES_NO_T": "1",
         # tmux talks to the REAL server through the inherited $TMUX socket no matter
         # what $HOME says, so without this the run sources the sandbox's ~/.tmux.conf
         # into the developer's live server — and makes the test depend on whether a
@@ -137,7 +136,7 @@ def test_migration_flips_links_and_moves_primary_onto_main(legacy):
     run_install(legacy_wt, home)
 
     # The links now resolve into the primary, and nothing dangles.
-    for link in (home / ".zshrc", home / "bin" / "t"):
+    for link in (home / ".zshrc", home / "bin" / "sleep-manager"):
         assert link.is_symlink()
         assert link.exists(), f"{link} dangles after migration"
         assert str(link.resolve()).startswith(str(primary.resolve()))
@@ -216,7 +215,7 @@ def test_partial_run_leaves_home_healthy_and_resumes(legacy):
     res = run_install(legacy_wt, home)
     assert res.returncode != 0, "failure injection did not fire"
 
-    for link in (home / ".zshrc", home / "bin" / "t"):
+    for link in (home / ".zshrc", home / "bin" / "sleep-manager"):
         assert link.exists(), f"{link} dangles after a partial run"
     # The legacy tree survives, but DETACHED — the ref was released, not the files.
     assert legacy_wt.exists()

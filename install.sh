@@ -247,13 +247,19 @@ link() {
 # parsing these `link` lines (bin/t's _INSTALL_LINK_RE), so a link outside link_all
 # would be a link doctor reports as drifted and the links-only relink never fixes —
 # a relink that fires on every single `dots` forever.
-# Standalone t owns its links once it passes the versioned installation contract.
+# t is an independent installation. Full setup bootstraps it; ordinary relinks
+# remain offline and use only a validated installed checkout.
 # shellcheck source=lib/t-integration.sh
 source "$DOTFILES_DIR/lib/t-integration.sh"
-STANDALONE_T=0
-if [[ -z "${DOTFILES_NO_T:-}" ]] && _dots_t_find >/dev/null; then
-    _dots_t_install "$LINK_SRC"
-    STANDALONE_T=1
+if [[ -z "${DOTFILES_NO_T:-}" ]]; then
+    if [[ -n "${DOTFILES_LINKS_ONLY:-}" ]]; then
+        _dots_t_install "$LINK_SRC" || {
+            echo 'dots: standalone t is missing; run install.sh for full setup' >&2
+            exit 1
+        }
+    else
+        _dots_t_bootstrap "$LINK_SRC"
+    fi
 fi
 
 link_all() {
@@ -261,34 +267,9 @@ link_all() {
     link "$LINK_SRC/.tmux.conf"           "$HOME/.tmux.conf"
     link "$LINK_SRC/bin/sleep-manager"    "$HOME/bin/sleep-manager"
     link "$LINK_SRC/bin/csync"            "$HOME/bin/csync"
-    if (( ! STANDALONE_T )); then
-    link "$LINK_SRC/bin/cursor-beam"      "$HOME/bin/cursor-beam"
-    fi
     link "$LINK_SRC/bin/pii-scan"         "$HOME/bin/pii-scan"
-    if (( ! STANDALONE_T )); then
-    link "$LINK_SRC/bin/claude-stamp-tmux" "$HOME/bin/claude-stamp-tmux"
-    fi
     link "$LINK_SRC/bin/clip-bridge"      "$HOME/bin/clip-bridge"
-    if (( ! STANDALONE_T )); then
-    link "$LINK_SRC/bin/t"                "$HOME/bin/t"
-    fi
     link "$LINK_SRC/bin/dots-sync"        "$HOME/bin/dots-sync"
-    if (( ! STANDALONE_T )); then
-    link "$LINK_SRC/claude/commands/tpush.md" "$HOME/.claude/commands/tpush.md"
-    fi
-    if (( ! STANDALONE_T )); then
-    link "$LINK_SRC/claude/commands/tpop.md"  "$HOME/.claude/commands/tpop.md"
-    fi
-    # Codex CLI's twins of /tpush and /tpop (custom prompts: ~/.codex/prompts/<name>.md
-    # → /name in the codex TUI). Linked unconditionally like everything here, which
-    # is why install_codex_hooks below gates on a REAL codex home (config/auth), not
-    # on the ~/.codex dir these links create.
-    if (( ! STANDALONE_T )); then
-    link "$LINK_SRC/codex/prompts/tpush.md"  "$HOME/.codex/prompts/tpush.md"
-    fi
-    if (( ! STANDALONE_T )); then
-    link "$LINK_SRC/codex/prompts/tpop.md"   "$HOME/.codex/prompts/tpop.md"
-    fi
     # `t todo` is retired: its /todo command file no longer exists, so the managed
     # link that pointed at it is removed rather than left dangling (a dangling link
     # here shows up in Claude's command list as a broken /todo).
@@ -312,248 +293,6 @@ link_all() {
 }
 
 link_all
-
-# Claude Code statusline — retired with `t todo`.
-#
-# This runs in the LINKS-ONLY path, above the exit below, so a plain `dots` applies
-# it: the README's contract is "you rarely need to run install.sh by hand — dots
-# reconciles", and a step only reachable by a manual full install breaks that (it is
-# how a released change lands on one machine and silently not on another). Safe here
-# for the same reasons link_all is: offline, idempotent, and it touches exactly one
-# key that this script itself wrote — unlike the brew/PII steps the exit exists to
-# skip.
-#
-# `t todo` is retired, and with it the statusLine it seeded (`t todo --statusline`).
-# The seed lived in settings.json.example AND in this targeted merge (Claude writes to
-# the live settings.json at runtime, so the example only ever reached a fresh box) —
-# so the retirement needs the same two halves: the example no longer carries the key,
-# and this removes it from an existing settings.json, ONLY when the command is exactly
-# the one we seeded. A hand-set statusline is never touched. Same tmp + os.replace
-# write, and silent unless it actually changes something, because it runs on every
-# single `dots`.
-retire_claude_statusline() {
-    (( STANDALONE_T )) && return 0
-    local dst="$HOME/.claude/settings.json"
-    [[ -e "$dst" ]] || return 0
-    command -v python3 >/dev/null 2>&1 || return 0
-    python3 - "$dst" <<'PY'
-import json, os, sys
-
-dst = sys.argv[1]
-try:
-    with open(dst, encoding="utf-8") as fh:
-        data = json.load(fh)
-except (OSError, ValueError):
-    sys.exit(0)          # not ours to repair, and never block a relink over it
-sl = data.get("statusLine") if isinstance(data, dict) else None
-if not (isinstance(sl, dict) and sl.get("type") == "command"
-        and sl.get("command", "").replace(os.path.expanduser("~"), "$HOME", 1)
-        == "$HOME/bin/t todo --statusline"):
-    sys.exit(0)          # absent, or hand-set — leave it alone
-del data["statusLine"]
-tmp = dst + ".tmp"
-with open(tmp, "w", encoding="utf-8") as fh:
-    json.dump(data, fh, indent=2)
-    fh.write("\n")
-os.replace(tmp, dst)
-print("Removed the retired `t todo --statusline` statusLine from %s" % dst)
-PY
-}
-retire_claude_statusline
-
-# The `sessions` MCP server (bin/t mcp) — "which session is working on what?" from
-# inside any Claude session. Same contract as the statusline retirement above, and here in
-# the links-only path for the same reason: a step only a manual install reaches lands
-# on one machine and silently not on another. Add-only — an entry that exists (or was
-# hand-edited) is never touched; `claude mcp remove sessions -s user` plus
-# DOTFILES_NO_MCP=1 in ~/.zshrc.local opts a machine out for good.
-#
-# Presence is read straight out of ~/.claude.json: `claude mcp get` SPAWNS the server
-# to health-check it, which is not a probe you want on every dots. Registration goes
-# through `claude mcp add` (Claude's own writer — that file holds OAuth state and
-# per-project history, never hand-merge it). The path is EXPANDED, unlike the
-# statusline's literal $HOME: a stdio MCP spawn does not go through a shell.
-install_claude_mcp() {
-    (( STANDALONE_T )) && return 0
-    [[ -z "${DOTFILES_NO_MCP:-}" ]] || return 0
-    command -v claude  >/dev/null 2>&1 || return 0   # fresh box: t doctor / t mcp --install later
-    command -v python3 >/dev/null 2>&1 || return 0
-    python3 - "$HOME/.claude.json" <<'PY' && return 0
-import json, sys
-try:
-    with open(sys.argv[1], encoding="utf-8") as fh:
-        data = json.load(fh)
-except OSError:
-    sys.exit(1)          # no file yet: register
-except ValueError:
-    sys.exit(0)          # not ours to repair, and never loop-add into a broken file
-servers = data.get("mcpServers") if isinstance(data, dict) else None
-sys.exit(0 if isinstance(servers, dict) and "sessions" in servers else 1)
-PY
-    if command claude mcp add sessions -s user -- "$HOME/bin/t" mcp >/dev/null 2>&1; then
-        echo "Registered MCP server 'sessions' (user scope) -> $HOME/bin/t mcp"
-    else
-        echo "WARNING: could not register the sessions MCP server; run by hand:" >&2
-        echo "  claude mcp add sessions -s user -- $HOME/bin/t mcp" >&2
-    fi
-}
-install_claude_mcp
-
-# Registering the server is only half of it: Claude Code prompts for EVERY MCP tool
-# call unless a permission rule covers it, and a prompt per lookup makes the server
-# useless mid-turn. This one is ours and read-only (four lookups over local
-# transcripts and tmux, spawned by `t mcp` from this checkout), so
-# it is allowed by default. Blanket `mcp__sessions` rather than four per-tool rules,
-# so a tool added to `t mcp` later is covered the day it ships.
-#
-# Same contract as the statusline merge above, for the same reason: seeding
-# settings.json.example only reaches a FRESH machine, because install_claude_settings
-# never clobbers an existing settings.json. Add-only and silent unless it changes
-# something — a hand-narrowed set of per-tool `mcp__sessions__*` rules is a deliberate
-# choice and is left alone, never widened back out from under you.
-install_claude_mcp_allow() {
-    (( STANDALONE_T )) && return 0
-    [[ -z "${DOTFILES_NO_MCP:-}" ]] || return 0
-    local dst="$HOME/.claude/settings.json"
-    [[ -e "$dst" ]] || return 0          # nothing to merge into; the seed already has it
-    command -v python3 >/dev/null 2>&1 || return 0
-    python3 - "$dst" <<'PY'
-import json, os, sys
-
-RULE = "mcp__sessions"
-dst = sys.argv[1]
-try:
-    with open(dst, encoding="utf-8") as fh:
-        data = json.load(fh)
-except (OSError, ValueError):
-    sys.exit(0)          # not ours to repair, and never block a relink over it
-if not isinstance(data, dict):
-    sys.exit(0)
-perms = data.setdefault("permissions", {})
-if not isinstance(perms, dict):
-    sys.exit(0)
-allow = perms.setdefault("allow", [])
-if not isinstance(allow, list):
-    sys.exit(0)
-rules = [r for r in allow if isinstance(r, str)]
-if RULE in rules or any(r.startswith(RULE + "__") for r in rules):
-    sys.exit(0)          # already allowed, or hand-narrowed per tool — leave it be
-allow.append(RULE)
-tmp = dst + ".tmp"
-with open(tmp, "w", encoding="utf-8") as fh:
-    json.dump(data, fh, indent=2)
-    fh.write("\n")
-os.replace(tmp, dst)
-print("Allowed %s in %s (the sessions MCP tools no longer prompt)" % (RULE, dst))
-PY
-}
-install_claude_mcp_allow
-
-# Codex CLI's twin of the SessionStart hook: the same bin/claude-stamp-tmux script
-# (agent-aware — `--agent codex`), registered in ~/.codex/hooks.json so a codex slot
-# gets the same registry / opened / origin / tmux stamps a claude slot gets. Same
-# contract as the statusline and MCP seeds above, in the links-only path for the same
-# reason: a plain `dots` must land it on every machine, and `t install codex` re-runs
-# this right after the binary appears. Add-only (an existing claude-stamp-tmux entry,
-# or a hand-edited file, is never touched), tmp + os.replace, silent unless it adds.
-# Gated on codex being present or a REAL codex home (its config.toml / auth.json —
-# NOT the bare ~/.codex dir, which link_all's prompt links create on every machine),
-# so a box that never runs codex never grows a hooks file. The command is a literal $HOME: Codex runs hook
-# commands through a shell (its own examples use `~` and `$(git …)`).
-#
-# Trust is the one half install.sh cannot do: Codex asks once, at its next startup
-# ("Hooks need review" → "Trust all and continue"), and records the decision against
-# the command's hash in ~/.codex/config.toml — no supported installer pre-trust exists
-# — which is why the argv is fixed here and `t doctor` reads that trust record.
-install_codex_hooks() {
-    (( STANDALONE_T )) && return 0
-    [[ -z "${DOTFILES_NO_CODEX_HOOKS:-}" ]] || return 0
-    command -v codex >/dev/null 2>&1 || [[ -f "$HOME/.codex/config.toml" || -f "$HOME/.codex/auth.json" ]] || return 0
-    command -v python3 >/dev/null 2>&1 || return 0
-    # shellcheck disable=SC2016  # the literal $HOME is the point: Codex expands it at hook time
-    python3 - "$HOME/.codex/hooks.json" '$HOME/bin/claude-stamp-tmux --agent codex' <<'PY'
-import json, os, sys
-
-dst, cmd = sys.argv[1], sys.argv[2]
-try:
-    with open(dst, encoding="utf-8") as fh:
-        data = json.load(fh)
-except OSError:
-    data = {}             # no file yet: create it
-except ValueError:
-    sys.exit(0)           # not ours to repair, and never block a relink over it
-if not isinstance(data, dict):
-    sys.exit(0)
-hooks = data.setdefault("hooks", {})
-if not isinstance(hooks, dict):
-    sys.exit(0)
-groups = hooks.setdefault("SessionStart", [])
-if not isinstance(groups, list):
-    sys.exit(0)
-for g in groups:
-    for h in (g.get("hooks") or []) if isinstance(g, dict) else []:
-        if isinstance(h, dict) and "claude-stamp-tmux" in str(h.get("command", "")):
-            sys.exit(0)   # already wired (or hand-edited) — silent no-op, this runs every dots
-groups.append({"hooks": [{"type": "command", "command": cmd}]})
-os.makedirs(os.path.dirname(dst), exist_ok=True)
-tmp = dst + ".tmp"
-with open(tmp, "w", encoding="utf-8") as fh:
-    json.dump(data, fh, indent=2)
-    fh.write("\n")
-os.replace(tmp, dst)
-print("Registered the SessionStart hook in %s -> claude-stamp-tmux --agent codex" % dst)
-print("  (one-time: start codex and accept its hooks prompt, 'Trust all and continue')")
-PY
-}
-install_codex_hooks
-
-# The tracked permission allow list (agents/permissions.allow + .retire) → every
-# installed agent's own config: ~/.claude/settings.json verbatim, codex's
-# ~/.codex/rules/dotfiles.rules and cursor's ~/.cursor/cli-config.json for the Bash
-# prefix rules. The parsing, translation and merge live in ONE place, bin/t — this
-# runs its `t permissions --apply`, `t permissions` is the by-hand twin and `t doctor`
-# prints the same report — so the installer and the diagnosis cannot drift. Here in
-# the links-only path like the seeds above, for the same reason: a rule allowed once
-# must land on every machine on its next `dots`. Add-and-retire: the merge appends
-# what is missing, removes what .retire names, and touches nothing else (hand-added
-# rules, deny lists, the rest of each file); silent unless something changed.
-#
-# bin/t is grep-guarded the way _dots_relink guards this script: the migration tests
-# seed a stub bin/t, and an older checkout's bin/t has no such verb — neither may fail
-# a relink. Runs from $LINK_SRC (the tree the links come from), so a session worktree's
-# ./install.sh applies the canonical list, not its own draft. DOTFILES_NO_PERMISSIONS=1
-# opts a machine out.
-install_agent_permissions() {
-    (( STANDALONE_T )) && return 0
-    [[ -z "${DOTFILES_NO_PERMISSIONS:-}" ]] || return 0
-    [[ -f "$LINK_SRC/agents/permissions.allow" ]] || return 0
-    command -v python3 >/dev/null 2>&1 || return 0
-    grep -q 'def cmd_permissions' "$LINK_SRC/bin/t" 2>/dev/null || return 0
-    python3 "$LINK_SRC/bin/t" permissions --apply \
-        || echo "⚠ t permissions --apply failed (rc $?) — run it by hand" >&2
-}
-install_agent_permissions
-
-# Every REGISTERED repo (DEV_REPOS) is trusted in each installed agent's own store —
-# ~/.claude.json, ~/.codex/config.toml, cursor-agent's .workspace-trusted markers — so
-# a session never opens on a "do you trust this folder?" prompt. Both claude and codex
-# key trust on the CANONICAL repo (a linked worktree resolves to it), so one entry per
-# repo covers every per-session worktree. `t trust --all -q` is the whole step (the
-# by-hand twin is `t trust`; `t doctor` reports the same state): add-only, silent
-# unless it trusted something, an agent that is not here is skipped. Links-only like
-# the seeds above so a repo registered on one machine is trusted on the next `dots`
-# everywhere; grep-guarded for the same stub / older-checkout reason as the
-# permissions step. It reads the repos from the t config bridge (~/.config/t/config.sh),
-# so a box with no registered repos is a no-op. DOTFILES_NO_TRUST=1 opts a machine out.
-install_agent_trust() {
-    (( STANDALONE_T )) && return 0
-    [[ -z "${DOTFILES_NO_TRUST:-}" ]] || return 0
-    command -v python3 >/dev/null 2>&1 || return 0
-    grep -q 'def cmd_trust' "$LINK_SRC/bin/t" 2>/dev/null || return 0
-    python3 "$LINK_SRC/bin/t" trust --all -q \
-        || echo "⚠ t trust --all failed (rc $?) — run it by hand" >&2
-}
-install_agent_trust
 
 # pr-watch — RETIRED. It was an autonomous PR fixer on a launchd StartInterval timer:
 # every 5 minutes it polled for a CONFLICTING / CI-failed PR and spawned a detached
@@ -629,8 +368,8 @@ install_clip_bridge() {
 install_clip_bridge
 
 # Everything below is the FULL install. The links-only relink stops here, before the
-# tmux source-file, the ssh Include rewrite, the ~/.zshrc.local and settings.json
-# seeds, the global gitconfig/hooksPath writes, the PII denylist branch (which would
+# tmux source-file, the ssh Include rewrite, the ~/.zshrc.local
+# seed, the global gitconfig/hooksPath writes, the PII denylist branch (which would
 # DELETE the denylist when PII_SCRUB_RULES is unset — always true from a shell hook),
 # and brew bundle. (The launchd agent restart is gone with pr-watch; its un-seed is
 # above, in the links-only path, so a plain `dots` disarms an opted-in machine.)
@@ -693,47 +432,6 @@ if [[ ! -e "$HOME/.zshrc.local" ]]; then
     cp "$LINK_SRC/.zshrc.local.example" "$HOME/.zshrc.local"
     echo "Created ~/.zshrc.local from template — run 't setup' in a new shell to register your repos and remote hosts (or edit it by hand)."
 fi
-
-# Claude Code settings — ~/.claude/settings.json is a REAL COPY seeded from
-# claude/settings.json.example (only the session-stamping hook the tmux tooling
-# needs), the same pattern as ~/.zshrc.local. It is deliberately per-machine and
-# untracked: Claude Code WRITES to this file at runtime (/model saves the default
-# model, "always allow" appends permission rules, plugin toggles land here), so a
-# tracked or symlinked copy keeps the repo dirty and risks committing private
-# allow-rules. A legacy author-mode symlink into the repo (the old install
-# choice 2) is materialized into a real copy of its current content. Never
-# clobber an existing real file.
-install_claude_settings() {
-    (( STANDALONE_T )) && return 0
-    local dst="$HOME/.claude/settings.json"
-    local example="$LINK_SRC/claude/settings.json.example"
-
-    mkdir -p "$HOME/.claude"
-
-    if [[ -L "$dst" ]]; then
-        if [[ -e "$dst" ]]; then
-            # Live symlink — copy through it, then atomically replace the link.
-            # mv -f does the rename in one step so a failure can't leave $dst gone.
-            cp "$dst" "$dst.tmp"
-            mv -f "$dst.tmp" "$dst"
-            echo "Materialized $dst as a real copy (settings are per-machine now)"
-        else
-            rm "$dst"   # dangling link (target gone) — reseed from the example
-        fi
-    fi
-
-    if [[ -e "$dst" ]]; then
-        echo "Keeping existing $dst"
-        return
-    fi
-
-    cp "$example" "$dst"
-    echo "Created $dst from settings.json.example"
-}
-install_claude_settings
-# the settings.json just seeded gets the tracked allow list in this same run, not the
-# next dots (the links-only call above found no file to merge into on a fresh box)
-install_agent_permissions
 
 # Global git default — a pull reconciliation strategy so `git pull` never emits
 # the "divergent branches" hint and never silently merges or rebases. ff-only: a

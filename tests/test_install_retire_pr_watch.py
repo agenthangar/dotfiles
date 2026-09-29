@@ -18,7 +18,7 @@ import pathlib
 
 import pytest
 
-from test_install_codex_hooks import box, relink  # noqa: F401  (pytest fixtures)
+from install_helpers import box, relink  # noqa: F401  (pytest fixtures)
 
 LABEL = "com.chrisobrien-ai.pr-watch"
 
@@ -61,7 +61,7 @@ def test_says_nothing_on_a_machine_that_never_had_it(box):
     assert "pr-watch" not in r.stdout, r.stdout
     assert not (home / "Library" / "LaunchAgents" / f"{LABEL}.plist").exists()
     # the other managed bins still land; only pr-watch stopped being linked
-    assert (home / "bin" / "t").is_symlink()
+    assert (home / "bin" / "sleep-manager").is_symlink()
     assert not (home / "bin" / "pr-watch").is_symlink()
 
 

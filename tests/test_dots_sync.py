@@ -65,6 +65,7 @@ def run(home, stub, *args):
         "XDG_CONFIG_HOME": str(home / ".config"),
         "DOTS_SYNC_SSH": str(stub),
         "DOTFILES_NO_TMUX": "1",
+        "DOTFILES_NO_T": "1",
         "DOTFILES_NO_MCP": "1",
         "DOTFILES_NO_PERMISSIONS": "1",
         "DOTFILES_NO_TRUST": "1",

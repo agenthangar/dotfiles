@@ -280,7 +280,7 @@ def test_ssh_config_scopes_the_tunnel_to_clip_bridges_match():
 
 # --- install.sh's install_clip_bridge --------------------------------------------
 
-from test_install_codex_hooks import box as install_box, relink  # noqa: E402,F401
+from install_helpers import box as install_box, relink  # noqa: E402,F401
 
 
 @pytest.mark.skipif(os.uname().sysname != "Darwin", reason="the listener is macOS-only")

@@ -260,7 +260,12 @@ the picker. Codex mints its thread id at the first prompt (there is no
 If its SessionStart hook never fires, `t ls` can still show the title and active
 context from a single conversation in the slot's directory updated since the
 running process started. This display fallback does not assign a session ID;
-commands that move a conversation still require its recorded identity.
+commands that move a conversation still require its recorded identity or a
+verified live title. For an unstamped Codex, `t` can recover the ID when its pane
+title and current status footer match one uniquely named conversation in the exact
+worktree, updated during this process's lifetime. Missing, stale, or ambiguous
+matches remain unresolved. `t app` saves the verified ID before stopping the CLI
+so a later handoff can still find it.
 Across machines, `t beam` ships a codex slot's rollout (and its origin stamp)
 with its date path intact and `csync` mirrors `~/.codex/sessions` to iCloud as
 `codex-sessions` — Codex indexes a copied-in rollout on the first resume, so only

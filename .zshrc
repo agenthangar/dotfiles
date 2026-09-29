@@ -1162,6 +1162,58 @@ except (OSError, ValueError, sqlite3.Error):
 PY
 }
 
+# Recover a missing hook stamp from Codex's CURRENT pane title and status footer.
+# The shared app-server can run outside the CLI's ancestry, leaving no pid stamp.
+# Unlike the display-only recency fallback, this requires the same exact named
+# conversation in both live UI surfaces and a unique thread in this worktree.
+# Do not cache it: the CLI may switch conversations without changing its pid.
+_codex_pane_sid() {
+  local session="$1" dir="$2" pid="$3" db start pane_title pane_text
+  [[ -n $dir && $pid == <-> ]] || return 0
+  db=$(_codex_db); [[ -r $db ]] || return 0
+  start=$(LC_ALL=C ps -o lstart= -p "$pid" 2>/dev/null) || return 0
+  pane_title=$(tmux display-message -p -t "=$session:" '#{pane_title}' 2>/dev/null)
+  [[ -n $pane_title ]] || return 0
+  pane_text=$(tmux capture-pane -p -t "=$session:" 2>/dev/null)
+  python3 - "$db" "$dir" "$start" "$pane_title" "$pane_text" <<'PY' 2>/dev/null
+import datetime, json, os, re, sqlite3, sys
+try:
+    db, cwd, started, pane_title, pane = sys.argv[1:]
+    start = datetime.datetime.strptime(started.strip(), '%a %b %d %H:%M:%S %Y').timestamp()
+    name, sep, folder = pane_title.rpartition(' | ')
+    if not sep or not name or folder != os.path.basename(cwd):
+        sys.exit(0)
+    # Only the last status line counts; a title in earlier output is not evidence.
+    footers = [parts for line in pane.splitlines()
+               if len(parts := line.strip().split(' · ')) >= 4]
+    if not footers:
+        sys.exit(0)
+    footer = footers[-1]
+    if len(footer) < 4 or os.path.expanduser(footer[1]) != cwd or footer[2] != name:
+        sys.exit(0)
+    c = sqlite3.connect('file:%s?mode=ro' % db, uri=True, timeout=0.5)
+    rows = c.execute("select id,rollout_path,updated_at,archived,first_user_message from threads "
+                     "where cwd=? and name=? and instr(source, '\"subagent\"')=0 limit 2",
+                     (cwd, name)).fetchall()
+    # Check uniqueness BEFORE recency: an older namesake is still ambiguous.
+    if len(rows) != 1:
+        sys.exit(0)
+    sid, rollout, updated, archived, prompt = rows[0]
+    if (updated < start or archived or not prompt.strip() or
+            not re.fullmatch(r'[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}', sid)):
+        sys.exit(0)
+    with open(rollout) as f:
+        meta = json.loads(f.readline())
+    payload = meta.get('payload', {})
+    if (meta.get('type') == 'session_meta' and payload.get('id') == sid and
+            payload.get('cwd') == cwd and payload.get('source') in ('cli', 'vscode') and
+            payload.get('thread_source') != 'subagent'):
+        print(sid)
+except (OSError, ValueError, TypeError, AttributeError, sqlite3.Error):
+    pass
+PY
+}
+
 # _dev_transcript_agent <path> — which agent wrote this transcript, from its name
 # (a codex rollout is `rollout-…`; everything else is a claude <sid>.jsonl).
 _dev_transcript_agent() { [[ ${1:t} == rollout-* ]] && print -r -- codex || print -r -- claude }
@@ -2554,10 +2606,12 @@ _dev_summary_for_pid() {
 #      cwd == dir check so a recycled pid's stale entry is ignored.
 #   2. The tmux stamp — but only if its transcript lives in THIS slot's own project
 #      dir; a stamp pointing at another repo's transcript is stale and is dropped.
-# Prints the id, or nothing (caller then falls back to a birthtime match).
+#   3. For an unstamped live Codex, its pane title + current status footer matched
+#      to a unique named thread in this cwd, with validated rollout metadata.
+# Prints the id, or nothing (display callers may use a recency fallback).
 _dev_session_sid() {
   setopt local_options null_glob bare_glob_qual
-  local session="$1" dir="${2:-}" sid cpid reg line rcwd
+  local session="$1" dir="${2:-}" sid cpid reg line rcwd agent
   [[ -n $dir ]] || dir=$(tmux display-message -p -t "$session" '#{session_path}' 2>/dev/null)
   cpid=$(_dev_session_claude_pid "$session")
   reg="${XDG_CACHE_HOME:-$HOME/.cache}/claude-sessions/$cpid"
@@ -2567,10 +2621,14 @@ _dev_session_sid() {
     sid=
   fi
   sid=$(tmux show-environment -t "$session" CLAUDE_RESUME_ID 2>/dev/null | cut -d= -f2)
-  [[ -n $sid ]] || return 0
+  agent=$(_dev_agent_of_session "$session")
   # per agent: claude's transcript must sit in THIS slot's project dir; a codex
   # rollout is date-keyed, so its existence (hook cache / sqlite / glob) is the test
-  _dev_agent_transcript "$(_dev_agent_of_session "$session")" "$sid" "$dir" >/dev/null && print -r -- "$sid"
+  if [[ -n $sid ]] && _dev_agent_transcript "$agent" "$sid" "$dir" >/dev/null; then
+    print -r -- "$sid"
+  elif [[ $agent == codex ]]; then
+    _codex_pane_sid "$session" "$dir" "$cpid"
+  fi
   return 0
 }
 

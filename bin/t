@@ -5893,6 +5893,10 @@ while [[ -n $up && $up != 0 && $up != 1 ]]; do
   }}
   up=$(ps -o ppid= -p "$up" 2>/dev/null); up=${{up//[[:space:]]/}}
 done
+# Preserve a recovered identity after the CLI (and its live title) disappears.
+# This is deliberately after revalidation and the self-handoff guard.
+tmux set-environment -t "=$session" CLAUDE_RESUME_ID "$expected_sid" || exit 1
+tmux set-environment -t "=$session" DEV_AGENT codex || exit 1
 # Some slots exec Codex as the pane process, with no shell to return to. Keep
 # that pane after exit too, or the session and its conversation stamp disappear.
 tmux set-option -p -t "=$session:" remain-on-exit on || exit 1

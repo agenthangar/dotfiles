@@ -1,470 +1,113 @@
 # dotfiles
 
-> Personal macOS + zsh dotfiles, built around a toolkit for running **Claude Code**
-> in tmux — teleport, search, and sync sessions across machines. Linux hosts are
-> supported as remote nodes (macOS-only pieces skip themselves).
+Personal macOS and zsh configuration: shell utilities, machine sync, clipboard
+bridging, sleep management, and PII scanning. Linux machines are supported as
+remote nodes; macOS-only features skip themselves.
 
-The everyday shell config is here (aliases, PATH, completions), but the
-distinctive part is the **Claude Code session tooling**, unified under a single
-GitHub-CLI-style command: **`t`** (a Python core in `bin/t` plus a thin `t()`
-shim in `.zshrc` for verbs that must run in your shell).
+The coding-agent session toolkit now lives in **[agenthangar/t](https://github.com/agenthangar/t)**.
+Install t independently for sessions, worktrees, remote handoff, setup/config,
+agent settings, and desktop handoff. This repository consumes that project.
 
-## The `t` command
+## Everyday commands
 
-| Command | What it does |
+| Command | Purpose |
 | --- | --- |
-| `t open <repo> [slot]` | Open or reattach a session in a per-repo detached tmux slot (`--new`, `--fg`, `--remote`, `--here`; `--codex` runs OpenAI's Codex CLI in the slot instead of Claude — `DEV_AGENT[repo]=codex` makes that the repo's default) |
-| `t app [repo] [slot]` | Move a local Codex slot into the macOS desktop app, opening the same conversation and its running web preview and referenced plan for annotation (`--url <url>`, `--plan <path>`, `--dry-run`) |
-| `t ls [-r] [-a]` | List live sessions, optionally across every machine (`-r`) and repo (`-a`) |
-| `t cd [repo] [slot]` | `cd` this shell into a slot's worktree (bare `t cd`: fzf pick across all worktrees) |
-| `t push` / `t pop` | Move a session between a foreground terminal and a detached tmux slot — one-live-owner guarantee |
-| `t beam <repo> [slot] --host <h>` | Teleport a running session to another machine; pull one back with `t open … --here` |
-| `t find <query>` | Semantic search across saved sessions ("which one was working on X?"), reranked by Claude |
-| `t install [agent…]` | Install and log in the agent CLIs — Claude Code, Codex, Cursor — on this machine and every remote host, `t setup`-style: one checklist with the present entries locked, the vendors' commands shown before anything runs; `--reinstall` runs an installer again for an agent already here; ends by opening `t setup` when `~/code` holds repos not registered yet ([details](#agents)) |
-| `t trust [dir…]` | Trust a folder in every installed agent at once — Claude Code, Codex, Cursor each keep their own "do you trust this folder?" answer. Bare: the repo you are standing in. Every registered repo is trusted by default (`dots` runs `t trust --all`) |
-| `t new [name]` | Wizard: create `~/code/<name>` + a GitHub repo (owner picked from your orgs; squash-only, auto-merge), register it here and clone + register it on every remote host. Re-running resumes; on an existing repo it just finishes the wiring |
-| `t mcp` | The `sessions` MCP server Claude Code spawns, so any Claude session can answer "which session is/was working on X?" from every saved transcript and the live slots. `--install` registers it (`dots` does), `--call <tool> '<json>'` runs one tool by hand |
+| `dots` | Update canonical dotfiles main and standalone t, reconcile links, reload |
+| `dots --all` | Update here, then run dots on every configured remote host |
+| `dots --dev` | Make the dotfiles session worktree you are standing in live |
+| `dots --relink` | Reconcile the selected dotfiles links without fetching |
+| `help` / `h` | List shell and installed commands |
+| `csync` | Optional two-way iCloud sync of agent transcripts and plans |
+| `prview` | Inspect a pull request from the terminal |
+| `nosleep` | Keep the Mac awake while work is active |
+| `sleep-manager` | Explicit macOS sleep control |
+| `clip-bridge` | Send copies from remote tmux back to the Mac you are using |
+| `pii-scan` | Scan tracked or staged files with a private identifier denylist |
 
-Run `t -h` for the full verb list.
+## Install
 
-In `t ls` and slot pickers, `↻` marks work still pending after a merged PR.
-It appears in yellow in the STATUS column, even when the summary is truncated.
-A clean slot whose work has already landed stays plain `merged`; updating to
-main or completing a later PR does not by itself mean work remains.
-
-For example, `t app api 13` automatically creates a new Codex desktop window,
-then stops that slot's Codex CLI and requests its existing thread and live dev URL
-in that window. It invokes the app's native **New Window** menu action, waits for
-a distinct window, and focuses that exact window before sending the handoff.
-Other session windows keep their contents. `--reuse-window` instead allows the
-app to navigate its existing window without creating another.
-
-Automatic window creation requires macOS **Accessibility** permission for the
-terminal running `t` (System Settings → Privacy & Security → Accessibility).
-If permission, menu access, or window creation fails, the CLI stays running and
-no thread link is sent. The native menu currently needs the English **New Window**
-label. No Swift compiler or extra Python packages are needed.
-The command confirms window creation separately from the URL request;
-macOS does not confirm that the app displayed the requested thread and preview.
-The handoff keeps the same conversation.
-Use **Annotation mode** to click an element or select an area and leave feedback.
-`t app api 13 --url 'http://localhost:5213/#budget'` selects a particular page
-and remembers its full URL for that conversation. Later `t app api 13` opens
-that page again, including its query and hash. With no remembered page it uses
-the server's root URL; it cannot infer the current browser page from the chat topic.
-The choice is cached locally under `~/.cache/claude-sessions/app-previews/` and
-is ignored if the conversation moves to a different worktree.
-Saved plans open automatically too: `t app` finds the last existing
-`~/.claude/plans/*.md` mentioned in that conversation's user/assistant messages.
-Use `--plan ~/.claude/plans/launch.md` for a different Markdown file; the choice
-is remembered as a fallback for that conversation and worktree. `--no-plan`
-skips it. `--no-preview` skips the web page; combine both to open only the chat.
-The plan opens in its own browser tab on the same conversation, with rendered
-headings, bold/emphasis, links, lists, tables, blockquotes, and code blocks for
-reading and annotation. The Markdown parser is bundled; no install step or
-external rendering service is needed. Refresh to see saved edits.
-A small local server exposes only that file at a random loopback URL, reuses it
-on repeat handoffs, and exits after an hour without requests. Rerun `t app` to
-restart an expired preview. The original Markdown stays in place.
-
-`--dry-run` prints the handoff link and selected plan without changing anything. The worktree and
-dev server stay running, and tmux keeps the slot reserved even when Codex was
-the pane's main process (the exited pane remains). To return
-to the terminal later, stop work in the app, then use `t pop api 13`.
-
-This requires a local Codex conversation and a recent desktop app installed in
-`/Applications` or `~/Applications` (named Codex or ChatGPT). It uses the app's
-`codex://threads/<id>?browserUrl=…` handler, verified against app version
-26.924.20706; this is an app-version-dependent interface. Without an explicit or
-remembered URL, a stopped dev server opens just the conversation with a notice;
-start the server and rerun to add the preview. Claude conversations cannot be
-imported by this command. Bring remote
-slots here first with `t beam <repo> <slot> --here`.
-
-## Other commands
-
-| Command | What it does |
-| --- | --- |
-| `dots [--all\|--dev]` | Sync the live checkout to `origin/main` HEAD and reload zsh; `--all` then runs `dots` on every host too; `--dev` makes the session worktree you are standing in live instead ([details](#keeping-machines-in-sync)) |
-| `csync` | Two-way sync of Claude session history and plans, Codex rollouts, and Cursor chats across machines via iCloud Drive |
-| `sleep-manager` | Block or restore macOS sleep (`status`, `disable`, `enable`) |
-| `pii-scan` | Keep personal data out of this public repo ([details](#pii-guard)) |
-| `help` / `h` | Auto-generated, grouped list of every command ([details](#the-help-command)) |
-
-## Layout & the symlink model
-
-The files **in this repo are the source of truth.** `install.sh` symlinks them
-into `$HOME`, so editing either side edits both — there is no copy or sync step.
-Specifically it links from the **canonical checkout** (the one parked on `main`),
-which is why that tree is the live surface and session worktrees are not — until
-you point them there yourself with `dots --dev`.
-
-| Repo file | Symlinked to |
-| --- | --- |
-| `.zshrc` | `~/.zshrc` |
-| `bin/<script>` | `~/bin/<script>` |
-| `claude/commands/*.md` | `~/.claude/commands/*.md` |
-| `codex/prompts/*.md` | `~/.codex/prompts/*.md` (Codex's `/tpush`, `/tpop`) |
-
-`bin/` holds the utility scripts (added to PATH):
-
-| Script | Role |
-| --- | --- |
-| `t` | The single Claude-session command (Python); paired with the `t()` shim in `.zshrc` |
-| `csync` | Two-way sync of Claude session history via iCloud Drive |
-| `sleep-manager` | Manage macOS sleep behavior |
-| `claude-stamp-tmux` | Claude SessionStart hook — records each session's id so `t pop`/`t plan` target the exact session |
-| `pii-scan` | Fail if any PII appears in tracked/staged files |
-
-Two files are deliberately **real copies, not symlinks**, so machine-specific or
-sensitive config never lands in the repo (`install.sh` seeds each from a template
-on first run and never clobbers an existing one):
-
-- **`~/.zshrc.local`** — your real repo list (`DEV_REPOS`), remote hosts
-  (`REMOTE_HOSTS`), and private completions. `.zshrc` sources it if present.
-- **`~/.claude/settings.json`** — see [Claude plugins & MCP](#claude-plugins--mcp).
-
-## Keeping machines in sync
-
-There is **one canonical checkout** of this repo (normally `~/code/dotfiles`),
-parked on `main`, and it **is** the live surface — the `$HOME` symlinks point
-straight at it. All development happens in **per-session worktrees**
-(`~/code/.worktrees/<repo>/<slot>` on `dev/<repo>-<slot>`), created by
-`t open <repo>` and reaped once their PR merges.
-
-**`dots`** syncs that checkout to **`origin/main` HEAD** and reloads your shell in
-one step: it fetches, fast-forwards to `origin/main`, and re-sources `~/.zshrc`.
-Your live dotfiles become exactly what's published on `main` — nothing is done
-locally (no merge, no commit), and the symlink model means it takes effect
-immediately. It's safe, stopping and only reloading if the working tree has
-uncommitted edits.
-
-Because that checkout is live, **don't edit or commit in it** — a save there changes
-your `$HOME` config instantly, and `main` is protected. A pre-commit hook refuses
-commits on `main` in the live tree, and `dots --dev` refuses to take it as a source.
-
-`dots` also **reconciles the managed symlinks every run**, so a released change that
-adds a managed file (a new `bin/` script, a new dotfile) lands without a manual
-install — the failure it fixes was a fast-forwarded machine whose `~/.tmux.conf` link
-had simply never been made. It is offline and prints nothing unless a link changed.
-**`dots --relink`** does just that step, without fetching.
-
-**`dots --all`** does that here and then on **every host** — one `dots` per
-`REMOTE_HOSTS` entry, in parallel over ssh, one result line each (a host that is
-asleep just says `unreachable`). Run it when a PR merges: nothing polls for a merge,
-so without it the other machines answer the next cross-host verb with the previous
-release. `dots-sync --no-hosts` is the local half alone, and any shell that was
-already open re-sources itself at its next prompt once the live `main` moves.
-
-**`dots --dev`** flips the live symlinks to the **session worktree you are standing
-in**, so its in-progress edits go live for testing before they merge — useful for a
-new `bin/` script that needs a fresh symlink. `cd` into the worktree
-(`t cd dot <slot>`) and run it; a later plain `dots` flips back. Anywhere else it
-errors rather than guessing. It skips `brew bundle` for speed.
-
-Start a dotfiles session with `t open dotfiles`. Session history syncs separately,
-in the background, via `csync`.
-
-## Agents
-
-The session tooling was built around Claude Code, and now takes **three agent
-CLIs**: Claude Code (`claude`), OpenAI's Codex CLI (`codex`), and the Cursor CLI
-(`cursor-agent`). `t install` installs and logs in whichever are missing, here
-and on every `REMOTE_HOSTS` host, using each vendor's published installer
-(`brew install --cask codex` on a Mac, their `curl … | sh` scripts elsewhere) and
-each one's login command — device-code variants over ssh. It is a checklist like
-`t setup`: installed and logged-in entries are locked under a ✓, the rest are
-pre-marked, and the review screen shows the exact commands before `y` runs any.
-`t install --status` prints this machine's state; `t doctor` reports an agent that
-is installed but not logged in. An installed agent is a locked row, so running its
-installer again is its own `reinstall <agent>` row under OPTIONS — `t install codex
---reinstall` pre-marks it — and it goes back through the door the binary came in by
-(`npm install -g`, `brew reinstall --cask`, or the vendor script): the vendor script
-run over an npm install leaves two binaries and lets `PATH` pick. A run that changes
-anything ends with a **sync** — what `dots` does for an agent that is here: codex's
-hook, the allow list and default permission mode below, and trust for every
-registered repo — and then, when `~/code` holds git repos `DEV_REPOS` does not know
-yet, opens `t setup` (under `-y` it only names it), so a fresh machine goes
-`install.sh` → `t install` → registered, trusted repos in one sitting.
-
-**Folders are trusted up front.** Each agent asks "do you trust this folder?" once
-per folder and keeps the answer in its own store; `t trust` writes it for all three —
-`~/.claude.json` (`projects[dir].hasTrustDialogAccepted`, the key Claude's own error
-text tells you to set), `~/.codex/config.toml` (`[projects."dir"] trust_level =
-"trusted"`), and cursor-agent's `~/.cursor/projects/<slug>/.workspace-trusted`
-marker. Claude and Codex both key trust on the **canonical repo** — a git worktree
-resolves to its main checkout, while a trusted *parent* directory covers nothing
-beneath it — so one entry per repo covers every per-session worktree. Every
-registered repo is trusted by default: `dots` runs `t trust --all -q`, and `t setup`,
-`t new` and `t install` trust what they register (on the remote hosts too). Add-only
-(an explicit Codex `untrusted` is never flipped), `$HOME` and anything above it is
-refused, `t trust --status` reports without writing, `t doctor` carries the same
-line, and `DOTFILES_NO_TRUST=1` opts a machine out of the automatic paths.
-
-**`t config`** is the local settings hub, with an arrow-key menu for:
-
-- **Tools, models, effort and Fast mode:** choose Claude or Codex as the default
-  tool, then open that tool's submenu for its model, effort and Fast mode settings.
-  Models come from the installed
-  CLI's current catalog; Claude aliases show their resolved model IDs. Choose a
-  listed model to see its supported effort levels. Changing models clears an
-  effort override that the new model doesn't report. Each setting can inherit
-  the tool's own setting. Custom model IDs and **Refresh model list** are available;
-  if discovery fails, the menu reports it instead of offering a stale list.
-- **Hosts:** add or edit SSH targets, remove retired hosts, and choose the default
-  beam destination. Removing a host stops `dots --all` and other host fan-outs
-  from trying it; reachability alone never removes a host. A removed host's beam
-  default and legacy host seed are cleared when they refer to it.
-- **Repos:** register a path, change a repo's tool, branch or worktree overrides,
-  or unregister it. Unregistering keeps its files, worktrees and sessions.
-  `t setup` remains available for automatic repo/SSH-host discovery and onboarding.
-- **Worktree defaults:** enable or disable worktrees, choose their root directory,
-  and set the fallback branch for shared-tree repos. Existing worktrees are not moved.
-- **All custom settings:** open `~/.zshrc.local` in `$VISUAL` / `$EDITOR` (or `vi`).
-  `t config --edit` opens the editor directly and checks shell syntax before reload.
-
-Choose **Save changes** or press **s** to review and apply pending edits. The save
-button stays visible below the list. Quitting with unsaved edits offers **Keep
-editing**, **Review and save**, or **Discard changes and exit**; the default keeps
-your edits. Backing out of review returns to settings. Only the managed settings
-block is rewritten; custom shell outside it is preserved. Removed registrations are explicitly unset, including
-in the calling shell, so their generated shortcuts disappear immediately too.
-`t config --show` prints current settings without opening the menu.
-Section headings separate session defaults, hosts/repos, and save actions. Current
-values appear in cyan beside their labels (underneath on narrow terminals), with
-a highlighted cursor row and a pending-change count beside **Save changes**.
-The other wizards and session/worktree pickers follow the same [shared TUI design](ui/README.md).
-
-Fast mode offers **Tool default**, **Off**, and **On** for models that report support.
-On can increase usage/cost and remains subject to the CLI's account restrictions.
-Changing to an unsupported model turns an explicit Fast mode override off.
-
-Tool, model, effort and Fast mode defaults apply to **new `t open` sessions**, including `--fg`.
-Existing/resumed conversations keep their normal behavior. `DEV_AGENT[repo]` and
-`--claude`/`--codex` still override the global tool; `DEV_MODEL[claude]` and
-`DEV_MODEL[codex]` hold each tool's model choice, with `DEV_EFFORT[claude]` and
-`DEV_EFFORT[codex]` for effort, and `DEV_FAST[claude/codex]` (`1` / `0` / empty)
-for Fast mode. Model discovery sends no prompts and happens only
-when you open a model, effort or Fast mode menu. Settings are per machine: run
-`t config` on each host to configure it. Cursor remains available through
-`t cursor`; it does not support dev slots.
-
-A dev slot runs either agent: `t open <repo> --codex` starts Codex CLI in a fresh
-slot (`--claude` forces Claude), `DEV_AGENT[repo]=codex` in `~/.zshrc.local` makes
-it a repo's default and `DEV_AGENT_DEFAULT` the global one. `t ls` marks a codex
-slot with `⬡` in its STATUS column and adds the glyph to the legend only when one
-is on screen, so a claude-only listing looks exactly as it always did. A codex
-slot's title comes from its rollout (the same cached parser as Claude's
-transcripts), `t pop`/`t push` move it with `codex resume`, and `t resume` lists
-a dead codex slot's conversations from Codex's own thread index, marked `⬡` in
-the picker. Codex mints its thread id at the first prompt (there is no
-`--session-id`), so an untouched codex slot reads as idle until you type.
-If its SessionStart hook never fires, `t ls` can still show the title and active
-context from a single conversation in the slot's directory updated since the
-running process started. This display fallback does not assign a session ID;
-commands that move a conversation still require its recorded identity or a
-verified live title. For an unstamped Codex, `t` can recover the ID when its pane
-title and current status footer match one uniquely named conversation in the exact
-worktree, updated during this process's lifetime. Missing, stale, or ambiguous
-matches remain unresolved. `t app` saves the verified ID before stopping the CLI
-so a later handoff can still find it.
-Across machines, `t beam` ships a codex slot's rollout (and its origin stamp)
-with its date path intact and `csync` mirrors `~/.codex/sessions` to iCloud as
-`codex-sessions` — Codex indexes a copied-in rollout on the first resume, so only
-the append-only rollouts travel, never its sqlite state.
-
-Not every verb supports every agent yet. The matrix below is **generated from
-`bin/t`** (a test pins this block to it), so a verb cannot gain or lose agent
-support without the README saying so:
-
-```text
-  surface                                                      ✱ claude                                   ⬡ codex                                                               ◆ cursor
-  -----------------------------------------------------------  -----------------------------------------  --------------------------------------------------------------------  -------------------------------------------------
-  t install (install · login · update · reinstall)             ✓                                          ✓                                                                     ✓
-  dev slots: t open / ls / kill / read / paste                 ✓                                          ✓ t open --codex · DEV_AGENT                                          ✗ no slot — t cursor ls
-  t push / t pop                                               ✓                                          ✓                                                                     ✗ no slot
-  t resume (dead slots)                                        ✓                                          ✓ (its sqlite thread index)                                           → t cursor resume
-  t beam / --from (move a session)                             ✓                                          ✓ (rollout + .origin)                                                 → t cursor [id] --host / --from
-  t app (desktop + browser preview)                            ✗ Codex conversations only                 ✓ local macOS slot → same thread                                      ✗
-  csync (iCloud union of transcripts)                          ✓ projects + plans                         ✓ codex-sessions                                                      ✓ cursor-chats
-  SessionStart stamps (registry · opened · origin)             ✓ settings.json hook                       ✓ hooks.json (trust once at startup)                                  ✗ no hook wired
-  t plan                                                       ✓                                          ✗ codex keeps no plan files (says so)                                 ✗
-  /tpush · /tpop slash commands                                ✓ ~/.claude/commands                       ✓ ~/.codex/prompts                                                    ✗
-  t find / t mcp (transcript search)                           ✓                                          ✗ claude transcripts only                                             ✗
-  t doctor agent row (version · login · hook)                  ✓                                          ✓                                                                     ✓ version · login
-  permissions (agents/permissions.allow, synced by dots)       ✓ ~/.claude/settings.json                  ✓ ~/.codex/rules/dotfiles.rules (argv prefixes) · sandbox network on  ✓ ~/.cursor/cli-config.json (argv + env prefixes)
-  default permission mode (seeded when the config names none)  ✓ auto (permissions.defaultMode)           ✓ full access (approval never · danger-full-access)                   ✗ left as cursor-agent set it
-  default subagent model (seeded when the config names none)   ✓ sonnet (env.CLAUDE_CODE_SUBAGENT_MODEL)  ✓ gpt-6-sol ([agents] default_subagent_model)                         ✗ not seeded
-  t trust (folder trust · every registered repo on dots)       ✓ ~/.claude.json projects                  ✓ ~/.codex/config.toml [projects]                                     ✓ ~/.cursor/projects/<slug> marker
-  nosleep (hold sleep while an agent works)                    ✓ caffeinate child · net bytes             ✓ net bytes                                                           ✓ net bytes
+```sh
+git clone https://github.com/agenthangar/dotfiles.git ~/code/dotfiles
+~/code/dotfiles/install.sh
 ```
 
-Codex needs one manual step after install: its SessionStart hook (the same
-`claude-stamp-tmux` script, registered in `~/.codex/hooks.json` by `install.sh`/
-`dots`) must be trusted once under `/hooks` inside codex — Codex has no supported
-way for an installer to pre-trust a hook.
+The installer keeps the canonical clone on `main`, links its managed files into
+HOME, and bootstraps `https://github.com/agenthangar/t.git` into `~/code/t` when
+needed. t owns its executable links, prompts, and additive agent integrations.
+Homebrew tools come from [Brewfile](Brewfile); the brew step skips on other platforms.
 
-**Permissions travel too.** `agents/permissions.allow` is the allow list every
-machine's agents get — Claude Code's rule syntax, one rule per line — and `dots`
-(`install.sh` → `t permissions --apply`) merges it into each installed agent's
-own config: `~/.claude/settings.json` verbatim, and every `Bash(<words>:*)` prefix
-rule as a `prefix_rule` in `~/.codex/rules/dotfiles.rules` and a `Shell(<words>)`
-in `~/.cursor/cli-config.json` (the rest — WebFetch, MCP tools, skills — is
-Claude-only). A rule with a leading env assignment — `Bash(*=* node *)`, needed
-because Claude strips a leading `NAME=value` only for its built-in safe list, so
-`DATABASE_URL=… node …` matches nothing else; space spelling only, the `:*` form
-of such a rule is accepted by Claude and never matches — reaches Claude and, as a
-whole-line glob, cursor. Codex cannot take it: its parser hands a script with an
-assignment (or a redirect) to the rules as one opaque token, and the prompt such a
-script raises is the sandbox blocking the network, so the same `dots` turns the
-codex workspace-write sandbox's network on (`[sandbox_workspace_write]
-network_access = true` in `~/.codex/config.toml`, add-only — set it false by hand
-to keep the sandbox offline). It is **add-and-retire**: deleting a rule from the list changes
-nothing anywhere; moving it to `agents/permissions.retire` removes it everywhere
-on the next `dots`. Hand-added rules, deny lists and the rest of each file are
-never touched. The same step seeds each agent's **default permission mode** where
-its config names none: Claude Code's auto mode (`permissions.defaultMode = "auto"`,
-with the `skipAutoPermissionPrompt` its opt-in dialog would write) and Codex's Full
-Access preset (`approval_policy = "never"` + `sandbox_mode = "danger-full-access"`,
-the pair its `/permissions` picker writes). A mode you chose yourself — any mode — is
-never changed, `DOTFILES_NO_AGENT_MODES=1` opts a machine out, and Cursor's is left
-as cursor-agent set it. Full access means Codex runs commands unsandboxed and
-unasked: that is the point on your own machines, and a reason to read this
-paragraph before running `install.sh` on one that is not.
+Existing shell files are backed up before linking. SSH config is preserved: an
+Include for this repository's snippet is appended rather than replacing the file.
+Machine configuration is a private regular file at `~/.zshrc.local`.
 
-The same step also picks a cheaper **default subagent model**, so a multi-agent
-fan-out (an ultracode workflow, a burst of Agent-tool calls, Codex's `spawn_agent`)
-does not run every helper on the flagship: Claude Code gets
-`env.CLAUDE_CODE_SUBAGENT_MODEL = "sonnet"` in `~/.claude/settings.json`, Codex gets
-`[agents] default_subagent_model = "gpt-6-sol"` in `~/.codex/config.toml`. It is only a
-default. A model named for one call (a workflow's `opts.model`, the Agent tool's
-`model`) or in an agent's own definition still wins, and your org's allowed-model
-list still applies. Change either value and it is never flipped back;
-`DOTFILES_NO_SUBAGENT_MODEL=1` opts a machine out.
-`t permissions` reports what is in sync and what is waiting,
-`t permissions --show` prints each rule's translations, `t doctor` carries the
-same line, and `DOTFILES_NO_PERMISSIONS=1` opts a machine out. The shipped list
-is deliberately broad — it allows `bash`, `python3`, `node`, `curl` and `claude`
-outright — so read it before running `install.sh` on a machine that is not yours.
-It carries commands and generic tool rules only: a project's MCP tool names, its
-skills and the domains it fetched say what you work on, and this repo is public.
+`DOTFILES_NO_T=1` skips standalone t setup for shell-only or sandbox installations.
+`DOTFILES_T_HOME` selects a different supported t checkout. A normal offline
+links-only refresh never clones anything; use full `install.sh` for first setup.
 
-## The `help` command
+## Two repositories, independent live checkouts
 
-`help` (or `h`) prints every custom command, grouped by purpose. Names and
-descriptions are **generated at call time**, not stored — read from the leading
-`# name <args> — description` comment above each `.zshrc` function and the header
-line of each `bin/` script. Give a new command that one-line comment and it shows
-up automatically.
+| Source | Managed surface |
+| --- | --- |
+| `~/code/dotfiles` on main | `~/.zshrc`, `~/.tmux.conf`, personal utility bins, SSH snippet |
+| `~/code/t` on main | `~/bin/t`, hook/transfer helpers, t prompts and shell plugin |
+| `~/code/.worktrees/<repo>/<slot>` | Isolated development, never canonical main |
 
-Grouping lives in the `groups` list inside the `help` function; uncategorized
-commands fall under **Other** so nothing is hidden, except a short `_hide` list of
-internal/automatic commands (a wrapper, a hook, a guard) you never invoke by hand.
-The generated sections (repo + host shortcuts) also print a one-line "how to add"
-hint. Output is self-contained — plain ANSI, colored only on a terminal.
+The `$HOME` symlinks point into the canonical clones. Editing a development
+worktree is not live until its PR merges and you update, or you explicitly select
+it with `dots --dev` / `t update --dev`. Ordinary `dots` returns dotfiles and t to
+their released main branches. `dots --dev` and `--relink` leave t's selection alone.
+An ordinary `t update` returns just t to main and preserves dirty worktree edits.
 
-## Claude plugins & MCP
+`dots --all` is the rollout step after a merged PR; nothing polls GitHub for merges.
+Inspect its per-host results: an unreachable host is reported and must be retried.
+Open shells reload when the selected code changes. Never develop or commit in a
+canonical main checkout: those files are your running configuration.
 
-Claude settings install as a **real copy**, never clobbering an existing
-`~/.claude/settings.json`. The seed is **`settings.json.example`** — minimal: the
-session-stamping hook the tmux tooling needs and the `mcp__sessions` allow rule.
-The tracked allow list (`agents/permissions.allow`, see [Agents](#agents)) is
-merged into it by the same install and by every `dots`.
+The t migration bridge validates `.t-install-version` before allowing t to own
+its links. Before pulling a dotfiles release that removes bundled t, it confirms
+the standalone installation works. If it cannot, it stops before removing the
+old executable. Recovery does not require a working command: invoke
+`T_LOCAL_RC="$HOME/.zshrc.local" ~/code/t/install.sh` directly, then rerun dots.
 
-The live file is **per-machine and untracked by design**: Claude Code writes to
-it at runtime (`/model` saves your default model, "always allow" appends
-permission rules, plugin toggles land there), so tracking or symlinking it keeps
-the repo dirty and risks committing private allow-rules. An earlier version
-shipped the author's tuned config as a symlink option; `install.sh` now
-materializes such a legacy symlink into a real copy and the path is gitignored.
+## Private configuration and policy
 
-MCP is two separate things:
+The t plugin reads `~/.zshrc.local` on this installation. `t setup` registers repos
+and SSH hosts; `t config` manages tools/models and session settings. See
+[t's configuration guide](https://github.com/agenthangar/t#configuration).
 
-- **claude.ai connectors** (Gmail, Calendar, Drive, Canva, Hugging Face, …) are
-  bound to your Anthropic account and sync automatically on login. Nothing to copy.
-- **Local/stdio MCP servers** live in `~/.claude.json`, a stateful file (OAuth
-  tokens, history) that is **not** symlinked and never committed. The one this repo
-  ships — `sessions`, i.e. `t mcp` — is registered by `install.sh`/`dots` through
-  `claude mcp add` (add-only; `DOTFILES_NO_MCP=1` opts a machine out). Any other
-  local server you add stays your own business.
+`lib/t-integration.sh` preserves this dotfiles setup's existing behavior: the
+personal `agents/permissions.allow` and `.retire` policy, automatic trust for
+registered repos, and agent mode/subagent defaults. Standalone t installations
+have separate opt-in defaults. Existing `DOTFILES_NO_MCP`, `DOTFILES_NO_TRUST`,
+`DOTFILES_NO_PERMISSIONS`, `DOTFILES_NO_AGENT_MODES`, `DOTFILES_NO_SUBAGENT_MODEL`,
+and `DOTFILES_NO_CODEX_HOOKS` switches map to the corresponding t switches.
+`DOTFILES_T_PERMISSIONS_DIR` can override the personal policy directory.
+
+Do not commit real hosts, repositories, tokens, agent settings, or transcripts.
+`~/.claude/settings.json`, agent auth, and the t config files stay per-machine.
 
 ## PII guard
 
-`pii-scan` keeps personal data out of this public repo. **This documents my own
-setup** — to reuse it in a fork, point `$PII_RULES` at your own denylist JSON
-(mine lives in a private repo). Three layers:
-
-1. **Denylist** — `scrub-rules.json`: literal personal identifiers (names, emails,
-   phones, private hosts). **Private, never committed here** (gitignored); read
-   locally from `~/.config/pii-scan/scrub-rules.json` (override with `$PII_RULES`),
-   in CI from the `PII_SCRUB_RULES` secret.
-2. **Ignore patterns** — `pii-ignore-patterns.txt`: regexes for known
-   false-positive *shapes* (no PII; tracked).
-3. **Allowlist** — `pii-allowlist.txt`: values intentionally public in *this* repo
-   (your GitHub handle, generic vendor names). A denylist hit clears only when an
-   allowlist entry appears on the same line. Don't edit the shared denylist to
-   silence a dotfiles false positive — add it here.
-
-It runs two ways, both wired by `install.sh`:
-
-- **Pre-commit hook** (`.githooks/pre-commit`) — scans staged content. **Fails
-  open** if the denylist is absent (a machine without it can still commit; CI is
-  the backstop). Bypass once with `git commit --no-verify`.
-- **GitHub Action** (the `Scan tracked files for PII` job in
-  `.github/workflows/ci.yml`) — runs on push/PR to `main` and **fails closed**, so
-  a missing secret is loud. Fork/Dependabot PRs can't read secrets, so that job
-  skips there; the push-to-`main` run is the backstop. Set the secret once:
-
-  ```sh
-  gh secret set PII_SCRUB_RULES < ~/.config/pii-scan/scrub-rules.json
-  ```
-
-Run it by hand anytime: `pii-scan` (all tracked files) or `pii-scan --staged`.
+`bin/pii-scan` uses a private denylist in `~/.config/pii-scan/scrub-rules.json`
+(or `PII_RULES`) plus tracked false-positive patterns and a repository allowlist.
+It scans staged blobs from the pre-commit hook and tracked files otherwise. Locally
+it warns and skips when no denylist is present; `--require-rules` fails closed.
+CI materializes the private `PII_SCRUB_RULES` secret and runs that stricter mode.
+The denylist is never committed. Add intended public exceptions to the tracked
+allowlist rather than weakening the private denylist.
 
 ## Tests
 
-The Python CLI (`bin/t`) has a `pytest` suite covering its
-pure logic (config parsing, path→repo resolution, the capture-pane ANSI stripper,
-PR triage). The test deps are **dev/CI-only** — `install.sh` never installs them.
-
 ```sh
-pip install -r requirements-dev.txt
-python3 -m pytest                       # run the suite
-python3 -m pytest --cov --cov-report=term-missing   # with coverage
+python3 -m pip install -r requirements-dev.txt
+python3 -m pytest
+bash -n install.sh
+zsh -n .zshrc
 ```
 
-CI runs it as the `pytest` job, gated by `--cov-fail-under` (a ratchet that only
-goes up). The gate feeds the single required `CI` check like every other job.
+Tests exercise the shell utilities and installation/migration under sandbox HOME,
+XDG directories, and tmux sockets. CI also runs shellcheck, gitleaks, the private
+PII scan, and dependency audit behind the required `CI` gate. The Python t suite
+and its 97% coverage requirement moved to the standalone repository.
 
-## Install on a new machine
-
-**Requirements:** macOS · zsh · [Homebrew](https://brew.sh) (for the `Brewfile`
-tools). The agent CLIs ([Claude Code](https://claude.com/claude-code), Codex,
-Cursor) are installed by `t install` afterwards.
-
-`install.sh` is location-independent — clone the repo anywhere and the symlink
-*targets* follow:
-
-```sh
-git clone git@github.com:chrisobrien-ai/dotfiles.git path/to/dotfiles
-path/to/dotfiles/install.sh
-```
-
-It creates the symlinks (backing up anything in the way to `*.bak`), seeds
-`~/.zshrc.local` and `~/.claude/settings.json` from their templates when absent,
-then runs `brew bundle` (skipped if Homebrew is absent). It is non-interactive and
-idempotent — an already-correct symlink is left alone and prints nothing. You rarely
-need to run it by hand after the first time: `dots` reconciles the symlinks itself.
-
-**SSH config** is the one exception to the symlink model: rather than replacing
-`~/.ssh/config`, `install.sh` links the snippet to `~/.ssh/dotfiles.conf` and
-appends an `Include dotfiles.conf` line to the bottom of `~/.ssh/config` (creating
-it if needed). The include goes last so the snippet's `Host *` defaults never
-override your per-host settings (OpenSSH is "first value wins"). Your existing
-config is left intact.
-
-## License & contributing
-
-MIT — see [LICENSE](LICENSE). A personal, opinionated setup published so others
-can borrow the patterns, not a general-purpose framework; see
-[CONTRIBUTING.md](CONTRIBUTING.md) for what that means for issues and PRs.
+MIT — [LICENSE](LICENSE). This remains a personal setup; [contributing](CONTRIBUTING.md).

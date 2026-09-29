@@ -36,7 +36,7 @@ jobs:
       - name: Run shellcheck
         run: |
           files=(install.sh)
-          for f in bin/* .githooks/* ui/*.sh lib/*.sh; do
+          for f in bin/* .githooks/* lib/*.sh; do
             head -1 "$f" | grep -qE '^#!.*\b(bash|sh)$' && files+=("$f")
           done
           printf 'linting: %s\n' "${files[*]}"
@@ -102,12 +102,8 @@ jobs:
         if: always()
         run: rm -f "$RUNNER_TEMP/scrub-rules.json"
 
-  # pytest suite for the pure logic in the Python bin (bin/t).
-  # Coverage is scoped (in pyproject.toml) to those two files and excludes the
-  # subprocess/ssh/tmux/CLI glue, so --cov-fail-under guards the deterministic
-  # helpers we actually test. The threshold is a RATCHET: raise it as coverage
-  # grows, never lower it. (Set a few points below the measured value so a minor
-  # refactor does not spuriously fail; bump it after a meaningful coverage gain.)
+  # Subprocess integration tests for shell utilities, migration, and the t adapter.
+  # The independent t repository retains the Python coverage gate.
   pytest:
     name: pytest
     runs-on: ubuntu-latest
@@ -143,8 +139,8 @@ jobs:
           }
           zsh --version
 
-      - name: Run tests with coverage gate
-        run: pytest --cov --cov-report=term-missing --cov-fail-under=97
+      - name: Run shell integration tests
+        run: pytest
 
   # Audit the CI/dev dependencies (requirements-dev.txt) for known CVEs. This is
   # the only dependency manifest in the repo — install.sh stays dependency-free,
@@ -166,35 +162,6 @@ jobs:
           pip install pip-audit
           pip-audit -r requirements-dev.txt
 
-  # CodeQL static analysis (SAST) over the Python. Only `python` is requested:
-  # CodeQL has no shell language, so the Bash scripts (install.sh, bin/csync,
-  # sleep-manager, …) are out of scope here — shellcheck covers them. The two
-  # interesting target, bin/t, is EXTENSIONLESS; CodeQL's
-  # Python extractor finds it anyway via its `#!/usr/bin/env python3` shebang
-  # (plus tests/*.py by extension). Do NOT add a paths/extension filter to "tidy"
-  # this — a `.py`-only filter would silently drop the one bin that shells out to
-  # ssh/git/tmux, which is the whole reason this job exists. Python is
-  # interpreted, so no autobuild step is needed: init → analyze.
-  codeql:
-    name: CodeQL
-    runs-on: ubuntu-latest
-    permissions:
-      # Job-level permissions REPLACE the workflow-level `contents: read`, so
-      # every scope CodeQL needs must be listed here (see scorecard.yml).
-      actions: read
-      contents: read
-      security-events: write   # upload SARIF results to the Security tab
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Initialize CodeQL
-        uses: github/codeql-action/init@v3
-        with:
-          languages: python
-
-      - name: Perform CodeQL analysis
-        uses: github/codeql-action/analyze@v3
-
   # The single required status check. Turns green only when every job above
   # succeeds (or is legitimately skipped, e.g. pii-scan on fork/Dependabot PRs).
   # `if: always()` is load-bearing: without it the gate is itself skipped when a
@@ -203,7 +170,7 @@ jobs:
   ci:
     name: CI
     if: always()
-    needs: [shellcheck, gitleaks, pii-scan, pytest, pip-audit, codeql]
+    needs: [shellcheck, gitleaks, pii-scan, pytest, pip-audit]
     runs-on: ubuntu-latest
     steps:
       - name: Verify all required jobs passed

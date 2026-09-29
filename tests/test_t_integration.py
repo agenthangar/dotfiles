@@ -12,6 +12,7 @@ def checkout(tmp_path):
     home.mkdir()
     repo = home / "code" / "dotfiles"
     _seed_worktree(repo)
+    (repo / "bin" / "t").write_text("#!/bin/sh\n")
     git("init", "-q", "-b", "main", cwd=repo)
     git("config", "user.name", "T", cwd=repo)
     git("config", "user.email", "t@example.test", cwd=repo)
@@ -47,7 +48,7 @@ def test_repeated_dotfiles_relink_keeps_standalone_ownership(tmp_path):
     home, repo = checkout(tmp_path)
     t = standalone(home)
     for _ in range(2):
-        r = run_install(repo, home, DOTFILES_LINKS_ONLY="1")
+        r = run_install(repo, home, DOTFILES_LINKS_ONLY="1", DOTFILES_NO_T="")
         assert r.returncode == 0, r.stderr
         for name in ("t", "claude-stamp-tmux", "cursor-beam"):
             assert (home / "bin" / name).resolve() == t / "bin" / name
@@ -56,13 +57,14 @@ def test_repeated_dotfiles_relink_keeps_standalone_ownership(tmp_path):
     ]
 
 
-def test_invalid_standalone_marker_keeps_bundled_t(tmp_path):
+def test_invalid_standalone_marker_stops_offline_relink(tmp_path):
     home, repo = checkout(tmp_path)
     t = standalone(home)
     (t / ".t-install-version").write_text("99\n")
-    r = run_install(repo, home, DOTFILES_LINKS_ONLY="1")
-    assert r.returncode == 0, r.stderr
-    assert (home / "bin" / "t").resolve() == repo / "bin" / "t"
+    r = run_install(repo, home, DOTFILES_LINKS_ONLY="1", DOTFILES_NO_T="")
+    assert r.returncode != 0
+    assert "standalone t is missing" in r.stderr
+    assert not (home / "bin" / "t").exists()
     assert not (t / "adapter.txt").exists()
 
 

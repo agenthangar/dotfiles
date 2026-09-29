@@ -1,57 +1,16 @@
-# ~/.zshrc.local — per-machine config, sourced by ~/.zshrc if it exists.
-# NOT committed. install.sh copies this template to ~/.zshrc.local on a fresh
-# machine; edit that copy with your own values — or run `t setup`, which scans
-# for local checkouts + ssh hosts and appends entries. `t config` manages defaults,
-# repo settings and hosts (including removals), or opens this file in your editor. DEV_REPOS is
-# already declared (typeset -gA) by the time this is sourced, so just add keys.
+# ~/.zshrc.local — private, per-machine configuration.
+# Dotfiles loads this through the standalone t plugin. `t setup` registers repos
+# and hosts here; `t config` manages tools/models and other session settings.
+# See ~/code/t/local.zsh.example for t configuration examples.
+# Do not commit this file: it may contain real paths, hostnames, and preferences.
 
-# Repos you want `dev`, the bare `<key>` cd shortcuts, tread, tbeam, and tab
-# completion to know about. Key = short alias, value = absolute path.
-DEV_REPOS[api]="$HOME/code/my-api"
-DEV_REPOS[web]="$HOME/code/my-web"
+# Dotfiles-specific switches (uncomment to opt out):
+# export DOTS_NO_AUTORELOAD=1
+# export DOTFILES_NO_MCP=1
+# export DOTFILES_NO_TRUST=1
+# export DOTFILES_NO_PERMISSIONS=1
+# export DOTFILES_NO_AGENT_MODES=1
+# export DOTFILES_NO_SUBAGENT_MODEL=1
 
-# Fallback branch for repos that OPT OUT of worktree-per-session
-# (DEV_WORKTREE[repo]=0). Worktree repos ignore this — each session gets its own
-# dev/<repo>-<slot> branch. Defaults to dev/claude-1 in ~/.zshrc.
-# DEV_BRANCH=dev/agent
-
-# Per-repo branch overrides for those same opt-out repos, keyed by the DEV_REPOS
-# alias. Use this for a repo whose workflow commits straight to main:
-# DEV_BRANCHES[myrepo]=main
-#
-# Do NOT pin the dotfiles repo here. Its canonical clone is parked on `main` and
-# IS the live surface ($HOME symlinks point at it); pinning it to a dev branch
-# would send an opt-out session to switch the live tree's branch.
-
-# Which agent CLI a dev slot runs: claude (Claude Code, the default) or codex (OpenAI
-# Codex CLI — `t install codex` puts it on the machine). Per repo, keyed like
-# DEV_BRANCHES; DEV_AGENT_DEFAULT flips the global default. `t open <repo> --codex`
-# / `--claude` override both for one fresh slot.
-# DEV_AGENT[myrepo]=codex
-# DEV_AGENT_DEFAULT=claude
-# `t config` queries each CLI for models and their supported effort levels.
-# Model/effort defaults apply only to NEW t sessions; empty inherits the tool's setting.
-# DEV_MODEL[claude]=sonnet
-# DEV_MODEL[codex]=your-model-id
-# DEV_EFFORT[claude]=high
-# DEV_EFFORT[codex]=high
-# Fast mode: 1 = on (higher usage/cost), 0 = off, empty = tool default.
-# `t config` only offers On for models whose CLI metadata reports support.
-# DEV_FAST[claude]=0
-# DEV_FAST[codex]=0
-
-# Default host for `tbeam` (teleport a Claude session to another machine).
-# Omit this to require an explicit host argument every time.
-# export TBEAM_HOST=my-remote
-
-# Remote machines `on` can reach (run a command there: `on mini dev dot`). Key =
-# short alias, value = ssh target. Each alias also gets its own shorthand function
-# (`mini dev dot` ≡ `on mini dev dot`) plus tab completion. REMOTE_HOSTS is already
-# declared, so just add keys. (An old MINI_HOST/TBEAM_HOST auto-seeds REMOTE_HOSTS
-# [mini], so `mini` keeps working even with no entry here.)
-# REMOTE_HOSTS[mini]=my-mini
-# REMOTE_HOSTS[studio]=studio.local
-
-# Any machine-specific shell completions. compinit has already run in ~/.zshrc,
-# so compdef is available here. Guard with -f so a missing file is a no-op.
+# Machine-specific completions (compinit has already run):
 # [[ -f "$HOME/.tool/completions/tool.zsh" ]] && source "$HOME/.tool/completions/tool.zsh"

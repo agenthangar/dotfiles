@@ -4,7 +4,7 @@ Guidance for AI agents working in this repository.
 
 ## What this is
 
-Personal macOS dotfiles: zsh config, shell utilities, and Claude Code session tooling (`t`). There is no web app, build system, or package manager lockfile. See `CLAUDE.md` and `README.md` for architecture details.
+Personal macOS dotfiles: zsh config and shell utilities. The `t` session toolkit lives in `agenthangar/t`; this repository installs and consumes it through `lib/t-integration.sh`. There is no web app or build system. See `CLAUDE.md` and `README.md`.
 
 ## Git workflow (all agents)
 
@@ -50,13 +50,13 @@ Ensure `~/bin` is on PATH (`export PATH="$HOME/bin:$PATH"`) before invoking `t` 
 
 Docker is started by `./scripts/cloud-docker-ready.sh` (wired in `.cursor/environment.json` `start`). Verify with `docker info` or `sudo docker info`.
 
-### Validation (no formal test suite)
+### Validation
 
 | Check | Command |
 | --- | --- |
 | Install / relink | `./install.sh` |
 | Bash lint (CI) | Discover shell scripts by shebang, then `shellcheck install.sh bin/* .githooks/* scripts/*` (same logic as `.github/workflows/ci.yml`) |
-| Python CLI syntax | `python3 -c "import py_compile; py_compile.compile('bin/t', cfile='/tmp/t.pyc', doraise=True)"` |
+| Shell integration tests | `python3 -m pytest` |
 | PII scan (local, fail-open) | `./bin/pii-scan` |
 | PII scan (fail-closed) | `./bin/pii-scan --require-rules` (needs `PII_SCRUB_RULES` secret / materialized denylist) |
 | Gitleaks (CI) | `docker run --rm -v "$PWD:/repo" ghcr.io/gitleaks/gitleaks:v8.21.2 detect --source=/repo --redact --verbose` |
@@ -66,7 +66,7 @@ Docker is started by `./scripts/cloud-docker-ready.sh` (wired in `.cursor/enviro
 
 ### Editing shell files
 
-After changing `.zshrc` or a `bin/` script, validate by sourcing or running it. For `bin/t`: compile to `/tmp` so `__pycache__/` is never committed. There is no eslint/ruff step.
+After changing `.zshrc` or a `bin/` script, validate by sourcing or running it. The `t` CLI and its Python tests are in their own repository. There is no eslint/ruff step.
 
 ### Services
 

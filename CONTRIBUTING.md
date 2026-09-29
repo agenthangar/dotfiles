@@ -1,7 +1,7 @@
 # Contributing
 
 This is a **personal, opinionated dotfiles repo** — one person's macOS + zsh +
-Claude Code setup, published in case the patterns are useful to borrow. It is not
+personal shell setup, published in case the patterns are useful to borrow. It is not
 a framework and isn't trying to be portable, configurable, or general-purpose.
 
 ## Contributor License Agreement
@@ -29,7 +29,7 @@ the PR is your acceptance.
 - **Don't commit personal data.** A `pii-scan` pre-commit hook and a CI check guard
   against it (see the **PII guard** section in the README). Run `./install.sh` to
   wire up the hook locally.
-- **No build or test step** — validate shell changes by sourcing the file
+- **Tests:** run `python3 -m pytest`; validate shell changes by sourcing the file
   (`source ~/.zshrc`) or running the script. Keep `set -euo pipefail` Bash scripts
   passing `zsh -n` / `bash -n`.
 - Match the surrounding style: each command carries a leading

@@ -176,7 +176,14 @@ def new_window(bundle, run, api=None):
         return None
 
     menu = wait_for(find_menu, "could not find an enabled New Window menu item in the desktop app")
-    original = api.read(application, "AXWindows") or []
+    def snapshot():
+        windows = api.read(application, "AXWindows")
+        # AX can be temporarily unavailable after launch/activation. Treating
+        # that as [] makes existing windows appear newly created after the press.
+        # Wrap a successful empty list so wait_for distinguishes it from failure.
+        return (windows,) if windows is not None else None
+
+    original, = wait_for(snapshot, "could not read the app's window list; no CLI was stopped")
     api.press(menu)
 
     def created():

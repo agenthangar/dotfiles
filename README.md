@@ -59,8 +59,10 @@ Saved plans open automatically too: `t app` finds the last existing
 Use `--plan ~/.claude/plans/launch.md` for a different Markdown file; the choice
 is remembered as a fallback for that conversation and worktree. `--no-plan`
 skips it. `--no-preview` skips the web page; combine both to open only the chat.
-The plan opens in its own browser tab on the same conversation, with headings
-and code blocks styled for reading and annotation. Refresh to see saved edits.
+The plan opens in its own browser tab on the same conversation, with rendered
+headings, bold/emphasis, links, lists, tables, blockquotes, and code blocks for
+reading and annotation. The Markdown parser is bundled; no install step or
+external rendering service is needed. Refresh to see saved edits.
 A small local server exposes only that file at a random loopback URL, reuses it
 on repeat handoffs, and exits after an hour without requests. Rerun `t app` to
 restart an expired preview. The original Markdown stays in place.

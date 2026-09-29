@@ -5757,43 +5757,40 @@ def _app_find_plan(row):
 
 
 def _app_plan_html(path):
-    """Self-contained plan preview. Escape all source; never execute embedded HTML.
-
-    Keep Markdown's whitespace/tables verbatim, with headings and fenced blocks
-    styled for reading and browser annotation. Refresh rereads the original file.
-    """
+    """Render Markdown for annotation, with embedded HTML escaped."""
     with open(path, encoding="utf-8") as fh:
         source = fh.read()
-    lines, fenced = [], False
-    for line in source.splitlines():
-        if line.startswith(("```", "~~~")):
-            lines.append("</pre>" if fenced else "<pre class=code>")
-            fenced = not fenced
-        elif fenced:
-            lines.append(html.escape(line) + "\n")
-        else:
-            heading = re.match(r"^(#{1,6}) (.*)$", line)
-            if heading:
-                level, text = len(heading[1]), html.escape(heading[2])
-                lines.append(f"<h{level}>{text}</h{level}>")
-            else:
-                lines.append('<div class=line>' + (html.escape(line) or "<br>") + "</div>")
-    if fenced:
-        lines.append("</pre>")
+    helper = os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__))),
+                          "libexec", "t_markdown.py")
+    content = runpy.run_path(helper)["render"](source)
     title = html.escape(os.path.basename(path))
     return ("<!doctype html><meta charset=utf-8><meta name=viewport content='width=device-width'>"
             f"<title>{title}</title><style>"
             "body{color:#e9e5db;background:#202124;font:16px/1.65 system-ui;margin:0}"
             "main{max-width:960px;margin:auto;padding:32px}header{border-bottom:1px solid #555;padding-bottom:20px}"
-            "small{color:#b8b5ad;overflow-wrap:anywhere}h1,h2,h3{line-height:1.25;color:#f0c778}"
-            ".line{white-space:pre-wrap;overflow-wrap:anywhere}.code{overflow:auto;background:#151617;padding:16px}"
+            "small{color:#b8b5ad;overflow-wrap:anywhere}article{overflow-wrap:anywhere}"
+            "h1,h2,h3,h4,h5,h6{line-height:1.25;color:#f0c778;margin:1.6em 0 .65em}"
+            "p,ul,ol,blockquote,pre,table{margin:0 0 1.15em}li{margin:.3em 0}"
+            "li>ul,li>ol{margin:.3em 0 .5em}a{color:#9bc5ff;text-underline-offset:3px}"
+            "code{font-family:ui-monospace,SFMono-Regular,monospace;font-size:.9em;background:#303134;"
+            "padding:.15em .35em;border-radius:4px}pre{overflow:auto;background:#151617;"
+            "padding:18px;border:1px solid #3d3f43;border-radius:8px}"
+            "pre code{background:none;padding:0;white-space:pre}"
+            "blockquote{border-left:3px solid #f0c778;padding:.2em 1em;color:#cfccc4}"
+            "blockquote>:last-child{margin-bottom:0}table{display:block;max-width:100%;"
+            "overflow:auto;border-collapse:collapse}th,td{padding:10px 14px;"
+            "border:1px solid #4b4d50;text-align:left;vertical-align:top}th{background:#2b2d30}"
+            "tr:nth-child(even){background:#252629}.task-list-item{list-style:none}"
+            ".task-list-item input{margin-right:.6em;accent-color:#f0c778}"
+            "hr{border:0;border-top:1px solid #4b4d50;margin:2em 0}img{max-width:100%}"
+            "@media(max-width:600px){main{padding:20px}body{font-size:15px}}"
             "</style><main><header>"
             f"<strong>{title}</strong><br><small>{html.escape(path)}</small>"
             "<p>Use Annotation mode to leave comments. Refresh to load the latest saved plan.</p>"
-            "</header><article>" + "".join(lines) + "</article></main>").encode("utf-8")
+            "</header><article>" + content + "</article></main>").encode("utf-8")
 
 
-def _app_plan_server(path, token):
+def _app_plan_server(path, token, port=0):
     """Only one file, loopback only, unguessable URL; no directory/file serving."""
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self):
@@ -5821,15 +5818,15 @@ def _app_plan_server(path, token):
         def log_message(self, *args):
             pass
 
-    server = HTTPServer(("127.0.0.1", 0), Handler)
+    server = HTTPServer(("127.0.0.1", port), Handler)
     server.timeout = 1
     server.last_access = time.monotonic()
     return server
 
 
-def _app_plan_serve(path):
-    token = secrets.token_hex(24)
-    with _app_plan_server(path, token) as server:
+def _app_plan_serve(path, token=None, port=0):
+    token = token or secrets.token_hex(24)
+    with _app_plan_server(path, token, port) as server:
         print(json.dumps({"url": f"http://127.0.0.1:{server.server_port}/{token}/"}), flush=True)
         sys.stdout.close()
         # Exit after an hour without a page request; a later t app restarts it.

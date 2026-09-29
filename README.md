@@ -14,7 +14,7 @@ shim in `.zshrc` for verbs that must run in your shell).
 | Command | What it does |
 | --- | --- |
 | `t open <repo> [slot]` | Open or reattach a session in a per-repo detached tmux slot (`--new`, `--fg`, `--remote`, `--here`; `--codex` runs OpenAI's Codex CLI in the slot instead of Claude — `DEV_AGENT[repo]=codex` makes that the repo's default) |
-| `t app [repo] [slot]` | Move a local Codex slot into the macOS desktop app, opening the same conversation and its running web preview for annotation (`--url <url>`, `--no-preview`, `--dry-run`) |
+| `t app [repo] [slot]` | Move a local Codex slot into the macOS desktop app, opening the same conversation and its running web preview and referenced plan for annotation (`--url <url>`, `--plan <path>`, `--dry-run`) |
 | `t ls [-r] [-a]` | List live sessions, optionally across every machine (`-r`) and repo (`-a`) |
 | `t phone [--client NAME] [--pick]` | Reconnect to your last live session on this machine; F1 opens a compact session picker ([phone setup](#phone-access-with-termius)) |
 | `t cd [repo] [slot]` | `cd` this shell into a slot's worktree (bare `t cd`: fzf pick across all worktrees) |
@@ -37,7 +37,18 @@ that page again, including its query and hash. With no remembered page it uses
 the server's root URL; it cannot infer the current browser page from the chat topic.
 The choice is cached locally under `~/.cache/claude-sessions/app-previews/` and
 is ignored if the conversation moves to a different worktree.
-`--dry-run` prints the handoff link without changing anything. The worktree and
+Saved plans open automatically too: `t app` finds the last existing
+`~/.claude/plans/*.md` mentioned in that conversation's user/assistant messages.
+Use `--plan ~/.claude/plans/launch.md` for a different Markdown file; the choice
+is remembered as a fallback for that conversation and worktree. `--no-plan`
+skips it. `--no-preview` skips the web page; combine both to open only the chat.
+The plan opens in its own browser tab on the same conversation, with headings
+and code blocks styled for reading and annotation. Refresh to see saved edits.
+A small local server exposes only that file at a random loopback URL, reuses it
+on repeat handoffs, and exits after an hour without requests. Rerun `t app` to
+restart an expired preview. The original Markdown stays in place.
+
+`--dry-run` prints the handoff link and selected plan without changing anything. The worktree and
 dev server stay running, and tmux keeps the slot reserved even when Codex was
 the pane's main process (the exited pane remains). To return
 to the terminal later, stop work in the app, then use `t pop api 13`.

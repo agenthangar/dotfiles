@@ -23,10 +23,13 @@ import calendar
 import copy
 import glob
 import hashlib
+import html
 import json
 import os
 import plistlib
 import re
+import secrets
+import select
 import shlex
 import shutil
 import socket
@@ -35,7 +38,9 @@ import subprocess
 import sys
 import tempfile
 import time
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.parse import urlencode, urlsplit
+from urllib.request import Request, urlopen
 
 HOME = os.path.expanduser("~")
 CONFIG = os.path.join(os.environ.get("XDG_CONFIG_HOME", os.path.join(HOME, ".config")), "t", "config.sh")
@@ -5613,11 +5618,12 @@ def _app_select(cfg, rows, repo, slot, cwd):
     return row
 
 
-def _app_link(sid, url=None):
+def _app_link(sid, url=None, tab_id=None):
     """Installed desktop app's threads deep link (verified on 26.924.20706).
 
     browserUrl opens a browser tab alongside the EXISTING thread. codex app PATH
     only selects a workspace. No prompt is sent and no new thread is created.
+    Stable browserTabId values keep the web page and plan in separate tabs.
     The deep-link contract is app-version dependent, not a documented CLI flag.
     """
     if url is not None:
@@ -5631,7 +5637,8 @@ def _app_link(sid, url=None):
             valid = False
         if not valid:
             raise ValueError("--url must be an http:// or https:// URL without credentials")
-    return "codex://threads/" + sid + ("?" + urlencode({"browserUrl": url}) if url else "")
+    query = {"browserUrl": url, "browserTabId": tab_id or "t-preview-" + sid} if url else {}
+    return "codex://threads/" + sid + ("?" + urlencode(query) if query else "")
 
 
 def _app_bundle():
@@ -5678,6 +5685,179 @@ def _app_remember_preview(row, url):
     _index_save(_app_preview_path(row), {"cwd": row["cwd"], "url": url})
 
 
+def _app_plan_path(path):
+    path = os.path.abspath(os.path.expanduser(path))
+    if not path.lower().endswith((".md", ".markdown")) or not os.path.isfile(path):
+        raise ValueError(f"plan must be an existing Markdown file: {path}")
+    try:
+        with open(path, encoding="utf-8") as fh:
+            fh.read()
+    except (OSError, UnicodeError) as e:
+        raise ValueError(f"cannot read plan {path}: {e}") from e
+    return path
+
+
+def _app_plan_cache(row):
+    return os.path.join(_cache_root(), "app-plans", row["sid"] + ".json")
+
+
+def _app_find_plan(row):
+    """Last existing plan mentioned by this conversation, never another slot's mtime.
+
+    Read human/assistant messages only: tool output and system instructions can
+    contain unrelated paths. A --plan choice is a fallback when no plan is named.
+    """
+    transcript = zsh_capture(shlex.join(["_dev_agent_transcript", "codex", row["sid"], row["cwd"]])).strip()
+    pattern = re.compile(r"(?:" + re.escape(HOME) + r"|~)/\.claude/plans/[^\n\"<>]*?\.md\b")
+    found = None
+    try:
+        with open(transcript, encoding="utf-8") as fh:
+            for line in fh:
+                try:
+                    rec = json.loads(line)
+                except ValueError:
+                    continue
+                if not isinstance(rec, dict) or rec.get("type") != "response_item":
+                    continue
+                msg = rec.get("payload")
+                if not isinstance(msg, dict) or msg.get("type") != "message" or msg.get("role") not in ("user", "assistant"):
+                    continue
+                content = msg.get("content")
+                if not isinstance(content, list):
+                    continue
+                for block in content:
+                    if not isinstance(block, dict) or not isinstance(block.get("text"), str):
+                        continue
+                    for path in pattern.findall(block["text"]):
+                        try:
+                            found = _app_plan_path(path)
+                        except ValueError:
+                            pass
+    except (OSError, UnicodeError):
+        pass
+    if found:
+        return found
+    try:
+        with open(_app_plan_cache(row), encoding="utf-8") as fh:
+            saved = json.load(fh)
+        if isinstance(saved, dict) and saved.get("cwd") == row["cwd"] and isinstance(saved.get("path"), str):
+            return _app_plan_path(saved["path"])
+    except (OSError, ValueError):
+        pass
+    return None
+
+
+def _app_plan_html(path):
+    """Self-contained plan preview. Escape all source; never execute embedded HTML.
+
+    Keep Markdown's whitespace/tables verbatim, with headings and fenced blocks
+    styled for reading and browser annotation. Refresh rereads the original file.
+    """
+    with open(path, encoding="utf-8") as fh:
+        source = fh.read()
+    lines, fenced = [], False
+    for line in source.splitlines():
+        if line.startswith(("```", "~~~")):
+            lines.append("</pre>" if fenced else "<pre class=code>")
+            fenced = not fenced
+        elif fenced:
+            lines.append(html.escape(line) + "\n")
+        else:
+            heading = re.match(r"^(#{1,6}) (.*)$", line)
+            if heading:
+                level, text = len(heading[1]), html.escape(heading[2])
+                lines.append(f"<h{level}>{text}</h{level}>")
+            else:
+                lines.append('<div class=line>' + (html.escape(line) or "<br>") + "</div>")
+    if fenced:
+        lines.append("</pre>")
+    title = html.escape(os.path.basename(path))
+    return ("<!doctype html><meta charset=utf-8><meta name=viewport content='width=device-width'>"
+            f"<title>{title}</title><style>"
+            "body{color:#e9e5db;background:#202124;font:16px/1.65 system-ui;margin:0}"
+            "main{max-width:960px;margin:auto;padding:32px}header{border-bottom:1px solid #555;padding-bottom:20px}"
+            "small{color:#b8b5ad;overflow-wrap:anywhere}h1,h2,h3{line-height:1.25;color:#f0c778}"
+            ".line{white-space:pre-wrap;overflow-wrap:anywhere}.code{overflow:auto;background:#151617;padding:16px}"
+            "</style><main><header>"
+            f"<strong>{title}</strong><br><small>{html.escape(path)}</small>"
+            "<p>Use Annotation mode to leave comments. Refresh to load the latest saved plan.</p>"
+            "</header><article>" + "".join(lines) + "</article></main>").encode("utf-8")
+
+
+def _app_plan_server(path, token):
+    """Only one file, loopback only, unguessable URL; no directory/file serving."""
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            if self.path != "/" + token + "/" or self.headers.get("Host") != f"127.0.0.1:{self.server.server_port}":
+                self.send_error(404)
+                return
+            try:
+                body = _app_plan_html(path)
+            except (OSError, UnicodeError):
+                self.send_error(404, "Plan is no longer readable")
+                return
+            self.server.last_access = time.monotonic()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("X-T-Plan", hashlib.sha256(path.encode()).hexdigest())
+            self.send_header("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline'; frame-ancestors 'none'")
+            self.end_headers()
+            if self.command != "HEAD":
+                self.wfile.write(body)
+
+        do_HEAD = do_GET
+
+        def log_message(self, *args):
+            pass
+
+    server = HTTPServer(("127.0.0.1", 0), Handler)
+    server.timeout = 1
+    server.last_access = time.monotonic()
+    return server
+
+
+def _app_plan_serve(path):
+    token = secrets.token_hex(24)
+    with _app_plan_server(path, token) as server:
+        print(json.dumps({"url": f"http://127.0.0.1:{server.server_port}/{token}/"}), flush=True)
+        sys.stdout.close()
+        # Exit after an hour without a page request; a later t app restarts it.
+        while time.monotonic() - server.last_access < 3600:
+            server.handle_request()
+
+
+def _app_plan_start(path):
+    key = hashlib.sha256(path.encode()).hexdigest()
+    cache = os.path.join(_cache_root(), "app-plan-servers", key + ".json")
+    try:
+        with open(cache, encoding="utf-8") as fh:
+            saved = json.load(fh)
+        url = saved.get("url") if isinstance(saved, dict) else None
+        if isinstance(url, str) and re.fullmatch(r"http://127\.0\.0\.1:\d+/[a-f0-9]{48}/", url):
+            with urlopen(Request(url, method="HEAD"), timeout=1) as response:
+                if response.headers.get("X-T-Plan") == key:
+                    return url
+    except (OSError, ValueError):
+        pass
+    process = subprocess.Popen([sys.executable, os.path.realpath(__file__), "_app-plan-server", path],
+        stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, start_new_session=True)
+    try:
+        if not select.select([process.stdout], [], [], 5)[0]:
+            raise ValueError("plan preview did not start")
+        saved = json.loads(process.stdout.readline())
+        url = saved["url"]
+    except (OSError, ValueError, KeyError, TypeError) as e:
+        process.terminate()
+        process.wait(timeout=5)
+        raise ValueError(f"could not start plan preview: {e}") from e
+    finally:
+        process.stdout.close()
+    _index_save(cache, saved)
+    return url
+
+
 def _app_stop_cli(row):
     """Revalidate the owner, stop only its agent, and wait before opening the app.
 
@@ -5722,10 +5902,13 @@ def cmd_app(cfg, args):
         # Validate explicit URLs before scanning or changing any session.
         if args.url is not None:
             _app_link("", args.url)
+        plan = _app_plan_path(args.plan) if args.plan else None
         row = _app_select(cfg, _parse_rows(zsh_capture("_dev_session_rows")),
                           args.repo, args.slot, os.getcwd())
         if not os.path.isdir(row["cwd"]):
             raise ValueError(f"the session's worktree is missing: {row['cwd']}")
+        if not args.no_plan and plan is None:
+            plan = _app_find_plan(row)
         url = None if args.no_preview else args.url or _app_preview_url(row)
         link = _app_link(row["sid"], url)
         print(f"{row['slot']} → Codex app · thread {row['sid']}")
@@ -5733,6 +5916,8 @@ def cmd_app(cfg, args):
             print(f"Preview: {url} (use Annotation mode in the app to leave comments)")
         elif not args.no_preview:
             print("No running preview found; start the slot's dev server and rerun, or pass --url.")
+        if plan:
+            print(f"Plan: {plan} (opens in a separate browser tab for annotation)")
         if args.dry_run:
             print("Would stop this slot's Codex CLI, keep its worktree/dev server, and open:")
             print(link)
@@ -5742,16 +5927,27 @@ def cmd_app(cfg, args):
         bundle = _app_bundle()
         if not bundle:
             raise ValueError("install the Codex desktop app in /Applications or ~/Applications first")
+        links = [link]
+        if plan:
+            try:
+                plan_url = _app_plan_start(plan)
+            except OSError as e:
+                raise ValueError(f"could not start plan preview: {e}") from e
+            # A second browser URL on the SAME thread keeps the web preview too.
+            # A raw Markdown OS-open would create a new projectless chat.
+            links.append(_app_link(row["sid"], plan_url, "t-plan-" + row["sid"]))
         stopped = _app_stop_cli(row)
         if stopped.returncode:
             raise ValueError(stopped.stderr.strip() or "could not stop the CLI; the app was not opened")
-        result = _run(["open", "-a", bundle, link], timeout=15)
+        result = _run(["open", "-a", bundle, *links], timeout=15)
         if result.returncode:
             recovery = shlex.join(["codex", "resume", row["sid"]])
             raise ValueError(f"could not open the app: {result.stderr.strip()}. "
                              f"To resume in a terminal: cd {shlex.quote(row['cwd'])} && {recovery}")
         if url:
             _app_remember_preview(row, url)
+        if plan:
+            _index_save(_app_plan_cache(row), {"cwd": row["cwd"], "path": plan})
         print("Sent to the desktop app; tmux keeps this worktree slot reserved.")
         return 0
     except ValueError as e:
@@ -6936,7 +7132,8 @@ Run `t <verb> -h` for a verb's own flags.""")
 
     sp = sub.add_parser("app", help="move a local Codex slot into the desktop app with its preview",
         description="Stop a local slot's Codex CLI and open the SAME conversation in the "
-            "Codex desktop app on macOS, with its running web preview in the built-in browser. "
+            "Codex desktop app on macOS, with its running web preview and referenced Markdown "
+            "plan in separate built-in browser tabs. "
             "Use Annotation mode there to leave comments. The tmux slot stays reserved, "
             "and the worktree and dev server keep running. A lone number means the "
             "cwd repo; bare `t app` uses the cwd worktree's slot, or the repo's only slot. "
@@ -6948,7 +7145,10 @@ Run `t <verb> -h` for a verb's own flags.""")
     sp.add_argument("slot", nargs="?", help="local slot number")
     preview = sp.add_mutually_exclusive_group()
     preview.add_argument("--url", help="preview page to open and remember for this thread (default: remembered URL, then slot's live dev URL)")
-    preview.add_argument("--no-preview", action="store_true", help="open only the conversation")
+    preview.add_argument("--no-preview", action="store_true", help="skip the web preview (plans still open unless --no-plan)")
+    plan = sp.add_mutually_exclusive_group()
+    plan.add_argument("--plan", metavar="PATH", help="Markdown plan to open (default: last plan referenced in the session, then remembered choice)")
+    plan.add_argument("--no-plan", action="store_true", help="skip opening a plan")
     sp.add_argument("--dry-run", action="store_true", help="show the handoff link without stopping or opening anything")
 
     sp = sub.add_parser("ls", help="list dev sessions (attached + active context)",
@@ -7311,6 +7511,9 @@ IMPLEMENTED = {
 
 
 def main(argv):
+    if len(argv) == 2 and argv[0] == "_app-plan-server":
+        _app_plan_serve(_app_plan_path(argv[1]))
+        return 0
     # `cursor` dispatches BEFORE argparse: its args belong to cursor-beam, and
     # argparse's REMAINDER rejects a LEADING flag (`t cursor --ls` errors before
     # the remainder engages). Side benefit: `t cursor -h` shows cursor-beam's

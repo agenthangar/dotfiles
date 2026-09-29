@@ -7208,10 +7208,11 @@ _t() {
       else _values 'flag' --client --pick -h --help; fi ;;
     app)
       if [[ ${words[CURRENT-1]} == --url ]]; then _message 'preview URL'
-      elif [[ ${words[CURRENT]} == -* ]]; then _values 'flag' --url --no-preview --dry-run -h --help
+      elif [[ ${words[CURRENT-1]} == --plan ]]; then _files -g '*.md'
+      elif [[ ${words[CURRENT]} == -* ]]; then _values 'flag' --url --no-preview --plan --no-plan --dry-run -h --help
       elif (( CURRENT == 3 )); then _values 'repo' ${(k)DEV_REPOS}
       elif (( CURRENT == 4 )); then _message 'local slot number'
-      else _values 'flag' --url --no-preview --dry-run -h --help; fi ;;
+      else _values 'flag' --url --no-preview --plan --no-plan --dry-run -h --help; fi ;;
     cursor)
       if (( CURRENT == 3 )); then _values 'chat / action' ls resume -p --from --host
       else _values 'flag' --host --from -p --pick -a --attach -h --help; fi ;;

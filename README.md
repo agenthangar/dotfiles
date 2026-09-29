@@ -16,7 +16,6 @@ shim in `.zshrc` for verbs that must run in your shell).
 | `t open <repo> [slot]` | Open or reattach a session in a per-repo detached tmux slot (`--new`, `--fg`, `--remote`, `--here`; `--codex` runs OpenAI's Codex CLI in the slot instead of Claude — `DEV_AGENT[repo]=codex` makes that the repo's default) |
 | `t app [repo] [slot]` | Move a local Codex slot into the macOS desktop app, opening the same conversation and its running web preview and referenced plan for annotation (`--url <url>`, `--plan <path>`, `--dry-run`) |
 | `t ls [-r] [-a]` | List live sessions, optionally across every machine (`-r`) and repo (`-a`) |
-| `t phone [--client NAME] [--pick]` | Reconnect to your last live session on this machine; F1 opens a compact session picker ([phone setup](#phone-access-with-termius)) |
 | `t cd [repo] [slot]` | `cd` this shell into a slot's worktree (bare `t cd`: fzf pick across all worktrees) |
 | `t push` / `t pop` | Move a session between a foreground terminal and a detached tmux slot — one-live-owner guarantee |
 | `t beam <repo> [slot] --host <h>` | Teleport a running session to another machine; pull one back with `t open … --here` |
@@ -61,45 +60,6 @@ remembered URL, a stopped dev server opens just the conversation with a notice;
 start the server and rerun to add the preview. Claude conversations cannot be
 imported by this command. Bring remote
 slots here first with `t beam <repo> <slot> --here`.
-
-## Phone access with Termius
-
-`t phone` remembers the conversation you last used on this Mac. After Termius
-closes its tabs, open the saved Mac connection again: it returns to that
-conversation if it is still running. **F1** opens a full-screen list of local
-sessions while your agents keep working. Press a displayed number (`1`–`9`)
-to switch immediately. Use `n`/`p` for another page, `j`/`k` or arrows then
-Enter to select, `r` to refresh, and `q` or Esc to cancel.
-If the task you are viewing exits, tmux returns you to the shell; run `t phone`
-again to choose another running task. F1 popups require tmux 3.2 or newer.
-
-Once the change has merged, run `dots` on the Mac, then set up Termius once:
-
-1. Save a snippet containing `zsh -lic 't phone'`, select it under the Mac's
-   **Host Details → Startup Command**, and save the host.
-   [Termius startup snippets](https://docs.termius.com/terminal/snippets#set-up-startup-snippets)
-2. Connect and choose a running session. The first connection shows the picker;
-   later connections return to your last choice. Run `t phone --pick` to choose
-   again from a shell.
-3. Open the **four-square button beside `+`**, then the extended keyboard's
-   **Customize** controls. Move the group containing **F1** into the first three
-   groups to keep it above the phone keyboard. Tap F1 to switch sessions—no
-   tmux prefix or shell command needed.
-   [Termius mobile keyboard](https://docs.termius.com/terminal/mobile-terminal#extended-keyboard)
-
-For separate saved connections, give each its own startup command, such as
-`zsh -lic 't phone --client phone-1'` and
-`zsh -lic 't phone --client phone-2'`. Each remembers its own choice; the default
-profile is `phone`. Termius's native tabs are not recreated automatically.
-
-Normal `t open` tmux sessions survive an SSH disconnect; the Mac must stay awake
-and reachable for work and reconnection. Foreground sessions (`--fg` or `t pop`)
-are outside this guarantee. `t phone` only attaches existing local sessions: it
-does not launch agents or revive a session that ended. If the remembered
-conversation is gone, it shows the picker instead of attaching a different task
-that reused its slot. After a reboot or logout that kills the processes, use
-`t resume -a -l` to recover saved conversations; killed commands cannot resume
-from their exact execution point.
 
 ## Other commands
 
@@ -223,9 +183,13 @@ line, and `DOTFILES_NO_TRUST=1` opts a machine out of the automatic paths.
 
 **`t config`** is the local settings hub, with an arrow-key menu for:
 
-- **Tools and models:** choose Claude or Codex as the default tool, with a separate
-  model for each. Pick a Claude alias, a model from Codex's local list, a custom
-  model ID, or “Use tool's own default”.
+- **Tools, models and effort:** choose Claude or Codex as the default tool, with
+  separate model and effort settings for each. Models come from the installed
+  CLI's current catalog; Claude aliases show their resolved model IDs. Choose a
+  listed model to see its supported effort levels. Changing models clears an
+  effort override that the new model doesn't report. Each setting can inherit
+  the tool's own setting. Custom model IDs and **Refresh model list** are available;
+  if discovery fails, the menu reports it instead of offering a stale list.
 - **Hosts:** add or edit SSH targets, remove retired hosts, and choose the default
   beam destination. Removing a host stops `dots --all` and other host fan-outs
   from trying it; reachability alone never removes a host. A removed host's beam
@@ -244,10 +208,12 @@ outside it is preserved. Removed registrations are explicitly unset, including
 in the calling shell, so their generated shortcuts disappear immediately too.
 `t config --show` prints current settings without opening the menu.
 
-Tool and model defaults apply to **new `t open` sessions**, including `--fg`.
+Tool, model and effort defaults apply to **new `t open` sessions**, including `--fg`.
 Existing/resumed conversations keep their normal behavior. `DEV_AGENT[repo]` and
 `--claude`/`--codex` still override the global tool; `DEV_MODEL[claude]` and
-`DEV_MODEL[codex]` hold each tool's model choice. Settings are per machine: run
+`DEV_MODEL[codex]` hold each tool's model choice, with `DEV_EFFORT[claude]` and
+`DEV_EFFORT[codex]` for effort. Model discovery sends no prompts and happens only
+when you open a model or effort menu. Settings are per machine: run
 `t config` on each host to configure it. Cursor remains available through
 `t cursor`; it does not support dev slots.
 

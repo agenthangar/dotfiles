@@ -32,6 +32,7 @@ import secrets
 import select
 import shlex
 import shutil
+import signal
 import socket
 import stat
 import subprocess
@@ -67,7 +68,7 @@ ZSH_PRELUDE = "setopt no_monitor no_notify 2>/dev/null; "
 # ─── config ──────────────────────────────────────────────────────────────────
 
 _CFG_LINE = re.compile(
-    r"^(DEV_REPOS|DEV_BRANCHES|REMOTE_HOSTS|DEV_WORKTREE|DEV_AGENT|DEV_MODEL)\[([^\]]+)\]=(.*)$"
+    r"^(DEV_REPOS|DEV_BRANCHES|REMOTE_HOSTS|DEV_WORKTREE|DEV_AGENT|DEV_MODEL|DEV_EFFORT)\[([^\]]+)\]=(.*)$"
     r"|^(DEV_BRANCH|DEV_WORKTREE_ROOT|DEV_WORKTREE_DEFAULT|DEV_AGENT_DEFAULT|TBEAM_HOST|MINI_HOST)=(.*)$")
 
 AGENTS = ("claude", "codex")   # the closed set a dev slot can run (the zsh _dev_agent_valid twin)
@@ -97,6 +98,7 @@ class Config:
         self.agents = {}     # alias -> claude|codex (DEV_AGENT[alias])
         self.agent_default = "claude"
         self.models = {}     # agent -> model for NEW sessions; empty defers to the CLI
+        self.efforts = {}    # agent -> reasoning effort for NEW sessions
         self.beam_host = ""
         self.mini_host = ""  # legacy host seed; cleared if its host is removed
         self._load()
@@ -115,7 +117,8 @@ class Config:
                 arr, key, val = m.group(1), m.group(2), _unquote(m.group(3))
                 {"DEV_REPOS": self.repos, "DEV_BRANCHES": self.branches,
                  "REMOTE_HOSTS": self.hosts, "DEV_WORKTREE": self.worktree,
-                 "DEV_AGENT": self.agents, "DEV_MODEL": self.models}[arr][key] = val
+                 "DEV_AGENT": self.agents, "DEV_MODEL": self.models,
+                 "DEV_EFFORT": self.efforts}[arr][key] = val
             elif m.group(4) == "DEV_BRANCH":
                 self.branch = _unquote(m.group(5))
             elif m.group(4) == "DEV_WORKTREE_ROOT":
@@ -1120,10 +1123,12 @@ def _parse_host_entry(ent, used):
 _CONFIG_BEGIN = "# >>> t config defaults >>>"
 _CONFIG_END = "# <<< t config defaults <<<"
 _MODEL_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/@+\[\]-]*\Z")
+_EFFORT_ID = re.compile(r"[a-z][a-z0-9_-]*\Z")
 
 
 _CONFIG_ARRAYS = {"DEV_REPOS": "repos", "REMOTE_HOSTS": "hosts", "DEV_BRANCHES": "branches",
-                  "DEV_AGENT": "agents", "DEV_WORKTREE": "worktree", "DEV_MODEL": "models"}
+                  "DEV_AGENT": "agents", "DEV_WORKTREE": "worktree", "DEV_MODEL": "models",
+                  "DEV_EFFORT": "efforts"}
 _CONFIG_SCALARS = {"DEV_AGENT_DEFAULT": "agent_default", "DEV_BRANCH": "branch",
                    "DEV_WORKTREE_ROOT": "worktree_root", "DEV_WORKTREE_DEFAULT": "worktree_default",
                    "TBEAM_HOST": "beam_host", "MINI_HOST": "mini_host"}
@@ -1163,6 +1168,8 @@ def _config_assignment(key, value):
         raise ValueError("choose claude or codex")
     if key.startswith("DEV_MODEL[") and value and not _MODEL_ID.fullmatch(value):
         raise ValueError("model IDs must contain no spaces or shell commands")
+    if key.startswith("DEV_EFFORT[") and value and not _EFFORT_ID.fullmatch(value):
+        raise ValueError("effort must be a level name reported by the tool")
     prefix = "export " if key == "TBEAM_HOST" else ""
     return f"{prefix}{key}={shlex.quote(value)}"
 
@@ -1244,29 +1251,209 @@ def _config_write(path, before, after):
             os.unlink(tmp)
 
 
-def _config_model_rows(agent, current, cache=None):
-    """Stable Claude aliases; Codex's locally discovered list, never a frozen catalog.
-    A saved custom/retired model remains selectable even when no cache lists it."""
-    values = [""]
-    if current:
-        values.append(current)
-    if agent == "claude":
-        values += ["sonnet", "opus", "haiku", "fable", "opusplan"]
-    elif isinstance(cache, dict) and isinstance(cache.get("models"), list):
-        values += [m["slug"] for m in cache["models"] if isinstance(m, dict)
-                   and m.get("visibility") == "list" and isinstance(m.get("slug"), str)
-                   and _MODEL_ID.fullmatch(m["slug"])]
-    rows = [(v, v or "Use tool's own default") for v in dict.fromkeys(values)]
-    return rows + [("__custom__", "Enter a custom model ID…")]
+class _ConfigRPC:
+    """Bounded metadata-only stdio exchange; no thread or user prompt is sent.
+    A separate process group keeps it off the TTY and lets us reap its helpers."""
+
+    def __init__(self, argv, timeout=10):
+        self.argv, self.timeout = argv, timeout
+        self.buffer, self.received = b"", 0
+
+    def __enter__(self):
+        env = dict(os.environ)
+        env.pop("CLAUDECODE", None)  # metadata lookup is not a nested conversation
+        self.process = subprocess.Popen(self.argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                        stderr=subprocess.DEVNULL, start_new_session=True,
+                                        cwd=HOME, env=env)
+        self.deadline = time.monotonic() + self.timeout
+        return self
+
+    def __exit__(self, *exc):
+        p = self.process
+        try:
+            os.killpg(p.pid, signal.SIGTERM)
+        except (ProcessLookupError, PermissionError):
+            p.terminate()  # macOS can report EPERM for an already-exited group
+        try:
+            p.wait(timeout=1)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(p.pid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                p.kill()
+            p.wait()
+        p.stdin.close()
+        p.stdout.close()
+
+    def send(self, message):
+        self.process.stdin.write((json.dumps(message) + "\n").encode())
+        self.process.stdin.flush()
+
+    def receive(self, wanted):
+        import select
+        while True:
+            while b"\n" in self.buffer:
+                raw, self.buffer = self.buffer.split(b"\n", 1)
+                try:
+                    message = json.loads(raw)
+                except ValueError:
+                    continue
+                if not isinstance(message, dict):
+                    continue
+                response = message.get("response", {})
+                if message.get("id") == wanted or (isinstance(response, dict)
+                        and message.get("type") == "control_response" and response.get("request_id") == wanted):
+                    return message
+            remaining = self.deadline - time.monotonic()
+            if remaining <= 0 or not select.select([self.process.stdout], [], [], remaining)[0]:
+                raise ValueError("model lookup timed out")
+            chunk = os.read(self.process.stdout.fileno(), 65536)
+            if not chunk:
+                raise ValueError("tool exited before returning its model list")
+            self.received += len(chunk)
+            if self.received > 4 * 1024 * 1024:
+                raise ValueError("model lookup response was too large")
+            self.buffer += chunk
+
+    def call(self, ident, method, params):
+        self.send({"id": ident, "method": method, "params": params})
+        message = self.receive(ident)
+        if "error" in message or not isinstance(message.get("result"), dict):
+            raise ValueError("tool could not provide model metadata")
+        return message["result"]
 
 
-def _config_codex_cache():
-    root = os.environ.get("CODEX_HOME") or os.path.join(HOME, ".codex")
-    try:
-        with open(os.path.join(root, "models_cache.json")) as fh:
-            return json.load(fh)
-    except (OSError, ValueError):
-        return None
+def _config_live_models(agent):
+    """Use the same capability metadata as the vendors' pickers, not a model catalog
+    frozen in dotfiles or a stale disk cache. See learn.chatgpt.com/docs/app-server
+    (model/list) and Claude Agent SDK's initialize response / ModelInfo."""
+    if agent == "codex":
+        with _ConfigRPC(["codex", "app-server"]) as rpc:
+            rpc.call(1, "initialize", {"clientInfo": {"name": "t-config", "version": "1"}})
+            rpc.send({"method": "initialized"})
+            models, cursor, seen = [], None, set()
+            for ident in range(2, 22):
+                result = rpc.call(ident, "model/list", {"limit": 100, "includeHidden": False, "cursor": cursor})
+                if not isinstance(result.get("data"), list):
+                    raise ValueError("tool returned an invalid model list")
+                models.extend(result["data"])
+                cursor = result.get("nextCursor")
+                if not cursor:
+                    return models
+                if not isinstance(cursor, str) or cursor in seen:
+                    break
+                seen.add(cursor)
+            raise ValueError("tool returned an incomplete model list")
+    argv = ["claude", "-p", "--input-format", "stream-json", "--output-format", "stream-json",
+            "--verbose", "--no-session-persistence", "--setting-sources", "user",
+            "--settings", '{"disableAllHooks":true}', "--strict-mcp-config"]
+    with _ConfigRPC(argv) as rpc:
+        rpc.send({"type": "control_request", "request_id": "t-models",
+                  "request": {"subtype": "initialize"}})
+        response = rpc.receive("t-models").get("response", {})
+        result = response.get("response")
+        if response.get("subtype") != "success" or not isinstance(result, dict) or not isinstance(result.get("models"), list):
+            raise ValueError("tool could not provide model metadata")
+        return result["models"]
+
+
+def _config_catalog(agent, raw):
+    """Normalize and filter the runtime model/effort metadata, keeping vendor order."""
+    catalog = []
+    seen = set()
+    for model in raw if isinstance(raw, list) else []:
+        if not isinstance(model, dict) or model.get("hidden"):
+            continue
+        ident = model.get("model" if agent == "codex" else "value")
+        if not isinstance(ident, str) or not _MODEL_ID.fullmatch(ident) or ident in seen:
+            continue
+        seen.add(ident)
+        resolved = model.get("resolvedModel", ident)
+        if not isinstance(resolved, str) or not _MODEL_ID.fullmatch(resolved):
+            resolved = ident
+        label = f"{resolved} ({ident})" if resolved != ident else ident
+        levels = model.get("supportedReasoningEfforts", []) if agent == "codex" else model.get("supportedEffortLevels", [])
+        if not isinstance(levels, list) or (agent == "claude" and model.get("supportsEffort") is False):
+            levels = []
+        efforts = []
+        for level in levels:
+            value = level.get("reasoningEffort") if isinstance(level, dict) else level
+            if isinstance(value, str) and _EFFORT_ID.fullmatch(value) and value not in efforts:
+                efforts.append(value)
+        catalog.append({"id": ident, "resolved": resolved, "label": label, "efforts": efforts})
+    return catalog
+
+
+def _config_find_model(catalog, model):
+    return next((m for m in catalog if model in (m["id"], m["resolved"])), None)
+
+
+def _config_model_rows(current, catalog):
+    rows = [("", "Use tool's own model setting")]
+    rows += [(m["id"], m["label"]) for m in catalog]
+    if current and current not in dict(rows):
+        suffix = "saved" if _config_find_model(catalog, current) else "saved; not in tool's current list"
+        rows.insert(1, (current, f"{current} ({suffix})"))
+    return rows + [("__custom__", "Enter a custom model ID…"), ("__refresh__", "Refresh model list")]
+
+
+def _config_effort_rows(current, model, catalog):
+    info = _config_find_model(catalog, model)
+    levels = info["efforts"] if info else []
+    rows = [("", "Use tool's own effort setting")] + [(v, v) for v in levels]
+    if current and current not in levels:
+        rows.insert(1, (current, f"{current} (saved; not verified for this model)"))
+    return rows + [("__refresh__", "Refresh model list")]
+
+
+def _config_set_model(cfg, agent, model, catalog):
+    cfg.models[agent] = model
+    info = _config_find_model(catalog, model)
+    effort = cfg.efforts.get(agent)
+    if effort and (info is None or effort not in info["efforts"]):
+        cfg.efforts[agent] = ""
+        return True
+    return False
+
+
+def _config_model_menu(ui, cfg, agent, catalogs, effort=False):
+    while True:
+        if agent not in catalogs:
+            ui.done("loading", f"Reading models and effort levels from {agent}…")
+            try:
+                catalogs[agent] = _config_catalog(agent, _config_live_models(agent))
+            except (OSError, ValueError) as exc:
+                catalogs[agent] = []
+                ui.done("unavailable", f"{agent}: {exc}. Use tool defaults, a custom model, or Refresh.")
+        catalog = catalogs[agent]
+        model = cfg.models.get(agent, "")
+        if effort:
+            current = cfg.efforts.get(agent, "")
+            rows = _config_effort_rows(current, model, catalog)
+            info = _config_find_model(catalog, model)
+            if info is None:
+                ui.done("effort", "Choose a listed model to see its supported effort levels.")
+            elif not info["efforts"]:
+                ui.done("effort", "This model reports no configurable effort levels.")
+        else:
+            current = model
+            rows = _config_model_rows(current, catalog)
+        picked = ui.pick(f"{agent} {'effort' if effort else 'model'}", rows,
+                         default=next(i for i, row in enumerate(rows) if row[0] == current))
+        if picked == "__refresh__":
+            del catalogs[agent]
+            continue
+        if picked == "__custom__":
+            picked = _config_input(ui, "model ID")
+            if picked is not None and not _MODEL_ID.fullmatch(picked):
+                ui.done("invalid", "Enter a model ID without spaces or shell commands.")
+                continue
+        if picked is not None:
+            if effort:
+                cfg.efforts[agent] = picked
+            elif _config_set_model(cfg, agent, picked, catalog):
+                ui.done("effort", "Reset to tool default: the previous level isn't reported for this model.")
+        return
 
 
 def _config_summary(agent, models, overrides):
@@ -1401,16 +1588,19 @@ def _config_worktrees(ui, cfg):
                 setattr(cfg, attr, value)
 
 
-def _config_wizard(cfg, cache):
+def _config_wizard(cfg):
     ui = _RailUI()
     edited = copy.deepcopy(cfg)
     initial = _config_state(cfg)
+    catalogs = {}
     ui.out.write("┌  t config · local settings · nothing written until Save changes\n")
     ui.raw()
     try:
         while True:
             rows = [("tool", f"Default tool     {edited.agent_default}")]
-            rows += [(a, f"{a} model    {edited.models.get(a) or 'tool default'}") for a in AGENTS]
+            for a in AGENTS:
+                rows += [(a, f"{a} model    {edited.models.get(a) or 'tool default'}"),
+                         (f"effort:{a}", f"{a} effort   {edited.efforts.get(a) or 'tool default'}")]
             rows += [("hosts", f"Hosts ({len(edited.hosts)}) · add, edit, remove"),
                      ("repos", f"Repos ({len(edited.repos)}) · paths and overrides"),
                      ("beam", f"Default beam host: {edited.beam_host or 'none'}"),
@@ -1461,20 +1651,11 @@ def _config_wizard(cfg, cache):
                                  default=AGENTS.index(edited.agent_default) if edited.agent_default in AGENTS else 0)
                 if picked is not None:
                     edited.agent_default = picked
+            elif choice.startswith("effort:"):
+                _config_model_menu(ui, edited, choice.split(":", 1)[1], catalogs, effort=True)
             else:
-                current = edited.models.get(choice, "")
-                options = _config_model_rows(choice, current, cache)
-                picked = ui.pick(f"{choice} model", options,
-                                 default=next(i for i, row in enumerate(options) if row[0] == current))
-                if picked == "__custom__":
-                    picked = _config_input(ui, "model ID")
-                    if picked is None:
-                        continue
-                    if not _MODEL_ID.fullmatch(picked):
-                        ui.done("invalid", "Enter a model ID without spaces or shell commands.")
-                        continue
-                if picked is not None:
-                    edited.models[choice] = picked
+                _config_model_menu(ui, edited, choice, catalogs)
+
     finally:
         ui.restore()
 
@@ -1494,6 +1675,8 @@ def _config_editor():
 def cmd_config(cfg, args):
     if args.show:
         print("\n".join(_config_summary(cfg.agent_default, cfg.models, cfg.agents)))
+        for agent in AGENTS:
+            print(f"{agent} effort: {cfg.efforts.get(agent) or 'tool default'}")
         print(f"Default beam host: {cfg.beam_host or 'none'}")
         print(f"Worktrees: {cfg.worktree_default} · root: {cfg.worktree_root} · shared-tree branch: {cfg.branch}")
         for alias, target in sorted(cfg.hosts.items()):
@@ -1508,7 +1691,7 @@ def cmd_config(cfg, args):
         return 1
     try:
         before = _config_read(ZSHRC_LOCAL)
-        result = "edit" if getattr(args, "edit", False) else _config_wizard(cfg, _config_codex_cache())
+        result = "edit" if getattr(args, "edit", False) else _config_wizard(cfg)
         if result is None:
             return 0
         if result == "edit":
@@ -2978,290 +3161,6 @@ def cmd_pending(cfg, args):
           f"bin. You reached bin/t directly (e.g. `command t {args._verb}`) — run "
           f"`t {args._verb} …` in an interactive zsh instead.", file=sys.stderr)
     return 2
-
-
-# ─── phone — reconnect one client; keep every agent in its existing tmux slot ──
-
-def _phone_profile(value):
-    if not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", value):
-        raise argparse.ArgumentTypeError("client name must be 1–64 letters, digits, _ or -")
-    return value
-
-
-def _phone_root():
-    return os.path.join(os.environ.get("XDG_STATE_HOME", os.path.join(HOME, ".local", "state")),
-                        "t", "phone")
-
-
-def _phone_load(path):
-    try:
-        with open(path, encoding="utf-8") as fh:
-            data = json.loads(fh.read(65536))
-        return data if isinstance(data, dict) else {}
-    except (OSError, ValueError, UnicodeError):
-        return {}
-
-
-def _phone_write(path, data):
-    """A connection or selection is one atomic record, never half of a JSON file."""
-    import tempfile
-    parent = os.path.dirname(path)
-    os.makedirs(parent, mode=0o700, exist_ok=True)
-    fd, tmp = tempfile.mkstemp(prefix=".phone-", dir=parent)
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as fh:
-            json.dump(data, fh, ensure_ascii=True)
-            fh.write("\n")
-            fh.flush()
-            os.fsync(fh.fileno())
-        os.replace(tmp, path)
-    finally:
-        if os.path.exists(tmp):
-            os.unlink(tmp)
-
-
-def _phone_remembered(rows, saved):
-    """Follow the conversation, never a reused slot. Before SessionStart stamps an
-    ID we may reattach only the very same session on the very same tmux server."""
-    if saved.get("sid"):
-        matches = [r for r in rows if r.get("sid") == saved["sid"]
-                   and r.get("agent") == saved.get("agent")]
-    else:
-        keys = ("socket", "server", "created", "id")
-        matches = [r for r in rows if all(saved.get(k) and saved[k] == r.get(k) for k in keys)]
-    return matches[0] if len(matches) == 1 else None
-
-
-def _phone_connection(record, client):
-    """A profile belongs to a tmux CLIENT, never the session several clients share.
-    PID + tty + server must all still match before a popup can update its profile."""
-    keys = ("pid", "name", "socket", "server")
-    if not all(record.get(k) and record[k] == client.get(k) for k in keys):
-        return None
-    profile = record.get("profile")
-    return profile if isinstance(profile, str) and re.fullmatch(r"[A-Za-z0-9_-]{1,64}", profile) else None
-
-
-def _phone_text(value, width):
-    """Terminal-safe single line, bounded in screen columns (including wide text)."""
-    import unicodedata
-    text = _ANSI_RE.sub("", str(value))
-    text = " ".join(text.split())
-    text = "".join(c for c in text if c.isprintable())
-    chars, used = [], 0
-    for c in text:
-        size = 0 if unicodedata.combining(c) else (2 if unicodedata.east_asian_width(c) in "WF" else 1)
-        if used + size > max(0, width):
-            while chars and used > width - 1:
-                old = chars.pop()
-                used -= 0 if unicodedata.combining(old) else (2 if unicodedata.east_asian_width(old) in "WF" else 1)
-            return "".join(chars) + ("…" if width > 0 else "")
-        chars.append(c)
-        used += size
-    return "".join(chars)
-
-
-def _phone_page(rows, cur, columns, lines):
-    """Number only the visible page, so every choice is one phone key (1–9)."""
-    columns, lines = max(1, columns), max(1, lines)
-    if not rows:
-        return [_phone_text(s, columns) for s in
-                ["No running t sessions.", "Start one with t open <repo>.",
-                 "Saved chats: t resume -a -l", "r refresh · q back"][:lines]], []
-    cur = max(0, min(cur, len(rows) - 1))
-    each = 2 if lines >= 7 else 1
-    count = min(9, max(1, (lines - 4) // each))
-    lo = (cur // count) * count
-    visible = rows[lo:lo + count]
-    page, pages = lo // count + 1, (len(rows) + count - 1) // count
-    out = [f"Sessions  {page}/{pages}", "1–9 pick · j/k move · Enter open"]
-    for n, row in enumerate(visible, 1):
-        mark = ">" if lo + n - 1 == cur else " "
-        out.append(f"{mark}{n} {row['slot']} · {row.get('agent', 'claude')}")
-        if each == 2:
-            out.append("   " + (row.get("summary") or "(no title yet)"))
-    out += ["n/p page · r refresh", "q / Esc back · other tasks keep running"]
-    return [_phone_text(s, columns) for s in out[:lines]], visible
-
-
-def _phone_tmux(*args):  # pragma: no cover — exercised against an isolated tmux server
-    return _run(["tmux", "-u", *args], timeout=10)
-
-
-def _phone_snapshot():  # pragma: no cover — tmux format/transport, tested end to end
-    fields = ("id", "name", "created", "server", "socket", "cwd", "stamp", "dead")
-    fmt = "\t".join("#{%s}" % f for f in
-                    ("session_id", "session_name", "session_created", "pid", "socket_path",
-                     "session_path", "CLAUDE_RESUME_ID", "pane_dead"))
-    result = _phone_tmux("list-sessions", "-F", fmt)
-    if result.returncode:
-        # A stopped server is an empty session list, not an invitation to start one.
-        if "no server running" in result.stderr or "No such file" in result.stderr:
-            return []
-        raise RuntimeError(result.stderr.strip() or "could not list tmux sessions")
-    rows = []
-    for line in result.stdout.splitlines():
-        parts = line.split("\t")
-        if (len(parts) == len(fields) and parts[-1] == "0"
-                and re.fullmatch(r"dev-.+-[0-9]+", parts[1])):
-            rows.append(dict(zip(fields, parts)))
-    return rows
-
-
-def _phone_sessions():  # pragma: no cover — shell integration uses existing authoritative resolver
-    before = _phone_snapshot()
-    if not before:
-        return []
-    # This is the same registry-first ID and transcript-title resolution as t ls.
-    # Raw tmux env can hold a predecessor's ID after a pane is reused; never use
-    # that stamp directly to follow a conversation across slots.
-    # SSH clients do not always forward a UTF-8 locale. -u also preserves tabs in
-    # tmux's formatted output; scope the override to this disposable data shell.
-    data = zsh_capture('function tmux() { command tmux -u "$@"; }; _dev_session_rows')
-    meta = {"dev-" + r["slot"]: r for r in _parse_rows(data)}
-    after = {r["id"]: r for r in _phone_snapshot()}
-    rows = []
-    for row in before:
-        # Refuse a row replaced or re-stamped while its metadata was being read.
-        if after.get(row["id"]) != row:
-            continue
-        detail = meta.get(row["name"], {})
-        if detail.get("cwd") != row["cwd"]:
-            continue
-        row.update(slot=detail["slot"], agent=detail["agent"],
-                   sid="" if detail["sid"] == "-" else detail["sid"],
-                   summary=detail["summary"])
-        rows.append(row)
-    return sorted(rows, key=lambda r: (r["slot"].rsplit("-", 1)[0],
-                                      int(r["slot"].rsplit("-", 1)[1])))
-
-
-def _phone_clients():  # pragma: no cover — tmux transport
-    fields = ("name", "pid", "server", "socket", "session")
-    fmt = "\t".join("#{%s}" % f for f in
-                    ("client_name", "client_pid", "pid", "socket_path", "session_id"))
-    result = _phone_tmux("list-clients", "-F", fmt)
-    return [dict(zip(fields, p)) for line in result.stdout.splitlines()
-            if len(p := line.split("\t")) == len(fields)]
-
-
-def _phone_client(name, pid):  # pragma: no cover — tmux transport
-    return next((c for c in _phone_clients() if c["name"] == name and c["pid"] == pid), None)
-
-
-def _phone_picker(rows):  # pragma: no cover — interactive UI covered with real PTYs
-    """Full-screen in both a popup and a fresh SSH terminal. No shell snippets are
-    sent to an agent. Resize is repainted even without a keypress (phone rotation)."""
-    import select
-    ui = _RailUI()
-    cur = 0
-    last_frame = None
-    try:
-        ui.raw()
-        ui.out.write("\x1b[?1049h")
-        while True:
-            cols, height = shutil.get_terminal_size((40, 18))
-            body, visible = _phone_page(rows, cur, max(1, cols - 1), max(1, height - 1))
-            frame = (cols, height, body)
-            if frame != last_frame:
-                ui.out.write("\x1b[H\x1b[2J" + "\r\n".join(body))
-                ui.out.flush()
-                last_frame = frame
-            if not select.select([ui.fd], [], [], 0.25)[0]:
-                continue
-            key = ui.read_key()
-            if key in ("q", "esc", "abort"):
-                return None
-            if key == "r":
-                rows = _phone_sessions()
-                cur = min(cur, max(0, len(rows) - 1))
-            elif visible and key in "123456789" and len(key) == 1:
-                n = int(key) - 1
-                if n < len(visible):
-                    return visible[n]
-            elif rows:
-                if key == "enter":
-                    return rows[cur]
-                if key in ("j", "down"):
-                    cur = (cur + 1) % len(rows)
-                elif key in ("k", "up"):
-                    cur = (cur - 1) % len(rows)
-                elif key in ("n", "space"):
-                    count = min(9, max(1, (max(1, height - 1) - 4) // (2 if height - 1 >= 7 else 1)))
-                    cur = (cur // count + 1) * count
-                    if cur >= len(rows):
-                        cur = 0
-                elif key == "p":
-                    count = min(9, max(1, (max(1, height - 1) - 4) // (2 if height - 1 >= 7 else 1)))
-                    cur = max(0, (cur // count - 1) * count)
-    finally:
-        ui.out.write("\x1b[?1049l")
-        ui.restore()
-
-
-def cmd_phone(cfg, args):
-    """Never launches an agent, kills a session, or falls through to t open."""
-    if not shutil.which("tmux"):
-        print("t phone: tmux is required.", file=sys.stderr)
-        return 1
-    if not sys.stdin.isatty() or not sys.stdout.isatty():
-        print("t phone needs an interactive terminal (SSH must allocate a TTY).", file=sys.stderr)
-        return 1
-    root = _phone_root()
-    target = None
-    profile = args.client
-    try:
-        if args.tmux_client or args.tmux_client_pid:
-            target = _phone_client(args.tmux_client, args.tmux_client_pid)
-            if not target:
-                raise RuntimeError("the terminal that opened this picker has disconnected")
-            record = _phone_load(os.path.join(root, "connections", target["pid"] + ".json"))
-            profile = _phone_connection(record, target)
-        elif os.environ.get("TMUX"):
-            print("Already inside tmux: press F1 to choose a session for this terminal.", file=sys.stderr)
-            return 1
-
-        state_path = os.path.join(root, "profiles", profile + ".json") if profile else None
-        saved = _phone_load(state_path) if state_path else {}
-        rows = _phone_sessions()
-        chosen = None if args.pick or target else _phone_remembered(rows, saved)
-        if not chosen:
-            if saved and not args.pick and not target:
-                print("Your previous session is no longer running. Choose another below.\n"
-                      "Saved conversations are available with t resume -a -l.", file=sys.stderr)
-            chosen = _phone_picker(rows)
-        if not chosen:
-            return 0
-
-        # The menu can stay open while an agent finishes. Revalidate the exact
-        # conversation and instance immediately before attaching, never its name.
-        fresh = _phone_remembered(_phone_sessions(), chosen)
-        if not fresh:
-            raise RuntimeError("that conversation ended or moved; press F1 / run t phone --pick again")
-        chosen = fresh
-        if target:
-            current = _phone_client(target["name"], target["pid"])
-            if current != target:
-                raise RuntimeError("the terminal changed while this picker was open; reopen it with F1")
-            result = _phone_tmux("switch-client", "-c", target["name"], "-t", chosen["id"])
-            if result.returncode:
-                raise RuntimeError(result.stderr.strip() or "could not switch sessions")
-            if state_path:
-                _phone_write(state_path, chosen)
-            return 0
-
-        _phone_write(state_path, chosen)
-        # exec preserves our PID: F1 receives the same #{client_pid}. A tty alone
-        # is insufficient because SSH can reuse it for an entirely new profile.
-        connection = {"profile": profile, "pid": str(os.getpid()),
-                      "name": os.ttyname(sys.stdin.fileno()), "server": chosen["server"],
-                      "socket": chosen["socket"]}
-        _phone_write(os.path.join(root, "connections", connection["pid"] + ".json"), connection)
-        # No -d: reconnecting the phone must not evict the user's desktop client.
-        os.execvp("tmux", ["tmux", "-u", "attach-session", "-t", chosen["id"]])
-    except (OSError, RuntimeError) as e:
-        print(f"t phone: {e}", file=sys.stderr)
-        return 1
 
 
 # ─── install — install + log in the agent CLIs (claude · codex · cursor) ───────
@@ -7073,7 +6972,6 @@ examples:
   t open ff:p4242         open an fg row with no session id by its pid label (as t ls shows it)
   t ls                    list this repo's live sessions
   t ls -r                 list live sessions across every machine
-  t phone                 reconnect from Termius; F1 switches sessions
   t push                  send the current session to a background tmux slot
   t pop api 3             pull dev-api-3 back to this terminal
   t resume api 3          revive dev-api-3's last conversation after it was closed
@@ -7094,20 +6992,6 @@ agents — what each verb supports per agent (t install --status adds this machi
 
 Run `t <verb> -h` for a verb's own flags.""")
     sub = p.add_subparsers(dest="verb", metavar="<verb>")
-
-    sp = sub.add_parser("phone", help="reconnect from your phone; F1 switches running sessions",
-        description="Attach your last selected live conversation on this Mac/host, or show a "
-            "compact numbered picker. Set Termius's Startup Command to: zsh -lic 't phone'. "
-            "F1 opens the picker while an agent is running. Each --client name remembers its "
-            "own selection even after Termius closes every tab. Only existing local tmux dev "
-            "sessions are attached: agents are never restarted or duplicated. If a session has "
-            "ended, recover saved conversations separately with t resume -a -l. Foreground "
-            "sessions (--fg / t pop) are outside this flow. Requires tmux 3.2+ for the F1 popup.")
-    sp.add_argument("--client", type=_phone_profile, default="phone", metavar="NAME",
-                    help="remembered phone profile (default: phone; separate tabs can use phone-1, phone-2)")
-    sp.add_argument("--pick", action="store_true", help="choose a running session instead of reconnecting the last one")
-    sp.add_argument("--tmux-client", help=argparse.SUPPRESS)
-    sp.add_argument("--tmux-client-pid", help=argparse.SUPPRESS)
 
     sp = sub.add_parser("open", help="open or reattach a session in a per-repo tmux slot",
         description="Open or reattach a Claude session in a per-repo tmux slot. Bare `t open` "
@@ -7321,13 +7205,14 @@ Run `t <verb> -h` for a verb's own flags.""")
     sp.add_argument("host", help="$REMOTE_HOSTS key, or a literal ssh target")
     sp.add_argument("rest", nargs=argparse.REMAINDER, help="command to run (omit for an interactive shell)")
 
-    sp = sub.add_parser("config", help="manage local settings: tools, models, repos and hosts",
-        description="Arrow-key settings hub for this machine: default tool and per-tool models; "
+    sp = sub.add_parser("config", help="manage local settings: tools, models, effort, repos and hosts",
+        description="Arrow-key settings hub for this machine: default tool, models and effort; "
+            "query each CLI for current models and their supported effort levels; "
             "add, edit or remove hosts; register or unregister repos and set their tool, branch "
             "and worktree overrides; choose the default beam host and worktree defaults. "
             "Save changes reviews then writes a managed block in ~/.zshrc.local. Removed "
             "hosts stop participating in dots --all; unregistering repos keeps their files "
-            "and sessions. Tool/model defaults apply to fresh tmux and --fg sessions only. "
+            "and sessions. Tool/model/effort defaults apply to fresh tmux and --fg sessions only. "
             "Open local config in editor covers all custom shell settings (VISUAL/EDITOR, else vi).")
     cg = sp.add_mutually_exclusive_group()
     cg.add_argument("--show", action="store_true", help="print current settings without opening the menu")
@@ -7499,7 +7384,6 @@ Run `t <verb> -h` for a verb's own flags.""")
 
 
 IMPLEMENTED = {
-    "phone": cmd_phone,
     "ls": cmd_ls, "session-rows": cmd_session_rows, "on": cmd_on, "read": cmd_read,
     "plan": cmd_plan, "paste": cmd_paste, "kill": cmd_kill, "setup": cmd_setup,
     "land": cmd_land, "kill-owner": cmd_kill_owner, "cursor": cmd_cursor,

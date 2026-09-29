@@ -444,33 +444,39 @@ def test_zsh_resume_session_uses_the_agent_resume_line(zsh):
 
 
 def test_zsh_sync_config_emits_the_agent_keys(zsh):
-    r = zsh("cat $HOME/.config/t/config.sh")
+    r = zsh("DEV_EFFORT[codex]=ultra; DEV_EFFORT[claude]=max; "
+            "rm -f $HOME/.config/t/config.sh; _t_sync_config; cat $HOME/.config/t/config.sh")
     lines = r.stdout.splitlines()
     assert "DEV_AGENT[api]=codex" in lines
     assert "DEV_AGENT_DEFAULT=claude" in lines
+    assert "DEV_EFFORT[codex]=ultra" in lines
+    assert "DEV_EFFORT[claude]=max" in lines
 
 
 def test_zsh_model_defaults_reach_new_tmux_sessions_and_not_resumes(zsh):
     r = zsh("DEV_MODEL[claude]=sonnet; DEV_MODEL[codex]=local/model; "
+            "DEV_EFFORT[claude]=max; DEV_EFFORT[codex]=ultra; "
             "_dev_new_session dev-api-3 $HOME/code/api dev/x 1 codex; "
             "_dev_new_session dev-web-4 $HOME/code/web dev/x 1 claude; "
             "_dev_resume_session dev-api-5 $HOME/code/api thread-id codex")
     assert r.returncode == 0, r.stderr
     lines = zsh.log.read_text().splitlines()
-    assert "send-keys -t dev-api-3 codex --model local/model; exit Enter" in lines
-    assert any("claude --session-id " in line and " --model sonnet; exit Enter" in line for line in lines)
+    assert "send-keys -t dev-api-3 codex --model local/model -c model_reasoning_effort=ultra; exit Enter" in lines
+    assert any("claude --session-id " in line and " --model sonnet --effort max; exit Enter" in line for line in lines)
     assert "send-keys -t dev-api-5 codex resume thread-id; exit Enter" in lines
 
 
 @pytest.mark.parametrize("agent", ["claude", "codex"])
-def test_zsh_foreground_uses_the_selected_tools_model(zsh, agent):
+def test_zsh_foreground_uses_the_selected_tools_model_and_effort(zsh, agent):
     (zsh.home / "code" / "web").mkdir(parents=True)
     r = zsh(f"DEV_AGENT_DEFAULT={agent}; DEV_MODEL[{agent}]='model[1m]'; "
+            f"DEV_EFFORT[{agent}]=high; "
             "DEV_WORKTREE[web]=0; _dev_repo_prepare() { :; }; "
             f"{agent}() {{ print -rl -- ARG \"$@\"; }}; "
             "_t_dev web new --fg")
     assert r.returncode == 0, r.stderr
-    assert r.stdout.endswith("ARG\n--model\nmodel[1m]\n"), r.stdout
+    effort_args = "-c\nmodel_reasoning_effort=high" if agent == "codex" else "--effort\nhigh"
+    assert r.stdout.endswith(f"ARG\n--model\nmodel[1m]\n{effort_args}\n"), r.stdout
 
 
 def test_zsh_model_shell_quoting_and_config_bridge(zsh):

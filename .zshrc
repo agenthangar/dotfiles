@@ -918,7 +918,7 @@ add-zsh-hook precmd _dots_reload_if_moved
 # are machine-specific, so they live in ~/.zshrc.local (not committed); this file
 # just declares the array and sources that override. See .zshrc.local.example.
 #   DEV_REPOS[api]="$HOME/code/my-api"
-typeset -gA DEV_REPOS DEV_BRANCHES REMOTE_HOSTS DEV_WORKTREE DEV_AGENT DEV_MODEL
+typeset -gA DEV_REPOS DEV_BRANCHES REMOTE_HOSTS DEV_WORKTREE DEV_AGENT DEV_MODEL DEV_EFFORT
 [[ -f "$HOME/.zshrc.local" ]] && source "$HOME/.zshrc.local"
 
 # DEV_BRANCH — the global default branch `dev`/`_dev_new_session` check out (and
@@ -1026,12 +1026,19 @@ _dev_agent_check() {
 }
 # _dev_agent_new_cmd <agent> [sid] — the pane command for a FRESH slot.
 # DEV_MODEL is keyed by agent, so switching tools never carries the other tool's model.
-# Resumes deliberately use the conversation's own model, not this new-session default.
+# Resumes deliberately retain their model/effort behavior, without these new-session defaults.
 _dev_agent_new_cmd() {
   local agent="$1" model="${DEV_MODEL[$1]:-}"
+  local effort="${DEV_EFFORT[$1]:-}"
   local -a launch_args=("$agent")
   [[ $agent == claude && -n $2 ]] && launch_args+=(--session-id "$2")
   [[ -n $model ]] && launch_args+=(--model "$model")
+  if [[ -n $effort ]]; then
+    case "$agent" in
+      codex) launch_args+=(-c "model_reasoning_effort=$effort") ;;
+      claude) launch_args+=(--effort "$effort") ;;
+    esac
+  fi
   print -r -- "${(j: :)${(@q)launch_args}}"
 }
 # _dev_agent_resume_cmd <agent> <sid> — the pane command that resumes conversation <sid>.
@@ -1760,6 +1767,7 @@ _t_sync_config() {
     for k in ${(k)DEV_WORKTREE};  do print -r -- "DEV_WORKTREE[$k]=${(q)DEV_WORKTREE[$k]}"; done
     for k in ${(k)DEV_AGENT};     do print -r -- "DEV_AGENT[$k]=${(q)DEV_AGENT[$k]}"; done
     for k in ${(k)DEV_MODEL};     do print -r -- "DEV_MODEL[$k]=${(q)DEV_MODEL[$k]}"; done
+    for k in ${(k)DEV_EFFORT};    do print -r -- "DEV_EFFORT[$k]=${(q)DEV_EFFORT[$k]}"; done
     print -r -- "DEV_AGENT_DEFAULT=${(q)DEV_AGENT_DEFAULT}"
     print -r -- "TBEAM_HOST=${(q)TBEAM_HOST}"
     print -r -- "MINI_HOST=${(q)MINI_HOST}"
@@ -3898,6 +3906,12 @@ _t_dev() {
     [[ -n $skip_prepare ]] || _dev_repo_prepare "$branch"
     local -a model_args=()
     [[ -n ${DEV_MODEL[$agent]:-} ]] && model_args=(--model "${DEV_MODEL[$agent]}")
+    if [[ -n ${DEV_EFFORT[$agent]:-} ]]; then
+      case "$agent" in
+        codex) model_args+=(-c "model_reasoning_effort=${DEV_EFFORT[$agent]}") ;;
+        claude) model_args+=(--effort "${DEV_EFFORT[$agent]}") ;;
+      esac
+    fi
     "$agent" "${model_args[@]}"   # retain the claude()/codex() wrappers (tpush sentinel)
     return
   fi
@@ -6903,7 +6917,7 @@ _t_install() {
       local key
       for key in ${(k)DEV_REPOS}; do unalias "$key" 2>/dev/null; done
       for key in ${(k)REMOTE_HOSTS}; do unfunction "$key" 2>/dev/null; done
-      DEV_REPOS=() DEV_BRANCHES=() REMOTE_HOSTS=() DEV_WORKTREE=() DEV_AGENT=() DEV_MODEL=()
+      DEV_REPOS=() DEV_BRANCHES=() REMOTE_HOSTS=() DEV_WORKTREE=() DEV_AGENT=() DEV_MODEL=() DEV_EFFORT=()
       unset DEV_AGENT_DEFAULT DEV_BRANCH DEV_WORKTREE_ROOT DEV_WORKTREE_DEFAULT TBEAM_HOST MINI_HOST
     fi
     source ~/.zshrc
@@ -7197,15 +7211,12 @@ alias h=help   # `h` is a shorthand for `help`
 # key for `on`), and slot/flags after. Pulls live from the ${(k)DEV_REPOS} /
 # ${(k)REMOTE_HOSTS} arrays so it stays current with ~/.zshrc.local.
 _t() {
-  local -a verbs=(open app ls phone kill push pop resume beam read plan paste find on cursor setup config new install permissions trust)
+  local -a verbs=(open app ls kill push pop resume beam read plan paste find on cursor setup config new install permissions trust)
   if (( CURRENT == 2 )); then
     _describe -t verbs 't verb' verbs
     return
   fi
   case ${words[2]} in
-    phone)
-      if [[ ${words[CURRENT-1]} == --client ]]; then _message 'phone profile name'
-      else _values 'flag' --client --pick -h --help; fi ;;
     app)
       if [[ ${words[CURRENT-1]} == --url ]]; then _message 'preview URL'
       elif [[ ${words[CURRENT-1]} == --plan ]]; then _files -g '*.md'

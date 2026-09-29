@@ -209,6 +209,9 @@ that file untouched. Only the managed settings block is rewritten; custom shell
 outside it is preserved. Removed registrations are explicitly unset, including
 in the calling shell, so their generated shortcuts disappear immediately too.
 `t config --show` prints current settings without opening the menu.
+Section headings separate session defaults, hosts/repos, and save actions. Current
+values appear in cyan beside their labels (underneath on narrow terminals), with
+a highlighted cursor row and a pending-change count beside **Save changes**.
 
 Tool, model and effort defaults apply to **new `t open` sessions**, including `--fg`.
 Existing/resumed conversations keep their normal behavior. `DEV_AGENT[repo]` and

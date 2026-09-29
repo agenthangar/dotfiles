@@ -93,6 +93,9 @@ class Menu:
         self.out = io.StringIO()
         self.restored = False
 
+    def intro(self, *args):
+        pass
+
     def raw(self):
         pass
 
@@ -128,10 +131,10 @@ def config_cli(t_mod, tmp_path, monkeypatch):
     monkeypatch.setattr(t_mod.sys.stdout, "isatty", lambda: True)
     monkeypatch.setattr(t_mod, "_config_live_models", lambda agent: [
         {"value": "opus", "resolvedModel": "claude-test-opus", "supportsEffort": True,
-         "supportedEffortLevels": ["low", "high", "max"]},
+         "supportedEffortLevels": ["low", "high", "max"], "supportsFastMode": True},
         {"value": "haiku", "resolvedModel": "claude-test-haiku"},
     ] if agent == "claude" else [
-        {"model": "test-model", "supportedReasoningEfforts": [{"reasoningEffort": "high"},
+        {"model": "test-model", "serviceTiers": [{"id": "priority"}], "supportedReasoningEfforts": [{"reasoningEffort": "high"},
                                                                {"reasoningEffort": "ultra"}]}])
     monkeypatch.setattr(t_mod, "zsh_capture", lambda snippet: "")
     return t_mod.Config(), local
@@ -139,7 +142,7 @@ def config_cli(t_mod, tmp_path, monkeypatch):
 
 def test_config_menu_save_then_cancel(t_mod, config_cli, monkeypatch):
     cfg, local = config_cli
-    ui = Menu(["tool", "codex", "codex", "__custom__", "claude", "opus", "save"], ["local/model"])
+    ui = Menu(["tool", "codex", "codex", "model", "__custom__", "back", "claude", "model", "opus", "back", "save"], ["local/model"])
     monkeypatch.setattr(t_mod, "_RailUI", lambda: ui)
     assert t_mod.cmd_config(cfg, SimpleNamespace(show=False)) == 0
     assert ui.restored
@@ -154,7 +157,7 @@ def test_config_menu_save_then_cancel(t_mod, config_cli, monkeypatch):
 def test_config_menu_custom_validation_back_reset_and_no_change(t_mod, config_cli, monkeypatch):
     cfg, local = config_cli
     cfg.models = {"codex": "old"}
-    ui = Menu(["tool", None, "codex", "__custom__", "__custom__", "codex", "", "save"],
+    ui = Menu(["tool", None, "codex", "model", "__custom__", "__custom__", "model", "", "back", "save"],
               ["bad model", ""])
     monkeypatch.setattr(t_mod, "_RailUI", lambda: ui)
     assert t_mod.cmd_config(cfg, SimpleNamespace(show=False)) == 0
@@ -240,7 +243,7 @@ def test_config_hosts_remove_save_and_cancel(t_mod, config_cli, monkeypatch):
     local.write_text("REMOTE_HOSTS[retired]=old.example\nREMOTE_HOSTS[mini]=mini.example\n"
                      "export TBEAM_HOST=old.example\nMINI_HOST=old.example\n")
     before = local.read_text()
-    ui = Menu(["hosts", "retired", "remove", "__back__", "cancel"])
+    ui = Menu(["hosts", "retired", "remove", "__back__", "cancel", "discard"])
     monkeypatch.setattr(t_mod, "_RailUI", lambda: ui)
     assert t_mod.cmd_config(cfg, SimpleNamespace(show=False)) == 0
     assert local.read_text() == before and "retired" in cfg.hosts
@@ -292,7 +295,7 @@ def test_config_worktree_defaults_and_beam_clear(t_mod, config_cli, monkeypatch,
 
 def test_config_review_can_back_out_or_cancel(t_mod, config_cli, monkeypatch):
     cfg, local = config_cli
-    ui = Menu(["tool", "codex", "save", "save"], pages=["n", "q"])
+    ui = Menu(["tool", "codex", "save", "save", "cancel", "discard"], pages=["n", "q"])
     monkeypatch.setattr(t_mod, "_RailUI", lambda: ui)
     assert t_mod.cmd_config(cfg, SimpleNamespace(show=False)) == 0
     assert local.read_text() == "# keep me\n"
@@ -310,7 +313,7 @@ def test_config_editor_uses_argument_list_and_checks_syntax(t_mod, monkeypatch):
 
 def test_config_editor_requires_pending_changes_to_be_saved(t_mod, config_cli, monkeypatch):
     cfg, local = config_cli
-    ui = Menu(["tool", "codex", "edit", "cancel"])
+    ui = Menu(["tool", "codex", "edit", "cancel", "discard"])
     monkeypatch.setattr(t_mod, "_RailUI", lambda: ui)
     monkeypatch.setattr(t_mod, "_config_editor", lambda: pytest.fail("must not open editor"))
     assert t_mod.cmd_config(cfg, SimpleNamespace(show=False)) == 0
@@ -319,8 +322,8 @@ def test_config_editor_requires_pending_changes_to_be_saved(t_mod, config_cli, m
 
 def test_config_selects_and_persists_model_specific_effort(t_mod, config_cli, monkeypatch):
     cfg, local = config_cli
-    ui = Menu(["claude", "opus", "effort:claude", "max",
-               "codex", "test-model", "effort:codex", "ultra", "save"])
+    ui = Menu(["claude", "model", "opus", "effort", "max", "back",
+               "codex", "model", "test-model", "effort", "ultra", "back", "save"])
     monkeypatch.setattr(t_mod, "_RailUI", lambda: ui)
     assert t_mod.cmd_config(cfg, SimpleNamespace(show=False)) == 0
     text = local.read_text()
@@ -331,7 +334,7 @@ def test_config_selects_and_persists_model_specific_effort(t_mod, config_cli, mo
 def test_config_switching_to_non_effort_model_clears_effort(t_mod, config_cli, monkeypatch):
     cfg, local = config_cli
     cfg.models, cfg.efforts = {"claude": "opus"}, {"claude": "max"}
-    ui = Menu(["claude", "haiku", "effort:claude", "", "save"])
+    ui = Menu(["claude", "model", "haiku", "effort", "", "back", "save"])
     monkeypatch.setattr(t_mod, "_RailUI", lambda: ui)
     assert t_mod.cmd_config(cfg, SimpleNamespace(show=False)) == 0
     assert "DEV_EFFORT[claude]=''" in local.read_text()
@@ -349,7 +352,7 @@ def test_config_model_lookup_is_lazy_and_refreshable(t_mod, config_cli, monkeypa
     ui = Menu(["cancel"])
     monkeypatch.setattr(t_mod, "_RailUI", lambda: ui)
     assert t_mod.cmd_config(cfg, SimpleNamespace(show=False)) == 0 and not calls
-    ui = Menu(["codex", "__refresh__", "new-model", "effort:codex", "ultra", "save"])
+    ui = Menu(["codex", "model", "__refresh__", "new-model", "effort", "ultra", "back", "save"])
     assert t_mod.cmd_config(cfg, SimpleNamespace(show=False)) == 0
     assert calls == ["codex", "codex"]  # one retry, then reuse within this menu
     assert "DEV_MODEL[codex]=new-model" in local.read_text()
@@ -360,7 +363,50 @@ def test_config_unavailable_metadata_keeps_custom_and_native_choices(t_mod, conf
     def unavailable(agent):
         raise FileNotFoundError(agent)
     monkeypatch.setattr(t_mod, "_config_live_models", unavailable)
-    ui = Menu(["codex", "__custom__", "effort:codex", "", "save"], ["private/model"])
+    ui = Menu(["codex", "model", "__custom__", "effort", "", "back", "save"], ["private/model"])
     monkeypatch.setattr(t_mod, "_RailUI", lambda: ui)
     assert t_mod.cmd_config(cfg, SimpleNamespace(show=False)) == 0
     assert "DEV_MODEL[codex]=private/model" in local.read_text()
+
+
+@pytest.mark.parametrize('quit_choice', ['cancel', None])
+def test_dirty_exit_keeps_edits_unless_discard_is_explicit(t_mod, config_cli, monkeypatch, quit_choice):
+    cfg, local = config_cli
+    ui = Menu(['tool', 'codex', quit_choice, None, quit_choice, 'keep', quit_choice, 'save'])
+    original_pick = ui.pick
+    def pick(label, rows, default=0, **kwargs):
+        if 'unsaved' in label:
+            assert rows[default][0] == 'keep'
+        return original_pick(label, rows, default, **kwargs)
+    ui.pick = pick
+    monkeypatch.setattr(t_mod, '_RailUI', lambda: ui)
+    assert t_mod.cmd_config(cfg, SimpleNamespace(show=False)) == 0
+    assert 'DEV_AGENT_DEFAULT=codex' in local.read_text()
+
+
+def test_fast_mode_persists_per_tool_and_can_be_disabled_or_inherited(t_mod, config_cli, monkeypatch):
+    cfg, local = config_cli
+    ui = Menu(['claude', 'model', 'opus', 'fast', '1', 'back',
+               'codex', 'model', 'test-model', 'fast', '1', 'back', 'save'])
+    monkeypatch.setattr(t_mod, '_RailUI', lambda: ui)
+    assert t_mod.cmd_config(cfg, SimpleNamespace(show=False)) == 0
+    assert 'DEV_FAST[claude]=1' in local.read_text() and 'DEV_FAST[codex]=1' in local.read_text()
+    cfg.fast = {'claude': '1', 'codex': '1'}
+    ui = Menu(['claude', 'fast', '0', 'back', 'codex', 'fast', '', 'back', 'save'])
+    assert t_mod.cmd_config(cfg, SimpleNamespace(show=False)) == 0
+    assert 'DEV_FAST[claude]=0' in local.read_text() and "DEV_FAST[codex]=''" in local.read_text()
+
+
+def test_unsupported_model_does_not_offer_fast_and_switching_disables_it(t_mod, config_cli, monkeypatch):
+    cfg, local = config_cli
+    cfg.models, cfg.fast = {'claude': 'opus'}, {'claude': '1'}
+    ui = Menu(['claude', 'model', 'haiku', 'fast', '0', 'back', 'save'])
+    original_pick = ui.pick
+    def pick(label, rows, default=0, **kwargs):
+        if 'Fast mode' in label:
+            assert '1' not in dict(rows)
+        return original_pick(label, rows, default, **kwargs)
+    ui.pick = pick
+    monkeypatch.setattr(t_mod, '_RailUI', lambda: ui)
+    assert t_mod.cmd_config(cfg, SimpleNamespace(show=False)) == 0
+    assert 'DEV_FAST[claude]=0' in local.read_text()

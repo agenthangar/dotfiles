@@ -191,8 +191,9 @@ line, and `DOTFILES_NO_TRUST=1` opts a machine out of the automatic paths.
 
 **`t config`** is the local settings hub, with an arrow-key menu for:
 
-- **Tools, models and effort:** choose Claude or Codex as the default tool, with
-  separate model and effort settings for each. Models come from the installed
+- **Tools, models, effort and Fast mode:** choose Claude or Codex as the default
+  tool, then open that tool's submenu for its model, effort and Fast mode settings.
+  Models come from the installed
   CLI's current catalog; Claude aliases show their resolved model IDs. Choose a
   listed model to see its supported effort levels. Changing models clears an
   effort override that the new model doesn't report. Each setting can inherit
@@ -210,21 +211,29 @@ line, and `DOTFILES_NO_TRUST=1` opts a machine out of the automatic paths.
 - **All custom settings:** open `~/.zshrc.local` in `$VISUAL` / `$EDITOR` (or `vi`).
   `t config --edit` opens the editor directly and checks shell syntax before reload.
 
-Choose **Save changes** to review and apply the pending menu edits. Cancel leaves
-that file untouched. Only the managed settings block is rewritten; custom shell
-outside it is preserved. Removed registrations are explicitly unset, including
+Choose **Save changes** or press **s** to review and apply pending edits. The save
+button stays visible below the list. Quitting with unsaved edits offers **Keep
+editing**, **Review and save**, or **Discard changes and exit**; the default keeps
+your edits. Backing out of review returns to settings. Only the managed settings
+block is rewritten; custom shell outside it is preserved. Removed registrations are explicitly unset, including
 in the calling shell, so their generated shortcuts disappear immediately too.
 `t config --show` prints current settings without opening the menu.
 Section headings separate session defaults, hosts/repos, and save actions. Current
 values appear in cyan beside their labels (underneath on narrow terminals), with
 a highlighted cursor row and a pending-change count beside **Save changes**.
+The other wizards and session/worktree pickers follow the same [shared TUI design](ui/README.md).
 
-Tool, model and effort defaults apply to **new `t open` sessions**, including `--fg`.
+Fast mode offers **Tool default**, **Off**, and **On** for models that report support.
+On can increase usage/cost and remains subject to the CLI's account restrictions.
+Changing to an unsupported model turns an explicit Fast mode override off.
+
+Tool, model, effort and Fast mode defaults apply to **new `t open` sessions**, including `--fg`.
 Existing/resumed conversations keep their normal behavior. `DEV_AGENT[repo]` and
 `--claude`/`--codex` still override the global tool; `DEV_MODEL[claude]` and
 `DEV_MODEL[codex]` hold each tool's model choice, with `DEV_EFFORT[claude]` and
-`DEV_EFFORT[codex]` for effort. Model discovery sends no prompts and happens only
-when you open a model or effort menu. Settings are per machine: run
+`DEV_EFFORT[codex]` for effort, and `DEV_FAST[claude/codex]` (`1` / `0` / empty)
+for Fast mode. Model discovery sends no prompts and happens only
+when you open a model, effort or Fast mode menu. Settings are per machine: run
 `t config` on each host to configure it. Cursor remains available through
 `t cursor`; it does not support dev slots.
 

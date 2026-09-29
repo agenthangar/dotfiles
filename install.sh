@@ -247,25 +247,48 @@ link() {
 # parsing these `link` lines (bin/t's _INSTALL_LINK_RE), so a link outside link_all
 # would be a link doctor reports as drifted and the links-only relink never fixes —
 # a relink that fires on every single `dots` forever.
+# Standalone t owns its links once it passes the versioned installation contract.
+# shellcheck source=lib/t-integration.sh
+source "$DOTFILES_DIR/lib/t-integration.sh"
+STANDALONE_T=0
+if [[ -z "${DOTFILES_NO_T:-}" ]] && _dots_t_find >/dev/null; then
+    _dots_t_install "$LINK_SRC"
+    STANDALONE_T=1
+fi
+
 link_all() {
     link "$LINK_SRC/.zshrc"               "$HOME/.zshrc"
     link "$LINK_SRC/.tmux.conf"           "$HOME/.tmux.conf"
     link "$LINK_SRC/bin/sleep-manager"    "$HOME/bin/sleep-manager"
     link "$LINK_SRC/bin/csync"            "$HOME/bin/csync"
+    if (( ! STANDALONE_T )); then
     link "$LINK_SRC/bin/cursor-beam"      "$HOME/bin/cursor-beam"
+    fi
     link "$LINK_SRC/bin/pii-scan"         "$HOME/bin/pii-scan"
+    if (( ! STANDALONE_T )); then
     link "$LINK_SRC/bin/claude-stamp-tmux" "$HOME/bin/claude-stamp-tmux"
+    fi
     link "$LINK_SRC/bin/clip-bridge"      "$HOME/bin/clip-bridge"
+    if (( ! STANDALONE_T )); then
     link "$LINK_SRC/bin/t"                "$HOME/bin/t"
+    fi
     link "$LINK_SRC/bin/dots-sync"        "$HOME/bin/dots-sync"
+    if (( ! STANDALONE_T )); then
     link "$LINK_SRC/claude/commands/tpush.md" "$HOME/.claude/commands/tpush.md"
+    fi
+    if (( ! STANDALONE_T )); then
     link "$LINK_SRC/claude/commands/tpop.md"  "$HOME/.claude/commands/tpop.md"
+    fi
     # Codex CLI's twins of /tpush and /tpop (custom prompts: ~/.codex/prompts/<name>.md
     # → /name in the codex TUI). Linked unconditionally like everything here, which
     # is why install_codex_hooks below gates on a REAL codex home (config/auth), not
     # on the ~/.codex dir these links create.
+    if (( ! STANDALONE_T )); then
     link "$LINK_SRC/codex/prompts/tpush.md"  "$HOME/.codex/prompts/tpush.md"
+    fi
+    if (( ! STANDALONE_T )); then
     link "$LINK_SRC/codex/prompts/tpop.md"   "$HOME/.codex/prompts/tpop.md"
+    fi
     # `t todo` is retired: its /todo command file no longer exists, so the managed
     # link that pointed at it is removed rather than left dangling (a dangling link
     # here shows up in Claude's command list as a broken /todo).
@@ -309,6 +332,7 @@ link_all
 # write, and silent unless it actually changes something, because it runs on every
 # single `dots`.
 retire_claude_statusline() {
+    (( STANDALONE_T )) && return 0
     local dst="$HOME/.claude/settings.json"
     [[ -e "$dst" ]] || return 0
     command -v python3 >/dev/null 2>&1 || return 0
@@ -350,6 +374,7 @@ retire_claude_statusline
 # per-project history, never hand-merge it). The path is EXPANDED, unlike the
 # statusline's literal $HOME: a stdio MCP spawn does not go through a shell.
 install_claude_mcp() {
+    (( STANDALONE_T )) && return 0
     [[ -z "${DOTFILES_NO_MCP:-}" ]] || return 0
     command -v claude  >/dev/null 2>&1 || return 0   # fresh box: t doctor / t mcp --install later
     command -v python3 >/dev/null 2>&1 || return 0
@@ -387,6 +412,7 @@ install_claude_mcp
 # something — a hand-narrowed set of per-tool `mcp__sessions__*` rules is a deliberate
 # choice and is left alone, never widened back out from under you.
 install_claude_mcp_allow() {
+    (( STANDALONE_T )) && return 0
     [[ -z "${DOTFILES_NO_MCP:-}" ]] || return 0
     local dst="$HOME/.claude/settings.json"
     [[ -e "$dst" ]] || return 0          # nothing to merge into; the seed already has it
@@ -440,6 +466,7 @@ install_claude_mcp_allow
 # the command's hash in ~/.codex/config.toml — no supported installer pre-trust exists
 # — which is why the argv is fixed here and `t doctor` reads that trust record.
 install_codex_hooks() {
+    (( STANDALONE_T )) && return 0
     [[ -z "${DOTFILES_NO_CODEX_HOOKS:-}" ]] || return 0
     command -v codex >/dev/null 2>&1 || [[ -f "$HOME/.codex/config.toml" || -f "$HOME/.codex/auth.json" ]] || return 0
     command -v python3 >/dev/null 2>&1 || return 0
@@ -497,6 +524,7 @@ install_codex_hooks
 # ./install.sh applies the canonical list, not its own draft. DOTFILES_NO_PERMISSIONS=1
 # opts a machine out.
 install_agent_permissions() {
+    (( STANDALONE_T )) && return 0
     [[ -z "${DOTFILES_NO_PERMISSIONS:-}" ]] || return 0
     [[ -f "$LINK_SRC/agents/permissions.allow" ]] || return 0
     command -v python3 >/dev/null 2>&1 || return 0
@@ -518,6 +546,7 @@ install_agent_permissions
 # permissions step. It reads the repos from the t config bridge (~/.config/t/config.sh),
 # so a box with no registered repos is a no-op. DOTFILES_NO_TRUST=1 opts a machine out.
 install_agent_trust() {
+    (( STANDALONE_T )) && return 0
     [[ -z "${DOTFILES_NO_TRUST:-}" ]] || return 0
     command -v python3 >/dev/null 2>&1 || return 0
     grep -q 'def cmd_trust' "$LINK_SRC/bin/t" 2>/dev/null || return 0
@@ -675,6 +704,7 @@ fi
 # choice 2) is materialized into a real copy of its current content. Never
 # clobber an existing real file.
 install_claude_settings() {
+    (( STANDALONE_T )) && return 0
     local dst="$HOME/.claude/settings.json"
     local example="$LINK_SRC/claude/settings.json.example"
 

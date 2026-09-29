@@ -59,6 +59,11 @@ sync_local() {
   [[ "$before" == "$(git -C "$p" rev-parse origin/main)" ]] && return 1
   git -C "$p" diff --quiet HEAD 2>/dev/null \
     || { skip "$p has local edits — it is the live surface (run dots)"; return; }
+  if [[ -r "$p/lib/t-integration.sh" ]]; then
+    # shellcheck source=lib/t-integration.sh
+    source "$p/lib/t-integration.sh"
+    _dots_t_preflight "$p" || { skip "standalone t is not ready"; return; }
+  fi
   git -C "$p" merge -q --ff-only origin/main >/dev/null 2>&1 \
     || { skip "$p cannot fast-forward origin/main"; return; }
   after=$(git -C "$p" rev-parse HEAD)

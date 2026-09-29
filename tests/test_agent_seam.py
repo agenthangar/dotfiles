@@ -29,6 +29,11 @@ PS_STUB = r"""#!/bin/bash
 # `ps -Axo pid,comm` (the whole table — what _dev_fg_pids enumerates over) is answered
 # too; `-Axo pid,ppid,comm` deliberately is NOT, so _dev_ps_snapshot stays empty and the
 # walkers keep taking their per-pid fallback path, as every other test here assumes.
+if [[ "$1" == -ww ]]; then
+  pid="${@: -1}"
+  [[ -n "${FAKE_ARGS:-}" ]] && awk -v p="$pid" '$1==p {$1=""; print}' "$FAKE_ARGS"
+  exit 0
+fi
 if [[ "$1" == -Axo ]]; then
   [[ "$2" == pid,comm ]] && awk '{print $1, $3}' "$FAKE_PS"
   exit 0
@@ -1119,7 +1124,129 @@ def test_zsh_kill_one_runs_tmux_kill_session(zsh):
     assert r.returncode == 0, r.stderr
     assert "command not found" not in r.stderr
     assert "Killed dev-api-3" in r.stdout
-    assert "kill-session -t dev-api-3" in zsh.log.read_text().splitlines()
+    assert "kill-session -t =dev-api-3" in zsh.log.read_text().splitlines()
+
+
+def test_rooted_cleanup_preserves_agent_trees_and_launchers(zsh, tmp_path):
+    """A shared daemon may inherit this slot's cwd while serving other slots.
+
+    Its runtime children aren't named codex, its launcher is a generic node, and
+    its own cwd can be OUTSIDE the cleanup directory. Protect the whole ownership
+    chain, without exempting an orphaned dev server just because it shares init.
+    Signals are recorded, never sent to fixture pids.
+    """
+    ps = tmp_path / "stubbin" / "ps"
+    ps.write_text("#!/bin/sh\ncat <<'TABLE'\n"
+                  "1 0 launchd\n"
+                  "4000 1 node\n"  # launcher
+                  "4100 4000 /opt/bin/codex\n"  # shared daemon (different cwd)
+                  "4101 4100 /opt/bin/codex-code-mode-host\n"
+                  "4102 4101 node\n"
+                  "4103 4102 node_repl\n"
+                  "4200 1 /Applications/ChatGPT.app/Contents/MacOS/ChatGPT\n"
+                  "4201 4200 node\n"
+                  "4300 1 claude\n"
+                  "4301 4300 node\n"
+                  "4400 1 codex-aarch64-apple-darwin\n"
+                  "4401 4400 node\n"
+                  "4500 1 cursor-agent\n"
+                  "4501 4500 node\n"
+                  "5000 1 node\n"  # orphaned dev server
+                  "5001 5000 esbuild\n"
+                  "6000 1 zsh\n"
+                  "6001 6000 bash\n"
+                  "7000 7001 node\n"  # inconsistent/cyclic snapshot: fail safe
+                  "7001 7000 node\n"
+                  "TABLE\n")
+    r = zsh('''
+      _dev_cwd_pids() { print -l 0 1 4000 4101 4102 4103 4200 4201 4300 4301 4400 4401 4500 4501 5000 5001 6000 6001 7000 9999; }
+      kill() { print -r -- "SIGNAL $*"; }
+      _dev_stop_rooted "$HOME/code/.worktrees/api/3"
+    ''')
+    assert r.returncode == 0, r.stderr
+    assert [line for line in r.stdout.splitlines() if line.startswith("SIGNAL")] == [
+        "SIGNAL -TERM 5000", "SIGNAL -TERM 5001"]
+
+
+def test_rooted_cleanup_preserves_callers_ancestors(zsh, tmp_path):
+    # Even an unknown agent/launcher name must never kill its own invoking tree.
+    ps = tmp_path / "stubbin" / "ps"
+    ps.write_text('#!/bin/sh\nprintf "%s 1234 unknown-tool\\n1234 1 unknown-parent\\n" "$CALLER"\n')
+    r = zsh('''
+      export CALLER=$$
+      _dev_cwd_pids() { print -l "$CALLER" 1234; }
+      kill() { print -r -- "SIGNAL $*"; }
+      _dev_stop_rooted "$HOME/worktree"
+    ''')
+    assert r.returncode == 0, r.stderr
+    assert "SIGNAL" not in r.stdout
+
+
+def test_rooted_cleanup_unreadable_process_table_never_signals(zsh, tmp_path):
+    (tmp_path / "stubbin" / "ps").write_text("#!/bin/sh\nexit 1\n")
+    r = zsh('''
+      _dev_cwd_pids() { print -l 5000; }
+      kill() { print -r -- "SIGNAL $*"; }
+      _dev_stop_rooted "$HOME/worktree"
+    ''')
+    assert r.returncode == 0, r.stderr
+    assert "SIGNAL" not in r.stdout
+
+
+def test_rooted_cleanup_rejects_empty_and_root_paths(zsh):
+    r = zsh('_dev_cwd_pids ""; echo empty=$?; _dev_cwd_pids /; echo root=$?')
+    assert r.stdout.splitlines() == ["empty=1", "root=1"]
+
+
+def test_kill_isolated_tmux_keeps_siblings_and_shared_daemon(zsh, tmp_path):
+    """Use real tmux and real signals, strictly on this test's disposable processes.
+
+    Only the process ancestry is supplied: the test runner itself may be inside
+    an agent tree, so pretending these sleepers are daemon/orphan processes keeps
+    the regression independent of whichever tool runs pytest.
+    """
+    tmux = shutil.which("tmux")
+    if not tmux:
+        pytest.skip("tmux is not installed")
+    socket = f"kill-isolation-{os.getpid()}-{time.monotonic_ns()}"
+    run = lambda *args: subprocess.run([tmux, "-L", socket, *args], capture_output=True, text=True)
+    wrapper = tmp_path / "stubbin" / "tmux"
+    wrapper.write_text(f'#!/bin/sh\nexec {shlex.quote(tmux)} -L {shlex.quote(socket)} "$@"\n')
+    wt = zsh.home / "code" / ".worktrees" / "api" / "3"
+    neighbor = wt.with_name("30")
+    wt.mkdir(parents=True)
+    neighbor.mkdir()
+    # The real cwd discovery must enforce directory boundaries, on both OSes.
+    lsof = shutil.which("lsof")
+    if lsof:
+        (tmp_path / "stubbin" / "lsof").write_text(f'#!/bin/sh\nexec {shlex.quote(lsof)} "$@"\n')
+    procs = [subprocess.Popen(["sleep", "300"], cwd=cwd) for cwd in (wt, wt, wt, neighbor)]
+    daemon, helper, devserver, other_server = procs
+    try:
+        ps = tmp_path / "stubbin" / "ps"
+        ps.write_text('#!/bin/sh\nif [ "$1" = -A ]; then\ncat <<\'TABLE\'\n'
+                      f'{daemon.pid} 1 codex\n{helper.pid} {daemon.pid} node\n'
+                      f'{devserver.pid} 1 node\n{other_server.pid} 1 node\n'
+                      'TABLE\nfi\n')
+        for name, cwd in (("dev-api-3", wt), ("dev-api-13", neighbor), ("dev-web-8", neighbor)):
+            r = run("-f", "/dev/null", "new-session", "-d", "-s", name, "-c", str(cwd), "sleep 300")
+            assert r.returncode == 0, r.stderr
+        r = zsh('_dev_session_remote_fallback() { return 1; }; _dev_kill api 1 1')
+        assert r.returncode == 1, (r.stdout, r.stderr)
+        assert run("has-session", "-t", "=dev-api-13").returncode == 0
+        r = zsh('_dev_kill api 3 1')
+        assert r.returncode == 0, (r.stdout, r.stderr)
+        assert run("has-session", "-t", "=dev-api-3").returncode != 0
+        assert run("has-session", "-t", "=dev-api-13").returncode == 0
+        assert run("has-session", "-t", "=dev-web-8").returncode == 0
+        assert devserver.wait(timeout=5) < 0
+        assert all(p.poll() is None for p in (daemon, helper, other_server))
+    finally:
+        run("kill-server")
+        for p in procs:
+            if p.poll() is None:
+                p.terminate()
+            p.wait(timeout=5)
 
 
 SSH_STUB = """#!/bin/bash
@@ -1203,6 +1330,23 @@ def test_zsh_fg_rows_skip_an_agent_nested_under_another(zsh, tmp_path):
     assert pids == ["4242", "4243"], pids
     rows = zsh("_dev_fg_rows", **env).stdout.splitlines()
     assert sorted(l.split("\t")[2] for l in rows) == ["dotfiles-pr136:p4242", "dotfiles-pr136:p4243"], rows
+
+
+def test_zsh_fg_rows_never_offer_reparented_app_servers_to_kill(zsh, tmp_path):
+    env = _fg_world(zsh, tmp_path, siblings=((4243, "codex"), (4244, "codex"), (4245, "codex")))
+    table = tmp_path / "ps.txt"
+    table.write_text(table.read_text().replace("4243 4200", "4243 1").replace("4244 4200", "4244 1"))
+    args = tmp_path / "args.txt"
+    args.write_text("4243 /opt/codex app-server --listen unix:// --managed-daemon\n"
+                    "4244 /opt/codex app-server daemon pid-update-loop\n"
+                    "4245 codex resume thread-123\n")
+    env["FAKE_ARGS"] = str(args)
+    pids = [line.split("\t")[0] for line in zsh("_dev_fg_pids", **env).stdout.splitlines()]
+    assert pids == ["4242", "4245"]
+    rows = zsh("_dev_fg_rows", **env).stdout.splitlines()
+    assert sorted(line.split("\t")[2] for line in rows) == ["dotfiles-pr136:p4242", "dotfiles-pr136:p4245"]
+    r = zsh('kill() { echo SIGNAL; }; _dev_kill_fg p4243 1; echo rc=$?', **env)
+    assert r.stdout.strip() == "rc=2"
 
 
 def test_zsh_fg_match_rules(zsh, tmp_path):

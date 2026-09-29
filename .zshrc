@@ -1005,6 +1005,13 @@ _dev_agent_for() {
 # codex)` row in `t ls` (2026-09-21). Linux truncates comm to 15 chars, which still
 # keeps the `codex-aarch64-`/`codex-x86_64-` prefix.
 _dev_agent_is_proc() { case "${1:t}" in claude|codex|codex-aarch64-*|codex-x86_64-*) return 0 ;; *) return 1 ;; esac }
+# A detached Codex app-server (including its pid-update-loop) is shared machinery,
+# never a foreground conversation, even after its launching CLI has exited.
+_dev_agent_is_service() {
+  local cmdline; cmdline=$(ps -ww -o args= -p "$1" 2>/dev/null)
+  local -a words; read -r -A words <<< "$cmdline"
+  (( ${words[(Ie)app-server]} ))
+}
 # _dev_agent_of_comm <comm> — the agent name for a process name (empty if none).
 _dev_agent_of_comm() { case "${1:t}" in claude) print -r -- claude ;; codex|codex-aarch64-*|codex-x86_64-*) print -r -- codex ;; esac }
 # _dev_agent_of_session <tmux-session> — which agent a slot runs: the comm of its live
@@ -1911,42 +1918,78 @@ _clawsync_periodic() {
 }
 add-zsh-hook precmd _clawsync_periodic
 
-# _dev_procs_rooted_in <dir> — pids of every process whose cwd is <dir> or below it,
-# minus shells and this process. The dev server a slot starts (`npm run dev` → vite)
+# _dev_procs_rooted_in <dir> — pids whose cwd is <dir> or below it, excluding shells,
+# agents and their infrastructure. The dev server a slot starts (`npm run dev` → vite)
 # is what this exists for: it is detached from the slot's tmux session, so it outlives
 # both `t kill` and the sweep, keeps serving the OLD code on the slot's port (the next
 # tenant of that slot number sees its URL in the statusline and trusts it), and
 # rewrites .vite/deps into the reaped path — the debris dir that blocked the next
 # `git worktree add`. Sixteen of them were found running, the oldest two weeks old.
-# Shells are excluded because a user's terminal sitting inside a dead slot is not a
-# leak; killing it would be. One lsof over the whole table (~0.25s) on macOS, /proc
-# on Linux — never a per-pid fork.
-_dev_procs_rooted_in() {
-  local dir="${1:A}" pid cwd comm line
-  [[ -n $dir && $dir != / ]] || return 1
-  local -a hits
+# A cwd is NOT proof of session ownership: Codex's shared app-server daemon inherits
+# the first CLI's worktree, and killing it disconnects every client. Protect agents,
+# GUI apps, their descendants AND launcher ancestors, even outside the target cwd.
+# One lsof and one ps snapshot on macOS, /proc on Linux — never a per-pid ps fork.
+_dev_cwd_pids() {
+  [[ -n $1 ]] || return 1
+  local dir="${1:A}" pid cwd line
+  [[ $dir != / ]] || return 1
   if [[ -d /proc ]]; then
     for pid in /proc/<->(N:t); do
       cwd=$(readlink "/proc/$pid/cwd" 2>/dev/null) || continue
-      [[ $cwd == $dir || $cwd == $dir/* ]] && hits+=("$pid")
+      [[ $cwd == $dir || $cwd == $dir/* ]] && print -r -- "$pid"
     done
   else
     for line in "${(@f)$(lsof -a -d cwd -Fpn 2>/dev/null)}"; do   # p<pid> / fcwd / n<path>
       case $line in
         p*) pid=${line#p} ;;
-        n*) cwd=${line#n}; [[ $cwd == $dir || $cwd == $dir/* ]] && hits+=("$pid") ;;
+        n*) cwd=${line#n}; [[ $cwd == $dir || $cwd == $dir/* ]] && print -r -- "$pid" ;;
       esac
     done
   fi
-  for pid in $hits; do
-    [[ $pid == $$ || $pid == $PPID ]] && continue
-    comm=$(ps -o comm= -p "$pid" 2>/dev/null); comm=${comm:t}
+  return 0
+}
+
+_dev_procs_rooted_in() {
+  local pid ppid comm line up
+  local -A parents names roots protected seen
+  local snapshot
+  # An unreadable table is not permission to signal processes by cwd alone.
+  snapshot=$(ps -A -o pid=,ppid=,comm= 2>/dev/null) || return 1
+  for line in ${(f)snapshot}; do
+    read -r pid ppid comm <<< "$line"
+    [[ $pid == <-> && $ppid == <-> && -n $comm ]] || continue
+    parents[$pid]=$ppid; names[$pid]=${comm:t}
+    if _dev_agent_is_proc "$comm" || [[ $comm == *.app/Contents/* || ${comm:t} == cursor-agent ]]; then
+      roots[$pid]=1
+    fi
+  done
+  # Protect launchers too: terminating a node wrapper may close its child's IPC.
+  # These ancestors are protected individually, NOT as roots of a protected tree.
+  for pid in ${(k)roots} $$ $PPID; do
+    up=$pid
+    while [[ $up == <-> ]] && (( up > 1 )); do
+      [[ -n ${protected[$up]} ]] && break
+      protected[$up]=1
+      up=${parents[$up]:-}
+    done
+  done
+  for pid in $(_dev_cwd_pids "$1"); do
+    [[ $pid == <-> ]] && (( pid > 1 )) || continue
+    [[ -n ${names[$pid]} && -z ${protected[$pid]} ]] || continue
+    comm=${names[$pid]}
     case $comm in zsh|bash|sh|fish|dash|tmux|login|-*) continue ;; esac
+    up=$pid; seen=()
+    while [[ $up == <-> ]] && (( up > 1 )); do
+      [[ -n ${roots[$up]} || -n ${seen[$up]} ]] && break
+      seen[$up]=1
+      up=${parents[$up]:-}
+    done
+    [[ $up == <-> && ( -n ${roots[$up]} || -n ${seen[$up]} ) ]] && continue
     print -r -- "$pid"
   done
 }
 
-# _dev_stop_rooted <dir> [why] — SIGTERM every non-shell process rooted in <dir>
+# _dev_stop_rooted <dir> [why] — SIGTERM unprotected leftover processes in <dir>
 # and print one summary line (nothing when there was nothing to stop).
 _dev_stop_rooted() {
   local dir="$1" why="${2:-}" n=0 pid
@@ -2706,6 +2749,7 @@ _dev_fg_rows() {
     live[$pid]=1
     [[ -n ${inslot[$pid]} || $pid == $me ]] && continue
     _dev_agent_nested "$pid" && continue          # part of another agent's session
+    _dev_agent_is_service "$pid" && continue      # shared daemon, possibly reparented
     agent=$(_dev_agent_of_comm "${_DEV_PS_COMM[$pid]:-$(ps -o comm= -p $pid 2>/dev/null)}"); [[ -n $agent ]] || agent=claude
     sid= cwd=
     [[ -r $reg/$pid ]] && IFS=$'\t' read -r sid cwd < "$reg/$pid"
@@ -3430,9 +3474,9 @@ _dev_kill_one() {
   # NOT `local path`: in zsh `path` is the array tied to $PATH, and a plain local
   # keeps the tie but starts EMPTY — so every command below (the kill itself) was
   # "command not found". Pinned by test_zshrc_never_declares_a_tied_special_….
-  local wt; wt=$(tmux display-message -p -t "$session" '#{session_path}' 2>/dev/null)
+  local wt; wt=$(tmux display-message -p -t "=$session:" '#{session_path}' 2>/dev/null)
   local _kerr
-  if _kerr=$(tmux kill-session -t "$session" 2>&1); then echo "Killed $session"
+  if _kerr=$(tmux kill-session -t "=$session" 2>&1); then echo "Killed $session"
   else echo "t kill: tmux kill-session $session failed${_kerr:+: $_kerr}" >&2; return 1; fi
   # A slot's dev server is detached from its tmux session and would outlive it,
   # serving the old code on the slot's port. Only a per-session worktree is swept
@@ -3488,6 +3532,7 @@ _dev_fg_pids() {
   for pid in ${(f)"$(ps -Axo pid,comm 2>/dev/null | awk '$0 ~ /\.app\/Contents\// {next} {n=$2; sub(/.*\//,"",n)} n=="claude"||n=="codex"||n~/^codex-(aarch64|x86_64)-/{print $1}')"}; do
     [[ -n ${inslot[$pid]} || $pid == $me ]] && continue
     _dev_agent_nested "$pid" && continue          # part of another agent's session
+    _dev_agent_is_service "$pid" && continue      # never a foreground kill target
     sid= cwd=
     [[ -r $reg/$pid ]] && IFS=$'\t' read -r sid cwd < "$reg/$pid"
     [[ -n $cwd ]] || cwd=$(readlink "/proc/$pid/cwd" 2>/dev/null)   # Linux: no lsof needed
@@ -3558,7 +3603,7 @@ _dev_kill_fg() {
     fi
     tsess=$(_dev_tmux_session_of_pid "$pid")
     if [[ -n $tsess ]]; then
-      tmux kill-session -t "$tsess" 2>/dev/null && { echo "Killed $label (tmux session $tsess)"; killed=1; }
+      tmux kill-session -t "=$tsess" 2>/dev/null && { echo "Killed $label (tmux session $tsess)"; killed=1; }
     else
       kill -TERM "$pid" 2>/dev/null && { echo "Killed $label (foreground pid $pid)"; killed=1; }
     fi
@@ -3601,7 +3646,7 @@ _dev_kill() {
     if [[ -n $slot && $slot != all ]]; then
       for _kk in ${(k)DEV_REPOS}; do
         [[ $_kk == $repo || ${DEV_REPOS[$_kk]} != $_kdir ]] && continue
-        tmux has-session -t "dev-${_kk}-${slot}" 2>/dev/null && { repo=$_kk; _repos=( $_kk ); break; }
+        tmux has-session -t "=dev-${_kk}-${slot}" 2>/dev/null && { repo=$_kk; _repos=( $_kk ); break; }
       done
     else
       for _kk in ${(k)DEV_REPOS}; do
@@ -3668,7 +3713,7 @@ _dev_kill() {
   fi
 
   local session="dev-${repo}-${slot}"
-  if ! tmux has-session -t "$session" 2>/dev/null; then
+  if ! tmux has-session -t "=$session" 2>/dev/null; then
     # Live on another host? Tear it down there (shared fallback; remote `t kill` still
     # confirms unless -y). Same remote detection pop/plan get; -r forces it explicitly.
     _dev_session_remote_fallback "$session" kill ${force:+-y} && return

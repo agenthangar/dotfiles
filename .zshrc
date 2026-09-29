@@ -719,6 +719,10 @@ _dots_legacy_present() {
 # install.sh, and the canonical checkout itself (it is already live and plain `dots`
 # manages it — the error lists your session worktrees instead). A later plain `dots`
 # flips live back to the canonical checkout. Skips brew bundle.
+# Load the standalone t bridge from this shell's own dotfiles source.
+_DOTS_SOURCE_ROOT=${${(%):-%N}:A:h}
+[[ -r $_DOTS_SOURCE_ROOT/lib/t-integration.sh ]] && source "$_DOTS_SOURCE_ROOT/lib/t-integration.sh"
+
 dots() {
   [[ "$1" == -h || "$1" == --help ]] && { _help_for dots; return 0; }
   # --all: the local run first (it re-sources ~/.zshrc, so what fans out is the
@@ -841,6 +845,8 @@ dots() {
     return
   fi
 
+  _dots_t_preflight "$primary" || return 1
+
   # Run install.sh when the layout needs repairing. Three distinct triggers:
   #   live != primary   — a legacy two-tree machine, or a flip back from --dev
   #   primary off main  — SELF-HEAL: something switched the live tree's branch;
@@ -924,6 +930,7 @@ add-zsh-hook precmd _dots_reload_if_moved
 #   DEV_REPOS[api]="$HOME/code/my-api"
 typeset -gA DEV_REPOS DEV_BRANCHES REMOTE_HOSTS DEV_WORKTREE DEV_AGENT DEV_MODEL DEV_EFFORT DEV_FAST
 [[ -f "$HOME/.zshrc.local" ]] && source "$HOME/.zshrc.local"
+_dots_t_environment "$_DOTS_SOURCE_ROOT"
 
 # DEV_BRANCH — the global default branch `dev`/`_dev_new_session` check out (and
 # create) when starting a fresh Claude session. Override in ~/.zshrc.local;
@@ -1774,7 +1781,7 @@ _dev_repo_prepare() {
   local branch="$1" here live
   here=$(git rev-parse --show-toplevel 2>/dev/null) || return 0
   live=$(_dots_live_tree 2>/dev/null)
-  if [[ -n $live && ${here:A} == ${live:A} ]]; then
+  if [[ -n $live && ${here:A} == ${live:A} ]] || _dots_t_is_live "$here"; then
     # Name the repo the way `t` does (alias, not the path tail — a worktree path ends
     # in its SLOT number, so ${here:t} would suggest `t open 1`).
     local _r _alias; _r=$(_dev_repo_of_dir "$here" 2>/dev/null); _alias=${_r%%$'\t'*}
@@ -2064,7 +2071,7 @@ _dev_worktree_sweep_run() {
     (( ${livepaths[(Ie)$wt]} )) && continue         # live session here → keep
     # Unlike the dirty/merged skips below this one is LOGGED: a worktree that is
     # merged, clean, and never reaped is otherwise a silent mystery.
-    if [[ -n $livewt && ${wt:A} == ${livewt:A} ]]; then
+    if [[ -n $livewt && ${wt:A} == ${livewt:A} ]] || _dots_t_is_live "$wt"; then
       print -r -- "[$(strftime '%F %T' $EPOCHSECONDS 2>/dev/null)] sweep: keeping $wt — it is the LIVE surface (dots --dev); run plain \`dots\` to flip live back"
       continue
     fi

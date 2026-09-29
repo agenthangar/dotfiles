@@ -30,7 +30,9 @@ Run `t -h` for the full verb list.
 For example, `t app api 13` stops that slot's Codex CLI and opens its existing
 thread in a new desktop app window, with the slot's live dev URL in the built-in browser.
 Use `--reuse-window` to open in the existing app window instead. On macOS the
-default launches a fresh app instance with `open -n`; it keeps the same conversation.
+default launches a fresh app instance with `open -n … --args`, passing the links
+directly to that process. Passing URLs as ordinary `open` operands can navigate
+an existing instance even with `-n`. The handoff keeps the same conversation.
 Use **Annotation mode** to click an element or select an area and leave feedback.
 `t app api 13 --url 'http://localhost:5213/#budget'` selects a particular page
 and remembers its full URL for that conversation. Later `t app api 13` opens

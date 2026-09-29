@@ -5894,9 +5894,13 @@ def cmd_app(cfg, args):
         stopped = _app_stop_cli(row)
         if stopped.returncode:
             raise ValueError(stopped.stderr.strip() or "could not stop the CLI; the app was not opened")
-        # macOS -n launches a fresh app instance/window. Send every handoff URL
-        # in that ONE launch, so the thread and previews share the new instance.
-        result = _run(["open", *([] if args.reuse_window else ["-n"]), "-a", bundle, *links], timeout=15)
+        # Bare URLs are OS open-url events, even with -n: they can navigate an
+        # already-running instance. --args delivers them only to the new process;
+        # Codex parses thread deep links from its startup argv. Reuse deliberately
+        # uses OS events because an existing process cannot receive new argv.
+        launch = (["open", "-a", bundle, *links] if args.reuse_window else
+                  ["open", "-n", "-a", bundle, "--args", *links])
+        result = _run(launch, timeout=15)
         if result.returncode:
             recovery = shlex.join(["codex", "resume", row["sid"]])
             raise ValueError(f"could not open the app: {result.stderr.strip()}. "

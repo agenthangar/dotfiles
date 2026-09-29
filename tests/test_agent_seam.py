@@ -228,7 +228,9 @@ case "$1" in
   list-sessions)
     if [[ -n "${FAKE_SESSION_ROWS:-}" ]]; then printf '%s\n' "$FAKE_SESSION_ROWS"
     elif [[ -n "${FAKE_SESSIONS:-}" ]]; then printf '%s\n' $FAKE_SESSIONS; fi ;;
-  display-message)  [[ -n "${FAKE_SESSION_PATH:-}" && "$*" == *session_path* ]] && echo "$FAKE_SESSION_PATH" ;;
+  display-message)
+    [[ -n "${FAKE_SESSION_PATH:-}" && "$*" == *session_path* ]] && echo "$FAKE_SESSION_PATH"
+    [[ -n "${FAKE_PANE_TITLE:-}" && "$*" == *pane_title* ]] && echo "$FAKE_PANE_TITLE" ;;
   list-panes)       [[ -n "${FAKE_PANES:-}" ]] && printf '%s\n' "$FAKE_PANES" ;;
 esac
 exit 0
@@ -653,6 +655,65 @@ def test_zsh_codex_registry_alone_marks_a_conversation_active(zsh):
     r = zsh(f'_dev_session_claude_pid() {{ print 4242; }}; '
             f'_dev_agent_at_welcome codex s {wt}; echo rc=$?')
     assert r.stdout.strip() == "rc=1"
+
+
+@pytest.mark.parametrize("scenario,expected", [
+    ("current", True), ("resumed", True), ("other_thread", True),
+    ("duplicate_name", False), ("stale", False), ("wrong_cwd", False),
+    ("subagent", False), ("archived", False), ("empty", False),
+    ("missing_start", False), ("missing_rollout", False), ("bad_rollout", False),
+    ("wrong_rollout", False), ("broken_index", False), ("missing_title", False),
+    ("wrong_title", False), ("old_screen_text", False), ("welcome", False),
+    ("wrong_pane_directory", False), ("not_codex", False),
+])
+def test_zsh_codex_recovers_unstamped_conversation_from_live_pane(zsh, scenario, expected):
+    """A named live Codex pane can identify its thread even when the shared server
+    never ran the hook in the CLI's ancestry. Recency alone is insufficient."""
+    import sqlite3
+    wt = f"{zsh.home}/code/.worktrees/api/3"
+    title = "Split command into repo"
+    started = "Mon Sep 28 12:00:00 2026"
+    epoch = int(time.mktime(time.strptime(started, "%a %b %d %H:%M:%S %Y")))
+    threads = [(SID, wt if scenario != "wrong_cwd" else wt + "0",
+                "" if scenario == "empty" else "prompt",
+                epoch - 1 if scenario == "stale" else epoch + 10,
+                int(scenario == "archived"), title,
+                SUBAGENT_SOURCE if scenario == "subagent" else "vscode")]
+    if scenario in ("duplicate_name", "other_thread"):
+        threads.append(("aaaaaaaa-0000-0000-0000-000000000002", wt, "other", epoch - 100,
+                        0, title if scenario == "duplicate_name" else "Another task"))
+    paths = _codex_home(zsh, threads, scan_cwd=True)
+    db = zsh.home / ".codex" / "state_5.sqlite"
+    if scenario == "resumed":
+        with sqlite3.connect(db) as c:
+            c.execute("update threads set created_at=?", (epoch - 1000,))
+        c.close()
+    if scenario == "missing_rollout":
+        paths[SID].unlink()
+    if scenario == "bad_rollout":
+        paths[SID].write_text("not json\n")
+    if scenario == "wrong_rollout":
+        paths[SID].write_text(paths[SID].read_text().replace(wt, wt + "0"))
+    if scenario == "broken_index":
+        db.write_text("not sqlite")
+    pane_title = title + (" | 30" if scenario == "wrong_pane_directory" else " | 3")
+    if scenario in ("wrong_title", "missing_title"):
+        pane_title = "Another task | 3" if scenario == "wrong_title" else ""
+    footer = f"  GPT-6 · {wt.replace(str(zsh.home), '~')} · {title} · Main [default]"
+    pane = ("Completed the plan.\n\n» Ask Codex to do anything\n\n" + footer +
+            "\n  ctrl+c copy · enter copy & follow · esc clear")
+    if scenario == "old_screen_text":
+        pane = footer + "\n» Ask Codex to do anything\n  GPT-6 · ~/elsewhere · New task · Main"
+    if scenario == "welcome":
+        pane = "OpenAI Codex (v0.158.0)"
+    r = zsh(f'_dev_session_claude_pid() {{ print 4242; }}; '
+            f'_dev_session_sid dev-api-3 {shlex.quote(wt)}',
+            FAKE_START="" if scenario == "missing_start" else started,
+            FAKE_DEV_AGENT="claude" if scenario == "not_codex" else "codex",
+            FAKE_PANE=pane, FAKE_PANE_TITLE=pane_title)
+    assert r.returncode == 0 and not r.stderr, r.stderr
+    assert r.stdout.strip() == (SID if expected else "")
+    assert not any("set-environment" in line for line in zsh.log.read_text().splitlines())
 
 
 def test_zsh_codex_threads_for_cwd_orders_and_filters(zsh):

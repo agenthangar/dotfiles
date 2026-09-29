@@ -343,7 +343,7 @@ def test_app_command_failed_launch_gives_recovery(t_mod, app_command, monkeypatc
 @pytest.mark.parametrize("scenario,ok", [
     ("normal", True), ("already_stopped", True), ("changed_sid", False),
     ("changed_cwd", False), ("changed_agent", False), ("missing", False),
-    ("self", False), ("term_failed", False), ("still_running", False),
+    ("self", False), ("term_failed", False), ("still_running", False), ("stamp_failed", False),
 ])
 def test_app_stop_shell_revalidates_and_waits(t_mod, app_slot, monkeypatch, tmp_path, scenario, ok):
     """Run the actual handoff shell with stub helpers/signals; never signal a real process."""
@@ -355,6 +355,7 @@ def test_app_stop_shell_revalidates_and_waits(t_mod, app_slot, monkeypatch, tmp_
 scenario={shlex.quote(scenario)}
 tmux() {{
   [[ $scenario == missing ]] && return 1
+  [[ $scenario == stamp_failed && $1 == set-environment ]] && return 1
   [[ $1 == display-message ]] && {{
     [[ $scenario == changed_cwd ]] && print /other || print -r -- {shlex.quote(row['cwd'])}
   }}
@@ -438,6 +439,10 @@ _dev_session_claude_pid() {{ tmux display-message -p -t "=$session:" '#{{pane_pi
                 break
             time.sleep(0.02)
         assert state.stdout.strip() == expected, result.stderr
+        if stop_process:
+            stamp = subprocess.run(tmux + ["show-environment", "-t", session, "CLAUDE_RESUME_ID"],
+                                   env=env, capture_output=True, text=True, check=True)
+            assert stamp.stdout.strip() == "CLAUDE_RESUME_ID=" + SID
     finally:
         subprocess.run(tmux + ["kill-server"], env=env, capture_output=True)
 

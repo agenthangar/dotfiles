@@ -31,6 +31,7 @@ class FakeAccessibility:
             ("bar", "AXChildren"): ["file"], ("file", "AXChildren"): ["menu"],
             ("menu", "AXTitle"): "New Window", ("menu", "AXRole"): "AXMenuItem",
             ("menu", "AXEnabled"): self.enabled, ("new", "AXSubrole"): "AXStandardWindow",
+            ("old", "AXSubrole"): "AXStandardWindow",
             ("extra", "AXSubrole"): "AXStandardWindow", ("dialog", "AXSubrole"): "AXDialog",
         }.get((element, attribute))
 
@@ -58,6 +59,38 @@ def test_creates_and_keeps_focusing_only_the_new_window(window_module):
     window.focus()
     assert api.focused == "new"
     assert api.actions == [("menu", "AXPress"), ("new", "AXRaise"), ("new", "AXRaise")]
+
+
+@pytest.mark.parametrize("recovers", [True, False])
+def test_unavailable_window_snapshot_is_not_an_empty_app(window_module, monkeypatch, recovers):
+    api = FakeAccessibility()
+    read = api.read
+    attempts = []
+    def not_ready(element, attribute):
+        if attribute == "AXWindows" and not api.actions:
+            attempts.append(1)
+            if not recovers or len(attempts) == 1:
+                return None
+        return read(element, attribute)
+    api.read = not_ready
+    create = window_module["new_window"]
+    if recovers:
+        window = create("/Applications/Test.app", successful_run, api)
+        assert window.original == ["old"] and api.focused == "new"
+        assert len(attempts) >= 2
+    else:
+        wait = window_module["wait_for"]
+        monkeypatch.setitem(create.__globals__, "wait_for", lambda probe, message, **kw: wait(probe, message, timeout=0))
+        with pytest.raises(ValueError, match="window list"):
+            create("/Applications/Test.app", successful_run, api)
+        assert api.actions == []
+
+
+def test_an_available_empty_window_list_can_open_a_window(window_module):
+    api = FakeAccessibility()
+    api.windows = []
+    window = window_module["new_window"]("/Applications/Test.app", successful_run, api)
+    assert window.original == [] and api.focused == "new"
 
 
 @pytest.mark.parametrize("action,message", [("noop", "distinct"), ("dialog", "distinct"), ("ambiguous", "multiple")])

@@ -10,7 +10,7 @@ testpaths = ["tests"]
 # scope measurement to the bin script under test (the */ prefix tolerates the
 # absolute CWD). This keeps the percentage about the code we test rather than
 # letting unmeasured Bash/zsh dilute it.
-include = ["*/bin/t", "*/libexec/t_app_window.py"]
+include = ["*/bin/t", "*/libexec/t_app_window.py", "*/libexec/t_markdown.py"]
 
 [tool.coverage.report]
 # Exclude the subprocess/ssh/tmux shells and the argparse/CLI plumbing:

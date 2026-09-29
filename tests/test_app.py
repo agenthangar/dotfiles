@@ -526,6 +526,48 @@ def test_app_plan_failure_before_stopping(t_mod, app_command, tmp_path, monkeypa
     assert not os.path.exists(t_mod._app_plan_cache(row))
 
 
+def test_app_plan_renders_markdown_structure_and_inline_formatting(t_mod, tmp_path):
+    plan = tmp_path / 'plan.md'
+    plan.write_text('''# Publish `t`
+
+Publish **`agenthangar/t`** with *fresh history*.
+This is the same paragraph.
+
+[Project](https://example.com/project) and ~~retired~~.
+
+1. Extract command
+   - Keep helpers
+   - Keep tests
+2. Publish
+
+- [x] Recover plan
+- [ ] Launch
+
+| Component | Destination |
+| --- | --- |
+| `bin/t` | **public repo** |
+
+> A quoted launch post.
+
+```sh
+echo '**literal** <tag>'
+```
+''')
+    body = t_mod._app_plan_html(str(plan)).decode()
+    assert '<h1>Publish <code>t</code></h1>' in body
+    assert '<strong><code>agenthangar/t</code></strong>' in body
+    assert '<em>fresh history</em>' in body
+    assert 'This is the same paragraph.</p>' in body
+    assert '<a href="https://example.com/project">Project</a>' in body
+    assert '<del>retired</del>' in body
+    assert '<ol>' in body and '<ul>' in body and '<li>Keep helpers</li>' in body
+    assert 'type="checkbox"' in body and 'checked' in body and 'disabled' in body
+    assert '<table>' in body and '<th>Component</th>' in body
+    assert '<td><code>bin/t</code></td>' in body
+    assert '<blockquote>' in body
+    assert "**literal** &lt;tag&gt;" in body
+
+
 def test_app_plan_preview_only_serves_selected_file_and_refreshes(t_mod, tmp_path):
     import threading
     from urllib.error import HTTPError
@@ -564,6 +606,27 @@ def test_app_plan_preview_only_serves_selected_file_and_refreshes(t_mod, tmp_pat
         server.shutdown()
         thread.join(timeout=5)
         server.server_close()
+
+
+def test_app_plan_markdown_keeps_active_content_inert(t_mod, tmp_path):
+    plan = tmp_path / 'plan.md'
+    plan.write_text('<script>alert(1)</script>\n\n[x](javascript:alert)\n\n'
+                    '[x](data:text/html,bad)\n\n![x](javascript:bad)\n\n'
+                    '```html\n<script>literal example</script>\n```')
+    body = t_mod._app_plan_html(str(plan)).decode()
+    assert '<script>' not in body
+    assert '&lt;script&gt;' in body
+    assert 'href="javascript:' not in body and 'href="data:' not in body
+    assert 'src="javascript:' not in body
+
+
+def test_app_plan_server_can_preserve_an_open_preview_url(t_mod, tmp_path):
+    plan = tmp_path / 'plan.md'
+    plan.write_text('# Plan')
+    with t_mod._app_plan_server(str(plan), 'token') as old:
+        port = old.server_port
+    with t_mod._app_plan_server(str(plan), 'token', port=port) as updated:
+        assert updated.server_port == port
 
 
 def test_app_plan_daemon_starts_reuses_and_restarts(t_mod, tmp_path, monkeypatch):

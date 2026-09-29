@@ -74,7 +74,7 @@ def test_app_link_roundtrips_route_and_query(t_mod):
     url = "http://localhost:5213/settings?q=a%20b&next=%2Fhome#chart"
     link = urlsplit(t_mod._app_link(SID, url))
     assert (link.scheme, link.netloc, link.path) == ("codex", "threads", "/" + SID)
-    assert parse_qs(link.query) == {"browserUrl": [url]}
+    assert parse_qs(link.query) == {"browserUrl": [url], "browserTabId": ["t-preview-" + SID]}
     assert t_mod._app_link(SID) == "codex://threads/" + SID
     assert "https%3A" in t_mod._app_link(SID, "https://example.com")
 
@@ -134,6 +134,22 @@ def test_app_command_stops_before_opening_same_thread(t_mod, app_command):
     assert call() == 0
     assert events == [("stop", row), ("open", ["open", "-a", "/Applications/ChatGPT.app",
                         t_mod._app_link(SID, "http://localhost:5213")])]
+
+
+def test_app_opens_referenced_plan_with_existing_thread_and_preview(t_mod, app_command, tmp_path, monkeypatch):
+    call, events, row = app_command
+    plan = tmp_path / "launch plan.md"
+    plan.write_text("# Launch plan\nKeep the original.\n")
+    monkeypatch.setattr(t_mod, "_app_find_plan", lambda selected: str(plan), raising=False)
+    monkeypatch.setattr(t_mod, "_app_plan_start", lambda path: "http://127.0.0.1:12345/secret/", raising=False)
+    assert call() == 0
+    links = events[-1][1][3:]
+    assert len(links) == 2
+    assert all(urlsplit(link).path == "/" + SID for link in links)
+    assert parse_qs(urlsplit(links[0]).query)["browserUrl"] == ["http://localhost:5213"]
+    assert parse_qs(urlsplit(links[1]).query)["browserUrl"] == ["http://127.0.0.1:12345/secret/"]
+    assert parse_qs(urlsplit(links[0]).query)["browserTabId"] != parse_qs(urlsplit(links[1]).query)["browserTabId"]
+    assert t_mod._app_preview_url(row) == "http://localhost:5213"
 
 
 def test_app_command_dry_run_is_read_only(app_command, capsys):
@@ -339,3 +355,183 @@ _dev_session_claude_pid() {{ tmux display-message -p -t "=$session:" '#{{pane_pi
         assert state.stdout.strip() == expected, result.stderr
     finally:
         subprocess.run(tmux + ["kill-server"], env=env, capture_output=True)
+
+
+def test_app_discovers_only_selected_conversation_messages(t_mod, app_slot, tmp_path, monkeypatch):
+    _, row = app_slot
+    monkeypatch.setattr(t_mod, "HOME", str(tmp_path))
+    plans = tmp_path / '.claude' / 'plans'
+    plans.mkdir(parents=True)
+    first, latest, unrelated = [plans / name for name in ('old.md', 'launch plan.md', 'unrelated.md')]
+    for plan in (first, latest, unrelated):
+        plan.write_text('# Plan')
+    def message(path, role='assistant'):
+        return dict(type='response_item', payload=dict(type='message', role=role,
+                    content=[{'type': 'output_text', 'text': f'Refreshed [plan](<{path}>).'}]))
+    transcript = tmp_path / 'rollout.jsonl'
+    records = [message(first), message(latest, 'user'),
+               message(unrelated, 'system'), {'type': 'response_item', 'payload': {'type': 'function_call_output', 'output': str(unrelated)}},
+               message(plans / 'missing.md'), [], {'type': 'response_item', 'payload': None},
+               {'type': 'response_item', 'payload': {'type': 'message', 'role': 'user', 'content': None}},
+               {'type': 'response_item', 'payload': {'type': 'message', 'role': 'user', 'content': [None, {'text': None}]}}]
+    transcript.write_text('\n'.join(json.dumps(rec) for rec in records) + '\n{partial')
+    calls = []
+    monkeypatch.setattr(t_mod, 'zsh_capture', lambda command: calls.append(command) or str(transcript))
+    assert t_mod._app_find_plan(row) == str(latest)
+    assert shlex.split(calls[0]) == ['_dev_agent_transcript', 'codex', SID, row['cwd']]
+    latest.unlink()
+    assert t_mod._app_find_plan(row) == str(first)
+
+
+def test_app_explicit_plan_is_remembered_and_can_be_skipped(t_mod, app_command, tmp_path, monkeypatch, capsys):
+    call, events, row = app_command
+    plan = tmp_path / 'specific plan.md'
+    plan.write_text('# Specific')
+    starts = []
+    monkeypatch.setattr(t_mod, '_app_plan_start', lambda path: starts.append(path) or 'http://127.0.0.1:12345/token/')
+    assert call('--plan', str(plan), '--dry-run') == 0
+    assert str(plan) in capsys.readouterr().out
+    assert events == starts == []
+    assert not os.path.exists(t_mod._app_plan_cache(row))
+    assert call('--plan', str(plan), '--no-preview') == 0
+    assert parse_qs(urlsplit(events[-1][1][-1]).query)['browserTabId'] == ['t-plan-' + SID]
+    assert starts == [str(plan)]
+    assert t_mod._app_find_plan(row) == str(plan)
+    assert t_mod._app_find_plan(dict(row, cwd='/another/worktree')) is None
+    assert call('--no-plan', '--no-preview') == 0
+    assert events[-1][1][-1] == t_mod._app_link(SID)
+    assert starts == [str(plan)]
+    plan.unlink()
+    assert t_mod._app_find_plan(row) is None
+
+
+@pytest.mark.parametrize('content', ['[]', '{broken', '{"cwd": null}', '{"url":"https://example.com"}'])
+def test_app_ignores_invalid_plan_cache(t_mod, app_slot, monkeypatch, content):
+    _, row = app_slot
+    monkeypatch.setattr(t_mod, 'zsh_capture', lambda command: '')
+    path = t_mod._app_plan_cache(row)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, 'w') as fh:
+        fh.write(content)
+    assert t_mod._app_find_plan(row) is None
+
+
+def test_app_plan_failure_before_stopping(t_mod, app_command, tmp_path, monkeypatch, capsys):
+    call, events, row = app_command
+    assert call('--plan', str(tmp_path / 'missing.md')) == 1
+    assert 'existing Markdown' in capsys.readouterr().err
+    assert not events
+    plan = tmp_path / 'unreadable.md'
+    plan.write_bytes(b'\xff')
+    assert call('--plan', str(plan)) == 1
+    assert 'cannot read plan' in capsys.readouterr().err
+    assert not events
+    plan.write_text('# Plan')
+    def fail(path):
+        raise OSError('no listener')
+    monkeypatch.setattr(t_mod, '_app_plan_start', fail)
+    assert call('--plan', str(plan)) == 1
+    assert 'no listener' in capsys.readouterr().err
+    assert not events
+    assert not os.path.exists(t_mod._app_plan_cache(row))
+
+
+def test_app_plan_preview_only_serves_selected_file_and_refreshes(t_mod, tmp_path):
+    import threading
+    from urllib.error import HTTPError
+    from urllib.request import Request, urlopen
+    plan = tmp_path / 'plan.md'
+    plan.write_text('# Launch <script>bad()</script>\n\n## Second\n- Keep original\n```js\nalert("x")\n```\n~~~\nunclosed')
+    server = t_mod._app_plan_server(str(plan), 'token')
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base = f'http://127.0.0.1:{server.server_port}'
+    try:
+        with urlopen(base + '/token/') as response:
+            body = response.read().decode()
+            assert '<h1>Launch &lt;script&gt;bad()&lt;/script&gt;</h1>' in body
+            assert '<script>' not in body
+            assert '<h2>Second</h2>' in body
+            assert body.count('<pre') == body.count('</pre>') == 2
+            assert "default-src 'none'" in response.headers['Content-Security-Policy']
+        for path in ('/', '/token/../plan.md', '/token/?file=other.md', '/other.md'):
+            with pytest.raises(HTTPError) as error:
+                urlopen(base + path)
+            assert error.value.code == 404
+        with pytest.raises(HTTPError) as error:
+            urlopen(Request(base + '/token/', headers={'Host': 'external.example'}))
+        assert error.value.code == 404
+        plan.write_text('# Revised')
+        with urlopen(base + '/token/') as response:
+            assert '<h1>Revised</h1>' in response.read().decode()
+        with urlopen(Request(base + '/token/', method='HEAD')) as response:
+            assert response.read() == b''
+        plan.unlink()
+        with pytest.raises(HTTPError) as error:
+            urlopen(base + '/token/')
+        assert error.value.code == 404
+    finally:
+        server.shutdown()
+        thread.join(timeout=5)
+        server.server_close()
+
+
+def test_app_plan_daemon_starts_reuses_and_restarts(t_mod, tmp_path, monkeypatch):
+    from urllib.request import urlopen
+    plan = tmp_path / 'plan.md'
+    plan.write_text('# Real background preview')
+    monkeypatch.setattr(t_mod, '_cache_root', lambda: str(tmp_path / 'cache'))
+    popen = subprocess.Popen
+    children = []
+    def launch(*args, **kwargs):
+        child = popen(*args, **kwargs)
+        children.append(child)
+        return child
+    monkeypatch.setattr(t_mod.subprocess, 'Popen', launch)
+    try:
+        first = t_mod._app_plan_start(str(plan))
+        with urlopen(first) as response:
+            assert b'Real background preview' in response.read()
+        assert t_mod._app_plan_start(str(plan)) == first
+        assert len(children) == 1
+        children[0].terminate()
+        children[0].wait(timeout=5)
+        again = t_mod._app_plan_start(str(plan))
+        assert again != first
+        assert len(children) == 2
+    finally:
+        for child in children:
+            if child.poll() is None:
+                child.terminate()
+            child.wait(timeout=5)
+
+
+@pytest.mark.parametrize('ready,reply', [(False, b''), (True, b'bad json'), (True, b'{}')])
+def test_app_plan_start_failure_cleans_up(t_mod, tmp_path, monkeypatch, ready, reply):
+    from types import SimpleNamespace
+    monkeypatch.setattr(t_mod, '_cache_root', lambda: str(tmp_path))
+    events = []
+    process = SimpleNamespace(stdout=io.BytesIO(reply), terminate=lambda: events.append('terminate'),
+                              wait=lambda **kw: events.append('wait'))
+    monkeypatch.setattr(t_mod.subprocess, 'Popen', lambda *a, **kw: process)
+    monkeypatch.setattr(t_mod.select, 'select', lambda *a: ([process.stdout] if ready else [], [], []))
+    with pytest.raises(ValueError, match='could not start plan preview'):
+        t_mod._app_plan_start('/tmp/plan.md')
+    assert events == ['terminate', 'wait']
+    assert process.stdout.closed
+
+
+def test_app_plan_serve_expires_after_idle_hour(t_mod, monkeypatch, capsys):
+    from types import SimpleNamespace
+    times = iter([0, 3601])
+    server = SimpleNamespace(server_port=12345, last_access=0, handle_request=lambda: None)
+    class Context:
+        def __enter__(self): return server
+        def __exit__(self, *a): pass
+    monkeypatch.setattr(t_mod, '_app_plan_server', lambda *a: Context())
+    monkeypatch.setattr(t_mod.time, 'monotonic', lambda: next(times))
+    output = io.StringIO()
+    monkeypatch.setattr(output, 'close', lambda: None)
+    monkeypatch.setattr(t_mod.sys, 'stdout', output)
+    t_mod._app_plan_serve('/tmp/plan.md')
+    assert json.loads(output.getvalue())['url'].startswith('http://127.0.0.1:12345/')

@@ -233,6 +233,7 @@ class Style:
         self.y = "\033[2m" if tty else ""
         self.b = "\033[1m" if tty else ""
         self.w = "\033[33m" if tty else ""
+        self.rev = "\033[7m" if tty else ""
         self.r = "\033[0m" if tty else ""
 
 
@@ -1438,8 +1439,9 @@ def _config_model_menu(ui, cfg, agent, catalogs, effort=False):
         else:
             current = model
             rows = _config_model_rows(current, catalog)
-        picked = ui.pick(f"{agent} {'effort' if effort else 'model'}", rows,
-                         default=next(i for i, row in enumerate(rows) if row[0] == current))
+        picked = ui.pick(f"{agent.title()} {'effort · ' + (model or 'tool default') if effort else 'model'}", rows,
+                         default=next(i for i, row in enumerate(rows) if row[0] == current),
+                         accents={key: "c" for key, _ in rows if key and not key.startswith("__")})
         if picked == "__refresh__":
             del catalogs[agent]
             continue
@@ -1467,7 +1469,7 @@ def _config_summary(agent, models, overrides):
 
 
 def _config_input(ui, label, current="", kind="text"):
-    value = ui.cooked_input(f"│  {label} (blank cancels) → ", prefill=current)
+    value = ui.cooked_input(f"      {label} (blank cancels) → ", prefill=current)
     if not value:
         return None
     if any(ord(c) < 32 or ord(c) == 127 for c in value):
@@ -1489,9 +1491,9 @@ def _config_input(ui, label, current="", kind="text"):
 
 def _config_hosts(ui, cfg):
     while True:
-        rows = [(h, f"{h}  {target}") for h, target in sorted(cfg.hosts.items())]
+        rows = [(h, h) for h in sorted(cfg.hosts)]
         rows += [("__add__", "+ Add host"), ("__back__", "Back")]
-        host = ui.pick("Hosts · removal unregisters; it never contacts the host", rows)
+        host = ui.pick("Hosts", rows, values=cfg.hosts, accents={"__add__": "g"})
         if host in (None, "__back__"):
             return
         if host == "__add__":
@@ -1505,9 +1507,9 @@ def _config_hosts(ui, cfg):
             if target is not None:
                 cfg.hosts[alias] = target
             continue
-        action = ui.pick(f"Host {host}", [("target", f"SSH target: {cfg.hosts[host]}"),
+        action = ui.pick(f"Host · {host}", [("target", "SSH target"),
                           ("beam", "Use as default beam host"), ("remove", "Remove host"),
-                          ("back", "Back")])
+                          ("back", "Back")], values={"target": cfg.hosts[host]}, accents={"remove": "w"})
         if action == "remove":
             _config_remove_host(cfg, host)
             ui.done("removed", f"{host} (pending Save changes)")
@@ -1526,9 +1528,10 @@ def _config_hosts(ui, cfg):
 
 def _config_repos(ui, cfg):
     while True:
-        rows = [(r, f"{r}  {_tilde(path)}") for r, path in sorted(cfg.repos.items())]
+        rows = [(r, r) for r in sorted(cfg.repos)]
         rows += [("__add__", "+ Register repo"), ("__back__", "Back")]
-        repo = ui.pick("Repos · unregistering keeps files and sessions", rows)
+        repo = ui.pick("Repositories", rows, values={r: _tilde(p) for r, p in cfg.repos.items()},
+                       accents={"__add__": "g"})
         if repo in (None, "__back__"):
             return
         if repo == "__add__":
@@ -1542,12 +1545,12 @@ def _config_repos(ui, cfg):
             if repo_path is not None:
                 cfg.repos[alias] = repo_path
             continue
-        action = ui.pick(f"Repo {repo}", [
-            ("path", f"Path: {_tilde(cfg.repos[repo])}"),
-            ("tool", f"Tool: {cfg.agents.get(repo) or 'inherit global default'}"),
-            ("branch", f"Shared-tree branch: {cfg.branches.get(repo) or 'inherit global default'}"),
-            ("worktree", f"Worktrees: {cfg.worktree.get(repo) or 'inherit global default'}"),
-            ("remove", "Unregister repo (keep files and sessions)"), ("back", "Back")])
+        action = ui.pick(f"Repository · {repo}", [
+            ("path", "Path"), ("tool", "Tool"), ("branch", "Shared-tree branch"), ("worktree", "Worktrees"),
+            ("remove", "Unregister (keep files and sessions)"), ("back", "Back")],
+            values={"path": _tilde(cfg.repos[repo]), "tool": cfg.agents.get(repo) or "inherit default",
+                    "branch": cfg.branches.get(repo) or "inherit default",
+                    "worktree": cfg.worktree.get(repo) or "inherit default"}, accents={"remove": "w"})
         if action == "remove":
             _config_remove_repo(cfg, repo)
         elif action == "path":
@@ -1571,10 +1574,11 @@ def _config_repos(ui, cfg):
 
 def _config_worktrees(ui, cfg):
     while True:
-        action = ui.pick("Worktree defaults · existing worktrees are not moved", [
-            ("enabled", f"Worktrees enabled: {cfg.worktree_default}"),
-            ("root", f"Worktree root: {_tilde(cfg.worktree_root)}"),
-            ("branch", f"Shared-tree fallback branch: {cfg.branch}"), ("back", "Back")])
+        action = ui.pick("Worktree defaults", [
+            ("enabled", "Worktrees"), ("root", "Root directory"),
+            ("branch", "Shared-tree branch"), ("back", "Back")],
+            values={"enabled": "enabled" if cfg.worktree_default == "1" else "disabled",
+                    "root": _tilde(cfg.worktree_root), "branch": cfg.branch})
         if action in (None, "back"):
             return
         if action == "enabled":
@@ -1593,24 +1597,33 @@ def _config_wizard(cfg):
     edited = copy.deepcopy(cfg)
     initial = _config_state(cfg)
     catalogs = {}
-    ui.out.write("┌  t config · local settings · nothing written until Save changes\n")
+    st = Style()
+    ui.out.write(f"\n  {st.b}{st.c}t config{st.r}  {st.y}Settings for this machine{st.r}\n"
+                 f"  {st.y}Changes stay pending until you save.{st.r}\n\n")
+    last = "tool"
     ui.raw()
     try:
         while True:
-            rows = [("tool", f"Default tool     {edited.agent_default}")]
+            rows = [("tool", "Default tool")]
+            values = {"tool": edited.agent_default}
             for a in AGENTS:
-                rows += [(a, f"{a} model    {edited.models.get(a) or 'tool default'}"),
-                         (f"effort:{a}", f"{a} effort   {edited.efforts.get(a) or 'tool default'}")]
-            rows += [("hosts", f"Hosts ({len(edited.hosts)}) · add, edit, remove"),
-                     ("repos", f"Repos ({len(edited.repos)}) · paths and overrides"),
-                     ("beam", f"Default beam host: {edited.beam_host or 'none'}"),
-                     ("worktrees", "Worktree and branch defaults"),
-                     ("edit", "Open local config in editor (all settings)"),
+                rows += [(a, f"{a.title()} model"), (f"effort:{a}", f"{a.title()} effort")]
+                values.update({a: edited.models.get(a) or "tool default",
+                               f"effort:{a}": edited.efforts.get(a) or "tool default"})
+            rows += [("hosts", "Hosts"), ("repos", "Repositories"), ("beam", "Default beam host"),
+                     ("worktrees", "Worktrees & branches"), ("edit", "Open config in editor"),
                      ("save", "Save changes"), ("cancel", "Cancel")]
-            choice = ui.pick("Local settings", rows)
+            pending = len(_config_diff(initial, _config_state(edited)))
+            values.update({"hosts": f"{len(edited.hosts)} registered", "repos": f"{len(edited.repos)} registered",
+                           "beam": edited.beam_host or "none", "save": f"{pending} pending"})
+            choice = ui.pick("Local settings", rows, values=values,
+                             sections={"tool": "Session defaults", "hosts": "Hosts & repositories", "edit": "Finish"},
+                             accents={"save": "g", "cancel": "y"},
+                             default=next(i for i, row in enumerate(rows) if row[0] == last))
             if choice in (None, "cancel"):
                 ui.done("cancelled", "nothing written")
                 return None
+            last = choice
             if choice == "edit":
                 if _config_diff(initial, _config_state(edited)):
                     ui.done("pending", "Save or cancel your menu changes before opening the editor.")
@@ -1619,7 +1632,7 @@ def _config_wizard(cfg):
             if choice == "save":
                 changes = _config_diff(initial, _config_state(edited))
                 try:
-                    lines = [_config_assignment(k, v) for k, v in changes.items()]
+                    lines = [f"      {st.c}{_config_assignment(k, v)}{st.r}" for k, v in changes.items()]
                 except ValueError as exc:
                     ui.done("invalid", str(exc))
                     continue
@@ -1640,8 +1653,8 @@ def _config_wizard(cfg):
                 _config_worktrees(ui, edited)
             elif choice == "beam":
                 options = [("", "No default (choose when beaming)")]
-                options += [(h, f"{h}  {target}") for h, target in sorted(edited.hosts.items())]
-                picked = ui.pick("Default beam host", options)
+                options += [(h, h) for h in sorted(edited.hosts)]
+                picked = ui.pick("Default beam host", options, values=edited.hosts)
                 if picked is not None:
                     edited.beam_host = edited.hosts.get(picked, "")
             elif choice == "tool":
@@ -1832,38 +1845,80 @@ class _RailUI:
 
     def done(self, label, value):
         st = self.st
-        self.commit([f"{st.g}◇{st.r}  {label:<11} {value}"])
+        color = st.w if label in ("invalid", "unavailable", "pending") else st.g
+        self.commit([f"  {color}◇  {label}{st.r}", f"      {value}", ""])
 
-    def pick(self, label, rows, multi=False, default=0, marked=None):
+    def pick(self, label, rows, multi=False, default=0, marked=None,
+             values=None, sections=None, accents=None):
         """A list under a ◆ step, redrawn in place: ↑↓/jk move, space marks (multi),
         enter picks, q/esc/ctrl-c cancels → None. rows: [(value, text)]. `default` is
         the initial cursor row, `marked` the pre-marked rows (multi) — the two things
-        that let a wizard step open on its suggestion."""
-        st, rail = self.st, self.rail
+        that let a wizard step open on its suggestion. Optional values form an
+        aligned second column (stacked on narrow screens); sections are headings
+        before keyed rows and do not participate in keyboard navigation."""
+        st, rail = self.st, f"  {self.rail}"
+        values, sections, accents = values or {}, sections or {}, accents or {}
         cur = max(0, min(default or 0, len(rows) - 1))
         marks = set(marked or ())
         # j/k are advertised on purpose: a phone keyboard has no arrow keys
-        keys = ("↑↓/jk move · space mark · enter pick · q quit" if multi
-                else "↑↓/jk move · enter pick · q quit")
+        keys = "↑↓/jk move" + (" · space mark" if multi else "")
         flash = ""
         while True:
-            head = self.head(label, flash or keys)
-            flash = ""
-            height = max(3, self.lines() - 7 - len(head))
-            lo = max(0, min(cur - height // 2, len(rows) - height)) if len(rows) > height else 0
-            hi = min(len(rows), lo + height)
-            lines = list(head)
-            if lo:
-                lines.append(f"{rail}   {st.y}… {lo} above{st.r}")
             width = self.cols()
-            for n in range(lo, hi):
+            head = [f"  {st.c}◆{st.r}  {st.b}{_truncate(label, width - 5)}{st.r}", rail]
+            hints = [keys, "enter select · q back"]
+            if len(" · ".join(hints)) + 6 <= width:
+                hints = [" · ".join(hints)]
+            footer = [rail] + [f"      {st.y}{hint}{st.r}" for hint in hints]
+            if self.lines() < 12:
+                head = head[:1]
+                footer = [f"      {st.y}↑↓/jk · ↵ · q{st.r}"]
+            if flash:
+                footer += [f"      {st.w}{_truncate(flash, width - 6)}{st.r}"]
+            flash = ""
+            disp = []
+            label_width = min(24, max((len(text) for key, text in rows if key in values), default=0))
+            for n, (key, text) in enumerate(rows):
+                if key in sections:
+                    if disp:
+                        disp.append((rail, None))
+                    title = _truncate(sections[key].upper(), width - 6)
+                    disp.append((f"{rail}   {st.b}{st.c}{title}{st.r}", None))
                 pre = f"{st.c}▸{st.r}" if n == cur else " "
                 box = (f"{st.c}◼{st.r} " if n in marks else "◻ ") if multi else ""
-                body = _truncate(rows[n][1], max(12, width - 8))
-                body = f"{st.b}{body}{st.r}" if n == cur else body
-                lines.append(f"{rail}  {pre}{box}{body}")
-            if hi < len(rows):
-                lines.append(f"{rail}   {st.y}… {len(rows) - hi} more{st.r}")
+                avail = max(4, width - 8 - (2 if multi else 0))
+                color = getattr(st, accents.get(key, ""), "")
+                value = str(values[key]) if key in values else None
+                stacked = value is not None and width < 60
+                if value is not None and not stacked:
+                    left = _truncate(text, label_width).ljust(label_width)
+                    right = _truncate(value, max(1, avail - label_width - 3))
+                    plain = f"{left}   {right}"
+                    body = f"{color}{left}{st.r}   {st.c}{right}{st.r}"
+                else:
+                    plain = _truncate(text, avail)
+                    body = f"{color}{plain}{st.r}"
+                if n == cur:
+                    body = f"{st.b}{st.rev}{plain.ljust(avail)}{st.r}"
+                disp.append((f"{rail}  {pre} {box}{body}", n))
+                if stacked:
+                    detail = _truncate(value, width - 10)
+                    style = st.b + st.rev if n == cur else st.c
+                    disp.append((f"{rail}      {style}{detail}{st.r}", n))
+            # Window physical display lines, including headings and stacked values.
+            # Reserve two rows for scroll markers; keep the entire selection visible.
+            height = max(3, self.lines() - sum(_term_rows(x, width) for x in head + footer) - 3)
+            focused = [i for i, (_, n) in enumerate(disp) if n == cur]
+            lo = max(0, min(focused[0] - height // 2, len(disp) - height))
+            lo = max(lo, focused[-1] - height + 1)
+            hi = min(len(disp), lo + height)
+            lines = list(head)
+            if lo:
+                lines.append(f"{rail}   {st.y}↑ more above{st.r}")
+            lines += [line for line, _ in disp[lo:hi]]
+            if hi < len(disp):
+                lines.append(f"{rail}   {st.y}↓ more below{st.r}")
+            lines += footer
             self.repaint(lines)
             k = self.read_key()
             if k in ("up", "k"):
@@ -1879,7 +1934,7 @@ class _RailUI:
                 return None
             else:
                 # a key that does nothing must SAY so — a silent no-op reads as broken
-                flash = f"⚠ no binding for that key — {keys}"
+                flash = "No binding for that key"
 
     def page(self, label, body, accept, keys=""):
         """A read-only block under a ◆ step (the review screens), windowed to the

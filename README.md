@@ -27,15 +27,20 @@ shim in `.zshrc` for verbs that must run in your shell).
 
 Run `t -h` for the full verb list.
 
-For example, `t app api 13` stops that slot's Codex CLI and opens its existing
-thread and live dev URL in the desktop app when Codex is not already running.
-If Codex is running, the command stops before touching the CLI or sending links.
-Open a new window in Codex, focus it, then run `t app api 13 --reuse-window`.
-That flag explicitly allows the app to navigate its existing window.
-Automatic new-window creation is currently unsupported: macOS `open -n` requests
-a new process, which can silently do nothing or route links to an existing window.
-The command uses normal macOS URL delivery and reports only that an open request
-was sent; macOS does not confirm that the app displayed it.
+For example, `t app api 13` automatically creates a new Codex desktop window,
+then stops that slot's Codex CLI and requests its existing thread and live dev URL
+in that window. It invokes the app's native **New Window** menu action, waits for
+a distinct window, and focuses that exact window before sending the handoff.
+Other session windows keep their contents. `--reuse-window` instead allows the
+app to navigate its existing window without creating another.
+
+Automatic window creation requires macOS **Accessibility** permission for the
+terminal running `t` (System Settings → Privacy & Security → Accessibility).
+If permission, menu access, or window creation fails, the CLI stays running and
+no thread link is sent. The native menu currently needs the English **New Window**
+label. No Swift compiler or extra Python packages are needed.
+The command confirms window creation separately from the URL request;
+macOS does not confirm that the app displayed the requested thread and preview.
 The handoff keeps the same conversation.
 Use **Annotation mode** to click an element or select an area and leave feedback.
 `t app api 13 --url 'http://localhost:5213/#budget'` selects a particular page

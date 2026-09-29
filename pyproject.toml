@@ -10,7 +10,7 @@ testpaths = ["tests"]
 # scope measurement to the bin script under test (the */ prefix tolerates the
 # absolute CWD). This keeps the percentage about the code we test rather than
 # letting unmeasured Bash/zsh dilute it.
-include = ["*/bin/t"]
+include = ["*/bin/t", "*/libexec/t_app_window.py"]
 
 [tool.coverage.report]
 # Exclude the subprocess/ssh/tmux shells and the argparse/CLI plumbing:
@@ -35,6 +35,9 @@ exclude_lines = [
     "def _read_usage\\(",
     "def _columns\\(",
     "class Style",
+    # Thin macOS ctypes bridge: exercised by test_app_macos.py on macOS.
+    "class Accessibility",
+    "class Element",
     # bin/t interactive setup glue (inline wizard + input() prompts)
     "def _tmux_session_name\\(",
     "def _setup_wizard\\(",

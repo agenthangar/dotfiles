@@ -35,6 +35,10 @@ DEV_REPOS[web]="$HOME/code/my-web"
 # DEV_MODEL[codex]=your-model-id
 # DEV_EFFORT[claude]=high
 # DEV_EFFORT[codex]=high
+# Fast mode: 1 = on (higher usage/cost), 0 = off, empty = tool default.
+# `t config` only offers On for models whose CLI metadata reports support.
+# DEV_FAST[claude]=0
+# DEV_FAST[codex]=0
 
 # Default host for `tbeam` (teleport a Claude session to another machine).
 # Omit this to require an explicit host argument every time.

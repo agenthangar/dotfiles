@@ -48,7 +48,7 @@ def test_picker_rows_preserve_saved_models_but_label_unknown_capabilities(t_mod)
 def test_switch_model_retains_only_reported_effort(t_mod):
     catalog = t_mod._config_catalog("codex", [{"model": "a", "supportedReasoningEfforts": [
         {"reasoningEffort": "high"}]}])
-    cfg = SimpleNamespace(models={}, efforts={"codex": "high"})
+    cfg = SimpleNamespace(models={}, efforts={"codex": "high"}, fast={})
     assert not t_mod._config_set_model(cfg, "codex", "a", catalog)
     assert cfg.efforts["codex"] == "high"
     assert t_mod._config_set_model(cfg, "codex", "custom-model", catalog)
@@ -147,3 +147,19 @@ def test_metadata_timeout_and_eof_reap_the_process(t_mod):
         with t_mod._ConfigRPC([sys.executable, "-c", "pass"]) as rpc:
             rpc.receive("missing")
     assert rpc.process.poll() is not None
+
+
+def test_fast_support_comes_from_each_vendors_capabilities(t_mod):
+    catalog = t_mod._config_catalog('codex', [
+        {'model': 'a', 'serviceTiers': [{'id': 'priority'}]},
+        {'model': 'b', 'serviceTiers': [{'id': 'fast'}]},
+        {'model': 'c', 'serviceTiers': [], 'additionalSpeedTiers': ['fast']},
+        {'model': 'd', 'additionalSpeedTiers': ['fast']},
+        {'model': 'e', 'additionalSpeedTiers': 1},
+    ])
+    assert [m['fast'] for m in catalog] == [True, True, False, True, False]
+    claude = t_mod._config_catalog('claude', [{'value': 'opus', 'supportsFastMode': True}, {'value': 'haiku'}])
+    assert [m['fast'] for m in claude] == [True, False]
+    assert t_mod._config_assignment('DEV_FAST[codex]', '1') == 'DEV_FAST[codex]=1'
+    with pytest.raises(ValueError, match='fast mode'):
+        t_mod._config_assignment('DEV_FAST[codex]', 'yes')

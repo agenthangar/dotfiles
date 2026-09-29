@@ -179,7 +179,14 @@ pick_chat() {
   [[ -t 0 && -t 1 ]] || { echo "cursor-beam: -p needs a terminal" >&2; return 1; }
   command -v fzf >/dev/null || { echo "cursor-beam: -p needs fzf" >&2; return 1; }
   local row
-  row=$(list_chats | fzf --prompt='cursor chat> ' --no-multi) || return 1
+  local tui_lib
+  tui_lib=$(python3 -c 'import os, sys; print(os.path.join(os.path.dirname(os.path.realpath(sys.argv[1])), "..", "ui", "fzf.sh"))' "$0")
+  _t_fzf() { command fzf "$@"; }
+  if [[ -r "$tui_lib" ]]; then
+    # shellcheck source=ui/fzf.sh
+    source "$tui_lib"
+  fi
+  row=$(list_chats | _t_fzf --prompt='cursor chat> ' --no-multi) || return 1
   awk '{print $1}' <<<"$row"
 }
 

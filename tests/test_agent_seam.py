@@ -1718,3 +1718,24 @@ def test_zsh_nosleep_hold_swaps_the_caffeinate(nosleep, tmp_path):
     assert log.read_text().splitlines() == ["-dims", "-ims"]
     body = open(ZSHRC).read().split("\nnosleep() {", 1)[1].split("\n}\n", 1)[0]
     assert "_nosleep_hold -dims" in body and "_nosleep_hold -ims; _nosleep_lock" in body
+
+
+@pytest.mark.parametrize('agent,fast,args', [
+    ('claude', '1', '--settings\n{"fastMode":true}\n'),
+    ('claude', '0', '--settings\n{"fastMode":false}\n'),
+    ('codex', '1', '-c\nservice_tier=fast\n--enable\nfast_mode\n'),
+    ('codex', '0', '-c\nservice_tier=default\n'),
+])
+def test_fast_mode_reaches_new_tmux_and_foreground_launches(zsh, agent, fast, args):
+    (zsh.home / 'code' / 'web').mkdir(parents=True)
+    r = zsh(f'DEV_FAST[{agent}]={fast}; DEV_AGENT_DEFAULT={agent}; '
+            'DEV_WORKTREE[web]=0; _dev_repo_prepare() { :; }; '
+            f'{agent}() {{ print -rl -- ARG "$@"; }}; '
+            f'eval "$(_dev_agent_new_cmd {agent})"; _t_dev web new --fg; '
+            f'_dev_resume_session dev-web-9 $HOME/code/web saved-id {agent}; '
+            'rm -f $HOME/.config/t/config.sh; _t_sync_config; cat $HOME/.config/t/config.sh')
+    assert r.returncode == 0, r.stderr
+    assert r.stdout.count('ARG\n' + args) == 2, r.stdout
+    assert f'DEV_FAST[{agent}]={fast}' in r.stdout
+    resume = f'{agent} resume saved-id' if agent == 'codex' else 'claude -r saved-id'
+    assert f'send-keys -t dev-web-9 {resume}; exit Enter' in zsh.log.read_text()

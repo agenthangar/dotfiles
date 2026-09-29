@@ -132,7 +132,7 @@ def app_command(t_mod, app_slot, monkeypatch):
 def test_app_command_stops_before_opening_same_thread(t_mod, app_command):
     call, events, row = app_command
     assert call() == 0
-    assert events == [("stop", row), ("open", ["open", "-a", "/Applications/ChatGPT.app",
+    assert events == [("stop", row), ("open", ["open", "-n", "-a", "/Applications/ChatGPT.app",
                         t_mod._app_link(SID, "http://localhost:5213")])]
 
 
@@ -143,7 +143,8 @@ def test_app_opens_referenced_plan_with_existing_thread_and_preview(t_mod, app_c
     monkeypatch.setattr(t_mod, "_app_find_plan", lambda selected: str(plan), raising=False)
     monkeypatch.setattr(t_mod, "_app_plan_start", lambda path: "http://127.0.0.1:12345/secret/", raising=False)
     assert call() == 0
-    links = events[-1][1][3:]
+    assert events[-1][1][:4] == ["open", "-n", "-a", "/Applications/ChatGPT.app"]
+    links = events[-1][1][4:]
     assert len(links) == 2
     assert all(urlsplit(link).path == "/" + SID for link in links)
     assert parse_qs(urlsplit(links[0]).query)["browserUrl"] == ["http://localhost:5213"]
@@ -156,7 +157,19 @@ def test_app_command_dry_run_is_read_only(app_command, capsys):
     call, events, _ = app_command
     assert call("--dry-run") == 0
     assert events == []
-    assert "Would stop" in capsys.readouterr().out
+    assert "open in a new app window" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("preview", [(), ("--no-preview", "--no-plan")])
+def test_app_reuse_window_is_explicit(t_mod, app_command, preview, capsys):
+    call, events, row = app_command
+    assert call("--reuse-window", "--dry-run", *preview) == 0
+    assert events == []
+    assert "open in the existing app window" in capsys.readouterr().out
+    assert call("--reuse-window", *preview) == 0
+    url = None if preview else "http://localhost:5213"
+    assert events == [("stop", row), ("open", ["open", "-a", "/Applications/ChatGPT.app",
+                       t_mod._app_link(SID, url)])]
 
 
 def test_app_command_explicit_url_and_no_preview(t_mod, app_command):

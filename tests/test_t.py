@@ -980,10 +980,17 @@ def test_slot_line_highlights_a_merged_pr_still_in_progress(t_mod):
     row = {"slot": "ff-20", "state": "detached", "context": "active",
            "summary": "search cleanup · #580 merged, still in progress"}
     line = t_mod._slot_line(row, st, 7, 80)
+    assert line.startswith(f"○ {st.c}✓{st.r} ✱ {st.w}↻{st.r} ")
     assert f"{st.w}#580 merged, still in progress{st.r}" in line
     plain = t_mod._slot_line(dict(row, summary="search cleanup · #580 merged"), st, 7, 80)
     assert st.w not in plain
     assert t_mod._vis_len(line) == len(t_mod._slot_line(row, t_mod.Style(tty=False), 7, 80))
+    # The icon does not depend on the text fitting, and does not shift the columns.
+    narrow = t_mod._slot_line(row, t_mod.Style(tty=False), 7, 12)
+    assert narrow == "○ ✓ ✱ ↻ ff-20   search clea…"
+    assert len(narrow) == 8 + 7 + 1 + 12
+    remote = t_mod._slot_line(dict(row, host="mini"), t_mod.Style(tty=False), 7, 12, host_w=4)
+    assert remote.startswith("○ ✓ ✱ ↻ mini ff-20")
 
 
 def test_header_lists_every_agent_always(t_mod):
@@ -991,6 +998,7 @@ def test_header_lists_every_agent_always(t_mod):
     legend = t_mod._agent_legend()
     assert legend == "✱ claude · ⬡ codex · ◆ cursor"
     assert t_mod._header(st, "").endswith(" · " + legend)          # nothing on screen: still the full legend
+    assert "↻ still in progress" in t_mod._header(st, "")
     h = t_mod._header(st, "/code/ff")
     assert " · " + legend in h and "(repo: ff" in h
 

@@ -27,6 +27,11 @@ shim in `.zshrc` for verbs that must run in your shell).
 
 Run `t -h` for the full verb list.
 
+In `t ls` and slot pickers, `↻` marks work still pending after a merged PR.
+It appears in yellow in the STATUS column, even when the summary is truncated.
+A clean slot whose work has already landed stays plain `merged`; updating to
+main or completing a later PR does not by itself mean work remains.
+
 For example, `t app api 13` automatically creates a new Codex desktop window,
 then stops that slot's Codex CLI and requests its existing thread and live dev URL
 in that window. It invokes the app's native **New Window** menu action, waits for

@@ -806,6 +806,96 @@ def test_zsh_pr_tag_says_when_work_continued_past_a_merge(zsh, tmp_path):
     assert tag(url, str(tmp_path / "gone")) == "· #5 merged"
 
 
+def test_zsh_pr_work_continued_recognizes_main_and_squashed_work(zsh, tmp_path):
+    wt = tmp_path / "wt"
+    wt.mkdir()
+
+    def git(*args):
+        return subprocess.run(["git", "-C", str(wt), "-c", "user.email=t@t", "-c", "user.name=t",
+                               *args], check=True, capture_output=True, text=True).stdout.strip()
+
+    def commit(name):
+        (wt / name).write_text(name)
+        git("add", name)
+        git("commit", "-qm", name)
+        return git("rev-parse", "HEAD")
+
+    git("init", "-q", "-b", "main")
+    head = commit("base")
+    git("update-ref", "refs/remotes/origin/main", head)
+    git("checkout", "-qb", "slot")
+    prdir = zsh.home / ".cache" / "claude-sessions" / "pr"
+    prdir.mkdir(parents=True)
+    hf = prdir / "o#r#5.head"
+    hf.write_text(head)
+    (prdir / "o#r#5").write_text("MERGED")
+
+    def pending():
+        r = zsh(f"_pr_work_continued {wt} {hf}; echo $?")
+        assert r.stderr == ""
+        return r.stdout.strip() == "0"
+
+    # Updating a finished slot to main is not new work, even after main moves again.
+    git("checkout", "-q", "main")
+    published = commit("upstream")
+    git("update-ref", "refs/remotes/origin/main", published)
+    git("checkout", "-q", "slot")
+    git("merge", "--ff-only", "main")
+    assert not pending()
+    # A multi-commit follow-up is pending until its squash merge is published.
+    commit("follow-up-1")
+    tip = commit("follow-up-2")
+    assert pending()
+    git("checkout", "-q", "main")
+    git("merge", "--squash", "slot")
+    git("commit", "-qm", "squash follow-up")
+    git("update-ref", "refs/remotes/origin/main", "HEAD")
+    git("checkout", "-q", "slot")
+    assert git("rev-parse", "HEAD") == tip
+    assert not pending()
+    git("checkout", "-q", "main")
+    git("update-ref", "refs/remotes/origin/main", commit("unrelated"))
+    git("checkout", "-q", "slot")
+    assert not pending()                               # older published tree still counts
+    # A newer cached merged PR also settles a tip with no identical main snapshot
+    # (e.g. upstream changes landed between branching and the squash merge).
+    tip = commit("next-follow-up")
+    assert pending()
+    (prdir / "other#repo#6").write_text("MERGED")
+    (prdir / "other#repo#6.head").write_text(tip)
+    (prdir / "o#r#6.head").write_text(tip)              # orphan sidecar is ignored
+    assert pending()
+    (prdir / "o#r#6").write_text("OPEN")
+    assert pending()
+    (prdir / "o#r#6").write_text("MERGED")
+    assert not pending()
+    # Uncommitted work wins over every form of merge evidence.
+    (wt / "dirty").write_text("untracked")
+    assert pending()
+    git("add", "dirty")
+    assert pending()
+    (wt / "dirty").unlink()
+    git("reset", "-q", "HEAD", "dirty")
+    (wt / "base").write_text("edited")
+    assert pending()
+
+
+def test_zsh_pr_tag_refreshes_later_merges_without_repeated_requests(zsh):
+    prdir = zsh.home / ".cache" / "claude-sessions" / "pr"
+    prdir.mkdir(parents=True)
+    (prdir / "o#r#5").write_text("MERGED")
+    (prdir / "o#r#5.head").write_text("old-head")
+    snippet = ("typeset -a _PR_STALE; typeset -A _PR_SPAWNED; "
+               "_pr_work_continued() { return 0; }; "
+               "_pr_state_tag github.com/o/r/pull/5 /wt; print -rl -- $_PR_STALE")
+    assert zsh(snippet).stdout.strip() == "o/r#5"
+    checked = prdir / "o#r.checked"
+    checked.touch()
+    assert zsh(snippet).stdout.strip() == ""
+    os.utime(checked, (time.time() - 301, time.time() - 301))
+    assert zsh(snippet).stdout.strip() == "o/r#5"
+
+
 def test_zsh_pr_refresh_records_the_merged_head(zsh, tmp_path):
     """The batched refresh stores headRefOid beside a MERGED state (a sidecar, so the
     state file stays a bare state for the Python readers), and back-fills it once for
@@ -821,6 +911,7 @@ def test_zsh_pr_refresh_records_the_merged_head(zsh, tmp_path):
     assert (prdir / "o#r#5.head").read_text() == "abc123"
     assert (prdir / "o#r#6").read_text() == "OPEN"
     assert not (prdir / "o#r#6.head").exists()
+    assert (prdir / "o#r.checked").exists()
 
 
 def test_zsh_codex_subagent_threads_are_not_conversations(zsh):

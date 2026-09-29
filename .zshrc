@@ -4772,6 +4772,9 @@ _pr_state_refresh() {
       # asked" from "asked and could not tell".
       print -rn -- "${st:-?}" > "$f.$$.tmp" 2>/dev/null && mv -f "$f.$$.tmp" "$f" 2>/dev/null
     done
+    # Also rate-limit refreshes for a live slot whose last-mentioned PR is already
+    # merged: later PRs can complete its work without appearing in its transcript.
+    touch "$prdir/${slug//\//#}.checked" 2>/dev/null
   done
 }
 
@@ -4801,8 +4804,8 @@ _pr_state_refresh() {
 # With a [worktree] (a LIVE slot's, from `t ls`), a merged PR is checked against the
 # work in that tree: "merged" alone reads as "this slot is done", which is wrong
 # when the session kept iterating after the merge (the PR did not fix it, a follow-up
-# is under way) — so a HEAD that moved off the PR's merged head, or a dirty tree,
-# renders "merged, still in progress" instead. The tag stays until the session's next PR
+# is under way) — so uncommitted edits or commits not known to have landed render
+# "merged, still in progress" instead. The tag stays until the session's next PR
 # URL replaces it, since the last PR mention in the transcript is the one shown.
 _pr_state_tag() {
   local pru=$1 wt=${2:-}
@@ -4811,7 +4814,8 @@ _pr_state_tag() {
   local prdir="${XDG_CACHE_HOME:-$HOME/.cache}/claude-sessions/pr"
   local prp=${pru#github.com/}; prp=${prp/\/pull\//\/}
   local prkey=${prp//\//#} prnum=${pru##*/}
-  local prcf="$prdir/$prkey" prraw= prst= prlab= prmt prhead=
+  local prcf="$prdir/$prkey" prraw= prst= prlab= prmt checked
+  local -i wip=0 refresh=0
   if [[ -f $prcf ]]; then
     prraw=$(<$prcf)
     [[ $prraw == MERGED || $prraw == CLOSED || $prraw == OPEN ]] && prst=$prraw
@@ -4820,12 +4824,19 @@ _pr_state_tag() {
   [[ -z $prlab ]] && command -v gh >/dev/null 2>&1 && prlab='?'
   if [[ $prst == MERGED && -n $wt ]] && _pr_work_continued "$wt" "$prcf.head"; then
     prlab='merged, still in progress'
+    wip=1
   fi
   if [[ -z ${_PR_SPAWNED[$prkey]:-} ]]; then
     prmt=$(zstat +mtime "$prcf" 2>/dev/null || echo 0)
     # a MERGED entry without its head sidecar predates it: fetch it once
     if _pr_state_stale "$prraw" $(( prmt ? EPOCHSECONDS - prmt : 999999999 )) ||
        { [[ $prraw == MERGED && ! -f $prcf.head ]] && command -v gh >/dev/null 2>&1; }; then
+      refresh=1
+    elif (( wip )); then
+      checked=$(zstat +mtime "$prdir/${prkey%#*}.checked" 2>/dev/null || echo 0)
+      _pr_state_stale OPEN $(( checked ? EPOCHSECONDS - checked : 999999999 )) && refresh=1
+    fi
+    if (( refresh )); then
       _PR_SPAWNED[$prkey]=1
       _PR_STALE+=("${prp%/*}#$prnum")
     fi
@@ -4834,20 +4845,38 @@ _pr_state_tag() {
 }
 
 # _pr_work_continued <worktree> <head-file> — has work gone on in <worktree> since
-# its PR merged? 0 = yes: HEAD is no longer the PR's merged head (a new commit, a
-# pull of main to start the follow-up), or the tree has uncommitted edits. HEAD is
-# compared first because it is one cheap rev-parse; the status walk runs only when
-# HEAD still sits on the merged head. An unknown head (sidecar not fetched yet)
-# falls back to the dirty check alone; anything unreadable = no (plain "merged").
+# its PR merged? 0 = yes. Check edits FIRST, even on a known merged commit. A clean
+# tree can sit on a later merged PR, main, or a squash-merged commit whose tree
+# appears in main's history. None is pending work just because its SHA differs
+# from the last PR mentioned in the transcript. All evidence is local; the caller
+# refreshes the repo's PR cache in the background when work still looks pending.
+# Unknown/unreadable history falls back to the dirty check alone.
 _pr_work_continued() {
-  local wt=$1 hf=$2 head= cur
+  local wt=$1 hf=$2 head= cur dirty f main base tree trees
   [[ -e $wt/.git ]] || return 1
+  dirty=$(git -C "$wt" status --porcelain 2>/dev/null) || return 1
+  [[ -n $dirty ]] && return 0
   [[ -f $hf ]] && head=$(<$hf)
-  if [[ -n $head ]]; then
-    cur=$(git -C "$wt" rev-parse HEAD 2>/dev/null) || return 1
-    [[ $cur != $head ]] && return 0
+  [[ -n $head ]] || return 1
+  cur=$(git -C "$wt" rev-parse HEAD 2>/dev/null) || return 1
+  [[ $cur == $head ]] && return 1
+  # The batched refresh already saves every merged head in this repo. A later PR
+  # may have landed the slot's tip even though its transcript still names an old PR.
+  for f in "${hf%#*}"\#*.head(N); do
+    [[ -f ${f%.head} ]] || continue
+    [[ $(<"${f%.head}") == MERGED && $(<"$f") == $cur ]] && return 1
+  done
+  main=$(git -C "$wt" rev-parse --verify refs/remotes/origin/main 2>/dev/null)
+  if [[ -n $main ]]; then
+    git -C "$wt" merge-base --is-ancestor "$cur" "$main" 2>/dev/null && return 1
+    tree=$(git -C "$wt" rev-parse 'HEAD^{tree}' 2>/dev/null) || return 1
+    base=$(git -C "$wt" merge-base "$cur" "$main" 2>/dev/null) || return 1
+    # Squash merges change the commit ID. Match published snapshots too, including
+    # older ones so an unrelated main update cannot make a finished slot look busy.
+    trees=$(git -C "$wt" log --first-parent --format=%T "$base..$main" 2>/dev/null) || return 1
+    [[ $'\n'$trees$'\n' == *$'\n'$tree$'\n'* ]] && return 1
   fi
-  [[ -n $(git -C "$wt" status --porcelain 2>/dev/null) ]]
+  return 0
 }
 
 # _pr_state_flush — spawn ONE detached, per-repo-batched refresh for everything

@@ -367,7 +367,7 @@ def _header(st, scope):
         # Make the scoped repo prominent (bold cyan) — the rest of the note stays dim.
         repo = os.path.basename(scope)
         note = f"   {st.y}(repo: {st.r}{st.b}{st.c}{repo}{st.r}{st.y} — --all for all){st.r}"
-    return f"dev sessions   {st.g}●{st.r} attached · {st.c}✓{st.r} active context · {_agent_legend()}{note}"
+    return f"dev sessions   {st.g}●{st.r} attached · {st.c}✓{st.r} active context · {st.w}↻{st.r} still in progress · {_agent_legend()}{note}"
 
 
 def _ls_scope(cfg, repo, all_repos, cwd):
@@ -435,6 +435,9 @@ def _slot_line(r, st, name_w, avail, host_w=None):
     cmark = f"{st.c}✓{st.r}" if r.get("context") == "active" else " "
     # third glyph = the agent's icon (every agent has one — the header legend says which)
     gmark = _agent_glyph(r.get("agent", "claude"))
+    # Use the spare status column: the mark survives a narrow/truncated summary,
+    # and remains visible without colour (including slot pickers and remote rows).
+    wmark = f"{st.w}↻{st.r}" if _PR_WIP_RE.search(r.get("summary") or "") else " "
     host = ""
     if host_w is not None:
         cell = "" if r.get("host", "local") == "local" else r["host"]
@@ -443,7 +446,7 @@ def _slot_line(r, st, name_w, avail, host_w=None):
     # a merged PR the slot kept working past (zsh _pr_state_tag) stands out of the dim
     # summary — coloured AFTER truncation, so the width math never counts an escape
     summary = _PR_WIP_RE.sub(lambda m: f"{st.r}{st.w}{m.group(0)}{st.r}{st.y}", summary)
-    return f"{amark} {cmark} {gmark}   {host}{r['slot']:<{name_w}} {st.y}{summary}{st.r}"
+    return f"{amark} {cmark} {gmark} {wmark} {host}{r['slot']:<{name_w}} {st.y}{summary}{st.r}"
 
 
 def _render_local(rows, scope, st, has_remote=False):

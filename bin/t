@@ -68,7 +68,7 @@ ZSH_PRELUDE = "setopt no_monitor no_notify 2>/dev/null; "
 # ─── config ──────────────────────────────────────────────────────────────────
 
 _CFG_LINE = re.compile(
-    r"^(DEV_REPOS|DEV_BRANCHES|REMOTE_HOSTS|DEV_WORKTREE|DEV_AGENT|DEV_MODEL|DEV_EFFORT)\[([^\]]+)\]=(.*)$"
+    r"^(DEV_REPOS|DEV_BRANCHES|REMOTE_HOSTS|DEV_WORKTREE|DEV_AGENT|DEV_MODEL|DEV_EFFORT|DEV_FAST)\[([^\]]+)\]=(.*)$"
     r"|^(DEV_BRANCH|DEV_WORKTREE_ROOT|DEV_WORKTREE_DEFAULT|DEV_AGENT_DEFAULT|TBEAM_HOST|MINI_HOST)=(.*)$")
 
 AGENTS = ("claude", "codex")   # the closed set a dev slot can run (the zsh _dev_agent_valid twin)
@@ -99,6 +99,7 @@ class Config:
         self.agent_default = "claude"
         self.models = {}     # agent -> model for NEW sessions; empty defers to the CLI
         self.efforts = {}    # agent -> reasoning effort for NEW sessions
+        self.fast = {}       # agent -> 1/0 fast mode; empty inherits the CLI setting
         self.beam_host = ""
         self.mini_host = ""  # legacy host seed; cleared if its host is removed
         self._load()
@@ -118,7 +119,7 @@ class Config:
                 {"DEV_REPOS": self.repos, "DEV_BRANCHES": self.branches,
                  "REMOTE_HOSTS": self.hosts, "DEV_WORKTREE": self.worktree,
                  "DEV_AGENT": self.agents, "DEV_MODEL": self.models,
-                 "DEV_EFFORT": self.efforts}[arr][key] = val
+                 "DEV_EFFORT": self.efforts, "DEV_FAST": self.fast}[arr][key] = val
             elif m.group(4) == "DEV_BRANCH":
                 self.branch = _unquote(m.group(5))
             elif m.group(4) == "DEV_WORKTREE_ROOT":
@@ -1129,7 +1130,7 @@ _EFFORT_ID = re.compile(r"[a-z][a-z0-9_-]*\Z")
 
 _CONFIG_ARRAYS = {"DEV_REPOS": "repos", "REMOTE_HOSTS": "hosts", "DEV_BRANCHES": "branches",
                   "DEV_AGENT": "agents", "DEV_WORKTREE": "worktree", "DEV_MODEL": "models",
-                  "DEV_EFFORT": "efforts"}
+                  "DEV_EFFORT": "efforts", "DEV_FAST": "fast"}
 _CONFIG_SCALARS = {"DEV_AGENT_DEFAULT": "agent_default", "DEV_BRANCH": "branch",
                    "DEV_WORKTREE_ROOT": "worktree_root", "DEV_WORKTREE_DEFAULT": "worktree_default",
                    "TBEAM_HOST": "beam_host", "MINI_HOST": "mini_host"}
@@ -1171,6 +1172,8 @@ def _config_assignment(key, value):
         raise ValueError("model IDs must contain no spaces or shell commands")
     if key.startswith("DEV_EFFORT[") and value and not _EFFORT_ID.fullmatch(value):
         raise ValueError("effort must be a level name reported by the tool")
+    if key.startswith("DEV_FAST[") and value not in ("", "1", "0"):
+        raise ValueError("fast mode must be 1, 0, or empty to inherit")
     prefix = "export " if key == "TBEAM_HOST" else ""
     return f"{prefix}{key}={shlex.quote(value)}"
 
@@ -1381,7 +1384,15 @@ def _config_catalog(agent, raw):
             value = level.get("reasoningEffort") if isinstance(level, dict) else level
             if isinstance(value, str) and _EFFORT_ID.fullmatch(value) and value not in efforts:
                 efforts.append(value)
-        catalog.append({"id": ident, "resolved": resolved, "label": label, "efforts": efforts})
+        fast = model.get("supportsFastMode") is True
+        if agent == "codex":
+            tiers = model.get("serviceTiers")
+            if isinstance(tiers, list):
+                fast = any(isinstance(tier, dict) and tier.get("id") in ("fast", "priority") for tier in tiers)
+            else:
+                legacy = model.get("additionalSpeedTiers")
+                fast = isinstance(legacy, list) and "fast" in legacy
+        catalog.append({"id": ident, "resolved": resolved, "label": label, "efforts": efforts, "fast": fast})
     return catalog
 
 
@@ -1411,24 +1422,41 @@ def _config_set_model(cfg, agent, model, catalog):
     cfg.models[agent] = model
     info = _config_find_model(catalog, model)
     effort = cfg.efforts.get(agent)
+    reset = []
     if effort and (info is None or effort not in info["efforts"]):
         cfg.efforts[agent] = ""
-        return True
-    return False
+        reset.append("effort")
+    if cfg.fast.get(agent) == "1" and (info is None or not info["fast"]):
+        cfg.fast[agent] = "0"
+        reset.append("fast mode")
+    return reset
 
 
-def _config_model_menu(ui, cfg, agent, catalogs, effort=False):
+def _config_model_menu(ui, cfg, agent, catalogs, setting="model"):
     while True:
         if agent not in catalogs:
             ui.done("loading", f"Reading models and effort levels from {agent}…")
             try:
                 catalogs[agent] = _config_catalog(agent, _config_live_models(agent))
+            except KeyboardInterrupt:
+                return  # back to the tool submenu, retaining all pending edits
             except (OSError, ValueError) as exc:
                 catalogs[agent] = []
                 ui.done("unavailable", f"{agent}: {exc}. Use tool defaults, a custom model, or Refresh.")
         catalog = catalogs[agent]
         model = cfg.models.get(agent, "")
-        if effort:
+        if setting == "fast":
+            current = cfg.fast.get(agent, "")
+            info = _config_find_model(catalog, model)
+            rows = [("", "Use tool's own setting"), ("0", "Off · standard speed")]
+            if info and info["fast"]:
+                rows.append(("1", "On · higher usage / cost"))
+            else:
+                ui.done("fast mode", "Choose a model that reports Fast mode support to enable it.")
+                if current == "1":
+                    rows.append(("1", "On (saved; support not verified)"))
+            rows.append(("__refresh__", "Refresh model list"))
+        elif setting == "effort":
             current = cfg.efforts.get(agent, "")
             rows = _config_effort_rows(current, model, catalog)
             info = _config_find_model(catalog, model)
@@ -1439,7 +1467,10 @@ def _config_model_menu(ui, cfg, agent, catalogs, effort=False):
         else:
             current = model
             rows = _config_model_rows(current, catalog)
-        picked = ui.pick(f"{agent.title()} {'effort · ' + (model or 'tool default') if effort else 'model'}", rows,
+        title = f"{agent.title()} {setting if setting != 'fast' else 'Fast mode'}"
+        if setting != "model":
+            title += f" · {model or 'tool default'}"
+        picked = ui.pick(title, rows,
                          default=next(i for i, row in enumerate(rows) if row[0] == current),
                          accents={key: "c" for key, _ in rows if key and not key.startswith("__")})
         if picked == "__refresh__":
@@ -1451,10 +1482,14 @@ def _config_model_menu(ui, cfg, agent, catalogs, effort=False):
                 ui.done("invalid", "Enter a model ID without spaces or shell commands.")
                 continue
         if picked is not None:
-            if effort:
+            if setting == "fast":
+                cfg.fast[agent] = picked
+            elif setting == "effort":
                 cfg.efforts[agent] = picked
-            elif _config_set_model(cfg, agent, picked, catalog):
-                ui.done("effort", "Reset to tool default: the previous level isn't reported for this model.")
+            else:
+                reset = _config_set_model(cfg, agent, picked, catalog)
+                if reset:
+                    ui.done("reset", "Model change reset " + ", ".join(reset) + "; review before saving.")
         return
 
 
@@ -1466,6 +1501,21 @@ def _config_summary(agent, models, overrides):
         lines.append("Repo tool overrides still win: " + ", ".join(
             f"{repo}={a}" for repo, a in sorted(overrides.items())))
     return lines
+
+
+def _config_tool_menu(ui, cfg, agent, catalogs):
+    last = "model"
+    while True:
+        rows = [("model", "Model"), ("effort", "Effort"), ("fast", "Fast mode"), ("back", "Back to settings")]
+        choice = ui.pick(f"{agent.title()} settings", rows,
+                         values={"model": cfg.models.get(agent) or "tool default",
+                                 "effort": cfg.efforts.get(agent) or "tool default",
+                                 "fast": {"1": "on", "0": "off"}.get(cfg.fast.get(agent), "tool default")},
+                         default=next(i for i, row in enumerate(rows) if row[0] == last))
+        if choice in (None, "back"):
+            return
+        last = choice
+        _config_model_menu(ui, cfg, agent, catalogs, setting=choice)
 
 
 def _config_input(ui, label, current="", kind="text"):
@@ -1598,8 +1648,7 @@ def _config_wizard(cfg):
     initial = _config_state(cfg)
     catalogs = {}
     st = Style()
-    ui.out.write(f"\n  {st.b}{st.c}t config{st.r}  {st.y}Settings for this machine{st.r}\n"
-                 f"  {st.y}Changes stay pending until you save.{st.r}\n\n")
+    ui.intro("t config", "Settings for this machine · changes stay pending until you save.")
     last = "tool"
     ui.raw()
     try:
@@ -1607,9 +1656,10 @@ def _config_wizard(cfg):
             rows = [("tool", "Default tool")]
             values = {"tool": edited.agent_default}
             for a in AGENTS:
-                rows += [(a, f"{a.title()} model"), (f"effort:{a}", f"{a.title()} effort")]
-                values.update({a: edited.models.get(a) or "tool default",
-                               f"effort:{a}": edited.efforts.get(a) or "tool default"})
+                rows.append((a, f"{a.title()} settings ›"))
+                values[a] = f"{edited.models.get(a) or 'tool default'} · {edited.efforts.get(a) or 'default'} effort"
+                if edited.fast.get(a) == "1":
+                    values[a] += " · fast"
             rows += [("hosts", "Hosts"), ("repos", "Repositories"), ("beam", "Default beam host"),
                      ("worktrees", "Worktrees & branches"), ("edit", "Open config in editor"),
                      ("save", "Save changes"), ("cancel", "Cancel")]
@@ -1619,10 +1669,19 @@ def _config_wizard(cfg):
             choice = ui.pick("Local settings", rows, values=values,
                              sections={"tool": "Session defaults", "hosts": "Hosts & repositories", "edit": "Finish"},
                              accents={"save": "g", "cancel": "y"},
+                             primary=("s", "SAVE CHANGES", f"{pending} pending"), shortcuts={"s": "save"},
                              default=next(i for i, row in enumerate(rows) if row[0] == last))
             if choice in (None, "cancel"):
-                ui.done("cancelled", "nothing written")
-                return None
+                if pending:
+                    choice = ui.pick(f"{pending} unsaved change{'s' if pending != 1 else ''}", [
+                        ("keep", "Keep editing"), ("save", "Review and save"),
+                        ("discard", "Discard changes and exit")],
+                        accents={"save": "g", "discard": "w"})
+                    if choice in (None, "keep"):
+                        continue
+                if choice != "save":
+                    ui.done("cancelled", "nothing written")
+                    return None
             last = choice
             if choice == "edit":
                 if _config_diff(initial, _config_state(edited)):
@@ -1638,12 +1697,9 @@ def _config_wizard(cfg):
                     continue
                 if changes:
                     answer = ui.page("Review local settings", lines, ("y", "n", "q", "esc", "abort"),
-                                     keys="y save · n back · q cancel")
-                    if answer == "n":
-                        continue
+                                     keys="n / esc / q back", primary=("y", "SAVE CHANGES", f"{pending} pending"))
                     if answer != "y":
-                        ui.done("cancelled", "nothing written")
-                        return None
+                        continue
                 return edited
             if choice == "hosts":
                 _config_hosts(ui, edited)
@@ -1664,10 +1720,8 @@ def _config_wizard(cfg):
                                  default=AGENTS.index(edited.agent_default) if edited.agent_default in AGENTS else 0)
                 if picked is not None:
                     edited.agent_default = picked
-            elif choice.startswith("effort:"):
-                _config_model_menu(ui, edited, choice.split(":", 1)[1], catalogs, effort=True)
             else:
-                _config_model_menu(ui, edited, choice, catalogs)
+                _config_tool_menu(ui, edited, choice, catalogs)
 
     finally:
         ui.restore()
@@ -1690,6 +1744,7 @@ def cmd_config(cfg, args):
         print("\n".join(_config_summary(cfg.agent_default, cfg.models, cfg.agents)))
         for agent in AGENTS:
             print(f"{agent} effort: {cfg.efforts.get(agent) or 'tool default'}")
+            print(f"{agent} Fast mode: " + {"1": "on", "0": "off"}.get(cfg.fast.get(agent), "tool default"))
         print(f"Default beam host: {cfg.beam_host or 'none'}")
         print(f"Worktrees: {cfg.worktree_default} · root: {cfg.worktree_root} · shared-tree branch: {cfg.branch}")
         for alias, target in sorted(cfg.hosts.items()):
@@ -1731,7 +1786,7 @@ def cmd_config(cfg, args):
 
 
 class _RailUI:
-    """The inline-wizard primitives shared by `t setup` and `t new`: raw single-key
+    """The shared design for `t config`, `t setup`, `t install`, and `t new`: raw single-key
     reads, an input line with a readline-PREFILLED suggestion, and in-place repaint of
     a block of rail lines via ANSI cursor-up — a step redraws itself while the finished
     steps above it stay in normal scrollback (the clack / `npm create` aesthetic).
@@ -1745,8 +1800,7 @@ class _RailUI:
         self.st, self.out = Style(), sys.stdout
         self.fd = sys.stdin.fileno()
         self.old_attrs = termios.tcgetattr(self.fd)
-        self.rail = f"{self.st.y}│{self.st.r}"
-        self.width = max(40, shutil.get_terminal_size((100, 24)).columns)
+        self.rail = f"  {self.st.y}│{self.st.r}"
         self.painted = [0]   # screen ROWS of the block currently on screen (0 = nothing to erase)
 
     def cols(self):
@@ -1756,16 +1810,98 @@ class _RailUI:
     def lines(self):
         return max(8, shutil.get_terminal_size((100, 24)).lines)
 
-    def head(self, label, hint, marker=None):
-        """The ◆ step line(s): the key hint rides on the label when the terminal is
-        wide enough and drops to a rail line of its own when it is not (a phone),
-        so the picker stays compact where it can and readable where it cannot."""
+    def intro(self, title, note):
+        st = self.st
+        self.out.write(f"\n  {st.b}{st.c}{title}{st.r}\n      {st.y}{note}{st.r}\n\n")
+
+    def head(self, label, hint="", marker=None):
         st = self.st
         mark = marker or f"{st.c}◆{st.r}"
-        one = f"{mark}  {st.b}{label}{st.r}  {st.y}{hint}{st.r}"
-        if not hint or _vis_len(one) <= self.cols():
-            return [one if hint else f"{mark}  {st.b}{label}{st.r}"]
-        return [f"{mark}  {st.b}{label}{st.r}", f"{self.rail}  {st.y}{hint}{st.r}"]
+        lines = [f"  {mark}  {st.b}{_truncate(label, self.cols() - 5)}{st.r}"]
+        if hint:
+            lines.append(f"      {st.y}{hint}{st.r}")
+        return lines
+
+    def chrome(self, label, keys, primary=None, flash=""):
+        """Shared title, spacing, key hints and prominent action for every wizard."""
+        st, width = self.st, self.cols()
+        head = self.head(label) + [self.rail]
+        hints, current = [], ""
+        for part in keys.split(" · "):
+            candidate = f"{current} · {part}" if current else part
+            if len(candidate) > width - 6 and current:
+                hints.append(current)
+                current = part
+            else:
+                current = candidate
+        if current:
+            hints.append(current)
+        footer = [self.rail] + [f"      {st.y}{hint}{st.r}" for hint in hints]
+        if self.lines() < 12:
+            head = head[:1]
+            footer = [f"      {st.y}↑↓/jk · ↵ · q{st.r}"]
+        if primary:
+            key, action, detail = primary
+            text = _truncate(f" {key}  {action} ", width - 6)
+            if self.lines() < 12:
+                footer = [f"      {st.g}{st.b}{st.rev}{text}{st.r}"]
+            else:
+                footer += [f"      {st.g}{st.b}{st.rev}{text}{st.r}" +
+                           (f"  {st.g}{detail}{st.r}" if detail and len(text) + len(detail) + 8 <= width else "")]
+        if flash:
+            footer.append(f"      {st.w}{_truncate(flash, width - 6)}{st.r}")
+        return head, footer
+
+    def section(self, label):
+        st = self.st
+        title, separator, detail = label.partition(" · ")
+        text = title.upper() + separator + detail
+        return f"{self.rail}   {st.b}{st.c}{_truncate(text, self.cols() - 6)}{st.r}"
+
+    def row(self, label, value=None, *, selected=False, mark=None, label_width=0, accent=""):
+        """Style only after clipping plain text: ANSI codes never count as columns."""
+        st, width = self.st, self.cols()
+        pre = f"{st.c}▸{st.r}" if selected else " "
+        box = f"{st.g if mark == '✓' else st.c}{mark}{st.r} " if mark else ""
+        avail = max(4, width - 8 - (2 if mark else 0))
+        color = getattr(st, accent, "")
+        value = str(value) if value is not None else None
+        stacked = value is not None and width < 60
+        if value is not None and not stacked:
+            left_width = min(24, label_width or len(label))
+            left = _truncate(label, left_width).ljust(left_width)
+            right = _truncate(value, max(1, avail - left_width - 3))
+            plain = f"{left}   {right}"
+            body = f"{color}{left}{st.r}   {st.c}{right}{st.r}"
+        else:
+            plain = _truncate(label, avail)
+            body = f"{color}{plain}{st.r}"
+        if selected:
+            body = f"{st.b}{st.rev}{plain.ljust(avail)}{st.r}"
+        lines = [f"{self.rail}  {pre} {box}{body}"]
+        if stacked:
+            detail = _truncate(value, width - 10)
+            style = st.b + st.rev if selected else st.c
+            lines.append(f"{self.rail}      {style}{detail}{st.r}")
+        return lines
+
+    def frame(self, label, display, current, keys, primary=None, flash=""):
+        """Window a [(styled line, item key)] body; headings have no item key.
+        Used by simple pickers and editable setup/install lists alike."""
+        st = self.st
+        head, footer = self.chrome(label, keys, primary, flash)
+        height = max(2, self.lines() - sum(_term_rows(x, self.cols()) for x in head + footer) - 3)
+        focused = [i for i, (_, key) in enumerate(display) if key == current and key is not None] or [0]
+        lo = max(0, min(focused[0] - height // 2, len(display) - height))
+        lo = max(lo, focused[-1] - height + 1)
+        hi = min(len(display), lo + height)
+        lines = list(head)
+        if lo:
+            lines.append(f"{self.rail}   {st.y}↑ more above{st.r}")
+        lines += [line for line, _ in display[lo:hi]]
+        if hi < len(display):
+            lines.append(f"{self.rail}   {st.y}↓ more below{st.r}")
+        self.repaint(lines + footer)
 
     def raw(self):
         import tty
@@ -1781,7 +1917,10 @@ class _RailUI:
 
     def read_key(self):
         import select
-        ch = os.read(self.fd, 1).decode(errors="replace")
+        try:
+            ch = os.read(self.fd, 1).decode(errors="replace")
+        except KeyboardInterrupt:
+            return "abort"
         if ch == "\x1b":
             r, _, _ = select.select([self.fd], [], [], 0.05)
             if r:
@@ -1800,6 +1939,7 @@ class _RailUI:
         # the cursor math for every input(), and escape codes break it.
         import termios
         import tty
+        prompt = "      " + prompt.removeprefix("│").lstrip()
         termios.tcsetattr(self.fd, termios.TCSADRAIN, self.old_attrs)
         self.out.write("\x1b[?25h")
         self.out.flush()
@@ -1813,7 +1953,7 @@ class _RailUI:
                 prompt = f"{prompt}[{prefill}] "
         try:
             s = input(prompt).strip()
-        except EOFError:
+        except (EOFError, KeyboardInterrupt):
             s = ""
         finally:
             if hooked:
@@ -1849,78 +1989,30 @@ class _RailUI:
         self.commit([f"  {color}◇  {label}{st.r}", f"      {value}", ""])
 
     def pick(self, label, rows, multi=False, default=0, marked=None,
-             values=None, sections=None, accents=None):
-        """A list under a ◆ step, redrawn in place: ↑↓/jk move, space marks (multi),
-        enter picks, q/esc/ctrl-c cancels → None. rows: [(value, text)]. `default` is
-        the initial cursor row, `marked` the pre-marked rows (multi) — the two things
-        that let a wizard step open on its suggestion. Optional values form an
-        aligned second column (stacked on narrow screens); sections are headings
-        before keyed rows and do not participate in keyboard navigation."""
-        st, rail = self.st, f"  {self.rail}"
+             values=None, sections=None, accents=None, primary=None, shortcuts=None):
+        """Single/multiple selection on the shared row/frame template.
+        Sections are not selectable; optional shortcuts return an action key."""
         values, sections, accents = values or {}, sections or {}, accents or {}
         cur = max(0, min(default or 0, len(rows) - 1))
         marks = set(marked or ())
-        # j/k are advertised on purpose: a phone keyboard has no arrow keys
-        keys = "↑↓/jk move" + (" · space mark" if multi else "")
+        keys = "↑↓/jk move" + (" · space mark" if multi else "") + " · enter select · q back"
         flash = ""
         while True:
-            width = self.cols()
-            head = [f"  {st.c}◆{st.r}  {st.b}{_truncate(label, width - 5)}{st.r}", rail]
-            hints = [keys, "enter select · q back"]
-            if len(" · ".join(hints)) + 6 <= width:
-                hints = [" · ".join(hints)]
-            footer = [rail] + [f"      {st.y}{hint}{st.r}" for hint in hints]
-            if self.lines() < 12:
-                head = head[:1]
-                footer = [f"      {st.y}↑↓/jk · ↵ · q{st.r}"]
-            if flash:
-                footer += [f"      {st.w}{_truncate(flash, width - 6)}{st.r}"]
-            flash = ""
-            disp = []
-            label_width = min(24, max((len(text) for key, text in rows if key in values), default=0))
+            display = []
+            label_width = max((len(text) for key, text in rows if key in values), default=0)
             for n, (key, text) in enumerate(rows):
                 if key in sections:
-                    if disp:
-                        disp.append((rail, None))
-                    title = _truncate(sections[key].upper(), width - 6)
-                    disp.append((f"{rail}   {st.b}{st.c}{title}{st.r}", None))
-                pre = f"{st.c}▸{st.r}" if n == cur else " "
-                box = (f"{st.c}◼{st.r} " if n in marks else "◻ ") if multi else ""
-                avail = max(4, width - 8 - (2 if multi else 0))
-                color = getattr(st, accents.get(key, ""), "")
-                value = str(values[key]) if key in values else None
-                stacked = value is not None and width < 60
-                if value is not None and not stacked:
-                    left = _truncate(text, label_width).ljust(label_width)
-                    right = _truncate(value, max(1, avail - label_width - 3))
-                    plain = f"{left}   {right}"
-                    body = f"{color}{left}{st.r}   {st.c}{right}{st.r}"
-                else:
-                    plain = _truncate(text, avail)
-                    body = f"{color}{plain}{st.r}"
-                if n == cur:
-                    body = f"{st.b}{st.rev}{plain.ljust(avail)}{st.r}"
-                disp.append((f"{rail}  {pre} {box}{body}", n))
-                if stacked:
-                    detail = _truncate(value, width - 10)
-                    style = st.b + st.rev if n == cur else st.c
-                    disp.append((f"{rail}      {style}{detail}{st.r}", n))
-            # Window physical display lines, including headings and stacked values.
-            # Reserve two rows for scroll markers; keep the entire selection visible.
-            height = max(3, self.lines() - sum(_term_rows(x, width) for x in head + footer) - 3)
-            focused = [i for i, (_, n) in enumerate(disp) if n == cur]
-            lo = max(0, min(focused[0] - height // 2, len(disp) - height))
-            lo = max(lo, focused[-1] - height + 1)
-            hi = min(len(disp), lo + height)
-            lines = list(head)
-            if lo:
-                lines.append(f"{rail}   {st.y}↑ more above{st.r}")
-            lines += [line for line, _ in disp[lo:hi]]
-            if hi < len(disp):
-                lines.append(f"{rail}   {st.y}↓ more below{st.r}")
-            lines += footer
-            self.repaint(lines)
+                    if display:
+                        display.append((self.rail, None))
+                    display.append((self.section(sections[key]), None))
+                mark = ("◼" if n in marks else "◻") if multi else None
+                display += [(line, n) for line in self.row(text, values.get(key), selected=n == cur,
+                            mark=mark, label_width=label_width, accent=accents.get(key, ""))]
+            self.frame(label, display, cur, keys, primary, flash)
+            flash = ""
             k = self.read_key()
+            if k in (shortcuts or {}):
+                return shortcuts[k]
             if k in ("up", "k"):
                 cur = (cur - 1) % len(rows)
             elif k in ("down", "j"):
@@ -1933,10 +2025,9 @@ class _RailUI:
             elif k in ("q", "esc", "abort"):
                 return None
             else:
-                # a key that does nothing must SAY so — a silent no-op reads as broken
                 flash = "No binding for that key"
 
-    def page(self, label, body, accept, keys=""):
+    def page(self, label, body, accept, keys="", primary=None):
         """A read-only block under a ◆ step (the review screens), windowed to the
         terminal and scrolled in place with ↑↓/jk (space = a screenful) when taller
         than it; a key in `accept` returns it. Rows are counted through _term_rows,
@@ -1950,14 +2041,14 @@ class _RailUI:
             heights = [_term_rows(ln, cols) for ln in body]
 
             def window(hint):
-                head = self.head(label, hint)
-                avail = max(3, lines - 2 - sum(_term_rows(h, cols) for h in head))
-                return head, _page_window(heights, top, avail)
+                head, footer = self.chrome(label, hint, primary)
+                avail = max(2, lines - 1 - sum(_term_rows(h, cols) for h in head + footer))
+                return head, footer, _page_window(heights, top, avail)
 
-            head, (lo, hi) = window(flash or keys)
+            head, footer, (lo, hi) = window(flash or keys)
             scrolls = (lo, hi) != (0, len(body))
             if scrolls and not flash:
-                head, (lo, hi) = window(scroll_hint)
+                head, footer, (lo, hi) = window(scroll_hint)
             flash, top = "", lo
             out = list(head)
             if lo:
@@ -1965,7 +2056,7 @@ class _RailUI:
             out.extend(body[lo:hi])
             if hi < len(body):
                 out.append(f"{rail}   {st.y}… {len(body) - hi} below{st.r}")
-            self.repaint(out)
+            self.repaint(out + footer)
             k = self.read_key()
             if k in accept:
                 return k
@@ -1991,8 +2082,8 @@ def _setup_wizard(items, taken, trailer=None):
     on apply (items mutated in place), False on abort; raises when raw mode is
     unavailable → _setup_prompt_flow."""
     ui = _RailUI()
-    st, out, rail, width = ui.st, ui.out, ui.rail, ui.width
-    read_key, cooked_input, repaint = ui.read_key, ui.cooked_input, ui.repaint
+    st, out, rail = ui.st, ui.out, ui.rail
+    read_key, cooked_input = ui.read_key, ui.cooked_input
 
     def used_aliases(skip=None):
         return taken | {it["alias"] for it in items
@@ -2000,23 +2091,12 @@ def _setup_wizard(items, taken, trailer=None):
 
     def row_text(it, aw, cur):
         if it.get("kind") == "addhost":
-            pre = f"{st.c}▸{st.r}" if cur else " "
-            text = it["alias"].lstrip("+ ") + "…"
-            body = f"{st.b}{text}{st.r}" if cur else text
-            tail = f"  {st.c}· space to add{st.r}" if cur else ""
-            return f"{rail}  {pre}{st.c}+{st.r} {body}{tail}"
-        # host/tbeam values are ssh targets (never home paths); everything else
-        # is a filesystem path worth ~-abbreviating (locked rows have no kind)
+            return ui.row(it["alias"].lstrip("+ ") + "…", selected=cur, accent="g", mark="+")
         val = it["value"] if it.get("kind") in ("host", "tbeam") else _tilde(str(it["value"]))
-        val = _truncate(str(val), max(8, width - aw - 12))
-        if it["t"] == "locked":
-            return f"{rail}   {st.g}✓{st.r} {st.y}{it['alias']:<{aw}}  {val} · registered{st.r}"
-        mark = f"{st.c}◼{st.r}" if it["checked"] else "◻"
-        pre = f"{st.c}▸{st.r}" if cur else " "
-        alias = (f"{st.b}{it['alias']:<{aw}}{st.r}" if cur else f"{it['alias']:<{aw}}")
-        # the cursor row advertises the rename key right where the eye is
-        tail = f"  {st.c}· e rename{st.r}" if cur and it.get("kind") in ("repo", "host") else ""
-        return f"{rail}  {pre}{mark} {alias}  {st.y}{val}{st.r}{tail}"
+        locked = it["t"] == "locked"
+        return ui.row(it["alias"], val, selected=cur,
+                      mark="✓" if locked else "◼" if it["checked"] else "◻",
+                      label_width=aw, accent="y" if locked else "")
 
     HINTS = "space select · e rename · enter review · q quit"
 
@@ -2030,31 +2110,18 @@ def _setup_wizard(items, taken, trailer=None):
             aw = max([len(items[i]["alias"]) for i in sel
                       if items[i].get("kind") != "addhost"] +
                      [len(x["alias"]) for x in items if x["t"] == "locked"] + [1])
-            head = ui.head("pick what to add", msg or HINTS)
-            nh = len(head)   # 1, or 2 when the hint dropped to its own rail line
-            disp = [(h, None) for h in head]
+            disp = []
             for idx, it in enumerate(items):
                 if it["t"] == "spacer":
                     disp.append((rail, None))
                 elif it["t"] == "header":
-                    disp.append((f"{rail}  {st.b}{it['label']}{st.r}", None))
+                    disp.append((ui.section(it["label"]), None))
                 elif it["t"] == "note":
-                    disp.append((f"{rail}   {st.y}{it['label']}{st.r}", None))
+                    disp.append((f"      {st.y}{_truncate(it['label'], ui.cols() - 6)}{st.r}", None))
                 else:
-                    disp.append((row_text(it, aw, idx == cur), idx))
-            # window the list when taller than the terminal, cursor kept visible
-            body = max(6, ui.lines() - 2 - nh)
-            if len(disp) > body:
-                cur_line = next((n for n, d in enumerate(disp) if d[1] == cur), nh)
-                lo = max(nh, min(cur_line - body // 2, len(disp) - (body - nh)))
-                lines = [d[0] for d in disp[:nh]] + [d[0] for d in disp[lo:lo + body - nh]]
-                if lo > nh:
-                    lines[nh] = f"{rail}  {st.y}… {lo - nh} more above{st.r}"
-                if lo + body - nh < len(disp):
-                    lines[-1] = f"{rail}  {st.y}… {len(disp) - (lo + body - nh)} more below{st.r}"
-            else:
-                lines = [d[0] for d in disp]
-            repaint(lines)
+                    disp += [(line, idx) for line in row_text(it, aw, idx == cur)]
+            ui.frame("Pick what to add", disp, cur, "↑↓/jk move · space select · e rename · a add host · q back",
+                     primary=("enter", "REVIEW CHANGES", ""), flash=msg)
             msg = ""
             k = read_key()
             it = items[cur] if sel else None
@@ -2113,16 +2180,16 @@ def _setup_wizard(items, taken, trailer=None):
         if trailer and repos:
             lines.append(f"{rail}  {st.c}→{st.r} {st.y}{trailer}{st.r}")
         k = ui.page("review — changes to ~/.zshrc.local", lines,
-                    accept=("y", "n", "esc", "q", "abort"), keys="y apply · n back · q quit")
+                    accept=("y", "n", "esc", "q", "abort"), keys="n back · q quit",
+                    primary=("y", "APPLY CHANGES", ""))
         if k == "y":
-            ui.commit([f"{st.g}◇{st.r}  {st.b}applied to ~/.zshrc.local{st.r}"] + lines)
+            ui.commit(ui.head("Applied to ~/.zshrc.local", marker=f"{st.g}◇{st.r}") + lines)
             return True
         if k in ("n", "esc"):
             return False
         return None
 
-    out.write(f"{st.y}┌{st.r}  {st.b}t setup{st.r} {st.y}· ~/.zshrc.local — nothing "
-              f"is written until you confirm{st.r}\n{rail}\n")
+    ui.intro("t setup", "Register repos and hosts · nothing is written until you confirm.")
     ui.raw()
     ok, msg = False, ""
     try:
@@ -2828,8 +2895,7 @@ def _new_wizard(cfg, answers, ctx):
     Raises when raw mode is unavailable → _new_prompt_flow."""
     ui = _RailUI()
     st, rail = ui.st, ui.rail
-    ui.out.write(f"{st.y}┌{st.r}  {st.b}t new{st.r} {st.y}· create a repo — nothing is created "
-                 f"until you confirm{st.r}\n{rail}\n")
+    ui.intro("t new", "Create a repository · nothing is created until you confirm.")
     ui.raw()
     result = None
     try:
@@ -2900,8 +2966,8 @@ def _new_wizard(cfg, answers, ctx):
                 hosts = []
                 ui.done("hosts", f"{st.y}none configured (REMOTE_HOSTS){st.r}")
             else:
-                rows = [(h, f"{h}  {st.y}{t}{st.r}") for h, t in sorted(cfg.hosts.items())]
-                picked = ui.pick("hosts", rows, multi=True, marked=range(len(rows)))
+                rows = [(h, h) for h in sorted(cfg.hosts)]
+                picked = ui.pick("Hosts", rows, values=cfg.hosts, multi=True, marked=range(len(rows)))
                 if picked is None:
                     return None
                 hosts = [(h, cfg.hosts[h]) for h in picked]
@@ -2919,9 +2985,9 @@ def _new_wizard(cfg, answers, ctx):
             # windowed + scrollable: on a phone the argv lines wrap and the whole
             # plan is taller than the screen — the y/n/q hint must stay reachable
             k = ui.page("review — what will run", body, accept=("y", "n", "esc", "q", "abort"),
-                        keys="y apply · n back · q quit")
+                        keys="n back · q quit", primary=("y", "CREATE REPOSITORY", ""))
             if k == "y":
-                ui.commit([f"{st.g}◇{st.r}  {st.b}review{st.r}"] + body)
+                ui.commit(ui.head("Review", marker=f"{st.g}◇{st.r}") + body)
                 result = (steps, answers)
                 return result
             if k in ("n", "esc"):
@@ -3657,17 +3723,14 @@ def _install_wizard(items, plan):
     through `plan()`. Returns True on apply (items mutated in place), False on abort;
     raises off a tty → _install_prompt_flow."""
     ui = _RailUI()
-    st, out, rail, width = ui.st, ui.out, ui.rail, ui.width
+    st, out, rail = ui.st, ui.out, ui.rail
     HINTS = "space select · enter review · q quit"
 
     def row_text(it, aw, cur):
-        val = _truncate(str(it["value"]), max(8, width - aw - 12))
-        if it["t"] == "locked":
-            return f"{rail}   {st.g}✓{st.r} {st.y}{it['alias']:<{aw}}  {val}{st.r}"
-        mark = f"{st.c}◼{st.r}" if it["checked"] else "◻"
-        pre = f"{st.c}▸{st.r}" if cur else " "
-        alias = f"{st.b}{it['alias']:<{aw}}{st.r}" if cur else f"{it['alias']:<{aw}}"
-        return f"{rail}  {pre}{mark} {alias}  {st.y}{val}{st.r}"
+        locked = it["t"] == "locked"
+        return ui.row(it["alias"], it["value"], selected=cur,
+                      mark="✓" if locked else "◼" if it["checked"] else "◻",
+                      label_width=aw, accent="y" if locked else "")
 
     def select_screen(msg=""):
         pos = 0
@@ -3676,28 +3739,16 @@ def _install_wizard(items, plan):
             pos = max(0, min(pos, len(sel) - 1))
             cur = sel[pos] if sel else -1
             aw = max([len(x["alias"]) for x in items if x["t"] in ("toggle", "locked")] + [1])
-            head = ui.head("pick what to install", msg or HINTS)
-            nh = len(head)
-            disp = [(h, None) for h in head]
+            disp = []
             for idx, it in enumerate(items):
                 if it["t"] == "spacer":
                     disp.append((rail, None))
                 elif it["t"] == "header":
-                    disp.append((f"{rail}  {st.b}{it['label']}{st.r}", None))
+                    disp.append((ui.section(it["label"]), None))
                 else:
-                    disp.append((row_text(it, aw, idx == cur), idx))
-            body = max(6, ui.lines() - 2 - nh)
-            if len(disp) > body:
-                cur_line = next((n for n, d in enumerate(disp) if d[1] == cur), nh)
-                lo = max(nh, min(cur_line - body // 2, len(disp) - (body - nh)))
-                lines = [d[0] for d in disp[:nh]] + [d[0] for d in disp[lo:lo + body - nh]]
-                if lo > nh:
-                    lines[nh] = f"{rail}  {st.y}… {lo - nh} more above{st.r}"
-                if lo + body - nh < len(disp):
-                    lines[-1] = f"{rail}  {st.y}… {len(disp) - (lo + body - nh)} more below{st.r}"
-            else:
-                lines = [d[0] for d in disp]
-            ui.repaint(lines)
+                    disp += [(line, idx) for line in row_text(it, aw, idx == cur)]
+            ui.frame("Pick what to install", disp, cur, "↑↓/jk move · space select · q back",
+                     primary=("enter", "REVIEW CHANGES", ""), flash=msg)
             msg = ""
             k = ui.read_key()
             it = items[cur] if sel else None
@@ -3720,14 +3771,14 @@ def _install_wizard(items, plan):
             return "empty"
         body = [f"{rail}  {ln}" for ln in lines]
         k = ui.page("review — what will run", body,
-                    accept=("y", "n", "esc", "q", "abort"), keys="y apply · n back · q quit")
+                    accept=("y", "n", "esc", "q", "abort"), keys="n back · q quit",
+                    primary=("y", "APPLY CHANGES", ""))
         if k == "y":
-            ui.commit([f"{st.g}◇{st.r}  {st.b}running{st.r}"] + body)
+            ui.commit(ui.head("Running", marker=f"{st.g}◇{st.r}") + body)
             return True
         return False if k in ("n", "esc") else None
 
-    out.write(f"{st.y}┌{st.r}  {st.b}t install{st.r} {st.y}· agent CLIs — nothing runs until "
-              f"you confirm{st.r}\n{rail}\n")
+    ui.intro("t install", "Agent CLIs · nothing runs until you confirm.")
     ui.raw()
     ok, msg = False, ""
     try:
@@ -7268,14 +7319,14 @@ Run `t <verb> -h` for a verb's own flags.""")
     sp.add_argument("host", help="$REMOTE_HOSTS key, or a literal ssh target")
     sp.add_argument("rest", nargs=argparse.REMAINDER, help="command to run (omit for an interactive shell)")
 
-    sp = sub.add_parser("config", help="manage local settings: tools, models, effort, repos and hosts",
-        description="Arrow-key settings hub for this machine: default tool, models and effort; "
+    sp = sub.add_parser("config", help="manage local settings: tools, models, effort, Fast mode, repos and hosts",
+        description="Arrow-key settings hub for this machine: default tool, plus model, effort and Fast mode submenus; "
             "query each CLI for current models and their supported effort levels; "
             "add, edit or remove hosts; register or unregister repos and set their tool, branch "
             "and worktree overrides; choose the default beam host and worktree defaults. "
             "Save changes reviews then writes a managed block in ~/.zshrc.local. Removed "
             "hosts stop participating in dots --all; unregistering repos keeps their files "
-            "and sessions. Tool/model/effort defaults apply to fresh tmux and --fg sessions only. "
+            "and sessions. Tool/model/effort/Fast mode defaults apply to fresh tmux and --fg sessions only. "
             "Open local config in editor covers all custom shell settings (VISUAL/EDITOR, else vi).")
     cg = sp.add_mutually_exclusive_group()
     cg.add_argument("--show", action="store_true", help="print current settings without opening the menu")

@@ -1,5 +1,9 @@
 export PATH="$HOME/bin:$HOME/.local/bin:$PATH"
 
+# Shared picker design (same palette as the inline t wizards).
+_t_fzf() { command fzf "$@"; }
+[[ -r "${${(%):-%x}:A:h}/ui/fzf.sh" ]] && source "${${(%):-%x}:A:h}/ui/fzf.sh"
+
 # Hardened hosts can ship a root-only /tmp (the openclaw gateway does: drwx------
 # root). That breaks every non-root temp-file user — zsh heredocs (TMPPREFIX),
 # mktemp, and tmux's socket dir — so fall back to a per-user tmp. TMUX_TMPDIR
@@ -918,7 +922,7 @@ add-zsh-hook precmd _dots_reload_if_moved
 # are machine-specific, so they live in ~/.zshrc.local (not committed); this file
 # just declares the array and sources that override. See .zshrc.local.example.
 #   DEV_REPOS[api]="$HOME/code/my-api"
-typeset -gA DEV_REPOS DEV_BRANCHES REMOTE_HOSTS DEV_WORKTREE DEV_AGENT DEV_MODEL DEV_EFFORT
+typeset -gA DEV_REPOS DEV_BRANCHES REMOTE_HOSTS DEV_WORKTREE DEV_AGENT DEV_MODEL DEV_EFFORT DEV_FAST
 [[ -f "$HOME/.zshrc.local" ]] && source "$HOME/.zshrc.local"
 
 # DEV_BRANCH — the global default branch `dev`/`_dev_new_session` check out (and
@@ -1039,6 +1043,12 @@ _dev_agent_new_cmd() {
       claude) launch_args+=(--effort "$effort") ;;
     esac
   fi
+  case "$agent:${DEV_FAST[$agent]:-}" in
+    codex:1) launch_args+=(-c service_tier=fast --enable fast_mode) ;;
+    codex:0) launch_args+=(-c service_tier=default) ;;
+    claude:1) launch_args+=(--settings '{"fastMode":true}') ;;
+    claude:0) launch_args+=(--settings '{"fastMode":false}') ;;
+  esac
   print -r -- "${(j: :)${(@q)launch_args}}"
 }
 # _dev_agent_resume_cmd <agent> <sid> — the pane command that resumes conversation <sid>.
@@ -1768,6 +1778,7 @@ _t_sync_config() {
     for k in ${(k)DEV_AGENT};     do print -r -- "DEV_AGENT[$k]=${(q)DEV_AGENT[$k]}"; done
     for k in ${(k)DEV_MODEL};     do print -r -- "DEV_MODEL[$k]=${(q)DEV_MODEL[$k]}"; done
     for k in ${(k)DEV_EFFORT};    do print -r -- "DEV_EFFORT[$k]=${(q)DEV_EFFORT[$k]}"; done
+    for k in ${(k)DEV_FAST};      do print -r -- "DEV_FAST[$k]=${(q)DEV_FAST[$k]}"; done
     print -r -- "DEV_AGENT_DEFAULT=${(q)DEV_AGENT_DEFAULT}"
     print -r -- "TBEAM_HOST=${(q)TBEAM_HOST}"
     print -r -- "MINI_HOST=${(q)MINI_HOST}"
@@ -2079,7 +2090,7 @@ _t_paste() {
   # the fast path. No TTY/fzf (or -n) falls back to the newest file by mtime.
   if (( ! newest )) && [[ -t 0 && -t 1 ]] && command -v fzf >/dev/null 2>&1; then
     # ls -t sorts newest-first; show just the basename but return the full path
-    src=$(ls -t "${files[@]}" | fzf --prompt='tpaste> ' --height=40% --reverse \
+    src=$(ls -t "${files[@]}" | _t_fzf --prompt='tpaste> ' --height=40% --reverse \
           --delimiter=/ --with-nth=-1) || { echo "Cancelled."; return 1; }
   else
     src=$(ls -t "${files[@]}" | head -1)
@@ -2811,7 +2822,7 @@ _dev_adopt_fg() {
     [[ -t 0 && -t 1 ]] || { echo "t open: several foreground sessions — name one (\`t open <id>\`) or pick from a terminal:" >&2; print -r -- "$resumable" | awk -F'\t' '{printf "  %s  %s\n",$3,$6}' >&2; return 1; }
     local pick
     pick=$(print -r -- "$resumable" | awk -F'\t' '{printf "%s\t%s\t%s\n", $1, $3, $6}' \
-             | fzf --with-nth=2.. --delimiter='\t' --prompt="t open > ") || return 1
+             | _t_fzf --with-nth=2.. --delimiter='\t' --prompt="t open > ") || return 1
     sid=${pick%%$'\t'*}
     cwd=$(print -r -- "$resumable" | awk -F'\t' -v s="$sid" '$1==s{print $2; exit}')
     agent=$(print -r -- "$resumable" | awk -F'\t' -v s="$sid" '$1==s{print $7; exit}')
@@ -2866,7 +2877,7 @@ _dev_attach_fg() {
   if (( ${#att} == 1 )); then
     sel=${att[1]}
   elif [[ -t 0 && -t 1 ]] && command -v fzf >/dev/null 2>&1; then
-    sel=$(print -rl -- "${att[@]}" | fzf --with-nth=5 --delimiter=$'\t' --prompt="t open > ") || return 0
+    sel=$(print -rl -- "${att[@]}" | _t_fzf --with-nth=5 --delimiter=$'\t' --prompt="t open > ") || return 0
   else
     echo "t open: several tmux'd sessions match '$handle' — name one:" >&2
     print -rl -- "${att[@]}" | awk -F'\t' '{printf "  t open %s   (tmux %s)\n", $5, $1}' >&2
@@ -3912,6 +3923,12 @@ _t_dev() {
         claude) model_args+=(--effort "${DEV_EFFORT[$agent]}") ;;
       esac
     fi
+    case "$agent:${DEV_FAST[$agent]:-}" in
+      codex:1) model_args+=(-c service_tier=fast --enable fast_mode) ;;
+      codex:0) model_args+=(-c service_tier=default) ;;
+      claude:1) model_args+=(--settings '{"fastMode":true}') ;;
+      claude:0) model_args+=(--settings '{"fastMode":false}') ;;
+    esac
     "$agent" "${model_args[@]}"   # retain the claude()/codex() wrappers (tpush sentinel)
     return
   fi
@@ -4058,7 +4075,7 @@ _dev_remote_resolve() {
   elif [[ -t 1 ]] && command -v fzf >/dev/null 2>&1; then
     local picked
     picked=$(print -r -- "$match" | awk -F'\t' '{printf "%s\t%s\t%s/%-12s %s\n", $1, $4, $1, $4, $7}' \
-          | fzf --delimiter=$'\t' --with-nth=3 --no-hscroll \
+          | _t_fzf --delimiter=$'\t' --with-nth=3 --no-hscroll \
                 --prompt="dev -r ${repo:-pick} > " --height=40% --reverse) || return 1
     [[ -n $picked ]] || return 1
     host=${picked%%$'\t'*}
@@ -4322,7 +4339,7 @@ _dev_remote_fg_open() {
   if (( n == 1 )); then
     sel=$rows
   elif [[ -t 0 && -t 1 ]] && command -v fzf >/dev/null 2>&1; then
-    sel=$(print -r -- "$rows" | fzf --with-nth=2,1,3 --delimiter=$'\t' --prompt="t open > ") || return 0
+    sel=$(print -r -- "$rows" | _t_fzf --with-nth=2,1,3 --delimiter=$'\t' --prompt="t open > ") || return 0
   else
     echo "t open: '$handle' matches foreground sessions on several hosts — name one:" >&2
     print -r -- "$rows" | awk -F'\t' '{printf "  t open %s   (on %s — %s)\n", $2, $1, $3}' >&2
@@ -5438,7 +5455,7 @@ _t_resume() {
     # down the list). The cost: a literal space no longer types into the filter
     # query — acceptable because fzf's fuzzy match crosses word gaps ("fixbug"
     # still matches "fix bug").
-    pick=$(print -rl -- "${(@)cands}" | fzf --multi --marker='✓' --bind 'space:toggle+down' \
+    pick=$(print -rl -- "${(@)cands}" | _t_fzf --multi --marker='✓' --bind 'space:toggle+down' \
       --delimiter=$'\t' --with-nth=-1 --no-hscroll \
       --header="${legend}   ·   space marks ✓ — every mark revives, first attaches" --prompt="$fprompt") || return 1
     [[ -n $pick ]] || return 1
@@ -5682,7 +5699,7 @@ _claude_sessions_semantic() {
   local query="$1"
   echo "↻ Asking Sonnet which session matches \"$query\"…  (-k to skip)" >&2
 
-  python3 - "$projects" "$query" <<'PY' | fzf --delimiter=$'\t' --with-nth=3 --no-hscroll \
+  python3 - "$projects" "$query" <<'PY' | _t_fzf --delimiter=$'\t' --with-nth=3 --no-hscroll \
         --prompt="resume claude (sonnet: $query) > " --height=60% --reverse
 import json, os, sys, glob, datetime, subprocess, re, time
 root, query = sys.argv[1], sys.argv[2]
@@ -6027,7 +6044,7 @@ _claude_sessions_fzf() {
   local fzf_prompt='resume claude (all) > '   # not `prompt`: that local IS the shell's PS1
   [[ -n $filter ]] && fzf_prompt="resume claude (${filter:t}) > "
   [[ -n $query  ]] && fzf_prompt="resume claude (search: $query) > "
-  _claude_session_rows "$filter" "$query" | fzf --delimiter=$'\t' --with-nth=3 --no-hscroll \
+  _claude_session_rows "$filter" "$query" | _t_fzf --delimiter=$'\t' --with-nth=3 --no-hscroll \
         --prompt="$fzf_prompt" --height=60% --reverse
 }
 
@@ -6917,7 +6934,7 @@ _t_install() {
       local key
       for key in ${(k)DEV_REPOS}; do unalias "$key" 2>/dev/null; done
       for key in ${(k)REMOTE_HOSTS}; do unfunction "$key" 2>/dev/null; done
-      DEV_REPOS=() DEV_BRANCHES=() REMOTE_HOSTS=() DEV_WORKTREE=() DEV_AGENT=() DEV_MODEL=() DEV_EFFORT=()
+      DEV_REPOS=() DEV_BRANCHES=() REMOTE_HOSTS=() DEV_WORKTREE=() DEV_AGENT=() DEV_MODEL=() DEV_EFFORT=() DEV_FAST=()
       unset DEV_AGENT_DEFAULT DEV_BRANCH DEV_WORKTREE_ROOT DEV_WORKTREE_DEFAULT TBEAM_HOST MINI_HOST
     fi
     source ~/.zshrc
@@ -6972,7 +6989,7 @@ _t_cd() {
       rows+=("${wt}"$'\t'"${wt#$DEV_WORKTREE_ROOT/}"$'\t'"${br:-?}")
     done
     line=$(print -rl -- "${rows[@]}" \
-             | fzf --with-nth=2.. --delimiter='\t' --prompt='t cd > ' --height=40% --reverse) || return 1
+             | _t_fzf --with-nth=2.. --delimiter='\t' --prompt='t cd > ' --height=40% --reverse) || return 1
     cd "${line%%$'\t'*}"; return
   fi
   local -a short; short=("${wts[@]#$DEV_WORKTREE_ROOT/}")

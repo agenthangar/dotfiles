@@ -2975,6 +2975,290 @@ def cmd_pending(cfg, args):
     return 2
 
 
+# ─── phone — reconnect one client; keep every agent in its existing tmux slot ──
+
+def _phone_profile(value):
+    if not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", value):
+        raise argparse.ArgumentTypeError("client name must be 1–64 letters, digits, _ or -")
+    return value
+
+
+def _phone_root():
+    return os.path.join(os.environ.get("XDG_STATE_HOME", os.path.join(HOME, ".local", "state")),
+                        "t", "phone")
+
+
+def _phone_load(path):
+    try:
+        with open(path, encoding="utf-8") as fh:
+            data = json.loads(fh.read(65536))
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError, UnicodeError):
+        return {}
+
+
+def _phone_write(path, data):
+    """A connection or selection is one atomic record, never half of a JSON file."""
+    import tempfile
+    parent = os.path.dirname(path)
+    os.makedirs(parent, mode=0o700, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix=".phone-", dir=parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump(data, fh, ensure_ascii=True)
+            fh.write("\n")
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, path)
+    finally:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+
+
+def _phone_remembered(rows, saved):
+    """Follow the conversation, never a reused slot. Before SessionStart stamps an
+    ID we may reattach only the very same session on the very same tmux server."""
+    if saved.get("sid"):
+        matches = [r for r in rows if r.get("sid") == saved["sid"]
+                   and r.get("agent") == saved.get("agent")]
+    else:
+        keys = ("socket", "server", "created", "id")
+        matches = [r for r in rows if all(saved.get(k) and saved[k] == r.get(k) for k in keys)]
+    return matches[0] if len(matches) == 1 else None
+
+
+def _phone_connection(record, client):
+    """A profile belongs to a tmux CLIENT, never the session several clients share.
+    PID + tty + server must all still match before a popup can update its profile."""
+    keys = ("pid", "name", "socket", "server")
+    if not all(record.get(k) and record[k] == client.get(k) for k in keys):
+        return None
+    profile = record.get("profile")
+    return profile if isinstance(profile, str) and re.fullmatch(r"[A-Za-z0-9_-]{1,64}", profile) else None
+
+
+def _phone_text(value, width):
+    """Terminal-safe single line, bounded in screen columns (including wide text)."""
+    import unicodedata
+    text = _ANSI_RE.sub("", str(value))
+    text = " ".join(text.split())
+    text = "".join(c for c in text if c.isprintable())
+    chars, used = [], 0
+    for c in text:
+        size = 0 if unicodedata.combining(c) else (2 if unicodedata.east_asian_width(c) in "WF" else 1)
+        if used + size > max(0, width):
+            while chars and used > width - 1:
+                old = chars.pop()
+                used -= 0 if unicodedata.combining(old) else (2 if unicodedata.east_asian_width(old) in "WF" else 1)
+            return "".join(chars) + ("…" if width > 0 else "")
+        chars.append(c)
+        used += size
+    return "".join(chars)
+
+
+def _phone_page(rows, cur, columns, lines):
+    """Number only the visible page, so every choice is one phone key (1–9)."""
+    columns, lines = max(1, columns), max(1, lines)
+    if not rows:
+        return [_phone_text(s, columns) for s in
+                ["No running t sessions.", "Start one with t open <repo>.",
+                 "Saved chats: t resume -a -l", "r refresh · q back"][:lines]], []
+    cur = max(0, min(cur, len(rows) - 1))
+    each = 2 if lines >= 7 else 1
+    count = min(9, max(1, (lines - 4) // each))
+    lo = (cur // count) * count
+    visible = rows[lo:lo + count]
+    page, pages = lo // count + 1, (len(rows) + count - 1) // count
+    out = [f"Sessions  {page}/{pages}", "1–9 pick · j/k move · Enter open"]
+    for n, row in enumerate(visible, 1):
+        mark = ">" if lo + n - 1 == cur else " "
+        out.append(f"{mark}{n} {row['slot']} · {row.get('agent', 'claude')}")
+        if each == 2:
+            out.append("   " + (row.get("summary") or "(no title yet)"))
+    out += ["n/p page · r refresh", "q / Esc back · other tasks keep running"]
+    return [_phone_text(s, columns) for s in out[:lines]], visible
+
+
+def _phone_tmux(*args):  # pragma: no cover — exercised against an isolated tmux server
+    return _run(["tmux", "-u", *args], timeout=10)
+
+
+def _phone_snapshot():  # pragma: no cover — tmux format/transport, tested end to end
+    fields = ("id", "name", "created", "server", "socket", "cwd", "stamp", "dead")
+    fmt = "\t".join("#{%s}" % f for f in
+                    ("session_id", "session_name", "session_created", "pid", "socket_path",
+                     "session_path", "CLAUDE_RESUME_ID", "pane_dead"))
+    result = _phone_tmux("list-sessions", "-F", fmt)
+    if result.returncode:
+        # A stopped server is an empty session list, not an invitation to start one.
+        if "no server running" in result.stderr or "No such file" in result.stderr:
+            return []
+        raise RuntimeError(result.stderr.strip() or "could not list tmux sessions")
+    rows = []
+    for line in result.stdout.splitlines():
+        parts = line.split("\t")
+        if (len(parts) == len(fields) and parts[-1] == "0"
+                and re.fullmatch(r"dev-.+-[0-9]+", parts[1])):
+            rows.append(dict(zip(fields, parts)))
+    return rows
+
+
+def _phone_sessions():  # pragma: no cover — shell integration uses existing authoritative resolver
+    before = _phone_snapshot()
+    if not before:
+        return []
+    # This is the same registry-first ID and transcript-title resolution as t ls.
+    # Raw tmux env can hold a predecessor's ID after a pane is reused; never use
+    # that stamp directly to follow a conversation across slots.
+    # SSH clients do not always forward a UTF-8 locale. -u also preserves tabs in
+    # tmux's formatted output; scope the override to this disposable data shell.
+    data = zsh_capture('function tmux() { command tmux -u "$@"; }; _dev_session_rows')
+    meta = {"dev-" + r["slot"]: r for r in _parse_rows(data)}
+    after = {r["id"]: r for r in _phone_snapshot()}
+    rows = []
+    for row in before:
+        # Refuse a row replaced or re-stamped while its metadata was being read.
+        if after.get(row["id"]) != row:
+            continue
+        detail = meta.get(row["name"], {})
+        if detail.get("cwd") != row["cwd"]:
+            continue
+        row.update(slot=detail["slot"], agent=detail["agent"],
+                   sid="" if detail["sid"] == "-" else detail["sid"],
+                   summary=detail["summary"])
+        rows.append(row)
+    return sorted(rows, key=lambda r: (r["slot"].rsplit("-", 1)[0],
+                                      int(r["slot"].rsplit("-", 1)[1])))
+
+
+def _phone_clients():  # pragma: no cover — tmux transport
+    fields = ("name", "pid", "server", "socket", "session")
+    fmt = "\t".join("#{%s}" % f for f in
+                    ("client_name", "client_pid", "pid", "socket_path", "session_id"))
+    result = _phone_tmux("list-clients", "-F", fmt)
+    return [dict(zip(fields, p)) for line in result.stdout.splitlines()
+            if len(p := line.split("\t")) == len(fields)]
+
+
+def _phone_client(name, pid):  # pragma: no cover — tmux transport
+    return next((c for c in _phone_clients() if c["name"] == name and c["pid"] == pid), None)
+
+
+def _phone_picker(rows):  # pragma: no cover — interactive UI covered with real PTYs
+    """Full-screen in both a popup and a fresh SSH terminal. No shell snippets are
+    sent to an agent. Resize is repainted even without a keypress (phone rotation)."""
+    import select
+    ui = _RailUI()
+    cur = 0
+    last_frame = None
+    try:
+        ui.raw()
+        ui.out.write("\x1b[?1049h")
+        while True:
+            cols, height = shutil.get_terminal_size((40, 18))
+            body, visible = _phone_page(rows, cur, max(1, cols - 1), max(1, height - 1))
+            frame = (cols, height, body)
+            if frame != last_frame:
+                ui.out.write("\x1b[H\x1b[2J" + "\r\n".join(body))
+                ui.out.flush()
+                last_frame = frame
+            if not select.select([ui.fd], [], [], 0.25)[0]:
+                continue
+            key = ui.read_key()
+            if key in ("q", "esc", "abort"):
+                return None
+            if key == "r":
+                rows = _phone_sessions()
+                cur = min(cur, max(0, len(rows) - 1))
+            elif visible and key in "123456789" and len(key) == 1:
+                n = int(key) - 1
+                if n < len(visible):
+                    return visible[n]
+            elif rows:
+                if key == "enter":
+                    return rows[cur]
+                if key in ("j", "down"):
+                    cur = (cur + 1) % len(rows)
+                elif key in ("k", "up"):
+                    cur = (cur - 1) % len(rows)
+                elif key in ("n", "space"):
+                    count = min(9, max(1, (max(1, height - 1) - 4) // (2 if height - 1 >= 7 else 1)))
+                    cur = (cur // count + 1) * count
+                    if cur >= len(rows):
+                        cur = 0
+                elif key == "p":
+                    count = min(9, max(1, (max(1, height - 1) - 4) // (2 if height - 1 >= 7 else 1)))
+                    cur = max(0, (cur // count - 1) * count)
+    finally:
+        ui.out.write("\x1b[?1049l")
+        ui.restore()
+
+
+def cmd_phone(cfg, args):
+    """Never launches an agent, kills a session, or falls through to t open."""
+    if not shutil.which("tmux"):
+        print("t phone: tmux is required.", file=sys.stderr)
+        return 1
+    if not sys.stdin.isatty() or not sys.stdout.isatty():
+        print("t phone needs an interactive terminal (SSH must allocate a TTY).", file=sys.stderr)
+        return 1
+    root = _phone_root()
+    target = None
+    profile = args.client
+    try:
+        if args.tmux_client or args.tmux_client_pid:
+            target = _phone_client(args.tmux_client, args.tmux_client_pid)
+            if not target:
+                raise RuntimeError("the terminal that opened this picker has disconnected")
+            record = _phone_load(os.path.join(root, "connections", target["pid"] + ".json"))
+            profile = _phone_connection(record, target)
+        elif os.environ.get("TMUX"):
+            print("Already inside tmux: press F1 to choose a session for this terminal.", file=sys.stderr)
+            return 1
+
+        state_path = os.path.join(root, "profiles", profile + ".json") if profile else None
+        saved = _phone_load(state_path) if state_path else {}
+        rows = _phone_sessions()
+        chosen = None if args.pick or target else _phone_remembered(rows, saved)
+        if not chosen:
+            if saved and not args.pick and not target:
+                print("Your previous session is no longer running. Choose another below.\n"
+                      "Saved conversations are available with t resume -a -l.", file=sys.stderr)
+            chosen = _phone_picker(rows)
+        if not chosen:
+            return 0
+
+        # The menu can stay open while an agent finishes. Revalidate the exact
+        # conversation and instance immediately before attaching, never its name.
+        fresh = _phone_remembered(_phone_sessions(), chosen)
+        if not fresh:
+            raise RuntimeError("that conversation ended or moved; press F1 / run t phone --pick again")
+        chosen = fresh
+        if target:
+            current = _phone_client(target["name"], target["pid"])
+            if current != target:
+                raise RuntimeError("the terminal changed while this picker was open; reopen it with F1")
+            result = _phone_tmux("switch-client", "-c", target["name"], "-t", chosen["id"])
+            if result.returncode:
+                raise RuntimeError(result.stderr.strip() or "could not switch sessions")
+            if state_path:
+                _phone_write(state_path, chosen)
+            return 0
+
+        _phone_write(state_path, chosen)
+        # exec preserves our PID: F1 receives the same #{client_pid}. A tty alone
+        # is insufficient because SSH can reuse it for an entirely new profile.
+        connection = {"profile": profile, "pid": str(os.getpid()),
+                      "name": os.ttyname(sys.stdin.fileno()), "server": chosen["server"],
+                      "socket": chosen["socket"]}
+        _phone_write(os.path.join(root, "connections", connection["pid"] + ".json"), connection)
+        # No -d: reconnecting the phone must not evict the user's desktop client.
+        os.execvp("tmux", ["tmux", "-u", "attach-session", "-t", chosen["id"]])
+    except (OSError, RuntimeError) as e:
+        print(f"t phone: {e}", file=sys.stderr)
+        return 1
+
+
 # ─── install — install + log in the agent CLIs (claude · codex · cursor) ───────
 #
 # The onboarding step `t setup` never covered: the agent binaries themselves. Before
@@ -5365,10 +5649,39 @@ def _app_bundle():
     return None
 
 
+def _app_preview_path(row):
+    return os.path.join(_cache_root(), "app-previews", row["sid"] + ".json")
+
+
+def _app_preview_url(row):
+    """Reuse this thread's chosen page, including its path, query, and hash.
+
+    A server port tells us the origin, not which page the user is reviewing.
+    --url selects that page explicitly; unrelated transcript URLs are not evidence.
+    A moved thread must choose again so it cannot inherit another slot's server.
+    """
+    try:
+        with open(_app_preview_path(row), encoding="utf-8") as f:
+            saved = json.load(f)
+        if isinstance(saved, dict) and saved.get("cwd") == row["cwd"]:
+            url = saved.get("url")
+            if isinstance(url, str):
+                _app_link(row["sid"], url)  # same validation as an explicit --url
+                return url
+    except (OSError, ValueError):
+        pass
+    return _dev_url(row["slot"], row["cwd"])
+
+
+def _app_remember_preview(row, url):
+    _app_link(row["sid"], url)
+    _index_save(_app_preview_path(row), {"cwd": row["cwd"], "url": url})
+
+
 def _app_stop_cli(row):
     """Revalidate the owner, stop only its agent, and wait before opening the app.
 
-    Keep the tmux shell: it reserves the worktree slot while the app uses it. In
+    Keep the tmux slot: it reserves the worktree while the app uses it. In
     particular do NOT use t kill, which also stops the preview's dev server.
     Refuse when invoked from the very agent being moved (it would kill this tool).
     """
@@ -5391,6 +5704,9 @@ while [[ -n $up && $up != 0 && $up != 1 ]]; do
   }}
   up=$(ps -o ppid= -p "$up" 2>/dev/null); up=${{up//[[:space:]]/}}
 done
+# Some slots exec Codex as the pane process, with no shell to return to. Keep
+# that pane after exit too, or the session and its conversation stamp disappear.
+tmux set-option -p -t "=$session:" remain-on-exit on || exit 1
 kill -TERM "$cpid" || exit 1
 for attempt in {{1..100}}; do
   kill -0 "$cpid" 2>/dev/null || exit 0
@@ -5410,7 +5726,7 @@ def cmd_app(cfg, args):
                           args.repo, args.slot, os.getcwd())
         if not os.path.isdir(row["cwd"]):
             raise ValueError(f"the session's worktree is missing: {row['cwd']}")
-        url = None if args.no_preview else args.url or _dev_url(row["slot"], row["cwd"])
+        url = None if args.no_preview else args.url or _app_preview_url(row)
         link = _app_link(row["sid"], url)
         print(f"{row['slot']} → Codex app · thread {row['sid']}")
         if url:
@@ -5434,7 +5750,9 @@ def cmd_app(cfg, args):
             recovery = shlex.join(["codex", "resume", row["sid"]])
             raise ValueError(f"could not open the app: {result.stderr.strip()}. "
                              f"To resume in a terminal: cd {shlex.quote(row['cwd'])} && {recovery}")
-        print("Sent to the desktop app; the tmux shell keeps this worktree slot reserved.")
+        if url:
+            _app_remember_preview(row, url)
+        print("Sent to the desktop app; tmux keeps this worktree slot reserved.")
         return 0
     except ValueError as e:
         print(f"t app: {e}", file=sys.stderr)
@@ -6559,6 +6877,7 @@ examples:
   t open ff:p4242         open an fg row with no session id by its pid label (as t ls shows it)
   t ls                    list this repo's live sessions
   t ls -r                 list live sessions across every machine
+  t phone                 reconnect from Termius; F1 switches sessions
   t push                  send the current session to a background tmux slot
   t pop api 3             pull dev-api-3 back to this terminal
   t resume api 3          revive dev-api-3's last conversation after it was closed
@@ -6579,6 +6898,20 @@ agents — what each verb supports per agent (t install --status adds this machi
 
 Run `t <verb> -h` for a verb's own flags.""")
     sub = p.add_subparsers(dest="verb", metavar="<verb>")
+
+    sp = sub.add_parser("phone", help="reconnect from your phone; F1 switches running sessions",
+        description="Attach your last selected live conversation on this Mac/host, or show a "
+            "compact numbered picker. Set Termius's Startup Command to: zsh -lic 't phone'. "
+            "F1 opens the picker while an agent is running. Each --client name remembers its "
+            "own selection even after Termius closes every tab. Only existing local tmux dev "
+            "sessions are attached: agents are never restarted or duplicated. If a session has "
+            "ended, recover saved conversations separately with t resume -a -l. Foreground "
+            "sessions (--fg / t pop) are outside this flow. Requires tmux 3.2+ for the F1 popup.")
+    sp.add_argument("--client", type=_phone_profile, default="phone", metavar="NAME",
+                    help="remembered phone profile (default: phone; separate tabs can use phone-1, phone-2)")
+    sp.add_argument("--pick", action="store_true", help="choose a running session instead of reconnecting the last one")
+    sp.add_argument("--tmux-client", help=argparse.SUPPRESS)
+    sp.add_argument("--tmux-client-pid", help=argparse.SUPPRESS)
 
     sp = sub.add_parser("open", help="open or reattach a session in a per-repo tmux slot",
         description="Open or reattach a Claude session in a per-repo tmux slot. Bare `t open` "
@@ -6604,8 +6937,8 @@ Run `t <verb> -h` for a verb's own flags.""")
     sp = sub.add_parser("app", help="move a local Codex slot into the desktop app with its preview",
         description="Stop a local slot's Codex CLI and open the SAME conversation in the "
             "Codex desktop app on macOS, with its running web preview in the built-in browser. "
-            "Use Annotation mode there to leave comments. The tmux shell stays to reserve "
-            "the slot; the worktree and dev server keep running. A lone number means the "
+            "Use Annotation mode there to leave comments. The tmux slot stays reserved, "
+            "and the worktree and dev server keep running. A lone number means the "
             "cwd repo; bare `t app` uses the cwd worktree's slot, or the repo's only slot. "
             "Several slots require an explicit number. Claude conversations cannot be "
             "converted. Remote slots must be brought here first with `t beam … --here`. "
@@ -6614,7 +6947,7 @@ Run `t <verb> -h` for a verb's own flags.""")
     sp.add_argument("repo", nargs="?", help="DEV_REPOS key; defaults to the cwd repo")
     sp.add_argument("slot", nargs="?", help="local slot number")
     preview = sp.add_mutually_exclusive_group()
-    preview.add_argument("--url", help="preview URL/route (default: the slot's live dev URL)")
+    preview.add_argument("--url", help="preview page to open and remember for this thread (default: remembered URL, then slot's live dev URL)")
     preview.add_argument("--no-preview", action="store_true", help="open only the conversation")
     sp.add_argument("--dry-run", action="store_true", help="show the handoff link without stopping or opening anything")
 
@@ -6966,6 +7299,7 @@ Run `t <verb> -h` for a verb's own flags.""")
 
 
 IMPLEMENTED = {
+    "phone": cmd_phone,
     "ls": cmd_ls, "session-rows": cmd_session_rows, "on": cmd_on, "read": cmd_read,
     "plan": cmd_plan, "paste": cmd_paste, "kill": cmd_kill, "setup": cmd_setup,
     "land": cmd_land, "kill-owner": cmd_kill_owner, "cursor": cmd_cursor,

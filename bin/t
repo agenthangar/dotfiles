@@ -29,6 +29,7 @@ import plistlib
 import re
 import shlex
 import shutil
+import signal
 import socket
 import stat
 import subprocess
@@ -62,7 +63,7 @@ ZSH_PRELUDE = "setopt no_monitor no_notify 2>/dev/null; "
 # ─── config ──────────────────────────────────────────────────────────────────
 
 _CFG_LINE = re.compile(
-    r"^(DEV_REPOS|DEV_BRANCHES|REMOTE_HOSTS|DEV_WORKTREE|DEV_AGENT|DEV_MODEL)\[([^\]]+)\]=(.*)$"
+    r"^(DEV_REPOS|DEV_BRANCHES|REMOTE_HOSTS|DEV_WORKTREE|DEV_AGENT|DEV_MODEL|DEV_EFFORT)\[([^\]]+)\]=(.*)$"
     r"|^(DEV_BRANCH|DEV_WORKTREE_ROOT|DEV_WORKTREE_DEFAULT|DEV_AGENT_DEFAULT|TBEAM_HOST|MINI_HOST)=(.*)$")
 
 AGENTS = ("claude", "codex")   # the closed set a dev slot can run (the zsh _dev_agent_valid twin)
@@ -92,6 +93,7 @@ class Config:
         self.agents = {}     # alias -> claude|codex (DEV_AGENT[alias])
         self.agent_default = "claude"
         self.models = {}     # agent -> model for NEW sessions; empty defers to the CLI
+        self.efforts = {}    # agent -> reasoning effort for NEW sessions
         self.beam_host = ""
         self.mini_host = ""  # legacy host seed; cleared if its host is removed
         self._load()
@@ -110,7 +112,8 @@ class Config:
                 arr, key, val = m.group(1), m.group(2), _unquote(m.group(3))
                 {"DEV_REPOS": self.repos, "DEV_BRANCHES": self.branches,
                  "REMOTE_HOSTS": self.hosts, "DEV_WORKTREE": self.worktree,
-                 "DEV_AGENT": self.agents, "DEV_MODEL": self.models}[arr][key] = val
+                 "DEV_AGENT": self.agents, "DEV_MODEL": self.models,
+                 "DEV_EFFORT": self.efforts}[arr][key] = val
             elif m.group(4) == "DEV_BRANCH":
                 self.branch = _unquote(m.group(5))
             elif m.group(4) == "DEV_WORKTREE_ROOT":
@@ -1115,10 +1118,12 @@ def _parse_host_entry(ent, used):
 _CONFIG_BEGIN = "# >>> t config defaults >>>"
 _CONFIG_END = "# <<< t config defaults <<<"
 _MODEL_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/@+\[\]-]*\Z")
+_EFFORT_ID = re.compile(r"[a-z][a-z0-9_-]*\Z")
 
 
 _CONFIG_ARRAYS = {"DEV_REPOS": "repos", "REMOTE_HOSTS": "hosts", "DEV_BRANCHES": "branches",
-                  "DEV_AGENT": "agents", "DEV_WORKTREE": "worktree", "DEV_MODEL": "models"}
+                  "DEV_AGENT": "agents", "DEV_WORKTREE": "worktree", "DEV_MODEL": "models",
+                  "DEV_EFFORT": "efforts"}
 _CONFIG_SCALARS = {"DEV_AGENT_DEFAULT": "agent_default", "DEV_BRANCH": "branch",
                    "DEV_WORKTREE_ROOT": "worktree_root", "DEV_WORKTREE_DEFAULT": "worktree_default",
                    "TBEAM_HOST": "beam_host", "MINI_HOST": "mini_host"}
@@ -1158,6 +1163,8 @@ def _config_assignment(key, value):
         raise ValueError("choose claude or codex")
     if key.startswith("DEV_MODEL[") and value and not _MODEL_ID.fullmatch(value):
         raise ValueError("model IDs must contain no spaces or shell commands")
+    if key.startswith("DEV_EFFORT[") and value and not _EFFORT_ID.fullmatch(value):
+        raise ValueError("effort must be a level name reported by the tool")
     prefix = "export " if key == "TBEAM_HOST" else ""
     return f"{prefix}{key}={shlex.quote(value)}"
 
@@ -1239,29 +1246,209 @@ def _config_write(path, before, after):
             os.unlink(tmp)
 
 
-def _config_model_rows(agent, current, cache=None):
-    """Stable Claude aliases; Codex's locally discovered list, never a frozen catalog.
-    A saved custom/retired model remains selectable even when no cache lists it."""
-    values = [""]
-    if current:
-        values.append(current)
-    if agent == "claude":
-        values += ["sonnet", "opus", "haiku", "fable", "opusplan"]
-    elif isinstance(cache, dict) and isinstance(cache.get("models"), list):
-        values += [m["slug"] for m in cache["models"] if isinstance(m, dict)
-                   and m.get("visibility") == "list" and isinstance(m.get("slug"), str)
-                   and _MODEL_ID.fullmatch(m["slug"])]
-    rows = [(v, v or "Use tool's own default") for v in dict.fromkeys(values)]
-    return rows + [("__custom__", "Enter a custom model ID…")]
+class _ConfigRPC:
+    """Bounded metadata-only stdio exchange; no thread or user prompt is sent.
+    A separate process group keeps it off the TTY and lets us reap its helpers."""
+
+    def __init__(self, argv, timeout=10):
+        self.argv, self.timeout = argv, timeout
+        self.buffer, self.received = b"", 0
+
+    def __enter__(self):
+        env = dict(os.environ)
+        env.pop("CLAUDECODE", None)  # metadata lookup is not a nested conversation
+        self.process = subprocess.Popen(self.argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                        stderr=subprocess.DEVNULL, start_new_session=True,
+                                        cwd=HOME, env=env)
+        self.deadline = time.monotonic() + self.timeout
+        return self
+
+    def __exit__(self, *exc):
+        p = self.process
+        try:
+            os.killpg(p.pid, signal.SIGTERM)
+        except (ProcessLookupError, PermissionError):
+            p.terminate()  # macOS can report EPERM for an already-exited group
+        try:
+            p.wait(timeout=1)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(p.pid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                p.kill()
+            p.wait()
+        p.stdin.close()
+        p.stdout.close()
+
+    def send(self, message):
+        self.process.stdin.write((json.dumps(message) + "\n").encode())
+        self.process.stdin.flush()
+
+    def receive(self, wanted):
+        import select
+        while True:
+            while b"\n" in self.buffer:
+                raw, self.buffer = self.buffer.split(b"\n", 1)
+                try:
+                    message = json.loads(raw)
+                except ValueError:
+                    continue
+                if not isinstance(message, dict):
+                    continue
+                response = message.get("response", {})
+                if message.get("id") == wanted or (isinstance(response, dict)
+                        and message.get("type") == "control_response" and response.get("request_id") == wanted):
+                    return message
+            remaining = self.deadline - time.monotonic()
+            if remaining <= 0 or not select.select([self.process.stdout], [], [], remaining)[0]:
+                raise ValueError("model lookup timed out")
+            chunk = os.read(self.process.stdout.fileno(), 65536)
+            if not chunk:
+                raise ValueError("tool exited before returning its model list")
+            self.received += len(chunk)
+            if self.received > 4 * 1024 * 1024:
+                raise ValueError("model lookup response was too large")
+            self.buffer += chunk
+
+    def call(self, ident, method, params):
+        self.send({"id": ident, "method": method, "params": params})
+        message = self.receive(ident)
+        if "error" in message or not isinstance(message.get("result"), dict):
+            raise ValueError("tool could not provide model metadata")
+        return message["result"]
 
 
-def _config_codex_cache():
-    root = os.environ.get("CODEX_HOME") or os.path.join(HOME, ".codex")
-    try:
-        with open(os.path.join(root, "models_cache.json")) as fh:
-            return json.load(fh)
-    except (OSError, ValueError):
-        return None
+def _config_live_models(agent):
+    """Use the same capability metadata as the vendors' pickers, not a model catalog
+    frozen in dotfiles or a stale disk cache. See learn.chatgpt.com/docs/app-server
+    (model/list) and Claude Agent SDK's initialize response / ModelInfo."""
+    if agent == "codex":
+        with _ConfigRPC(["codex", "app-server"]) as rpc:
+            rpc.call(1, "initialize", {"clientInfo": {"name": "t-config", "version": "1"}})
+            rpc.send({"method": "initialized"})
+            models, cursor, seen = [], None, set()
+            for ident in range(2, 22):
+                result = rpc.call(ident, "model/list", {"limit": 100, "includeHidden": False, "cursor": cursor})
+                if not isinstance(result.get("data"), list):
+                    raise ValueError("tool returned an invalid model list")
+                models.extend(result["data"])
+                cursor = result.get("nextCursor")
+                if not cursor:
+                    return models
+                if not isinstance(cursor, str) or cursor in seen:
+                    break
+                seen.add(cursor)
+            raise ValueError("tool returned an incomplete model list")
+    argv = ["claude", "-p", "--input-format", "stream-json", "--output-format", "stream-json",
+            "--verbose", "--no-session-persistence", "--setting-sources", "user",
+            "--settings", '{"disableAllHooks":true}', "--strict-mcp-config"]
+    with _ConfigRPC(argv) as rpc:
+        rpc.send({"type": "control_request", "request_id": "t-models",
+                  "request": {"subtype": "initialize"}})
+        response = rpc.receive("t-models").get("response", {})
+        result = response.get("response")
+        if response.get("subtype") != "success" or not isinstance(result, dict) or not isinstance(result.get("models"), list):
+            raise ValueError("tool could not provide model metadata")
+        return result["models"]
+
+
+def _config_catalog(agent, raw):
+    """Normalize and filter the runtime model/effort metadata, keeping vendor order."""
+    catalog = []
+    seen = set()
+    for model in raw if isinstance(raw, list) else []:
+        if not isinstance(model, dict) or model.get("hidden"):
+            continue
+        ident = model.get("model" if agent == "codex" else "value")
+        if not isinstance(ident, str) or not _MODEL_ID.fullmatch(ident) or ident in seen:
+            continue
+        seen.add(ident)
+        resolved = model.get("resolvedModel", ident)
+        if not isinstance(resolved, str) or not _MODEL_ID.fullmatch(resolved):
+            resolved = ident
+        label = f"{resolved} ({ident})" if resolved != ident else ident
+        levels = model.get("supportedReasoningEfforts", []) if agent == "codex" else model.get("supportedEffortLevels", [])
+        if not isinstance(levels, list) or (agent == "claude" and model.get("supportsEffort") is False):
+            levels = []
+        efforts = []
+        for level in levels:
+            value = level.get("reasoningEffort") if isinstance(level, dict) else level
+            if isinstance(value, str) and _EFFORT_ID.fullmatch(value) and value not in efforts:
+                efforts.append(value)
+        catalog.append({"id": ident, "resolved": resolved, "label": label, "efforts": efforts})
+    return catalog
+
+
+def _config_find_model(catalog, model):
+    return next((m for m in catalog if model in (m["id"], m["resolved"])), None)
+
+
+def _config_model_rows(current, catalog):
+    rows = [("", "Use tool's own model setting")]
+    rows += [(m["id"], m["label"]) for m in catalog]
+    if current and current not in dict(rows):
+        suffix = "saved" if _config_find_model(catalog, current) else "saved; not in tool's current list"
+        rows.insert(1, (current, f"{current} ({suffix})"))
+    return rows + [("__custom__", "Enter a custom model ID…"), ("__refresh__", "Refresh model list")]
+
+
+def _config_effort_rows(current, model, catalog):
+    info = _config_find_model(catalog, model)
+    levels = info["efforts"] if info else []
+    rows = [("", "Use tool's own effort setting")] + [(v, v) for v in levels]
+    if current and current not in levels:
+        rows.insert(1, (current, f"{current} (saved; not verified for this model)"))
+    return rows + [("__refresh__", "Refresh model list")]
+
+
+def _config_set_model(cfg, agent, model, catalog):
+    cfg.models[agent] = model
+    info = _config_find_model(catalog, model)
+    effort = cfg.efforts.get(agent)
+    if effort and (info is None or effort not in info["efforts"]):
+        cfg.efforts[agent] = ""
+        return True
+    return False
+
+
+def _config_model_menu(ui, cfg, agent, catalogs, effort=False):
+    while True:
+        if agent not in catalogs:
+            ui.done("loading", f"Reading models and effort levels from {agent}…")
+            try:
+                catalogs[agent] = _config_catalog(agent, _config_live_models(agent))
+            except (OSError, ValueError) as exc:
+                catalogs[agent] = []
+                ui.done("unavailable", f"{agent}: {exc}. Use tool defaults, a custom model, or Refresh.")
+        catalog = catalogs[agent]
+        model = cfg.models.get(agent, "")
+        if effort:
+            current = cfg.efforts.get(agent, "")
+            rows = _config_effort_rows(current, model, catalog)
+            info = _config_find_model(catalog, model)
+            if info is None:
+                ui.done("effort", "Choose a listed model to see its supported effort levels.")
+            elif not info["efforts"]:
+                ui.done("effort", "This model reports no configurable effort levels.")
+        else:
+            current = model
+            rows = _config_model_rows(current, catalog)
+        picked = ui.pick(f"{agent} {'effort' if effort else 'model'}", rows,
+                         default=next(i for i, row in enumerate(rows) if row[0] == current))
+        if picked == "__refresh__":
+            del catalogs[agent]
+            continue
+        if picked == "__custom__":
+            picked = _config_input(ui, "model ID")
+            if picked is not None and not _MODEL_ID.fullmatch(picked):
+                ui.done("invalid", "Enter a model ID without spaces or shell commands.")
+                continue
+        if picked is not None:
+            if effort:
+                cfg.efforts[agent] = picked
+            elif _config_set_model(cfg, agent, picked, catalog):
+                ui.done("effort", "Reset to tool default: the previous level isn't reported for this model.")
+        return
 
 
 def _config_summary(agent, models, overrides):
@@ -1396,16 +1583,19 @@ def _config_worktrees(ui, cfg):
                 setattr(cfg, attr, value)
 
 
-def _config_wizard(cfg, cache):
+def _config_wizard(cfg):
     ui = _RailUI()
     edited = copy.deepcopy(cfg)
     initial = _config_state(cfg)
+    catalogs = {}
     ui.out.write("┌  t config · local settings · nothing written until Save changes\n")
     ui.raw()
     try:
         while True:
             rows = [("tool", f"Default tool     {edited.agent_default}")]
-            rows += [(a, f"{a} model    {edited.models.get(a) or 'tool default'}") for a in AGENTS]
+            for a in AGENTS:
+                rows += [(a, f"{a} model    {edited.models.get(a) or 'tool default'}"),
+                         (f"effort:{a}", f"{a} effort   {edited.efforts.get(a) or 'tool default'}")]
             rows += [("hosts", f"Hosts ({len(edited.hosts)}) · add, edit, remove"),
                      ("repos", f"Repos ({len(edited.repos)}) · paths and overrides"),
                      ("beam", f"Default beam host: {edited.beam_host or 'none'}"),
@@ -1456,20 +1646,11 @@ def _config_wizard(cfg, cache):
                                  default=AGENTS.index(edited.agent_default) if edited.agent_default in AGENTS else 0)
                 if picked is not None:
                     edited.agent_default = picked
+            elif choice.startswith("effort:"):
+                _config_model_menu(ui, edited, choice.split(":", 1)[1], catalogs, effort=True)
             else:
-                current = edited.models.get(choice, "")
-                options = _config_model_rows(choice, current, cache)
-                picked = ui.pick(f"{choice} model", options,
-                                 default=next(i for i, row in enumerate(options) if row[0] == current))
-                if picked == "__custom__":
-                    picked = _config_input(ui, "model ID")
-                    if picked is None:
-                        continue
-                    if not _MODEL_ID.fullmatch(picked):
-                        ui.done("invalid", "Enter a model ID without spaces or shell commands.")
-                        continue
-                if picked is not None:
-                    edited.models[choice] = picked
+                _config_model_menu(ui, edited, choice, catalogs)
+
     finally:
         ui.restore()
 
@@ -1489,6 +1670,8 @@ def _config_editor():
 def cmd_config(cfg, args):
     if args.show:
         print("\n".join(_config_summary(cfg.agent_default, cfg.models, cfg.agents)))
+        for agent in AGENTS:
+            print(f"{agent} effort: {cfg.efforts.get(agent) or 'tool default'}")
         print(f"Default beam host: {cfg.beam_host or 'none'}")
         print(f"Worktrees: {cfg.worktree_default} · root: {cfg.worktree_root} · shared-tree branch: {cfg.branch}")
         for alias, target in sorted(cfg.hosts.items()):
@@ -1503,7 +1686,7 @@ def cmd_config(cfg, args):
         return 1
     try:
         before = _config_read(ZSHRC_LOCAL)
-        result = "edit" if getattr(args, "edit", False) else _config_wizard(cfg, _config_codex_cache())
+        result = "edit" if getattr(args, "edit", False) else _config_wizard(cfg)
         if result is None:
             return 0
         if result == "edit":
@@ -6822,13 +7005,14 @@ Run `t <verb> -h` for a verb's own flags.""")
     sp.add_argument("host", help="$REMOTE_HOSTS key, or a literal ssh target")
     sp.add_argument("rest", nargs=argparse.REMAINDER, help="command to run (omit for an interactive shell)")
 
-    sp = sub.add_parser("config", help="manage local settings: tools, models, repos and hosts",
-        description="Arrow-key settings hub for this machine: default tool and per-tool models; "
+    sp = sub.add_parser("config", help="manage local settings: tools, models, effort, repos and hosts",
+        description="Arrow-key settings hub for this machine: default tool, models and effort; "
+            "query each CLI for current models and their supported effort levels; "
             "add, edit or remove hosts; register or unregister repos and set their tool, branch "
             "and worktree overrides; choose the default beam host and worktree defaults. "
             "Save changes reviews then writes a managed block in ~/.zshrc.local. Removed "
             "hosts stop participating in dots --all; unregistering repos keeps their files "
-            "and sessions. Tool/model defaults apply to fresh tmux and --fg sessions only. "
+            "and sessions. Tool/model/effort defaults apply to fresh tmux and --fg sessions only. "
             "Open local config in editor covers all custom shell settings (VISUAL/EDITOR, else vi).")
     cg = sp.add_mutually_exclusive_group()
     cg.add_argument("--show", action="store_true", help="print current settings without opening the menu")

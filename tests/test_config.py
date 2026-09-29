@@ -1,7 +1,6 @@
 """Session defaults: safe persistence, picker choices, and save/cancel behavior."""
 
 import io
-import json
 import stat
 from types import SimpleNamespace
 
@@ -88,28 +87,6 @@ def test_config_creates_missing_local_file(t_mod, tmp_path):
     assert target.read_text() == "new\n" and stat.S_IMODE(target.stat().st_mode) == 0o600
 
 
-def test_config_model_choices_handle_bad_or_missing_cache(t_mod):
-    cache = {"models": [None, {}, {"slug": "bad name", "visibility": "list"},
-                        {"slug": "hidden", "visibility": "hide"},
-                        {"slug": "local/model", "visibility": "list"},
-                        {"slug": "local/model", "visibility": "list"}]}
-    choices = t_mod._config_model_rows("codex", "saved-model", cache)
-    assert [row[0] for row in choices] == ["", "saved-model", "local/model", "__custom__"]
-    for bad in (None, [], {}, {"models": "bad"}):
-        assert [r[0] for r in t_mod._config_model_rows("codex", "", bad)] == ["", "__custom__"]
-    assert [r[0] for r in t_mod._config_model_rows("claude", "opus")].count("opus") == 1
-
-
-def test_config_cache_honors_codex_home(t_mod, tmp_path, monkeypatch):
-    monkeypatch.setenv("CODEX_HOME", str(tmp_path))
-    assert t_mod._config_codex_cache() is None
-    cache = tmp_path / "models_cache.json"
-    cache.write_text("invalid json")
-    assert t_mod._config_codex_cache() is None
-    cache.write_text(json.dumps({"models": []}))
-    assert t_mod._config_codex_cache() == {"models": []}
-
-
 class Menu:
     def __init__(self, picks, inputs=(), pages=("y",)):
         self.picks, self.inputs, self.pages = iter(picks), iter(inputs), iter(pages)
@@ -149,7 +126,13 @@ def config_cli(t_mod, tmp_path, monkeypatch):
     monkeypatch.setattr(t_mod, "ZSHRC_LOCAL", str(local))
     monkeypatch.setattr(t_mod.sys.stdin, "isatty", lambda: True)
     monkeypatch.setattr(t_mod.sys.stdout, "isatty", lambda: True)
-    monkeypatch.setattr(t_mod, "_config_codex_cache", lambda: None)
+    monkeypatch.setattr(t_mod, "_config_live_models", lambda agent: [
+        {"value": "opus", "resolvedModel": "claude-test-opus", "supportsEffort": True,
+         "supportedEffortLevels": ["low", "high", "max"]},
+        {"value": "haiku", "resolvedModel": "claude-test-haiku"},
+    ] if agent == "claude" else [
+        {"model": "test-model", "supportedReasoningEfforts": [{"reasoningEffort": "high"},
+                                                               {"reasoningEffort": "ultra"}]}])
     monkeypatch.setattr(t_mod, "zsh_capture", lambda snippet: "")
     return t_mod.Config(), local
 
@@ -171,7 +154,7 @@ def test_config_menu_save_then_cancel(t_mod, config_cli, monkeypatch):
 def test_config_menu_custom_validation_back_reset_and_no_change(t_mod, config_cli, monkeypatch):
     cfg, local = config_cli
     cfg.models = {"codex": "old"}
-    ui = Menu(["tool", None, "codex", "__custom__", "codex", "__custom__", "codex", "", "save"],
+    ui = Menu(["tool", None, "codex", "__custom__", "__custom__", "codex", "", "save"],
               ["bad model", ""])
     monkeypatch.setattr(t_mod, "_RailUI", lambda: ui)
     assert t_mod.cmd_config(cfg, SimpleNamespace(show=False)) == 0
@@ -332,3 +315,52 @@ def test_config_editor_requires_pending_changes_to_be_saved(t_mod, config_cli, m
     monkeypatch.setattr(t_mod, "_config_editor", lambda: pytest.fail("must not open editor"))
     assert t_mod.cmd_config(cfg, SimpleNamespace(show=False)) == 0
     assert local.read_text() == "# keep me\n"
+
+
+def test_config_selects_and_persists_model_specific_effort(t_mod, config_cli, monkeypatch):
+    cfg, local = config_cli
+    ui = Menu(["claude", "opus", "effort:claude", "max",
+               "codex", "test-model", "effort:codex", "ultra", "save"])
+    monkeypatch.setattr(t_mod, "_RailUI", lambda: ui)
+    assert t_mod.cmd_config(cfg, SimpleNamespace(show=False)) == 0
+    text = local.read_text()
+    assert "DEV_EFFORT[claude]=max" in text and "DEV_EFFORT[codex]=ultra" in text
+    assert "DEV_MODEL[claude]=opus" in text and "DEV_MODEL[codex]=test-model" in text
+
+
+def test_config_switching_to_non_effort_model_clears_effort(t_mod, config_cli, monkeypatch):
+    cfg, local = config_cli
+    cfg.models, cfg.efforts = {"claude": "opus"}, {"claude": "max"}
+    ui = Menu(["claude", "haiku", "effort:claude", "", "save"])
+    monkeypatch.setattr(t_mod, "_RailUI", lambda: ui)
+    assert t_mod.cmd_config(cfg, SimpleNamespace(show=False)) == 0
+    assert "DEV_EFFORT[claude]=''" in local.read_text()
+
+
+def test_config_model_lookup_is_lazy_and_refreshable(t_mod, config_cli, monkeypatch):
+    cfg, local = config_cli
+    calls = []
+    def discover(agent):
+        calls.append(agent)
+        if len(calls) == 1:
+            raise ValueError("offline")
+        return [{"model": "new-model", "supportedReasoningEfforts": [{"reasoningEffort": "ultra"}]}]
+    monkeypatch.setattr(t_mod, "_config_live_models", discover)
+    ui = Menu(["cancel"])
+    monkeypatch.setattr(t_mod, "_RailUI", lambda: ui)
+    assert t_mod.cmd_config(cfg, SimpleNamespace(show=False)) == 0 and not calls
+    ui = Menu(["codex", "__refresh__", "new-model", "effort:codex", "ultra", "save"])
+    assert t_mod.cmd_config(cfg, SimpleNamespace(show=False)) == 0
+    assert calls == ["codex", "codex"]  # one retry, then reuse within this menu
+    assert "DEV_MODEL[codex]=new-model" in local.read_text()
+
+
+def test_config_unavailable_metadata_keeps_custom_and_native_choices(t_mod, config_cli, monkeypatch):
+    cfg, local = config_cli
+    def unavailable(agent):
+        raise FileNotFoundError(agent)
+    monkeypatch.setattr(t_mod, "_config_live_models", unavailable)
+    ui = Menu(["codex", "__custom__", "effort:codex", "", "save"], ["private/model"])
+    monkeypatch.setattr(t_mod, "_RailUI", lambda: ui)
+    assert t_mod.cmd_config(cfg, SimpleNamespace(show=False)) == 0
+    assert "DEV_MODEL[codex]=private/model" in local.read_text()

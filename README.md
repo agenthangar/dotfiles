@@ -172,9 +172,13 @@ line, and `DOTFILES_NO_TRUST=1` opts a machine out of the automatic paths.
 
 **`t config`** is the local settings hub, with an arrow-key menu for:
 
-- **Tools and models:** choose Claude or Codex as the default tool, with a separate
-  model for each. Pick a Claude alias, a model from Codex's local list, a custom
-  model ID, or “Use tool's own default”.
+- **Tools, models and effort:** choose Claude or Codex as the default tool, with
+  separate model and effort settings for each. Models come from the installed
+  CLI's current catalog; Claude aliases show their resolved model IDs. Choose a
+  listed model to see its supported effort levels. Changing models clears an
+  effort override that the new model doesn't report. Each setting can inherit
+  the tool's own setting. Custom model IDs and **Refresh model list** are available;
+  if discovery fails, the menu reports it instead of offering a stale list.
 - **Hosts:** add or edit SSH targets, remove retired hosts, and choose the default
   beam destination. Removing a host stops `dots --all` and other host fan-outs
   from trying it; reachability alone never removes a host. A removed host's beam
@@ -193,10 +197,12 @@ outside it is preserved. Removed registrations are explicitly unset, including
 in the calling shell, so their generated shortcuts disappear immediately too.
 `t config --show` prints current settings without opening the menu.
 
-Tool and model defaults apply to **new `t open` sessions**, including `--fg`.
+Tool, model and effort defaults apply to **new `t open` sessions**, including `--fg`.
 Existing/resumed conversations keep their normal behavior. `DEV_AGENT[repo]` and
 `--claude`/`--codex` still override the global tool; `DEV_MODEL[claude]` and
-`DEV_MODEL[codex]` hold each tool's model choice. Settings are per machine: run
+`DEV_MODEL[codex]` hold each tool's model choice, with `DEV_EFFORT[claude]` and
+`DEV_EFFORT[codex]` for effort. Model discovery sends no prompts and happens only
+when you open a model or effort menu. Settings are per machine: run
 `t config` on each host to configure it. Cursor remains available through
 `t cursor`; it does not support dev slots.
 

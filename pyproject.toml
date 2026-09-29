@@ -47,6 +47,9 @@ exclude_lines = [
     "def _config_repos\\(",
     "def _config_worktrees\\(",
     "def _config_editor\\(",
+    "class _ConfigRPC",
+    "def _config_live_models\\(",
+    "def _config_model_menu\\(",
     # bin/t `t new` subprocess / ssh / wizard glue (the pure _new_* helpers are tested)
     "def _run\\(",
     "class _RailUI",

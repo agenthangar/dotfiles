@@ -5818,7 +5818,8 @@ def cmd_app(cfg, args):
         if plan:
             print(f"Plan: {plan} (opens in a separate browser tab for annotation)")
         if args.dry_run:
-            print("Would stop this slot's Codex CLI, keep its worktree/dev server, and open:")
+            window = "the existing app window" if args.reuse_window else "a new app window"
+            print(f"Would stop this slot's Codex CLI, keep its worktree/dev server, and open in {window}:")
             print(link)
             return 0
         if sys.platform != "darwin":
@@ -5838,7 +5839,9 @@ def cmd_app(cfg, args):
         stopped = _app_stop_cli(row)
         if stopped.returncode:
             raise ValueError(stopped.stderr.strip() or "could not stop the CLI; the app was not opened")
-        result = _run(["open", "-a", bundle, *links], timeout=15)
+        # macOS -n launches a fresh app instance/window. Send every handoff URL
+        # in that ONE launch, so the thread and previews share the new instance.
+        result = _run(["open", *([] if args.reuse_window else ["-n"]), "-a", bundle, *links], timeout=15)
         if result.returncode:
             recovery = shlex.join(["codex", "resume", row["sid"]])
             raise ValueError(f"could not open the app: {result.stderr.strip()}. "
@@ -7016,7 +7019,7 @@ Run `t <verb> -h` for a verb's own flags.""")
 
     sp = sub.add_parser("app", help="move a local Codex slot into the desktop app with its preview",
         description="Stop a local slot's Codex CLI and open the SAME conversation in the "
-            "Codex desktop app on macOS, with its running web preview and referenced Markdown "
+            "Codex desktop app in a new window on macOS, with its running web preview and referenced Markdown "
             "plan in separate built-in browser tabs. "
             "Use Annotation mode there to leave comments. The tmux slot stays reserved, "
             "and the worktree and dev server keep running. A lone number means the "
@@ -7033,6 +7036,7 @@ Run `t <verb> -h` for a verb's own flags.""")
     plan = sp.add_mutually_exclusive_group()
     plan.add_argument("--plan", metavar="PATH", help="Markdown plan to open (default: last plan referenced in the session, then remembered choice)")
     plan.add_argument("--no-plan", action="store_true", help="skip opening a plan")
+    sp.add_argument("--reuse-window", action="store_true", help="open in the existing app window instead of launching a new one")
     sp.add_argument("--dry-run", action="store_true", help="show the handoff link without stopping or opening anything")
 
     sp = sub.add_parser("ls", help="list dev sessions (attached + active context)",

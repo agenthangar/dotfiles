@@ -20,6 +20,7 @@
 
 import argparse
 import calendar
+import copy
 import glob
 import hashlib
 import json
@@ -32,6 +33,7 @@ import socket
 import stat
 import subprocess
 import sys
+import tempfile
 import time
 from urllib.parse import urlencode, urlsplit
 
@@ -60,8 +62,8 @@ ZSH_PRELUDE = "setopt no_monitor no_notify 2>/dev/null; "
 # ─── config ──────────────────────────────────────────────────────────────────
 
 _CFG_LINE = re.compile(
-    r"^(DEV_REPOS|DEV_BRANCHES|REMOTE_HOSTS|DEV_WORKTREE|DEV_AGENT)\[([^\]]+)\]=(.*)$"
-    r"|^(DEV_BRANCH|DEV_WORKTREE_ROOT|DEV_WORKTREE_DEFAULT|DEV_AGENT_DEFAULT)=(.*)$")
+    r"^(DEV_REPOS|DEV_BRANCHES|REMOTE_HOSTS|DEV_WORKTREE|DEV_AGENT|DEV_MODEL)\[([^\]]+)\]=(.*)$"
+    r"|^(DEV_BRANCH|DEV_WORKTREE_ROOT|DEV_WORKTREE_DEFAULT|DEV_AGENT_DEFAULT|TBEAM_HOST|MINI_HOST)=(.*)$")
 
 AGENTS = ("claude", "codex")   # the closed set a dev slot can run (the zsh _dev_agent_valid twin)
 
@@ -89,6 +91,9 @@ class Config:
         self.worktree_default = "1"
         self.agents = {}     # alias -> claude|codex (DEV_AGENT[alias])
         self.agent_default = "claude"
+        self.models = {}     # agent -> model for NEW sessions; empty defers to the CLI
+        self.beam_host = ""
+        self.mini_host = ""  # legacy host seed; cleared if its host is removed
         self._load()
 
     def _load(self):
@@ -105,7 +110,7 @@ class Config:
                 arr, key, val = m.group(1), m.group(2), _unquote(m.group(3))
                 {"DEV_REPOS": self.repos, "DEV_BRANCHES": self.branches,
                  "REMOTE_HOSTS": self.hosts, "DEV_WORKTREE": self.worktree,
-                 "DEV_AGENT": self.agents}[arr][key] = val
+                 "DEV_AGENT": self.agents, "DEV_MODEL": self.models}[arr][key] = val
             elif m.group(4) == "DEV_BRANCH":
                 self.branch = _unquote(m.group(5))
             elif m.group(4) == "DEV_WORKTREE_ROOT":
@@ -114,6 +119,10 @@ class Config:
                 self.worktree_default = _unquote(m.group(5))
             elif m.group(4) == "DEV_AGENT_DEFAULT":
                 self.agent_default = _unquote(m.group(5))
+            elif m.group(4) == "TBEAM_HOST":
+                self.beam_host = _unquote(m.group(5))
+            elif m.group(4) == "MINI_HOST":
+                self.mini_host = _unquote(m.group(5))
 
     def agent_for(self, alias, override=None):
         """The agent a NEW slot of `alias` runs — the Python twin of zsh _dev_agent_for:
@@ -796,6 +805,17 @@ def _local_entries(text):
     (still-quoted) values."""
     repos, hosts, tbeam = {}, {}, False
     for line in text.splitlines():
+        # `t config` masks registrations without rewriting arbitrary user shell.
+        # A later `t setup` must see those removals, too.
+        removed = _config_unset_key(line.strip())
+        if removed:
+            if removed == "TBEAM_HOST":
+                tbeam = False
+            else:
+                m = _CFG_LINE.match(removed + "=")
+                if m and m.group(1) in ("DEV_REPOS", "REMOTE_HOSTS"):
+                    (repos if m.group(1) == "DEV_REPOS" else hosts).pop(m.group(2), None)
+            continue
         if _TBEAM_LINE.match(line):
             tbeam = True
             continue
@@ -1088,6 +1108,425 @@ def _parse_host_entry(ent, used):
     if not _SETUP_KEY.match(alias) or alias in used:
         return None, f"'{alias}' is taken or not a valid key"
     return alias, target
+
+
+# ─── config — defaults for new sessions on this machine ────────────────────────
+
+_CONFIG_BEGIN = "# >>> t config defaults >>>"
+_CONFIG_END = "# <<< t config defaults <<<"
+_MODEL_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/@+\[\]-]*\Z")
+
+
+_CONFIG_ARRAYS = {"DEV_REPOS": "repos", "REMOTE_HOSTS": "hosts", "DEV_BRANCHES": "branches",
+                  "DEV_AGENT": "agents", "DEV_WORKTREE": "worktree", "DEV_MODEL": "models"}
+_CONFIG_SCALARS = {"DEV_AGENT_DEFAULT": "agent_default", "DEV_BRANCH": "branch",
+                   "DEV_WORKTREE_ROOT": "worktree_root", "DEV_WORKTREE_DEFAULT": "worktree_default",
+                   "TBEAM_HOST": "beam_host", "MINI_HOST": "mini_host"}
+_CONFIG_ALIAS = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.-]*\Z")
+
+
+def _config_state(cfg):
+    state = {key: getattr(cfg, attr) for key, attr in _CONFIG_SCALARS.items()}
+    for arr, attr in _CONFIG_ARRAYS.items():
+        state.update({f"{arr}[{key}]": value for key, value in getattr(cfg, attr).items()})
+    return state
+
+
+def _config_diff(before, after):
+    return {key: after.get(key) for key in sorted(before.keys() | after.keys())
+            if before.get(key) != after.get(key)}
+
+
+def _config_unset_key(line):
+    try:
+        words = shlex.split(line)
+    except ValueError:
+        return None
+    return words[1] if len(words) == 2 and words[0] == "unset" else None
+
+
+def _config_assignment(key, value):
+    """Only our known keys may become shell assignments; every value is quoted."""
+    m = _CFG_LINE.fullmatch(key + "=")
+    if not m or (m.group(1) and not _CONFIG_ALIAS.fullmatch(m.group(2))):
+        raise ValueError(f"unsupported setting {key!r}; use Open local config in editor")
+    if value is None or (key in ("TBEAM_HOST", "MINI_HOST") and not value):
+        return "unset " + shlex.quote(key)
+    if not isinstance(value, str) or any(ord(c) < 32 or ord(c) == 127 for c in value):
+        raise ValueError("settings must be a single line without control characters")
+    if (key == "DEV_AGENT_DEFAULT" or key.startswith("DEV_AGENT[")) and value not in AGENTS:
+        raise ValueError("choose claude or codex")
+    if key.startswith("DEV_MODEL[") and value and not _MODEL_ID.fullmatch(value):
+        raise ValueError("model IDs must contain no spaces or shell commands")
+    prefix = "export " if key == "TBEAM_HOST" else ""
+    return f"{prefix}{key}={shlex.quote(value)}"
+
+
+def _config_text(text, changes, effective=None):
+    """Update a small overlay at EOF; leave arbitrary user shell byte-for-byte.
+    Explicit unsets keep removed hosts/repos gone after a reload. Retain earlier
+    managed choices, reconciling them with any later t setup registrations."""
+    lines = text.splitlines(keepends=True)
+    starts = [i for i, line in enumerate(lines) if line.rstrip("\r\n") == _CONFIG_BEGIN]
+    ends = [i for i, line in enumerate(lines) if line.rstrip("\r\n") == _CONFIG_END]
+    settings = {}
+    if starts or ends:
+        if len(starts) != 1 or len(ends) != 1 or starts[0] >= ends[0]:
+            raise ValueError("malformed t config defaults block in ~/.zshrc.local; repair its markers first")
+        for line in lines[starts[0] + 1:ends[0]]:
+            raw = line.strip()
+            if not raw or raw.startswith("#"):
+                continue
+            removed = _config_unset_key(raw)
+            match = _CFG_LINE.fullmatch(raw.removeprefix("export "))
+            if removed:
+                key, value = removed, None
+            elif match:
+                key = (f"{match.group(1)}[{match.group(2)}]" if match.group(1) else match.group(4))
+                value = _unquote(match.group(3) if match.group(1) else match.group(5))
+            else:
+                raise ValueError("custom shell inside the t config block; move it outside the markers first")
+            settings[key] = effective.get(key) if effective is not None else value
+        del lines[starts[0]:ends[0] + 1]
+    settings.update(changes)
+    assignments = [_config_assignment(key, value) for key, value in sorted(settings.items())]
+    body = "".join(lines)
+    if body and not body.endswith("\n"):
+        body += "\n"
+    if body and not body.endswith("\n\n"):
+        body += "\n"
+    return body + "\n".join([_CONFIG_BEGIN, *assignments, _CONFIG_END, ""])
+
+
+def _config_remove_host(cfg, alias):
+    target = cfg.hosts.pop(alias)
+    if cfg.beam_host in (alias, target) or not cfg.hosts:
+        cfg.beam_host = ""
+    if cfg.mini_host in (alias, target) or not cfg.hosts:
+        cfg.mini_host = ""
+
+
+def _config_remove_repo(cfg, alias):
+    for attr in ("repos", "agents", "branches", "worktree"):
+        getattr(cfg, attr).pop(alias, None)
+
+
+def _config_read(path):
+    try:
+        with open(path) as fh:
+            return fh.read()
+    except FileNotFoundError:
+        return ""
+
+
+def _config_write(path, before, after):
+    """Atomic replacement, preserving a local-file symlink and its target's mode.
+    Refuse a concurrent edit rather than overwriting changes made during the UI."""
+    target = os.path.realpath(path)
+    if _config_read(target) != before:
+        raise ValueError("~/.zshrc.local changed while the menu was open; run t config again")
+    mode = stat.S_IMODE(os.stat(target).st_mode) if os.path.exists(target) else 0o600
+    tmp = None
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", dir=os.path.dirname(target),
+                                         prefix=".t-config-", delete=False) as fh:
+            tmp = fh.name
+            fh.write(after)
+            os.fchmod(fh.fileno(), mode)
+        os.replace(tmp, target)
+    finally:
+        if tmp and os.path.exists(tmp):
+            os.unlink(tmp)
+
+
+def _config_model_rows(agent, current, cache=None):
+    """Stable Claude aliases; Codex's locally discovered list, never a frozen catalog.
+    A saved custom/retired model remains selectable even when no cache lists it."""
+    values = [""]
+    if current:
+        values.append(current)
+    if agent == "claude":
+        values += ["sonnet", "opus", "haiku", "fable", "opusplan"]
+    elif isinstance(cache, dict) and isinstance(cache.get("models"), list):
+        values += [m["slug"] for m in cache["models"] if isinstance(m, dict)
+                   and m.get("visibility") == "list" and isinstance(m.get("slug"), str)
+                   and _MODEL_ID.fullmatch(m["slug"])]
+    rows = [(v, v or "Use tool's own default") for v in dict.fromkeys(values)]
+    return rows + [("__custom__", "Enter a custom model ID…")]
+
+
+def _config_codex_cache():
+    root = os.environ.get("CODEX_HOME") or os.path.join(HOME, ".codex")
+    try:
+        with open(os.path.join(root, "models_cache.json")) as fh:
+            return json.load(fh)
+    except (OSError, ValueError):
+        return None
+
+
+def _config_summary(agent, models, overrides):
+    lines = [f"Default tool: {agent}"]
+    lines += [f"{a} model: {models.get(a) or 'tool default'}" for a in AGENTS]
+    lines.append("Applies to new t sessions on this machine (tmux and --fg).")
+    if overrides:
+        lines.append("Repo tool overrides still win: " + ", ".join(
+            f"{repo}={a}" for repo, a in sorted(overrides.items())))
+    return lines
+
+
+def _config_input(ui, label, current="", kind="text"):
+    value = ui.cooked_input(f"│  {label} (blank cancels) → ", prefill=current)
+    if not value:
+        return None
+    if any(ord(c) < 32 or ord(c) == 127 for c in value):
+        ui.done("invalid", "Enter a single line without control characters.")
+        return None
+    if kind == "alias" and not _CONFIG_ALIAS.fullmatch(value):
+        ui.done("invalid", "Use letters, numbers, dots, underscores or hyphens for the alias.")
+        return None
+    if kind == "host" and (not _BARE_HOST.fullmatch(value) or value.startswith("-")):
+        ui.done("invalid", "Use an SSH host name, address or user@host.")
+        return None
+    if kind == "path":
+        value = os.path.expanduser(value.replace("$HOME", HOME))
+        if not os.path.isabs(value):
+            ui.done("invalid", "Use an absolute path or ~/path.")
+            return None
+    return value
+
+
+def _config_hosts(ui, cfg):
+    while True:
+        rows = [(h, f"{h}  {target}") for h, target in sorted(cfg.hosts.items())]
+        rows += [("__add__", "+ Add host"), ("__back__", "Back")]
+        host = ui.pick("Hosts · removal unregisters; it never contacts the host", rows)
+        if host in (None, "__back__"):
+            return
+        if host == "__add__":
+            alias = _config_input(ui, "host alias", kind="alias")
+            if alias is None:
+                continue
+            if alias in cfg.hosts or alias in ("__add__", "__back__"):
+                ui.done("invalid", "That alias is already in use or reserved.")
+                continue
+            target = _config_input(ui, "SSH target", kind="host")
+            if target is not None:
+                cfg.hosts[alias] = target
+            continue
+        action = ui.pick(f"Host {host}", [("target", f"SSH target: {cfg.hosts[host]}"),
+                          ("beam", "Use as default beam host"), ("remove", "Remove host"),
+                          ("back", "Back")])
+        if action == "remove":
+            _config_remove_host(cfg, host)
+            ui.done("removed", f"{host} (pending Save changes)")
+        elif action == "beam":
+            cfg.beam_host = cfg.hosts[host]
+        elif action == "target":
+            old = cfg.hosts[host]
+            target = _config_input(ui, "SSH target", old, "host")
+            if target is not None:
+                cfg.hosts[host] = target
+                if cfg.beam_host == old:
+                    cfg.beam_host = target
+                if cfg.mini_host == old:
+                    cfg.mini_host = target
+
+
+def _config_repos(ui, cfg):
+    while True:
+        rows = [(r, f"{r}  {_tilde(path)}") for r, path in sorted(cfg.repos.items())]
+        rows += [("__add__", "+ Register repo"), ("__back__", "Back")]
+        repo = ui.pick("Repos · unregistering keeps files and sessions", rows)
+        if repo in (None, "__back__"):
+            return
+        if repo == "__add__":
+            alias = _config_input(ui, "repo alias", kind="alias")
+            if alias is None:
+                continue
+            if alias in cfg.repos or alias in ("__add__", "__back__"):
+                ui.done("invalid", "That alias is already in use or reserved.")
+                continue
+            repo_path = _config_input(ui, "repo path", kind="path")
+            if repo_path is not None:
+                cfg.repos[alias] = repo_path
+            continue
+        action = ui.pick(f"Repo {repo}", [
+            ("path", f"Path: {_tilde(cfg.repos[repo])}"),
+            ("tool", f"Tool: {cfg.agents.get(repo) or 'inherit global default'}"),
+            ("branch", f"Shared-tree branch: {cfg.branches.get(repo) or 'inherit global default'}"),
+            ("worktree", f"Worktrees: {cfg.worktree.get(repo) or 'inherit global default'}"),
+            ("remove", "Unregister repo (keep files and sessions)"), ("back", "Back")])
+        if action == "remove":
+            _config_remove_repo(cfg, repo)
+        elif action == "path":
+            value = _config_input(ui, "repo path", cfg.repos[repo], "path")
+            if value is not None:
+                cfg.repos[repo] = value
+        elif action in ("tool", "worktree", "branch"):
+            attr = {"tool": "agents", "worktree": "worktree", "branch": "branches"}[action]
+            options = [("", "Inherit global default")]
+            options += ([(a, a) for a in AGENTS] if action == "tool" else
+                        [("1", "Enabled"), ("0", "Disabled (shared tree)")] if action == "worktree" else
+                        [("custom", "Set branch")])
+            value = ui.pick(f"{repo} {action}", options)
+            if value == "custom":
+                value = _config_input(ui, "branch", cfg.branches.get(repo, ""))
+            if value == "":
+                getattr(cfg, attr).pop(repo, None)
+            elif value is not None:
+                getattr(cfg, attr)[repo] = value
+
+
+def _config_worktrees(ui, cfg):
+    while True:
+        action = ui.pick("Worktree defaults · existing worktrees are not moved", [
+            ("enabled", f"Worktrees enabled: {cfg.worktree_default}"),
+            ("root", f"Worktree root: {_tilde(cfg.worktree_root)}"),
+            ("branch", f"Shared-tree fallback branch: {cfg.branch}"), ("back", "Back")])
+        if action in (None, "back"):
+            return
+        if action == "enabled":
+            value = ui.pick("Default worktree mode", [("1", "Enabled"), ("0", "Disabled (shared tree)")])
+            if value is not None:
+                cfg.worktree_default = value
+        else:
+            attr = "worktree_root" if action == "root" else "branch"
+            value = _config_input(ui, action, getattr(cfg, attr), "path" if action == "root" else "text")
+            if value is not None:
+                setattr(cfg, attr, value)
+
+
+def _config_wizard(cfg, cache):
+    ui = _RailUI()
+    edited = copy.deepcopy(cfg)
+    initial = _config_state(cfg)
+    ui.out.write("┌  t config · local settings · nothing written until Save changes\n")
+    ui.raw()
+    try:
+        while True:
+            rows = [("tool", f"Default tool     {edited.agent_default}")]
+            rows += [(a, f"{a} model    {edited.models.get(a) or 'tool default'}") for a in AGENTS]
+            rows += [("hosts", f"Hosts ({len(edited.hosts)}) · add, edit, remove"),
+                     ("repos", f"Repos ({len(edited.repos)}) · paths and overrides"),
+                     ("beam", f"Default beam host: {edited.beam_host or 'none'}"),
+                     ("worktrees", "Worktree and branch defaults"),
+                     ("edit", "Open local config in editor (all settings)"),
+                     ("save", "Save changes"), ("cancel", "Cancel")]
+            choice = ui.pick("Local settings", rows)
+            if choice in (None, "cancel"):
+                ui.done("cancelled", "nothing written")
+                return None
+            if choice == "edit":
+                if _config_diff(initial, _config_state(edited)):
+                    ui.done("pending", "Save or cancel your menu changes before opening the editor.")
+                    continue
+                return "edit"
+            if choice == "save":
+                changes = _config_diff(initial, _config_state(edited))
+                try:
+                    lines = [_config_assignment(k, v) for k, v in changes.items()]
+                except ValueError as exc:
+                    ui.done("invalid", str(exc))
+                    continue
+                if changes:
+                    answer = ui.page("Review local settings", lines, ("y", "n", "q", "esc", "abort"),
+                                     keys="y save · n back · q cancel")
+                    if answer == "n":
+                        continue
+                    if answer != "y":
+                        ui.done("cancelled", "nothing written")
+                        return None
+                return edited
+            if choice == "hosts":
+                _config_hosts(ui, edited)
+            elif choice == "repos":
+                _config_repos(ui, edited)
+            elif choice == "worktrees":
+                _config_worktrees(ui, edited)
+            elif choice == "beam":
+                options = [("", "No default (choose when beaming)")]
+                options += [(h, f"{h}  {target}") for h, target in sorted(edited.hosts.items())]
+                picked = ui.pick("Default beam host", options)
+                if picked is not None:
+                    edited.beam_host = edited.hosts.get(picked, "")
+            elif choice == "tool":
+                options = [(a, f"{a}" + ("" if shutil.which(a) else f" (install with t install {a})"))
+                           for a in AGENTS]
+                picked = ui.pick("Default tool (repo overrides still win)", options,
+                                 default=AGENTS.index(edited.agent_default) if edited.agent_default in AGENTS else 0)
+                if picked is not None:
+                    edited.agent_default = picked
+            else:
+                current = edited.models.get(choice, "")
+                options = _config_model_rows(choice, current, cache)
+                picked = ui.pick(f"{choice} model", options,
+                                 default=next(i for i, row in enumerate(options) if row[0] == current))
+                if picked == "__custom__":
+                    picked = _config_input(ui, "model ID")
+                    if picked is None:
+                        continue
+                    if not _MODEL_ID.fullmatch(picked):
+                        ui.done("invalid", "Enter a model ID without spaces or shell commands.")
+                        continue
+                if picked is not None:
+                    edited.models[choice] = picked
+    finally:
+        ui.restore()
+
+
+def _config_editor():
+    command = os.environ.get("VISUAL") or os.environ.get("EDITOR") or "vi"
+    argv = shlex.split(command)
+    if not argv:
+        raise ValueError("set VISUAL or EDITOR to an editor command")
+    rc = subprocess.call([*argv, ZSHRC_LOCAL])
+    if rc:
+        return rc
+    # Keep an incomplete edit from being sourced into the calling shell.
+    return subprocess.call(["zsh", "-n", ZSHRC_LOCAL])
+
+
+def cmd_config(cfg, args):
+    if args.show:
+        print("\n".join(_config_summary(cfg.agent_default, cfg.models, cfg.agents)))
+        print(f"Default beam host: {cfg.beam_host or 'none'}")
+        print(f"Worktrees: {cfg.worktree_default} · root: {cfg.worktree_root} · shared-tree branch: {cfg.branch}")
+        for alias, target in sorted(cfg.hosts.items()):
+            print(f"Host {alias}: {target}")
+        for alias, repo_path in sorted(cfg.repos.items()):
+            print(f"Repo {alias}: {repo_path} · tool: {cfg.agents.get(alias) or 'inherit'} · "
+                  f"branch: {cfg.branches.get(alias) or 'inherit'} · worktrees: {cfg.worktree.get(alias) or 'inherit'}")
+        return 0
+    if not sys.stdin.isatty() or not sys.stdout.isatty():
+        print("t config: open this menu in a terminal; t config --show prints current settings",
+              file=sys.stderr)
+        return 1
+    try:
+        before = _config_read(ZSHRC_LOCAL)
+        result = "edit" if getattr(args, "edit", False) else _config_wizard(cfg, _config_codex_cache())
+        if result is None:
+            return 0
+        if result == "edit":
+            rc = _config_editor()
+            if rc:
+                print("t config: editor or syntax check failed; local config was not reloaded", file=sys.stderr)
+                return rc
+        else:
+            current = _config_state(cfg)
+            changes = _config_diff(current, _config_state(result))
+            if not changes:
+                print("Settings unchanged — nothing written")
+                return 0
+            after = _config_text(before, changes, current)
+            _config_write(ZSHRC_LOCAL, before, after)
+    except (OSError, ValueError) as exc:
+        print(f"t config: {exc}", file=sys.stderr)
+        return 1
+    zsh_capture("_t_sync_config")
+    print("✓ saved local settings to ~/.zshrc.local")
+    if not os.environ.get("T_SETUP_SHIM"):
+        print("run `source ~/.zshrc` (or open a new shell) to use these settings")
+    return 0
 
 
 class _RailUI:
@@ -2534,6 +2973,290 @@ def cmd_pending(cfg, args):
           f"bin. You reached bin/t directly (e.g. `command t {args._verb}`) — run "
           f"`t {args._verb} …` in an interactive zsh instead.", file=sys.stderr)
     return 2
+
+
+# ─── phone — reconnect one client; keep every agent in its existing tmux slot ──
+
+def _phone_profile(value):
+    if not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", value):
+        raise argparse.ArgumentTypeError("client name must be 1–64 letters, digits, _ or -")
+    return value
+
+
+def _phone_root():
+    return os.path.join(os.environ.get("XDG_STATE_HOME", os.path.join(HOME, ".local", "state")),
+                        "t", "phone")
+
+
+def _phone_load(path):
+    try:
+        with open(path, encoding="utf-8") as fh:
+            data = json.loads(fh.read(65536))
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError, UnicodeError):
+        return {}
+
+
+def _phone_write(path, data):
+    """A connection or selection is one atomic record, never half of a JSON file."""
+    import tempfile
+    parent = os.path.dirname(path)
+    os.makedirs(parent, mode=0o700, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix=".phone-", dir=parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump(data, fh, ensure_ascii=True)
+            fh.write("\n")
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, path)
+    finally:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+
+
+def _phone_remembered(rows, saved):
+    """Follow the conversation, never a reused slot. Before SessionStart stamps an
+    ID we may reattach only the very same session on the very same tmux server."""
+    if saved.get("sid"):
+        matches = [r for r in rows if r.get("sid") == saved["sid"]
+                   and r.get("agent") == saved.get("agent")]
+    else:
+        keys = ("socket", "server", "created", "id")
+        matches = [r for r in rows if all(saved.get(k) and saved[k] == r.get(k) for k in keys)]
+    return matches[0] if len(matches) == 1 else None
+
+
+def _phone_connection(record, client):
+    """A profile belongs to a tmux CLIENT, never the session several clients share.
+    PID + tty + server must all still match before a popup can update its profile."""
+    keys = ("pid", "name", "socket", "server")
+    if not all(record.get(k) and record[k] == client.get(k) for k in keys):
+        return None
+    profile = record.get("profile")
+    return profile if isinstance(profile, str) and re.fullmatch(r"[A-Za-z0-9_-]{1,64}", profile) else None
+
+
+def _phone_text(value, width):
+    """Terminal-safe single line, bounded in screen columns (including wide text)."""
+    import unicodedata
+    text = _ANSI_RE.sub("", str(value))
+    text = " ".join(text.split())
+    text = "".join(c for c in text if c.isprintable())
+    chars, used = [], 0
+    for c in text:
+        size = 0 if unicodedata.combining(c) else (2 if unicodedata.east_asian_width(c) in "WF" else 1)
+        if used + size > max(0, width):
+            while chars and used > width - 1:
+                old = chars.pop()
+                used -= 0 if unicodedata.combining(old) else (2 if unicodedata.east_asian_width(old) in "WF" else 1)
+            return "".join(chars) + ("…" if width > 0 else "")
+        chars.append(c)
+        used += size
+    return "".join(chars)
+
+
+def _phone_page(rows, cur, columns, lines):
+    """Number only the visible page, so every choice is one phone key (1–9)."""
+    columns, lines = max(1, columns), max(1, lines)
+    if not rows:
+        return [_phone_text(s, columns) for s in
+                ["No running t sessions.", "Start one with t open <repo>.",
+                 "Saved chats: t resume -a -l", "r refresh · q back"][:lines]], []
+    cur = max(0, min(cur, len(rows) - 1))
+    each = 2 if lines >= 7 else 1
+    count = min(9, max(1, (lines - 4) // each))
+    lo = (cur // count) * count
+    visible = rows[lo:lo + count]
+    page, pages = lo // count + 1, (len(rows) + count - 1) // count
+    out = [f"Sessions  {page}/{pages}", "1–9 pick · j/k move · Enter open"]
+    for n, row in enumerate(visible, 1):
+        mark = ">" if lo + n - 1 == cur else " "
+        out.append(f"{mark}{n} {row['slot']} · {row.get('agent', 'claude')}")
+        if each == 2:
+            out.append("   " + (row.get("summary") or "(no title yet)"))
+    out += ["n/p page · r refresh", "q / Esc back · other tasks keep running"]
+    return [_phone_text(s, columns) for s in out[:lines]], visible
+
+
+def _phone_tmux(*args):  # pragma: no cover — exercised against an isolated tmux server
+    return _run(["tmux", "-u", *args], timeout=10)
+
+
+def _phone_snapshot():  # pragma: no cover — tmux format/transport, tested end to end
+    fields = ("id", "name", "created", "server", "socket", "cwd", "stamp", "dead")
+    fmt = "\t".join("#{%s}" % f for f in
+                    ("session_id", "session_name", "session_created", "pid", "socket_path",
+                     "session_path", "CLAUDE_RESUME_ID", "pane_dead"))
+    result = _phone_tmux("list-sessions", "-F", fmt)
+    if result.returncode:
+        # A stopped server is an empty session list, not an invitation to start one.
+        if "no server running" in result.stderr or "No such file" in result.stderr:
+            return []
+        raise RuntimeError(result.stderr.strip() or "could not list tmux sessions")
+    rows = []
+    for line in result.stdout.splitlines():
+        parts = line.split("\t")
+        if (len(parts) == len(fields) and parts[-1] == "0"
+                and re.fullmatch(r"dev-.+-[0-9]+", parts[1])):
+            rows.append(dict(zip(fields, parts)))
+    return rows
+
+
+def _phone_sessions():  # pragma: no cover — shell integration uses existing authoritative resolver
+    before = _phone_snapshot()
+    if not before:
+        return []
+    # This is the same registry-first ID and transcript-title resolution as t ls.
+    # Raw tmux env can hold a predecessor's ID after a pane is reused; never use
+    # that stamp directly to follow a conversation across slots.
+    # SSH clients do not always forward a UTF-8 locale. -u also preserves tabs in
+    # tmux's formatted output; scope the override to this disposable data shell.
+    data = zsh_capture('function tmux() { command tmux -u "$@"; }; _dev_session_rows')
+    meta = {"dev-" + r["slot"]: r for r in _parse_rows(data)}
+    after = {r["id"]: r for r in _phone_snapshot()}
+    rows = []
+    for row in before:
+        # Refuse a row replaced or re-stamped while its metadata was being read.
+        if after.get(row["id"]) != row:
+            continue
+        detail = meta.get(row["name"], {})
+        if detail.get("cwd") != row["cwd"]:
+            continue
+        row.update(slot=detail["slot"], agent=detail["agent"],
+                   sid="" if detail["sid"] == "-" else detail["sid"],
+                   summary=detail["summary"])
+        rows.append(row)
+    return sorted(rows, key=lambda r: (r["slot"].rsplit("-", 1)[0],
+                                      int(r["slot"].rsplit("-", 1)[1])))
+
+
+def _phone_clients():  # pragma: no cover — tmux transport
+    fields = ("name", "pid", "server", "socket", "session")
+    fmt = "\t".join("#{%s}" % f for f in
+                    ("client_name", "client_pid", "pid", "socket_path", "session_id"))
+    result = _phone_tmux("list-clients", "-F", fmt)
+    return [dict(zip(fields, p)) for line in result.stdout.splitlines()
+            if len(p := line.split("\t")) == len(fields)]
+
+
+def _phone_client(name, pid):  # pragma: no cover — tmux transport
+    return next((c for c in _phone_clients() if c["name"] == name and c["pid"] == pid), None)
+
+
+def _phone_picker(rows):  # pragma: no cover — interactive UI covered with real PTYs
+    """Full-screen in both a popup and a fresh SSH terminal. No shell snippets are
+    sent to an agent. Resize is repainted even without a keypress (phone rotation)."""
+    import select
+    ui = _RailUI()
+    cur = 0
+    last_frame = None
+    try:
+        ui.raw()
+        ui.out.write("\x1b[?1049h")
+        while True:
+            cols, height = shutil.get_terminal_size((40, 18))
+            body, visible = _phone_page(rows, cur, max(1, cols - 1), max(1, height - 1))
+            frame = (cols, height, body)
+            if frame != last_frame:
+                ui.out.write("\x1b[H\x1b[2J" + "\r\n".join(body))
+                ui.out.flush()
+                last_frame = frame
+            if not select.select([ui.fd], [], [], 0.25)[0]:
+                continue
+            key = ui.read_key()
+            if key in ("q", "esc", "abort"):
+                return None
+            if key == "r":
+                rows = _phone_sessions()
+                cur = min(cur, max(0, len(rows) - 1))
+            elif visible and key in "123456789" and len(key) == 1:
+                n = int(key) - 1
+                if n < len(visible):
+                    return visible[n]
+            elif rows:
+                if key == "enter":
+                    return rows[cur]
+                if key in ("j", "down"):
+                    cur = (cur + 1) % len(rows)
+                elif key in ("k", "up"):
+                    cur = (cur - 1) % len(rows)
+                elif key in ("n", "space"):
+                    count = min(9, max(1, (max(1, height - 1) - 4) // (2 if height - 1 >= 7 else 1)))
+                    cur = (cur // count + 1) * count
+                    if cur >= len(rows):
+                        cur = 0
+                elif key == "p":
+                    count = min(9, max(1, (max(1, height - 1) - 4) // (2 if height - 1 >= 7 else 1)))
+                    cur = max(0, (cur // count - 1) * count)
+    finally:
+        ui.out.write("\x1b[?1049l")
+        ui.restore()
+
+
+def cmd_phone(cfg, args):
+    """Never launches an agent, kills a session, or falls through to t open."""
+    if not shutil.which("tmux"):
+        print("t phone: tmux is required.", file=sys.stderr)
+        return 1
+    if not sys.stdin.isatty() or not sys.stdout.isatty():
+        print("t phone needs an interactive terminal (SSH must allocate a TTY).", file=sys.stderr)
+        return 1
+    root = _phone_root()
+    target = None
+    profile = args.client
+    try:
+        if args.tmux_client or args.tmux_client_pid:
+            target = _phone_client(args.tmux_client, args.tmux_client_pid)
+            if not target:
+                raise RuntimeError("the terminal that opened this picker has disconnected")
+            record = _phone_load(os.path.join(root, "connections", target["pid"] + ".json"))
+            profile = _phone_connection(record, target)
+        elif os.environ.get("TMUX"):
+            print("Already inside tmux: press F1 to choose a session for this terminal.", file=sys.stderr)
+            return 1
+
+        state_path = os.path.join(root, "profiles", profile + ".json") if profile else None
+        saved = _phone_load(state_path) if state_path else {}
+        rows = _phone_sessions()
+        chosen = None if args.pick or target else _phone_remembered(rows, saved)
+        if not chosen:
+            if saved and not args.pick and not target:
+                print("Your previous session is no longer running. Choose another below.\n"
+                      "Saved conversations are available with t resume -a -l.", file=sys.stderr)
+            chosen = _phone_picker(rows)
+        if not chosen:
+            return 0
+
+        # The menu can stay open while an agent finishes. Revalidate the exact
+        # conversation and instance immediately before attaching, never its name.
+        fresh = _phone_remembered(_phone_sessions(), chosen)
+        if not fresh:
+            raise RuntimeError("that conversation ended or moved; press F1 / run t phone --pick again")
+        chosen = fresh
+        if target:
+            current = _phone_client(target["name"], target["pid"])
+            if current != target:
+                raise RuntimeError("the terminal changed while this picker was open; reopen it with F1")
+            result = _phone_tmux("switch-client", "-c", target["name"], "-t", chosen["id"])
+            if result.returncode:
+                raise RuntimeError(result.stderr.strip() or "could not switch sessions")
+            if state_path:
+                _phone_write(state_path, chosen)
+            return 0
+
+        _phone_write(state_path, chosen)
+        # exec preserves our PID: F1 receives the same #{client_pid}. A tty alone
+        # is insufficient because SSH can reuse it for an entirely new profile.
+        connection = {"profile": profile, "pid": str(os.getpid()),
+                      "name": os.ttyname(sys.stdin.fileno()), "server": chosen["server"],
+                      "socket": chosen["socket"]}
+        _phone_write(os.path.join(root, "connections", connection["pid"] + ".json"), connection)
+        # No -d: reconnecting the phone must not evict the user's desktop client.
+        os.execvp("tmux", ["tmux", "-u", "attach-session", "-t", chosen["id"]])
+    except (OSError, RuntimeError) as e:
+        print(f"t phone: {e}", file=sys.stderr)
+        return 1
 
 
 # ─── install — install + log in the agent CLIs (claude · codex · cursor) ───────
@@ -6154,6 +6877,7 @@ examples:
   t open ff:p4242         open an fg row with no session id by its pid label (as t ls shows it)
   t ls                    list this repo's live sessions
   t ls -r                 list live sessions across every machine
+  t phone                 reconnect from Termius; F1 switches sessions
   t push                  send the current session to a background tmux slot
   t pop api 3             pull dev-api-3 back to this terminal
   t resume api 3          revive dev-api-3's last conversation after it was closed
@@ -6174,6 +6898,20 @@ agents — what each verb supports per agent (t install --status adds this machi
 
 Run `t <verb> -h` for a verb's own flags.""")
     sub = p.add_subparsers(dest="verb", metavar="<verb>")
+
+    sp = sub.add_parser("phone", help="reconnect from your phone; F1 switches running sessions",
+        description="Attach your last selected live conversation on this Mac/host, or show a "
+            "compact numbered picker. Set Termius's Startup Command to: zsh -lic 't phone'. "
+            "F1 opens the picker while an agent is running. Each --client name remembers its "
+            "own selection even after Termius closes every tab. Only existing local tmux dev "
+            "sessions are attached: agents are never restarted or duplicated. If a session has "
+            "ended, recover saved conversations separately with t resume -a -l. Foreground "
+            "sessions (--fg / t pop) are outside this flow. Requires tmux 3.2+ for the F1 popup.")
+    sp.add_argument("--client", type=_phone_profile, default="phone", metavar="NAME",
+                    help="remembered phone profile (default: phone; separate tabs can use phone-1, phone-2)")
+    sp.add_argument("--pick", action="store_true", help="choose a running session instead of reconnecting the last one")
+    sp.add_argument("--tmux-client", help=argparse.SUPPRESS)
+    sp.add_argument("--tmux-client-pid", help=argparse.SUPPRESS)
 
     sp = sub.add_parser("open", help="open or reattach a session in a per-repo tmux slot",
         description="Open or reattach a Claude session in a per-repo tmux slot. Bare `t open` "
@@ -6383,6 +7121,18 @@ Run `t <verb> -h` for a verb's own flags.""")
     sp.add_argument("host", help="$REMOTE_HOSTS key, or a literal ssh target")
     sp.add_argument("rest", nargs=argparse.REMAINDER, help="command to run (omit for an interactive shell)")
 
+    sp = sub.add_parser("config", help="manage local settings: tools, models, repos and hosts",
+        description="Arrow-key settings hub for this machine: default tool and per-tool models; "
+            "add, edit or remove hosts; register or unregister repos and set their tool, branch "
+            "and worktree overrides; choose the default beam host and worktree defaults. "
+            "Save changes reviews then writes a managed block in ~/.zshrc.local. Removed "
+            "hosts stop participating in dots --all; unregistering repos keeps their files "
+            "and sessions. Tool/model defaults apply to fresh tmux and --fg sessions only. "
+            "Open local config in editor covers all custom shell settings (VISUAL/EDITOR, else vi).")
+    cg = sp.add_mutually_exclusive_group()
+    cg.add_argument("--show", action="store_true", help="print current settings without opening the menu")
+    cg.add_argument("--edit", action="store_true", help="open ~/.zshrc.local in VISUAL/EDITOR directly")
+
     sp = sub.add_parser("setup", help="register local repos and ssh hosts in ~/.zshrc.local",
         description="Interactive onboarding for this machine's per-machine config: a stepped "
             "inline wizard over every git checkout found under the scan dirs (default ~/code) "
@@ -6549,12 +7299,14 @@ Run `t <verb> -h` for a verb's own flags.""")
 
 
 IMPLEMENTED = {
+    "phone": cmd_phone,
     "ls": cmd_ls, "session-rows": cmd_session_rows, "on": cmd_on, "read": cmd_read,
     "plan": cmd_plan, "paste": cmd_paste, "kill": cmd_kill, "setup": cmd_setup,
     "land": cmd_land, "kill-owner": cmd_kill_owner, "cursor": cmd_cursor,
     "doctor": cmd_doctor, "mcp": cmd_mcp, "new": cmd_new, "new-land": cmd_new_land,
     "install": cmd_install, "permissions": cmd_permissions, "trust": cmd_trust,
     "app": cmd_app,
+    "config": cmd_config,
 }
 
 

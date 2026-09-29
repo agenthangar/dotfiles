@@ -5851,6 +5851,16 @@ exit 1
 '''], timeout=15)
 
 
+def _app_running(bundle):
+    """Read process identity without activating or automating the desktop UI."""
+    result = _run(["ps", "-x", "-o", "comm="], timeout=5)
+    if result.returncode:
+        raise ValueError("could not check whether Codex is running; no CLI was stopped")
+    prefix = os.path.realpath(bundle) + "/Contents/MacOS/"
+    return any(os.path.realpath(line.strip()).startswith(prefix)
+               for line in result.stdout.splitlines() if line.strip())
+
+
 def cmd_app(cfg, args):
     try:
         # Validate explicit URLs before scanning or changing any session.
@@ -5873,7 +5883,7 @@ def cmd_app(cfg, args):
         if plan:
             print(f"Plan: {plan} (opens in a separate browser tab for annotation)")
         if args.dry_run:
-            window = "the existing app window" if args.reuse_window else "a new app window"
+            window = "the existing app window" if args.reuse_window else "the app (only if it is not already running)"
             print(f"Would stop this slot's Codex CLI, keep its worktree/dev server, and open in {window}:")
             print(link)
             return 0
@@ -5882,6 +5892,14 @@ def cmd_app(cfg, args):
         bundle = _app_bundle()
         if not bundle:
             raise ValueError("install the Codex desktop app in /Applications or ~/Applications first")
+        # open -n requests a second PROCESS, not a Codex window. It can either
+        # navigate an existing window or return zero with no visible effect.
+        # Until Codex exposes a window-targeted launcher, preserve the running
+        # desktop and CLI unless window reuse was explicitly requested.
+        if not args.reuse_window and _app_running(bundle):
+            raise ValueError("Codex is already running and cannot be given a new window through this launcher. "
+                             "Open a new window in Codex, focus it, then rerun with --reuse-window. "
+                             "No CLI was stopped and no app navigation was requested.")
         links = [link]
         if plan:
             try:
@@ -5894,13 +5912,7 @@ def cmd_app(cfg, args):
         stopped = _app_stop_cli(row)
         if stopped.returncode:
             raise ValueError(stopped.stderr.strip() or "could not stop the CLI; the app was not opened")
-        # Bare URLs are OS open-url events, even with -n: they can navigate an
-        # already-running instance. --args delivers them only to the new process;
-        # Codex parses thread deep links from its startup argv. Reuse deliberately
-        # uses OS events because an existing process cannot receive new argv.
-        launch = (["open", "-a", bundle, *links] if args.reuse_window else
-                  ["open", "-n", "-a", bundle, "--args", *links])
-        result = _run(launch, timeout=15)
+        result = _run(["open", "-a", bundle, *links], timeout=15)
         if result.returncode:
             recovery = shlex.join(["codex", "resume", row["sid"]])
             raise ValueError(f"could not open the app: {result.stderr.strip()}. "
@@ -5909,7 +5921,8 @@ def cmd_app(cfg, args):
             _app_remember_preview(row, url)
         if plan:
             _index_save(_app_plan_cache(row), {"cwd": row["cwd"], "path": plan})
-        print("Sent to the desktop app; tmux keeps this worktree slot reserved.")
+        print("Open request sent to macOS; app delivery is not confirmed. "
+              "Tmux keeps this worktree slot reserved.")
         return 0
     except ValueError as e:
         print(f"t app: {e}", file=sys.stderr)
@@ -7078,13 +7091,15 @@ Run `t <verb> -h` for a verb's own flags.""")
 
     sp = sub.add_parser("app", help="move a local Codex slot into the desktop app with its preview",
         description="Stop a local slot's Codex CLI and open the SAME conversation in the "
-            "Codex desktop app in a new window on macOS, with its running web preview and referenced Markdown "
+            "Codex desktop app on macOS, with its running web preview and referenced Markdown "
             "plan in separate built-in browser tabs. "
             "Use Annotation mode there to leave comments. The tmux slot stays reserved, "
             "and the worktree and dev server keep running. A lone number means the "
             "cwd repo; bare `t app` uses the cwd worktree's slot, or the repo's only slot. "
             "Several slots require an explicit number. Claude conversations cannot be "
             "converted. Remote slots must be brought here first with `t beam … --here`. "
+            "If Codex is already running, open and focus a new window yourself, then use "
+            "--reuse-window; automatic new-window launch is not supported. "
             "The browser deep link requires a recent desktop app. Run from a separate "
             "terminal if the command would stop the agent executing it.")
     sp.add_argument("repo", nargs="?", help="DEV_REPOS key; defaults to the cwd repo")
@@ -7095,7 +7110,7 @@ Run `t <verb> -h` for a verb's own flags.""")
     plan = sp.add_mutually_exclusive_group()
     plan.add_argument("--plan", metavar="PATH", help="Markdown plan to open (default: last plan referenced in the session, then remembered choice)")
     plan.add_argument("--no-plan", action="store_true", help="skip opening a plan")
-    sp.add_argument("--reuse-window", action="store_true", help="open in the existing app window instead of launching a new one")
+    sp.add_argument("--reuse-window", action="store_true", help="allow navigating the running app's window (open and focus a new window first to preserve other work)")
     sp.add_argument("--dry-run", action="store_true", help="show the handoff link without stopping or opening anything")
 
     sp = sub.add_parser("ls", help="list dev sessions (attached + active context)",

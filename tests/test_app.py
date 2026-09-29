@@ -113,6 +113,7 @@ def app_command(t_mod, app_slot, monkeypatch):
     monkeypatch.setattr(t_mod, "zsh_capture", lambda snippet: text)
     monkeypatch.setattr(t_mod.sys, "platform", "darwin")
     monkeypatch.setattr(t_mod, "_app_bundle", lambda: "/Applications/ChatGPT.app")
+    monkeypatch.setattr(t_mod, "_app_running", lambda bundle: False)
     monkeypatch.setattr(t_mod, "_dev_url", lambda key, cwd: "http://localhost:5213")
     events = []
     def stop(selected):
@@ -132,7 +133,7 @@ def app_command(t_mod, app_slot, monkeypatch):
 def test_app_command_stops_before_opening_same_thread(t_mod, app_command):
     call, events, row = app_command
     assert call() == 0
-    assert events == [("stop", row), ("open", ["open", "-n", "-a", "/Applications/ChatGPT.app", "--args",
+    assert events == [("stop", row), ("open", ["open", "-a", "/Applications/ChatGPT.app",
                         t_mod._app_link(SID, "http://localhost:5213")])]
 
 
@@ -143,8 +144,8 @@ def test_app_opens_referenced_plan_with_existing_thread_and_preview(t_mod, app_c
     monkeypatch.setattr(t_mod, "_app_find_plan", lambda selected: str(plan), raising=False)
     monkeypatch.setattr(t_mod, "_app_plan_start", lambda path: "http://127.0.0.1:12345/secret/", raising=False)
     assert call() == 0
-    assert events[-1][1][:5] == ["open", "-n", "-a", "/Applications/ChatGPT.app", "--args"]
-    links = events[-1][1][5:]
+    assert events[-1][1][:3] == ["open", "-a", "/Applications/ChatGPT.app"]
+    links = events[-1][1][3:]
     assert len(links) == 2
     assert all(urlsplit(link).path == "/" + SID for link in links)
     assert parse_qs(urlsplit(links[0]).query)["browserUrl"] == ["http://localhost:5213"]
@@ -157,12 +158,72 @@ def test_app_command_dry_run_is_read_only(app_command, capsys):
     call, events, _ = app_command
     assert call("--dry-run") == 0
     assert events == []
-    assert "open in a new app window" in capsys.readouterr().out
+    assert "only if it is not already running" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("with_plan", [False, True])
+def test_app_running_desktop_does_not_report_a_silent_handoff(t_mod, app_command, monkeypatch, capsys, tmp_path, with_plan):
+    """open -n --args can return zero without opening anything in Codex."""
+    call, events, row = app_command
+    monkeypatch.setattr(t_mod, "_app_running", lambda bundle: True)
+    if with_plan:
+        plan = tmp_path / "plan.md"
+        plan.write_text("# Plan")
+        monkeypatch.setattr(t_mod, "_app_find_plan", lambda row: str(plan))
+        monkeypatch.setattr(t_mod, "_app_plan_start", lambda path: pytest.fail("must not start a plan server"))
+    assert call() == 1
+    assert events == [], "an unsupported launch must not stop the CLI or navigate another window"
+    output = capsys.readouterr()
+    assert "--reuse-window" in output.err
+    assert "new window" in output.err
+    assert "Sent to the desktop app" not in output.out
+    assert not os.path.exists(t_mod._app_preview_path(row))
+
+
+def test_app_os_acceptance_is_not_reported_as_delivery(app_command, capsys):
+    call, _, _ = app_command
+    assert call("--reuse-window") == 0
+    output = capsys.readouterr().out
+    assert "Open request sent" in output
+    assert "Sent to the desktop app" not in output
+
+
+@pytest.mark.parametrize("commands,expected", [
+    ("/Applications/ChatGPT.app/Contents/MacOS/ChatGPT\n", True),
+    ("  /Applications/ChatGPT.app/Contents/MacOS/ChatGPT  \n\n", True),
+    ("/Applications/ChatGPT.app/Contents/Frameworks/Helper.app/Contents/MacOS/Helper\n", False),
+    ("/Applications/Other.app/Contents/MacOS/ChatGPT\n/bin/zsh\n", False),
+    ("", False),
+])
+def test_app_running_checks_main_process(t_mod, monkeypatch, commands, expected):
+    def run(argv, **kwargs):
+        assert argv == ["ps", "-x", "-o", "comm="]
+        assert kwargs["timeout"] == 5
+        return subprocess.CompletedProcess(argv, 0, commands, "")
+    monkeypatch.setattr(t_mod, "_run", run)
+    assert t_mod._app_running("/Applications/ChatGPT.app") is expected
+
+
+def test_app_running_probe_failure_is_not_treated_as_stopped(t_mod, monkeypatch):
+    monkeypatch.setattr(t_mod, "_run", lambda *a, **kw: subprocess.CompletedProcess([], 124, "", "timeout"))
+    with pytest.raises(ValueError, match="could not check"):
+        t_mod._app_running("/Applications/ChatGPT.app")
+
+
+def test_app_failed_running_probe_does_not_stop_cli(t_mod, app_command, monkeypatch, capsys):
+    call, events, _ = app_command
+    def probe(bundle):
+        raise ValueError("could not check whether Codex is running")
+    monkeypatch.setattr(t_mod, "_app_running", probe)
+    assert call() == 1
+    assert events == []
+    assert "could not check" in capsys.readouterr().err
 
 
 @pytest.mark.parametrize("preview", [(), ("--no-preview", "--no-plan")])
-def test_app_reuse_window_is_explicit(t_mod, app_command, preview, capsys):
+def test_app_reuse_window_is_explicit(t_mod, app_command, preview, capsys, monkeypatch):
     call, events, row = app_command
+    monkeypatch.setattr(t_mod, "_app_running", lambda bundle: pytest.fail("reuse needs no process check"))
     assert call("--reuse-window", "--dry-run", *preview) == 0
     assert events == []
     assert "open in the existing app window" in capsys.readouterr().out

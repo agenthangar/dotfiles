@@ -28,11 +28,15 @@ shim in `.zshrc` for verbs that must run in your shell).
 Run `t -h` for the full verb list.
 
 For example, `t app api 13` stops that slot's Codex CLI and opens its existing
-thread in a new desktop app window, with the slot's live dev URL in the built-in browser.
-Use `--reuse-window` to open in the existing app window instead. On macOS the
-default launches a fresh app instance with `open -n … --args`, passing the links
-directly to that process. Passing URLs as ordinary `open` operands can navigate
-an existing instance even with `-n`. The handoff keeps the same conversation.
+thread and live dev URL in the desktop app when Codex is not already running.
+If Codex is running, the command stops before touching the CLI or sending links.
+Open a new window in Codex, focus it, then run `t app api 13 --reuse-window`.
+That flag explicitly allows the app to navigate its existing window.
+Automatic new-window creation is currently unsupported: macOS `open -n` requests
+a new process, which can silently do nothing or route links to an existing window.
+The command uses normal macOS URL delivery and reports only that an open request
+was sent; macOS does not confirm that the app displayed it.
+The handoff keeps the same conversation.
 Use **Annotation mode** to click an element or select an area and leave feedback.
 `t app api 13 --url 'http://localhost:5213/#budget'` selects a particular page
 and remembers its full URL for that conversation. Later `t app api 13` opens

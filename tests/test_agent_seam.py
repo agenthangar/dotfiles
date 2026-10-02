@@ -215,6 +215,168 @@ def nosleep(zsh, tmp_path):
     return call
 
 
+@pytest.fixture
+def nosleep_loop(zsh, tmp_path):
+    """Run the actual control loop with a virtual clock and no real power/network changes."""
+    log = tmp_path / "nosleep-loop.log"
+    setup = r'''
+        zmodload -u zsh/datetime
+        typeset -gi EPOCHSECONDS=1000 online_probe=0 busy_probe=0 pmset_reset=0
+        typeset -a online_results=( ${=FAKE_ONLINE} ) busy_results=( ${=FAKE_BUSY} )
+        sudo() { print -r -- "sudo $EPOCHSECONDS $*" >> "$LOOP_LOG"; }
+        ps() { return 0; }
+        caffeinate() { return 0; }
+        _nosleep_hold() { print -r -- "hold $EPOCHSECONDS $*" >> "$LOOP_LOG"; }
+        _nosleep_lock() { print -r -- "lock $EPOCHSECONDS" >> "$LOOP_LOG"; }
+        _nosleep_lid_closed() { (( EPOCHSECONDS >= ${FAKE_LID_AT:-99999} )); }
+        _nosleep_pmset_held() {
+            if (( ! pmset_reset && EPOCHSECONDS >= ${FAKE_RESET_AT:-99999} )); then
+                pmset_reset=1
+                return 1
+            fi
+            return 0
+        }
+        _nosleep_online() {
+            print -r -- "online $EPOCHSECONDS" >> "$LOOP_LOG"
+            (( online_probe < ${#online_results} )) && (( ++online_probe ))
+            (( online_results[online_probe] ))
+        }
+        _nosleep_busy_at() {
+            print -r -- "busy $EPOCHSECONDS baselines=${#_NOSLEEP_NET_AT}" >> "$LOOP_LOG"
+            (( busy_probe < ${#busy_results} )) && (( ++busy_probe ))
+            REPLY=0
+            (( busy_results[busy_probe] )) && REPLY=$EPOCHSECONDS
+            _NOSLEEP_NET_AT=( 42 $EPOCHSECONDS )
+            (( EPOCHSECONDS += ${FAKE_BUSY_SECONDS:-0} ))
+        }
+        sleep() {
+            (( EPOCHSECONDS += $1 ))
+            if (( EPOCHSECONDS >= ${FAKE_STOP_AT:-99999} )); then kill -TERM $$; fi
+            if (( EPOCHSECONDS > 5000 )); then print -u2 "virtual clock limit"; exit 99; fi
+        }
+    '''
+
+    def call(args="", **env):
+        result = zsh(setup + f'\nnosleep {args}; rc=$?; print -r -- "exit=$rc at=$EPOCHSECONDS"',
+                     LOOP_LOG=str(log), FAKE_ONLINE=env.pop("FAKE_ONLINE", "1"),
+                     FAKE_BUSY=env.pop("FAKE_BUSY", "0"), **env)
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert not result.stderr, result.stderr
+        return result, log.read_text().splitlines() if log.exists() else []
+
+    return call
+
+
+@pytest.mark.parametrize("offline", [False, True])
+def test_zsh_nosleep_grace_then_three_backoff_retries(nosleep_loop, offline):
+    result, log = nosleep_loop(FAKE_ONLINE="0" if offline else "1")
+    assert "retry 1/3 in 30s" in result.stdout
+    assert "retry 2/3 in 60s" in result.stdout
+    assert "retry 3/3 in 120s" in result.stdout
+    assert "3 retries exhausted" in result.stdout
+    assert "exit=0 at=2140" in result.stdout
+    assert [line for line in log if line.startswith("online ")][-4:] == [
+        "online 1930", "online 1960", "online 2020", "online 2140"]
+    assert [line for line in log if "disablesleep" in line] == [
+        "sudo 1000 pmset -a disablesleep 1", "sudo 2140 -n pmset -a disablesleep 0"]
+
+
+def test_zsh_nosleep_zero_grace_still_samples_then_retries(nosleep_loop):
+    result, log = nosleep_loop("--grace 0 --every 2 --backoff 2")
+    assert [line for line in log if line.startswith("online ")] == [
+        "online 1000", "online 1002", "online 1004", "online 1008", "online 1016"]
+    assert "exit=0 at=1016" in result.stdout
+
+
+def test_zsh_nosleep_activity_recovery_resets_backoff(nosleep_loop):
+    result, log = nosleep_loop("--grace 0 --every 2 --backoff 2",
+                               FAKE_BUSY="0 0 0 1 0")
+    assert "activity recovered" in result.stdout
+    assert result.stdout.count("retry 1/3 in 2s") == 2
+    assert "exit=0 at=1024" in result.stdout
+    assert "online 1010" in log  # normal cadence resumes after recovery at 1008
+
+
+def test_zsh_nosleep_reconnect_resets_activity_grace_and_baselines(nosleep_loop):
+    result, log = nosleep_loop("--grace 4 --every 2 --backoff 2",
+                               FAKE_ONLINE="0 0 0 0 0 1")
+    assert "network recovered — restarting agent activity sampling and grace" in result.stdout
+    assert "busy 1012 baselines=0" in log
+    assert "online 1014" in log  # normal cadence resumes, without consuming a retry
+    assert "no local agent activity for 6s — retry 1/3 in 2s" in result.stdout
+    assert "exit=0 at=1032" in result.stdout
+
+
+def test_zsh_nosleep_short_blips_stay_inside_grace(nosleep_loop):
+    result, _ = nosleep_loop("--grace 8 --every 2", FAKE_ONLINE="1 0 1",
+                             FAKE_BUSY="1 0 0 1", FAKE_STOP_AT="1008")
+    assert "retry 1/" not in result.stdout and "letting go" not in result.stdout
+    assert "exit=130 at=1008" in result.stdout
+
+
+def test_zsh_nosleep_slow_successful_probe_does_not_expire_zero_grace(nosleep_loop):
+    result, _ = nosleep_loop("--grace 0 --every 2", FAKE_BUSY="1",
+                             FAKE_BUSY_SECONDS="2", FAKE_STOP_AT="1012")
+    assert "retry 1/" not in result.stdout and "letting go" not in result.stdout
+    assert "exit=130 at=1012" in result.stdout
+
+
+def test_zsh_nosleep_lid_sudo_and_interrupt_work_during_backoff(nosleep_loop):
+    result, log = nosleep_loop("--grace 0", FAKE_LID_AT="1110", FAKE_STOP_AT="1200",
+                               FAKE_RESET_AT="1160")
+    assert "retry 3/3 in 120s" in result.stdout
+    assert "lock 1110" in log  # between checks at 1060 and 1120
+    assert "sudo 1180 -n -v" in log  # keep sudo alive during the 120s wait
+    assert "sudo 1180 -n pmset -a disablesleep 1" in log  # re-arm during backoff too
+    assert "exit=130 at=1200" in result.stdout
+    assert [line for line in log if "disablesleep 0" in line] == [
+        "sudo 1200 -n pmset -a disablesleep 0"]
+
+
+def test_zsh_nosleep_retry_delay_is_capped(nosleep_loop):
+    result, _ = nosleep_loop("--grace 0 --every 2 --backoff 200 --retries 4")
+    assert "retry 1/4 in 200s" in result.stdout
+    assert all(f"retry {i}/4 in 300s" in result.stdout for i in (2, 3, 4))
+    assert "exit=0 at=2102" in result.stdout
+
+
+def test_zsh_nosleep_retries_can_be_disabled(nosleep_loop):
+    result, _ = nosleep_loop("--grace 0 --every 2 --retries 0")
+    assert "retry 1/" not in result.stdout
+    assert "exit=0 at=1002" in result.stdout
+
+
+def test_zsh_nosleep_forever_skips_probes(nosleep_loop):
+    result, log = nosleep_loop("--forever", FAKE_STOP_AT="1060")
+    assert not any(line.startswith(("online ", "busy ")) for line in log)
+    assert "exit=130 at=1060" in result.stdout
+
+
+@pytest.mark.parametrize("args", ["--grace", "--every", "--retries", "--backoff",
+                                  "--retries -1", "--retries 11", "--retries abc",
+                                  "--backoff 0", "--backoff 301", "--backoff abc"])
+def test_zsh_nosleep_invalid_retry_options_do_not_change_power_settings(zsh, args):
+    result = zsh('sudo() { echo unexpected-sudo; }; ' + f'nosleep {args}; echo rc=$?')
+    assert result.stdout.strip() == "rc=2"
+    assert "nosleep:" in result.stderr
+
+
+@pytest.mark.parametrize("outcomes, expected, rc", [
+    ("0", ["https://api.anthropic.com/"], 0),
+    ("6 0", ["https://api.anthropic.com/", "https://api.openai.com/"], 0),
+    ("6 28", ["https://api.anthropic.com/", "https://api.openai.com/"], 1),
+])
+def test_zsh_nosleep_connectivity_tries_another_provider(zsh, outcomes, expected, rc):
+    result = zsh(r'''
+        typeset -a results=( ${=FAKE_CURL_RESULTS} )
+        typeset -i n=0
+        curl() { print -r -- "$*"; (( ++n )); return $results[n]; }
+        _nosleep_online; print -r -- "rc=$?"
+    ''', FAKE_CURL_RESULTS=outcomes)
+    assert result.stdout.splitlines() == [
+        f"-s -o /dev/null --max-time 4 {url}" for url in expected] + [f"rc={rc}"]
+
+
 def test_zsh_nosleep_agent_of_comm(zsh):
     # the slot seam's match (claude, codex, the npm codex-<triple>) plus cursor-agent —
     # by basename, since ps reports argv[0] and cursor-agent's launcher execs its own path
@@ -255,7 +417,6 @@ def test_zsh_nosleep_pmset_held_reads_the_flag(zsh, tmp_path):
     stub.chmod(0o755)
     assert zsh("_nosleep_pmset_held; echo rc=$?", FAKE_SLEEP_DISABLED="1").stdout.strip() == "rc=0"
     assert zsh("_nosleep_pmset_held; echo rc=$?", FAKE_SLEEP_DISABLED="0").stdout.strip() == "rc=1"
-    assert "_nosleep_pmset_held" in open(ZSHRC).read().split("checked_at=$now", 1)[1].split("_nosleep_online", 1)[0]
 
 
 def test_zsh_nosleep_claude_caffeinate_is_busy_at_once(nosleep):

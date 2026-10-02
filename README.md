@@ -24,6 +24,36 @@ agent settings, and desktop handoff. This repository consumes that project.
 | `clip-bridge` | Send copies from remote tmux back to the Mac you are using |
 | `pii-scan` | Scan tracked or staged files with a private identifier denylist |
 
+## Sleep and connection recovery
+
+`nosleep` keeps the Mac awake while a local agent is working. Missing activity or
+internet connectivity gets a 15-minute grace period, then three more checks after
+30, 60, and 120 seconds before sleep is restored. The lid still locks or dims as
+usual during backoff. Recovery resets the retry budget; a restored connection
+also restarts activity sampling and grace so an agent has time to resume.
+
+```sh
+nosleep --grace 900 --retries 3 --backoff 30
+```
+
+`--every` sets the normal check interval (30 seconds). `--backoff` sets the first
+retry delay (1–300 seconds), which doubles up to five minutes; `--retries` accepts
+0–10. `--forever` holds until Ctrl-C. Connectivity checks try both Anthropic and
+OpenAI, so a single provider being unreachable does not mean the network is down.
+
+For native reconnection, enable **System Settings → Wi-Fi → Details → Automatically
+join this network** for each trusted Wi-Fi network. On macOS Tahoe 26 or later,
+set **Wi-Fi → Ask to join hotspots → Automatic**. Keep the nearby iPhone/iPad's
+Wi-Fi and Bluetooth on and use the same Apple Account (or configured Family
+Sharing), with a cellular plan that supports Personal Hotspot. See Apple's
+[Wi-Fi settings](https://support.apple.com/guide/mac-help/mh11935/mac) and
+[Instant Hotspot guide](https://support.apple.com/en-us/109321).
+
+macOS attempts auto-join while `nosleep` waits. Hotspot auto-join applies when no
+known Wi-Fi is available; it may not leave connected Wi-Fi whose internet uplink
+is broken. `nosleep` does not toggle Wi-Fi, edit saved networks, or store passwords.
+These auto-join settings are per-machine and are not changed by `dots --all`.
+
 ## Install
 
 ```sh

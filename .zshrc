@@ -164,13 +164,16 @@ prview() {
 # nosleep — keep the Mac awake while a local agent is working and the network is up
 #
 # Usage: nosleep [-f|--forever] [-d|--dim] [--grace <secs>] [--every <secs>]
+#                [--retries <count>] [--backoff <secs>]
 #
 # Options:
 #   -f, --forever    hold sleep off until Ctrl-C, unconditionally (the old behaviour)
 #   -d, --dim        stay logged in with the lid shut too: on lid close dim the built-in
 #                    panel instead of locking (for computer-use agents)
-#   --grace <secs>   how long a signal may be absent before nosleep lets go (default 900)
-#   --every <secs>   how often the two signals are re-checked (default 30)
+#   --grace <secs>   how long a signal may be absent before retries start (default 900)
+#   --every <secs>   normal interval between signal checks (default 30)
+#   --retries <n>    extra checks after grace expires (0–10, default 3)
+#   --backoff <secs> first retry delay (1–300, default 30); doubles up to 300s
 #
 # Blocks SYSTEM sleep via `pmset disablesleep 1` + a background caffeinate, and holds
 # the DISPLAY on while the lid is open (no idle dim, sleep or screensaver — the screen
@@ -184,31 +187,48 @@ prview() {
 # built-in panel to NOSLEEP_DIM_LEVEL (default 0) and restores it when the lid opens —
 # computer-use agents need an unlocked, lit session to see and click. It keeps holding only
 # while BOTH signals stay fresh: internet (an HTTPS exchange with
-# api.anthropic.com) and tokens burning — a local claude, codex, cursor-agent or
+# api.anthropic.com or api.openai.com) and tokens burning — a local claude, codex, cursor-agent or
 # Claude/ChatGPT app mid-turn (Claude Code runs its own caffeinate while a turn is
 # in flight; for every agent, bytes moving on its sockets since the last check — at least
 # NOSLEEP_NET_MIN a probe, 48 KiB, and NOSLEEP_NET_BPS over longer gaps, 1 KiB/s,
 # both overridable in ~/.zshrc.local). Network activity needs two samples: the first
 # check records counters, and the next (after --every seconds) can detect work.
-# Sleep stays blocked while sampling. Once either signal has been
-# missing for the grace window it restores sleep and exits — so a run that finishes,
-# or a network that drops, lets the Mac sleep on its own instead of holding it awake
-# until you remember Ctrl-C.
+# Sleep stays blocked while sampling and retrying. After grace expires, checks retry
+# after 30, 60 and 120 seconds by default before restoring sleep and exiting. Recovery
+# resets the retry budget; reconnecting also restarts activity sampling and its grace.
+# Lid handling and sudo refresh continue throughout the backoff.
+#
+# Reconnection uses macOS auto-join: in System Settings > Wi-Fi, enable Automatically
+# join this network for trusted networks. On macOS 26+, set Ask to join hotspots to
+# Automatic for a nearby iPhone/iPad on the same Apple Account (Wi-Fi and Bluetooth on).
+# Hotspot auto-join requires no known Wi-Fi network to be available; it may not switch
+# away from connected Wi-Fi with a broken internet uplink. nosleep does not toggle the
+# Wi-Fi radio, change saved networks, or store passwords.
 # For a persistent, unconditional block use `sleep-manager disable` instead.
 nosleep() {
   [[ "$1" == -h || "$1" == --help ]] && { _help_for nosleep; return 0; }
-  local forever=0 dim=0 grace=900 every=30
+  local forever=0 dim=0 grace=900 every=30 retries=3 backoff=30
   while (( $# )); do
     case $1 in
       -f|--forever) forever=1 ;;
       -d|--dim) dim=1 ;;
-      --grace) grace=${2:-}; shift ;;
-      --every) every=${2:-}; shift ;;
+      --grace|--every|--retries|--backoff)
+        (( $# >= 2 )) || { echo "nosleep: $1 needs a value" >&2; return 2; }
+        case $1 in
+          --grace) grace=$2 ;;
+          --every) every=$2 ;;
+          --retries) retries=$2 ;;
+          --backoff) backoff=$2 ;;
+        esac
+        shift ;;
       *) echo "nosleep: unknown option '$1' (see nosleep -h)" >&2; return 2 ;;
     esac
     shift
   done
   [[ $grace == <-> && $every == <-> && $every -gt 0 ]] || { echo "nosleep: --grace/--every take a number of seconds" >&2; return 2; }
+  [[ $retries == <-> && $retries -le 10 && $backoff == <-> && $backoff -ge 1 && $backoff -le 300 ]] || {
+    echo "nosleep: --retries must be 0–10 and --backoff must be 1–300 seconds" >&2; return 2
+  }
 
   # Teardown is idempotent: it runs from the INT trap, the EXIT trap (zsh scopes a
   # function's EXIT trap to the function, so it fires on every return path), and
@@ -259,25 +279,23 @@ nosleep() {
   # fights _nosleep_lock's display sleep behind the lid; --dim keeps -dims throughout.
   _nosleep_hold -dims
 
-  # Each signal carries the epoch it was LAST seen at; nosleep lets go when the
-  # OLDER of the two falls more than $grace behind now. One failed probe (a wifi
-  # blip, an agent between turns) therefore does nothing on its own, and there is
-  # no double window: an agent last mid-turn at T can hold the Mac awake until
-  # exactly T+grace. Both probes are LAST-SEEN updates — an idle answer leaves the
-  # epoch where it was (assigning the probe's 0 straight to busy_at made the first
-  # idle probe read as "idle for 55 years" and let go at once, grace unapplied).
-  # The loop ticks every 2s for the lid (a lock that lands 30s after the lid shut
-  # is no lock) and runs the two signal probes only every $every.
-  local now busy_at online_at=$EPOCHSECONDS oldest why checked_at=0 lid_was=0 pinged_at=0 probes=0
+  # LAST-SEEN timestamps preserve grace across failed probes. Once a signal expires,
+  # schedule bounded retries without sleeping through lid changes or sudo refresh.
+  # Always take two activity samples, even with --grace 0, before judging idleness.
+  local now busy_at online_at=$EPOCHSECONDS why checked_at=0 next_check=0 lid_was=0 pinged_at=0 probes=0
+  local retry_count=0 retry_delay=$backoff retry_for='' missing online=1 was_online=1 refreshed_at=0
   local lid_does='display held on, lid close locks'
   (( dim )) && lid_does='staying logged in, lid close dims'
   if (( forever )); then
     echo "nosleep: holding sleep off until Ctrl-C ($lid_does)"
   else
-    echo "nosleep: holding sleep off while a local agent (claude · codex · cursor-agent · the Claude/ChatGPT apps) is working and the network is up (grace ${grace}s, $lid_does, Ctrl-C to stop)"
+    echo "nosleep: holding sleep off while a local agent (claude · codex · cursor-agent · the Claude/ChatGPT apps) is working and the network is up (grace ${grace}s + $retries retries, $lid_does, Ctrl-C to stop)"
   fi
   busy_at=$online_at
   while :; do
+    # A signal delivered inside a helper returns from that helper, not this loop.
+    # Teardown has already run; never re-arm power assertions on the next tick.
+    (( _NOSLEEP_DONE )) && return 130
     now=$EPOCHSECONDS
     if _nosleep_lid_closed; then
       if (( ! lid_was )); then
@@ -300,8 +318,10 @@ nosleep() {
       # auto-brightness (the ambient sensor behind a shut lid) can move the level back
       (( lid_was )) && _nosleep_brightness "${NOSLEEP_DIM_LEVEL:-0}" >/dev/null
     fi
-    if (( ! forever && now - checked_at >= every )); then
-      checked_at=$now
+    # Keep the sudo timestamp warm even during long retries (or --forever).
+    if (( now - refreshed_at >= 30 )); then
+      sudo -n -v 2>/dev/null
+      refreshed_at=$now
       if ! _nosleep_pmset_held; then
         # Cleared under us — another nosleep's exit resets it for everyone (its restore
         # is global, and the survivor's caffeinate still holds IDLE sleep off, so nothing
@@ -314,31 +334,74 @@ nosleep() {
           echo "nosleep: the sleep-disable flag was reset under this run and sudo could not re-arm it — a closed lid would sleep the Mac" >&2
         fi
       fi
-      _nosleep_online && online_at=$now
+    fi
+    if (( ! forever && now >= next_check )); then
+      checked_at=$now
+      next_check=$(( checked_at + every ))
+      online=0
+      if _nosleep_online; then
+        online=1
+        online_at=$EPOCHSECONDS
+        if (( ! was_online )); then
+          # Offline silence cannot establish that the task finished. Give a resumed
+          # agent fresh baselines, grace and retries instead of exiting on stale work.
+          busy_at=$online_at
+          _NOSLEEP_NET=() _NOSLEEP_NET_AT=()
+          probes=0 retry_count=0 retry_delay=$backoff retry_for=''
+          [[ -t 1 ]] && printf '\r\e[K'
+          echo "nosleep: network recovered — restarting agent activity sampling and grace"
+        fi
+      elif (( was_online )); then
+        [[ -t 1 ]] && printf '\r\e[K'
+        echo "nosleep: connection lost — holding awake while macOS auto-join can reconnect"
+      fi
+      was_online=$online
       _nosleep_busy_at; (( REPLY )) && busy_at=$REPLY
+      (( _NOSLEEP_DONE )) && return 130
+      now=$EPOCHSECONDS
       (( ++probes ))
-      oldest=$(( busy_at < online_at ? busy_at : online_at ))
-      if (( now - oldest > grace )); then
-        (( busy_at < online_at )) && why="no local agent (claude · codex · cursor-agent) has been working for ${grace}s" || why="the network has been down for ${grace}s"
-        [[ -t 1 ]] && printf '\r\e[K'                # the status line below leaves no newline
-        echo "nosleep: letting go — $why"
-        _nosleep_restore
-        return 0
+      missing=''
+      if (( ! online && now - online_at > grace )); then
+        missing=network why="the network has been down for $(( now - online_at ))s"
+      elif (( probes > 1 && ! REPLY && now - busy_at > grace )); then
+        missing=activity why="no local agent activity for $(( now - busy_at ))s"
+      fi
+      if [[ -n $missing ]]; then
+        # A different missing signal gets its own retry budget. Network recovery
+        # above also resets activity, since agents often stop sending while offline.
+        if [[ $retry_for != $missing ]]; then
+          retry_count=0 retry_delay=$backoff retry_for=$missing
+        fi
+        [[ -t 1 ]] && printf '\r\e[K'
+        if (( retry_count >= retries )); then
+          echo "nosleep: letting go — $why; $retries retries exhausted"
+          _nosleep_restore
+          return 0
+        fi
+        (( ++retry_count ))
+        next_check=$(( now + retry_delay ))
+        echo "nosleep: $why — retry $retry_count/$retries in ${retry_delay}s (sleep stays blocked)"
+        retry_delay=$(( retry_delay < 150 ? retry_delay * 2 : 300 ))
+      else
+        if (( retry_count )); then
+          [[ -t 1 ]] && printf '\r\e[K'
+          echo "nosleep: activity recovered — resuming normal checks"
+        fi
+        retry_count=0 retry_delay=$backoff retry_for=''
       fi
       if [[ -t 1 ]]; then
-        if [[ -n $_NOSLEEP_WHO ]]; then
+        if (( retry_count )); then
+          printf '\r\e[K  waiting for %s · retry %d/%d in %ds · sleep stays blocked' "$retry_for" "$retry_count" "$retries" $(( next_check - now ))
+        elif [[ -n $_NOSLEEP_WHO ]]; then
           printf '\r\e[K  %s active %ds ago · network ok %ds ago' "$_NOSLEEP_WHO" $(( now - busy_at )) $(( now - online_at ))
         elif (( probes == 1 )); then
           # The first network probe only records baselines, even mid-turn. It is
           # not evidence of idleness (and sleep is already held during sampling).
           printf '\r\e[K  sampling agent activity (next check in %ds) · network ok %ds ago' "$every" $(( now - online_at ))
         else
-          printf '\r\e[K  no agent activity detected yet (letting go in %ds) · network ok %ds ago' $(( grace - (now - busy_at) )) $(( now - online_at ))
+          printf '\r\e[K  no agent activity detected yet (grace remaining %ds) · network ok %ds ago' $(( grace > now - busy_at ? grace - (now - busy_at) : 0 )) $(( now - online_at ))
         fi
       fi
-      # Keep the sudo timestamp warm so the restore never blocks on a password prompt
-      # that nobody is at the keyboard to answer — the whole point is running unattended.
-      sudo -n -v 2>/dev/null
     fi
     sleep 2
   done
@@ -431,10 +494,16 @@ _nosleep_undim() {
 # The flag is what keeps a CLOSED lid from sleeping the Mac; caffeinate alone holds
 # only idle sleep. It is global state that any nosleep's restore clears.
 _nosleep_pmset_held() { pmset -g 2>/dev/null | grep -qE '^ *SleepDisabled[[:space:]]+1'; }
-# _nosleep_online — true when an HTTPS exchange with api.anthropic.com completes.
+# _nosleep_online — true when an HTTPS exchange with either agent provider completes.
 # Any HTTP status counts (no -f): a 404 proves the network path; only DNS/connect/
 # TLS failures — the outages that actually stop tokens burning — return nonzero.
-_nosleep_online() { curl -s -o /dev/null --max-time 4 https://api.anthropic.com/ 2>/dev/null; }
+_nosleep_online() {
+  local endpoint
+  for endpoint in https://api.anthropic.com/ https://api.openai.com/; do
+    curl -s -o /dev/null --max-time 4 "$endpoint" 2>/dev/null && return 0
+  done
+  return 1
+}
 # NOSLEEP_NET_MIN / NOSLEEP_NET_BPS — what an agent CLI must move on its sockets (in +
 # out) between two probes to count as working: at least NOSLEEP_NET_MIN bytes, AND at
 # least NOSLEEP_NET_BPS × the seconds since its last probe. Two bounds because idle

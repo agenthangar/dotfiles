@@ -32,8 +32,10 @@ git clone https://github.com/agenthangar/dotfiles.git ~/code/dotfiles
 ```
 
 The installer keeps the canonical clone on `main`, links its managed files into
-HOME, and bootstraps `https://github.com/agenthangar/t.git` into `~/code/t` when
-needed. t owns its executable links, prompts, and additive agent integrations.
+HOME, and installs the latest verified [t release](https://github.com/agenthangar/t/releases)
+when needed. The release lives under `~/.local/share/t/releases/` by default;
+an existing supported t checkout is preserved. t owns its executable links,
+prompts, and additive agent integrations.
 Homebrew tools come from [Brewfile](Brewfile); the brew step skips on other platforms.
 
 Existing shell files are backed up before linking. SSH config is preserved: an
@@ -41,22 +43,26 @@ Include for this repository's snippet is appended rather than replacing the file
 Machine configuration is a private regular file at `~/.zshrc.local`.
 
 `DOTFILES_NO_T=1` skips standalone t setup for shell-only or sandbox installations.
-`DOTFILES_T_HOME` selects a different supported t checkout. A normal offline
-links-only refresh never clones anything; use full `install.sh` for first setup.
+`DOTFILES_T_HOME` selects an existing supported t installation. A normal
+links-only refresh stays offline; the sole exception migrates a dangling
+`~/bin/t` link owned by the former bundled dotfiles command to a verified t
+release. Use full `install.sh` for first setup. `T_INSTALL_DIR` can move the
+release installation base.
 
-## Two repositories, independent live checkouts
+## Two repositories, independent installations
 
 | Source | Managed surface |
 | --- | --- |
 | `~/code/dotfiles` on main | `~/.zshrc`, `~/.tmux.conf`, personal utility bins, SSH snippet |
-| `~/code/t` on main | `~/bin/t`, hook/transfer helpers, t prompts and shell plugin |
+| Selected t release or `~/code/t` checkout | `~/bin/t`, hook/transfer helpers, t prompts and shell plugin |
 | `~/code/.worktrees/<repo>/<slot>` | Isolated development, never canonical main |
 
-The `$HOME` symlinks point into the canonical clones. Editing a development
+The `$HOME` symlinks point into the selected installations. Editing a development
 worktree is not live until its PR merges and you update, or you explicitly select
 it with `dots --dev` / `t update --dev`. Ordinary `dots` returns dotfiles and t to
-their released main branches. `dots --dev` and `--relink` leave t's selection alone.
-An ordinary `t update` returns just t to main and preserves dirty worktree edits.
+their released versions. `dots --dev` and `--relink` leave t's selection alone.
+An ordinary `t update` refreshes the selected release or checkout and preserves
+dirty worktree edits.
 
 `dots --all` is the rollout step after a merged PR; nothing polls GitHub for merges.
 Inspect its per-host results: an unreachable host is reported and must be retried.
@@ -66,8 +72,10 @@ canonical main checkout: those files are your running configuration.
 The t migration bridge validates `.t-install-version` before allowing t to own
 its links. Before pulling a dotfiles release that removes bundled t, it confirms
 the standalone installation works. If it cannot, it stops before removing the
-old executable. Recovery does not require a working command: invoke
-`T_LOCAL_RC="$HOME/.zshrc.local" ~/code/t/install.sh` directly, then rerun dots.
+old executable. Recovery does not require a working command: run the public
+[`t` release installer](https://github.com/agenthangar/t#install), then rerun
+`dots`. A machine running an intermediate dotfiles bridge that refuses its
+preflight before updating also needs this one-time installation.
 
 ## Private configuration and policy
 

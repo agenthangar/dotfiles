@@ -26,8 +26,8 @@ DOTFILES_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 #   default              LINK_SRC = $PRIMARY      (live = the canonical checkout on main)
 #   DOTFILES_LINK_DEV=1  LINK_SRC = $DOTFILES_DIR (live = the session worktree you are
 #                        standing in; the fast inner-loop, set by `dots --dev`)
-#   DOTFILES_LINKS_ONLY=1  link from $DOTFILES_DIR and stop (the offline relink `dots`
-#                        runs every invocation; never migrates, never fetches)
+#   DOTFILES_LINKS_ONLY=1  link from $DOTFILES_DIR and stop (offline except the
+#                        one-time legacy bundled-t cutover)
 
 # Legacy-only: where a pre-migration `main` worktree may still be sitting. Read in
 # exactly two places (here and _dots_legacy_present in .zshrc) so a host that
@@ -204,10 +204,11 @@ EOF
     git -C "$PRIMARY" worktree prune 2>/dev/null || true
 }
 
-# DOTFILES_LINKS_ONLY=1 is the fast, OFFLINE relink `dots` runs on every invocation
+# DOTFILES_LINKS_ONLY=1 is the fast relink `dots` runs on every invocation
 # (see _dots_relink in .zshrc): link from THIS tree — whichever copy of install.sh the
-# caller chose to run — and stop right after link_all. Deliberately skips the
-# migration, so it never fetches and never removes anything.
+# caller chose to run — and stop right after link_all. It skips the layout
+# migration. The only network exception is an owned legacy ~/bin/t link left by
+# a pre-split dots command that fast-forwarded before calling this installer.
 if [[ -n "${DOTFILES_LINKS_ONLY:-}" ]]; then
     LINK_SRC="$DOTFILES_DIR"
 elif [[ -n "${DOTFILES_LINK_DEV:-}" ]]; then
@@ -247,15 +248,24 @@ link() {
 # parsing these `link` lines (bin/t's _INSTALL_LINK_RE), so a link outside link_all
 # would be a link doctor reports as drifted and the links-only relink never fixes —
 # a relink that fires on every single `dots` forever.
-# t is an independent installation. Full setup bootstraps it; ordinary relinks
-# remain offline and use only a validated installed checkout.
+# t is an independent installation. Full setup bootstraps a verified release;
+# ordinary relinks remain offline and use a validated installation.
 # shellcheck source=lib/t-integration.sh
 source "$DOTFILES_DIR/lib/t-integration.sh"
 if [[ -z "${DOTFILES_NO_T:-}" ]]; then
     if [[ -n "${DOTFILES_LINKS_ONLY:-}" ]]; then
         _dots_t_install "$LINK_SRC" || {
-            echo 'dots: standalone t is missing; run install.sh for full setup' >&2
-            exit 1
+            if [[ -z "${DOTFILES_T_HOME:-}" ]] && _dots_t_legacy_link "$LINK_SRC"; then
+                echo 'dots: migrating bundled t to its standalone release' >&2
+                _dots_t_environment "$LINK_SRC"
+                if ! _dots_t_release_install || ! _dots_t_install "$LINK_SRC"; then
+                    echo 'dots: standalone t release installation failed; retry dots when online' >&2
+                    exit 1
+                fi
+            else
+                echo 'dots: standalone t is missing; run install.sh for full setup' >&2
+                exit 1
+            fi
         }
     else
         _dots_t_bootstrap "$LINK_SRC"

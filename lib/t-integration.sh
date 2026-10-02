@@ -42,18 +42,47 @@ _dots_t_environment() {
     export T_NO_SUBAGENT_MODEL="${T_NO_SUBAGENT_MODEL:-${DOTFILES_NO_SUBAGENT_MODEL:-}}"
 }
 
+# Fetch the small public bootstrap script first, so a failed download cannot be
+# mistaken for a successful empty `curl | python3` pipeline. The script verifies
+# the release archive against its published SHA256SUMS before installing it.
+_dots_t_release_install() {
+    local script
+    script=$(mktemp "${TMPDIR:-/tmp}/dots-t-release.XXXXXXXX") || return 1
+    if ! curl -fLsS -o "$script" \
+        https://raw.githubusercontent.com/agenthangar/t/main/scripts/install-release.py; then
+        rm -f "$script"
+        return 1
+    fi
+    local result
+    if python3 "$script"; then result=0; else result=$?; fi
+    rm -f "$script"
+    return "$result"
+}
+
+# The pre-split `dots` command fast-forwards before invoking the NEW install.sh
+# in links-only mode. At that point its ~/bin/t link is dangling. Only this exact
+# dotfiles-owned legacy link permits a one-time network bootstrap in that mode.
+_dots_t_legacy_link() {
+    [ -L "$HOME/bin/t" ] && command -v python3 >/dev/null 2>&1 || return 1
+    python3 - "$HOME/bin/t" "$1/bin/t" <<'PY'
+import os
+import sys
+sys.exit(0 if os.path.realpath(sys.argv[1]) == os.path.realpath(sys.argv[2]) else 1)
+PY
+}
+
 _dots_t_bootstrap() {
     local dotroot="$1" target
     [ -z "${DOTFILES_NO_T:-}" ] || return 0
     if ! _dots_t_find >/dev/null; then
-        target="${DOTFILES_T_HOME:-$HOME/code/t}"
-        if [ -e "$target" ]; then
-            printf 'dots: %s exists but is not a supported standalone t checkout\n' "$target" >&2
+        if [ -n "${DOTFILES_T_HOME:-}" ]; then
+            printf 'dots: %s is not a supported standalone t installation\n' "$DOTFILES_T_HOME" >&2
             return 1
         fi
-        mkdir -p "$(dirname "$target")" || return 1
-        git clone -- https://github.com/agenthangar/t.git "$target" || return 1
-        _dots_t_valid "$target" || return 1
+        _dots_t_environment "$dotroot"
+        _dots_t_release_install || return 1
+        _dots_t_find >/dev/null || return 1
+        return 0
     fi
     target=$(_dots_t_find) || return 1
     _dots_t_environment "$dotroot"
@@ -66,6 +95,7 @@ _dots_t_is_live() {
     active=$(_dots_t_find) || return 1
     active=$(cd "$active" && pwd -P) || return 1
     [ "$here" = "$active" ] && return 0
+    [ ! -f "$active/.t-release-version" ] || return 1
     common=$(git -C "$active" rev-parse --git-common-dir 2>/dev/null) || return 1
     case "$common" in /*) ;; *) common="$active/$common" ;; esac
     canonical=$(cd "$common/.." && pwd -P) || return 1
@@ -92,9 +122,7 @@ _dots_t_preflight() {
     if _dots_t_find >/dev/null && _dots_t_install "$dotroot"; then
         return 0
     fi
-    printf '%s\n' 'dots: standalone t must be installed before this update.' >&2
-    printf '%s\n' '  git clone https://github.com/agenthangar/t.git ~/code/t' >&2
-    # shellcheck disable=SC2016
-    printf '%s\n' '  T_LOCAL_RC="$HOME/.zshrc.local" ~/code/t/install.sh' >&2
+    _dots_t_bootstrap "$dotroot" && return 0
+    printf '%s\n' 'dots: standalone t release installation failed; dotfiles was not updated.' >&2
     return 1
 }

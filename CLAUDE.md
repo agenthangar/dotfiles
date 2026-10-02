@@ -16,13 +16,13 @@ engine, tests, and release process. Dotfiles installs and consumes it through
 | Checkout | Role |
 | --- | --- |
 | `~/code/dotfiles` on `main` | Canonical dotfiles checkout and usual live target of `~/.zshrc` and other managed links |
-| `~/code/t` on `main` | Canonical standalone t checkout; its installer owns `~/bin/t`, hook/transfer links, and agent integrations |
+| Selected t release or `~/code/t` checkout | Standalone t installation; it owns `~/bin/t`, hook/transfer links, and agent integrations |
 | `~/code/.worktrees/<repo>/<slot>` | Per-session development work; never use a canonical checkout for a task |
 
 `dots --dev` temporarily points dotfiles links at the dotfiles worktree in
 `$PWD`. `t update --dev` independently selects a t worktree. Plain `dots`
 returns dotfiles to canonical `main` and invokes `command t update` before
-reloading the shell, returning t to its canonical `main`. `dots --relink`
+reloading the shell, refreshing the selected t release or checkout. `dots --relink`
 only reconciles current links and leaves the selected t source alone.
 
 These are separate live surfaces. `_dots_live_tree` resolves the dotfiles
@@ -44,8 +44,11 @@ success.
 `dots --dev` accepts only a real dotfiles session worktree containing a
 runnable installer. It refuses the canonical checkout and other repositories.
 `DOTFILES_LINK_DEV=1` selects that worktree; an ordinary install or update
-selects the canonical checkout. `DOTFILES_LINKS_ONLY=1` stays offline and
-relinks from the selected source without running full setup. Keep new dotfiles
+selects the canonical checkout. `DOTFILES_LINKS_ONLY=1` normally stays offline
+and relinks from the selected source without running full setup. Its sole
+network exception recognizes the old dotfiles-owned `~/bin/t` symlink after
+pre-split `dots` fast-forwards past bundled t, then installs a verified release.
+Keep new dotfiles
 links inside `link_all()` so both full installs and link reconciliation see
 them. `DOTFILES_NO_TMUX=1` prevents sandbox install tests from touching a
 real tmux server through an inherited socket.
@@ -61,13 +64,17 @@ Do not replace this sequence with a destructive worktree removal or reset.
 
 ## Standalone t bridge
 
-`lib/t-integration.sh` validates a t checkout with the
+`lib/t-integration.sh` validates a t installation with the
 `.t-install-version` marker and required files. The full dotfiles installer
-can bootstrap `~/code/t`; links-only refresh remains offline. Before
+downloads the public t release bootstrap script to a temporary file; that
+script verifies the release archive's SHA-256 checksum before installing under
+`~/.local/share/t/releases/` (or `$T_INSTALL_DIR`). An existing valid checkout
+stays selected. An explicit invalid `DOTFILES_T_HOME` is an error. Before
 fast-forwarding to a release without bundled t, `_dots_t_preflight`
-installs or repairs standalone t. If that fails, it stops while the outgoing
-dotfiles code and links still work. A recovery path is the absolute
-`~/code/t/install.sh`, followed by `dots`.
+installs or repairs standalone t. If it fails, it stops while the outgoing
+dotfiles code and links still work. A machine already running an intermediate
+bridge with an older preflight can need one manual run of the public installer
+before `dots`; no new dotfiles code can execute until that preflight passes.
 
 Dotfiles sets `T_LOCAL_RC=~/.zshrc.local`, the personal permission-policy
 directory in `agents/`, the preferred GitHub owner, automatic trust, and

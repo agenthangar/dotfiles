@@ -731,7 +731,7 @@ dots() {
   # just-updated dots-sync), then `dots` on every host. dots-sync never runs `dots
   # --all` remotely, so the fan-out cannot echo back.
   if [[ "$1" == --all || "$1" == -a ]]; then
-    dots
+    dots || return 1
     # if/else, not `A && B || C`: C runs when B merely returns nonzero too (SC2015),
     # which would report a missing dots-sync every time a host was unreachable.
     if command -v dots-sync >/dev/null 2>&1; then
@@ -756,7 +756,7 @@ dots() {
     # Explicit, fetch-free reconcile of the live surface — the escape hatch that
     # replaces hand-typing a path to install.sh. Uses $live, not $primary, so it is
     # correct after `dots --dev` too (relink whatever is live right now).
-    local out target="${live:-$primary}"
+    local out target="${live:-$primary}" relink_failed=0
     if out=$(_dots_relink "$target"); then
       if [[ -n "$out" ]]; then
         print -r -- "${g}✓${r0} ${y}relinked from ${c}${target/#$HOME/~}${r0}"
@@ -764,9 +764,12 @@ dots() {
       else
         print -r -- "${g}✓${r0} ${y}links already up to date (${c}${target/#$HOME/~}${r0}${y})${r0}"
       fi
+    else
+      print -u2 -r -- "dots: relink failed: $out"
+      relink_failed=1
     fi
     source ~/.zshrc
-    return
+    return $relink_failed
   fi
 
   if [[ "$1" == --dev || "$1" == -d ]]; then
@@ -894,18 +897,26 @@ dots() {
   # the ff (the new install.sh and its new link set only exist on disk once the merge
   # above ran) and BEFORE _dots_tmux_apply, so a newly linked ~/.tmux.conf is what
   # gets sourced into the running server.
-  if relinked=$(_dots_relink "$primary") && [[ -n "$relinked" ]]; then
-    print -r -- "${g}✓${r0} ${y}relinked newly managed file(s):${r0}"
-    print -r -- "$relinked"
+  local update_failed=0
+  if relinked=$(_dots_relink "$primary"); then
+    if [[ -n "$relinked" ]]; then
+      print -r -- "${g}✓${r0} ${y}relinked newly managed file(s):${r0}"
+      print -r -- "$relinked"
+    fi
+  else
+    print -u2 -r -- "dots: relink failed: $relinked"
+    update_failed=1
   fi
   _dots_tmux_apply
-  # A normal dots update converges the standalone command to its canonical main
+  # A normal dots update refreshes the standalone release or canonical main
   # checkout before the new shell integration is sourced. Development and relink
   # modes above intentionally keep the selected t source.
-  if ! command t update; then
-    print -u2 -r -- "dots: t update failed; run ~/code/t/install.sh to repair the standalone command."
+  if [[ -z ${DOTFILES_NO_T:-} ]] && ! command t update; then
+    print -u2 -r -- "dots: t update failed; run the standalone t installer or its checkout's install.sh to repair it."
+    update_failed=1
   fi
   source ~/.zshrc
+  return $update_failed
 }
 
 # _dots_reload_if_moved — precmd: when the live checkout's `main` moved under this
@@ -943,7 +954,7 @@ else
   DEV_REPOS=() DEV_BRANCHES=() REMOTE_HOSTS=() DEV_WORKTREE=() DEV_AGENT=() DEV_MODEL=() DEV_EFFORT=() DEV_FAST=()
   [[ -f $T_LOCAL_RC ]] && source "$T_LOCAL_RC"
   t() {
-    print -u2 -r -- "t: standalone shell integration is missing. Install ~/code/t and source its t.plugin.zsh; run dots --relink to repair links."
+    print -u2 -r -- "t: standalone shell integration is missing. Run install.sh to install a release, then open a new shell."
     return 127
   }
 fi

@@ -1028,6 +1028,13 @@ else
   }
 fi
 
+# Personal script checkout. Local config can override the directory or disable it
+# with an empty value. Re-sourcing through dots must not duplicate the PATH entry.
+DOTFILES_SCRIPTS_DIR="${DOTFILES_SCRIPTS_DIR-$HOME/code/personal-scripts}"
+if [[ -d "$DOTFILES_SCRIPTS_DIR" ]] && (( ${path[(Ie)$DOTFILES_SCRIPTS_DIR]} == 0 )); then
+  path=("$DOTFILES_SCRIPTS_DIR" "${path[@]}")
+fi
+
 # csync — two-way sync of Claude Code session history with iCloud Drive.
 # Lives in bin/csync (install.sh symlinks it onto PATH; `help` lists it by
 # scanning ~/bin). Run `csync` on any machine to converge.

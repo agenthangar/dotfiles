@@ -113,6 +113,12 @@ The t plugin reads `~/.zshrc.local` on this installation. `t setup` registers re
 and SSH hosts; `t config` manages tools/models and session settings. See
 [t's configuration guide](https://github.com/agenthangar/t#configuration).
 
+Shell setup adds `~/code/personal-scripts` to PATH when that directory exists.
+Set `DOTFILES_SCRIPTS_DIR` in `~/.zshrc.local` to use a different directory, or
+set it to an empty string to disable the addition. This applies in new shells
+and when `dots` reloads the configuration; repeated reloads do not add duplicates.
+The setting controls additions and does not remove an entry already in PATH.
+
 `lib/t-integration.sh` preserves this dotfiles setup's existing behavior: the
 personal `agents/permissions.allow` and `.retire` policy, automatic trust for
 registered repos, and agent mode/subagent defaults. Standalone t installations

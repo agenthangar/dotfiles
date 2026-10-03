@@ -12,5 +12,9 @@
 # export DOTFILES_NO_AGENT_MODES=1
 # export DOTFILES_NO_SUBAGENT_MODEL=1
 
+# Personal scripts are added to PATH when ~/code/personal-scripts exists.
+# Override the directory here, or set an empty string to disable it:
+# DOTFILES_SCRIPTS_DIR="$HOME/code/my-scripts"
+
 # Machine-specific completions (compinit has already run):
 # [[ -f "$HOME/.tool/completions/tool.zsh" ]] && source "$HOME/.tool/completions/tool.zsh"

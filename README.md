@@ -28,14 +28,30 @@ agent settings, and desktop handoff. This repository consumes that project.
 ## Sleep and connection recovery
 
 ```sh
-nosleep                       # keep awake; closing the laptop locks the screen
-nosleep --no-lock              # keep unlocked when the laptop closes; dim display
-nosleep --no-lock --forever    # keep awake and unlocked until Ctrl-C
+nosleep                       # closing the lid locks and turns the display off
+nosleep --dim                 # closing the lid locks and dims the display
+nosleep --no-lock              # display off on close, without requesting a lock
+nosleep --dim --no-lock        # dim on close, without requesting a lock
+nosleep --forever              # keep awake until Ctrl-C; skip activity checks
+nosleep config                # arrow-key menu for this machine's defaults
+nosleep config --show          # print effective defaults
+nosleep config --edit          # edit defaults with VISUAL/EDITOR
 ```
 
-`--no-lock` preserves an already-unlocked session; it cannot unlock an existing
-lock. `--dim` (or `-d`) selects the same behavior: dim the built-in display on
-close and skip locking. `nosleep --help` shows the short option reference.
+Dimming and locking are independent. `--dim` (or `-d`) only changes the display
+behavior on close. Locking stays enabled by default; disable it with `--no-lock`
+or a saved preference. `--no-lock` skips nosleep's explicit lock request. It never unlocks an existing lock or
+changes macOS's own automatic locking settings. For the former dim-and-no-lock
+behavior, use both `--dim --no-lock`.
+
+`nosleep config` follows `t config`: select a setting with arrow keys, stage
+changes, then review and save. Cancel leaves defaults unchanged. Defaults live
+in `${XDG_CONFIG_HOME:-~/.config}/nosleep/config.json`, apply to the next run,
+and stay local to that machine. Command-line flags override them for one run;
+use `--no-dim`, `--lock`, or `--no-forever` to override saved dimming, no-lock,
+or forever settings. Timing defaults use `--grace`, `--every`, `--retries`, and
+`--backoff`. `nosleep --help` lists all options. Configuration commands never
+change power settings or an already-running instance.
 
 `nosleep` shows a live snapshot instead of a long startup message:
 
@@ -49,15 +65,16 @@ Live status
 
 Configuration
   Sleep:    Blocked                   (--forever: until Ctrl-C)
-  Display:  On; off when closed       (--dim: dim on close)
-  Dim:      Off                       (--dim; also skips locking)
-  Locking:  When closed               (--no-lock: disable)
+  Display:  On; off when closed       (--dim: dim when closed)
+  Dim:      Disabled                  (--dim: dim when closed)
+  Locking:  Lock when closed          (--no-lock: skip lock)
 
-  Grace:    15m idle/offline          (--grace <seconds>)
+  Grace:    15m idle/offline (closed)  (--grace <seconds>)
   Checks:   30s                       (--every <seconds>)
   Retries:  3                         (--retries <count>)
   Backoff:  30s, doubles to 5m        (--backoff <seconds>)
 
+  Defaults  nosleep config
   Stop      Ctrl-C · release sleep hold
 ```
 
@@ -69,7 +86,7 @@ change them. In `--forever` mode, unused timing controls are marked inactive.
 Agents shows activity observed at the last check, then switches to quiet
 with a last-seen time when activity stops. Internet shows the latest connection
 result; Next shows remaining grace or the pending retry when needed. Failures to
-hold sleep off or dim the display appear as a Notice when relevant.
+hold sleep off, lock, dim, or restore brightness appear as a Notice when relevant.
 `--forever` explicitly marks agent and internet checks as disabled. Redirected
 output and basic terminals get plain snapshots at each check, without cursor codes.
 Interactive terminals use green for healthy states, amber for sampling, quiet
@@ -81,8 +98,8 @@ While the laptop is open, `nosleep` keeps the display on and inhibits idle locki
 so an unlocked session can stay unlocked. It never unlocks an existing lock.
 Closing the laptop normally requests a screen lock and turns the display off;
 opening it restores the display hold. Unlocking is manual.
-`nosleep --no-lock` instead dims the built-in display and requests no lock, keeping
-an already-unlocked session available. Docked clamshell mode keeps the external
+`nosleep --dim` instead dims the built-in display on close. The independent
+locking setting controls whether it also requests a lock; `--no-lock` skips it. Docked clamshell mode keeps the external
 display on and skips the lock/dim action when you close the laptop. The Configuration
 rows show the selected display, dimming, and locking behavior alongside the sleep policy.
 

@@ -1,5 +1,6 @@
 """Dotfiles shell regression tests: csync, nosleep and zsh startup."""
 
+import json
 import os
 import pathlib
 import pty
@@ -222,20 +223,29 @@ def nosleep_loop(zsh, tmp_path):
     log = tmp_path / "nosleep-loop.log"
     setup = r'''
         zmodload -u zsh/datetime
-        typeset -gi EPOCHSECONDS=1000 online_probe=0 busy_probe=0 pmset_reset=0
+        typeset -gi EPOCHSECONDS=1000 online_probe=0 busy_probe=0 pmset_reset=0 restore_attempts=0
         typeset -a online_results=( ${=FAKE_ONLINE} ) busy_results=( ${=FAKE_BUSY} )
         sudo() { print -r -- "sudo $EPOCHSECONDS $*" >> "$LOOP_LOG"; }
         ps() { return 0; }
         caffeinate() { return 0; }
         _nosleep_hold() { print -r -- "hold $EPOCHSECONDS $*" >> "$LOOP_LOG"; }
-        _nosleep_lock() { print -r -- "lock $EPOCHSECONDS" >> "$LOOP_LOG"; }
+        _nosleep_lock() {
+            print -r -- "lock $EPOCHSECONDS" >> "$LOOP_LOG"
+            (( ! ${FAKE_LOCK_FAILURE:-0} ))
+        }
+        _nosleep_display_off() { print -r -- "display-off $EPOCHSECONDS" >> "$LOOP_LOG"; }
         _nosleep_brightness() {
             print -r -- "brightness $EPOCHSECONDS ${1:-read}" >> "$LOOP_LOG"
+            (( EPOCHSECONDS < ${FAKE_DIM_RECOVER_AT:-0} )) && return 1
+            if [[ $1 == 0.6200 ]]; then
+                (( ++restore_attempts ))
+                (( restore_attempts <= ${FAKE_RESTORE_FAILURES:-0} )) && return 1
+            fi
             print -r -- 0.6200
         }
         pmset() { print -r -- "pmset $EPOCHSECONDS $*" >> "$LOOP_LOG"; }
         _nosleep_lid_shut() { (( EPOCHSECONDS >= ${FAKE_LID_AT:-99999} && EPOCHSECONDS < ${FAKE_LID_OPEN_AT:-99999} )); }
-        _nosleep_lid_closed() { _nosleep_lid_shut; }
+        _nosleep_lid_closed() { (( ! ${FAKE_DOCKED:-0} )) && _nosleep_lid_shut; }
         _nosleep_pmset_held() {
             if (( ! pmset_reset && EPOCHSECONDS >= ${FAKE_RESET_AT:-99999} )); then
                 pmset_reset=1
@@ -267,6 +277,7 @@ def nosleep_loop(zsh, tmp_path):
     '''
 
     def call(args="", **env):
+        log.unlink(missing_ok=True)
         tty = env.pop("_tty", False)
         columns = env.pop("_columns", None)
         if tty:
@@ -280,6 +291,7 @@ def nosleep_loop(zsh, tmp_path):
         assert not result.stderr, result.stderr
         return result, log.read_text().splitlines() if log.exists() else []
 
+    call.home = zsh.home
     return call
 
 
@@ -359,7 +371,7 @@ def test_zsh_nosleep_tty_retry_counts_down_and_releases_once(nosleep_loop):
 def test_zsh_nosleep_tty_narrow_terminal_clips_each_dashboard_row(nosleep_loop):
     result, _ = nosleep_loop(FAKE_STOP_AT="1002", _tty=True, _columns=40)
     visible = re.sub(r"\x1b\[[0-9;]*[A-Za-z]", "", result.stdout)
-    dashboard = [line for line in visible.splitlines() if line.startswith(("nosleep", "  "))]
+    dashboard = [line for line in visible.splitlines() if line == "nosleep" or line.startswith("  ")]
     assert dashboard
     assert any(line.endswith("…") for line in dashboard)
     assert all(len(line) <= 39 for line in dashboard), dashboard
@@ -655,22 +667,20 @@ def test_zsh_nosleep_net_floor_is_tunable(nosleep):
 
 
 
-def test_zsh_nosleep_lock_locks_then_sleeps_the_display(nosleep, tmp_path):
-    # lid close: lock the screen (SACLockScreenImmediate via python ctypes), THEN put the
-    # display to sleep — under disablesleep macOS leaves the panel lit behind a closed lid
-    # until the displaysleep timer. Both calls are stubbed: the real ones would lock and
-    # blank the developer's screen mid-test.
+def test_zsh_nosleep_lock_and_display_off_are_independent(nosleep, tmp_path):
+    # Both operations are stubbed: the real ones would lock and blank the developer's
+    # screen. Separating them lets --dim lock without putting the display to sleep.
     bins = tmp_path / "stubbin"
     for name, tag in (("python3", ""), ("pmset", "pmset ")):
         stub = bins / name
         stub.write_text('#!/bin/bash\nprintf "%s%%s\\n" "$*" >> "$LOCK_LOG"\nexit 0\n' % tag)
         stub.chmod(0o755)
     log = tmp_path / "lock.log"
-    r = nosleep("_nosleep_lock", LOCK_LOG=str(log))
+    r = nosleep("_nosleep_lock; _nosleep_display_off", LOCK_LOG=str(log))
     calls = log.read_text().splitlines()
-    assert len(calls) == 2 and "SACLockScreenImmediate" in calls[0]     # lock first …
-    assert calls[1] == "pmset displaysleepnow"                          # … then the display off
-    assert r.stdout.strip() == "nosleep: laptop closed — screen locked, display off"
+    assert len(calls) == 2 and "SACLockScreenImmediate" in calls[0]
+    assert calls[1] == "pmset displaysleepnow"
+    assert not r.stdout.strip()
 
 
 def test_zsh_nosleep_lid_closed_only_when_macos_would_sleep_on_it(nosleep):
@@ -821,9 +831,8 @@ def test_zsh_nosleep_desktop_claude_caffeinate_is_labelled_the_app(nosleep):
 
 
 def test_zsh_nosleep_dim_dims_then_restores_the_builtin_panel(nosleep, tmp_path):
-    # --no-lock's lid close: brightness down (remembering the level it was at), no lock, no
-    # display sleep; lid open puts the level back. python3 is stubbed — the real call
-    # would dim the developer's screen mid-test.
+    # Brightness is independent of lock policy. Remember the previous level and
+    # restore it on opening. python3 is stubbed to avoid dimming the real screen.
     stub = tmp_path / "stubbin" / "python3"
     stub.write_text('#!/bin/bash\ncat >/dev/null\nprintf "%s\\n" "$*" >> "$DIM_LOG"\necho 0.6200\n')
     stub.chmod(0o755)
@@ -832,38 +841,136 @@ def test_zsh_nosleep_dim_dims_then_restores_the_builtin_panel(nosleep, tmp_path)
                 '_nosleep_dim; echo "saved=$_NOSLEEP_BRIGHT"; '
                 '_nosleep_undim; echo "saved=[$_NOSLEEP_BRIGHT]"',
                 DIM_LOG=str(log), NOSLEEP_DIM_LEVEL="0.05")
-    assert r.stdout.splitlines() == ["nosleep: laptop closed — no lock requested, display dimmed", "saved=0.6200",
-                                     "nosleep: laptop closed — no lock requested, display dimmed", "saved=0.6200",
-                                     "saved=[]"]
+    assert r.stdout.splitlines() == ["saved=0.6200", "saved=0.6200", "saved=[]"]
     # a second dim (auto-brightness re-applied) never overwrites the level to restore
     assert log.read_text().splitlines() == ["- 0.05", "- 0.05", "- 0.6200"]
 
 
-@pytest.mark.parametrize("option", ["--no-lock", "-d", "--dim"])
-def test_zsh_nosleep_no_lock_dims_without_locking_and_restores_on_open(nosleep_loop, option):
-    result, log = nosleep_loop(f"{option} --every 2", FAKE_LID_AT="1002",
+def test_zsh_nosleep_undim_keeps_saved_brightness_until_restore_succeeds(nosleep):
+    result = nosleep('typeset -gi restores=0; _NOSLEEP_BRIGHT=0.6200; '
+                     '_nosleep_brightness() { (( ++restores )); (( restores > 1 )); }; '
+                     '_nosleep_undim; print -r -- "first=$? saved=$_NOSLEEP_BRIGHT"; '
+                     '_nosleep_undim; print -r -- "second=$? saved=[$_NOSLEEP_BRIGHT] restores=$restores"')
+    assert result.stdout.splitlines() == ["first=1 saved=0.6200", "second=0 saved=[] restores=2"]
+
+
+@pytest.mark.parametrize(
+    "options,locked,dimmed",
+    [("", True, False), ("--dim", True, True),
+     ("--no-lock", False, False), ("--dim --no-lock", False, True),
+     ("-d", True, True)],
+)
+def test_zsh_nosleep_lid_close_options_are_independent(nosleep_loop, options, locked, dimmed):
+    result, log = nosleep_loop(f"{options} --every 2", FAKE_LID_AT="1002",
                                FAKE_LID_OPEN_AT="1006", FAKE_STOP_AT="1008")
-    assert "laptop closed — no lock requested, display dimmed" in result.stdout
+    outcome = "display dimmed" if dimmed else "display off"
+    lock_state = "screen locked" if locked else "no lock requested"
+    assert f"laptop closed — {lock_state}, {outcome}" in result.stdout
     assert "exit=130 at=1008" in result.stdout
-    assert [line for line in log if line.startswith("hold ")] == ["hold 1000 -dims"]
-    assert not any(line.startswith("lock ") for line in log)
-    assert not any("displaysleepnow" in line for line in log)
-    assert "brightness 1002 0" in log
-    assert "brightness 1006 0.6200" in log
+    assert [line for line in log if line.startswith("lock ")] == (["lock 1002"] if locked else [])
+    assert [line for line in log if line.startswith("display-off ")] == ([] if dimmed else ["display-off 1002"])
+    assert [line for line in log if line.startswith("hold ")] == (
+        ["hold 1000 -dims"] if dimmed else ["hold 1000 -dims", "hold 1002 -ims", "hold 1006 -dims"])
+    assert ("brightness 1002 0" in log) == dimmed
+    assert ("brightness 1006 0.6200" in log) == dimmed
+    if locked and dimmed:
+        assert log.index("lock 1002") < log.index("brightness 1002 0")
     assert [line for line in log if "disablesleep 0" in line] == [
         "sudo 1008 -n pmset -a disablesleep 0"]
 
 
-def test_zsh_nosleep_no_lock_restores_brightness_on_interrupt_behind_closed_lid(nosleep_loop):
-    result, log = nosleep_loop("--no-lock --forever", FAKE_STOP_AT="1004")
+@pytest.mark.parametrize("options", ["--dim", "--dim --no-lock"])
+def test_zsh_nosleep_dim_restores_brightness_on_interrupt_behind_closed_lid(nosleep_loop, options):
+    result, log = nosleep_loop(f"{options} --forever", FAKE_STOP_AT="1004")
     assert "exit=130 at=1004" in result.stdout
     assert "brightness 1000 0" in log
     assert "brightness 1004 0.6200" in log
-    assert not any(line.startswith("lock ") for line in log)
+    assert ("lock 1000" in log) == ("--no-lock" not in options)
     assert [line for line in log if line.startswith("hold ")] == ["hold 1000 -dims"]
     assert not any(line.startswith(("online ", "busy ")) for line in log)
     assert [line for line in log if "disablesleep 0" in line] == [
         "sudo 1004 -n pmset -a disablesleep 0"]
+
+
+def test_zsh_nosleep_reports_lock_failure_without_claiming_success(nosleep_loop):
+    result, log = nosleep_loop("--dim --forever", FAKE_LOCK_FAILURE="1", FAKE_STOP_AT="1004")
+    assert "lock 1000" in log
+    assert "brightness 1000 0" in log
+    assert "screen lock failed" in result.stdout
+    assert "screen locked, display dimmed" not in result.stdout
+
+
+def test_zsh_nosleep_retries_failed_dim_and_restores_original_brightness(nosleep_loop):
+    result, log = nosleep_loop("--dim --forever --every 2", FAKE_DIM_RECOVER_AT="1002",
+                               FAKE_STOP_AT="1004")
+    assert "screen locked, could not dim display" in result.stdout
+    assert "Could not dim" in result.stdout
+    assert "brightness 1002 0" in log
+    assert "brightness 1004 0.6200" in log
+
+
+def test_zsh_nosleep_retries_failed_brightness_restore_after_open(nosleep_loop):
+    result, log = nosleep_loop("--dim --forever --every 2", FAKE_LID_AT="1002",
+                               FAKE_LID_OPEN_AT="1006", FAKE_RESTORE_FAILURES="1",
+                               FAKE_STOP_AT="1010")
+    assert "brightness 1002 0" in log
+    assert [line for line in log if line.endswith("0.6200")] == [
+        "brightness 1006 0.6200", "brightness 1008 0.6200"]
+    assert "exit=130 at=1010" in result.stdout
+
+
+def test_zsh_nosleep_stop_after_initial_dim_failure_sleeps_closed_display(nosleep_loop):
+    result, log = nosleep_loop("--dim --forever --every 2", FAKE_DIM_RECOVER_AT="9999",
+                               FAKE_STOP_AT="1004")
+    assert "could not dim display" in result.stdout
+    assert "display-off 1004" in log
+    assert not any(line.endswith("0.6200") for line in log)
+
+
+def test_zsh_nosleep_config_defaults_and_cli_overrides(nosleep_loop):
+    config = nosleep_loop.home / ".config" / "nosleep" / "config.json"
+    config.parent.mkdir(parents=True)
+    config.write_text(json.dumps({"dim": True, "lock": False, "forever": True}))
+
+    result, log = nosleep_loop(FAKE_STOP_AT="1004")
+    assert "no lock requested, display dimmed" in result.stdout
+    assert not [line for line in log if line.startswith(("lock ", "online ", "busy "))]
+    assert "display-off 1004" in log  # teardown sleeps the still-closed display
+    assert "brightness 1000 0" in log
+
+    result, log = nosleep_loop("--no-dim --lock --no-forever --every 2", FAKE_STOP_AT="1004")
+    assert "screen locked, display off" in result.stdout
+    assert "lock 1000" in log and "display-off 1000" in log
+    assert not any(line.startswith("brightness ") for line in log)
+    assert any(line.startswith(("online ", "busy ")) for line in log)
+
+
+def test_zsh_nosleep_config_dispatch_does_not_change_power(zsh):
+    result = zsh('sudo() { print -r -- "unexpected sudo"; }; '
+                 'nosleep config --show; nosleep config --help')
+    assert result.returncode == 0
+    assert not result.stderr
+    assert "nosleep defaults" in result.stdout
+    assert "nosleep config [--show|--edit]" in result.stdout
+    assert "unexpected sudo" not in result.stdout
+    assert not (zsh.home / ".config" / "nosleep" / "config.json").exists()
+
+
+def test_zsh_nosleep_invalid_config_stops_before_changing_power(zsh):
+    config = zsh.home / ".config" / "nosleep" / "config.json"
+    config.parent.mkdir(parents=True)
+    config.write_text('{"dim": "sometimes"}')
+    result = zsh('sudo() { print -r -- "unexpected sudo"; }; nosleep --forever; print -r -- "rc=$?"')
+    assert re.search(r"rc=[1-9]", result.stdout)
+    assert "unexpected sudo" not in result.stdout
+    assert "nosleep config:" in result.stderr
+
+
+def test_zsh_nosleep_docked_lid_skips_display_and_lock_actions(nosleep_loop):
+    # A shut lid in powered clamshell mode does not trigger the close action.
+    # Physical lid state is still shut; the kernel verdict says it would not sleep.
+    result, log = nosleep_loop("--dim --forever", FAKE_STOP_AT="1004", FAKE_DOCKED="1")
+    assert not any(line.startswith(("lock ", "display-off ", "brightness ")) for line in log)
 
 
 @pytest.mark.parametrize("args", ["--help", "--no-lock --help"])
@@ -898,5 +1005,3 @@ def test_zsh_nosleep_hold_swaps_the_caffeinate(nosleep, tmp_path):
                 'kill -0 $b 2>/dev/null && echo b-alive; kill $b', CAF_LOG=str(log))
     assert r.stdout.split() == ["a-gone", "b-alive"]
     assert log.read_text().splitlines() == ["-dims", "-ims"]
-    body = open(ZSHRC).read().split("\nnosleep() {", 1)[1].split("\n}\n", 1)[0]
-    assert "_nosleep_hold -dims" in body and "_nosleep_hold -ims; _nosleep_lock" in body

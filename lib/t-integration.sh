@@ -116,6 +116,9 @@ _dots_t_install() {
 _dots_t_preflight() {
     local dotroot="$1"
     [ -z "${DOTFILES_NO_T:-}" ] || return 0
+    # Once this checkout has crossed the split, t owns its own installation and
+    # updates. A missing/broken standalone t is not another bundled migration.
+    git -C "$dotroot" cat-file -e HEAD:bin/t 2>/dev/null || return 0
     if git -C "$dotroot" cat-file -e origin/main:bin/t 2>/dev/null; then
         return 0
     fi

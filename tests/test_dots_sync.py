@@ -58,7 +58,7 @@ def world(tmp_path):
     return seed, co, home, log, stub
 
 
-def run(home, stub, *args):
+def run(home, stub, *args, t_opt_out=True):
     env = {
         **os.environ,
         "HOME": str(home),
@@ -71,6 +71,8 @@ def run(home, stub, *args):
         "DOTFILES_NO_TRUST": "1",
         "DOTFILES_NO_CODEX_HOOKS": "1",
     }
+    if not t_opt_out:
+        env.pop("DOTFILES_NO_T")
     return subprocess.run([str(DOTS_SYNC), *args], env=env, capture_output=True, text=True)
 
 
@@ -162,6 +164,51 @@ def test_no_hosts_syncs_only_here(world):
     run(home, stub, "--no-hosts")
     assert head(co) == tip
     assert not log.exists()
+
+
+def test_no_hosts_post_split_syncs_without_t(world):
+    seed, co, home, log, stub = world
+    tip = land(seed)
+    r = run(home, stub, "--no-hosts", t_opt_out=False)
+    assert r.returncode == 0, r.stderr
+    assert not r.stderr
+    assert head(co) == tip
+    assert (home / "bin" / "sleep-manager").is_symlink()
+    assert not log.exists()
+    assert not (home / "bin" / "t").exists()
+
+
+@pytest.mark.skipif(not subprocess.run(["which", "zsh"], capture_output=True).stdout, reason="no zsh")
+def test_zsh_dots_updates_post_split_without_t_or_brew(world, tmp_path):
+    seed, co, home, _, _ = world
+    (seed / ".zshrc").write_bytes((REPO_ROOT / ".zshrc").read_bytes())
+    git("add", ".zshrc", cwd=seed)
+    git("commit", "-qm", "install real zshrc", "--no-verify", cwd=seed)
+    git("push", "-q", "origin", "main", cwd=seed)
+    git("pull", "-q", "--ff-only", cwd=co)
+    tip = land(seed)
+
+    calls = tmp_path / "external-calls.log"
+    fakebin = tmp_path / "fakebin"
+    fakebin.mkdir()
+    for name in ("t", "brew", "tmux"):
+        script = fakebin / name
+        if name == "tmux":
+            script.write_text("#!/bin/sh\nexit 1\n")
+        else:
+            script.write_text('#!/bin/sh\nprintf "%s\\n" "$0 $*" >> "$EXTERNAL_CALLS"\nexit 93\n')
+        script.chmod(0o755)
+    env = {k: v for k, v in os.environ.items() if not k.startswith("TMUX")}
+    env.update(HOME=str(home), ZDOTDIR=str(home), XDG_CONFIG_HOME=str(home / ".config"),
+               PATH=str(fakebin) + os.pathsep + os.environ["PATH"], EXTERNAL_CALLS=str(calls),
+               DOTFILES_NO_T="", DOTFILES_NO_CLIP_BRIDGE="1")
+    result = subprocess.run(["zsh", "-f", "-c", "source ~/.zshrc >/dev/null 2>&1; dots"],
+                            env=env, capture_output=True, text=True, timeout=60)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert head(co) == tip
+    assert (home / "bin" / "sleep-manager").is_symlink()
+    assert not (home / "bin" / "t").exists()
+    assert not calls.exists(), calls.read_text() if calls.exists() else ""
 
 
 def test_bad_arg(world):

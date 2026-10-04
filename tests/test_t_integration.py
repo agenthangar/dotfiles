@@ -81,24 +81,31 @@ subprocess.run([str(root / "install.sh")], check=True)
 def test_repeated_dotfiles_relink_keeps_standalone_ownership(tmp_path):
     home, repo = checkout(tmp_path)
     t = standalone(home)
+    (home / "bin").mkdir()
+    for name in ("t", "claude-stamp-tmux", "cursor-beam"):
+        (home / "bin" / name).symlink_to(t / "bin" / name)
+    install_log = tmp_path / "t-install.log"
+    (t / "install.sh").write_text('#!/bin/sh\necho called >> "$T_INSTALL_LOG"\nexit 42\n')
     for _ in range(2):
-        r = run_install(repo, home, DOTFILES_LINKS_ONLY="1", DOTFILES_NO_T="")
+        r = run_install(repo, home, DOTFILES_LINKS_ONLY="1", DOTFILES_NO_T="",
+                        T_INSTALL_LOG=str(install_log))
         assert r.returncode == 0, r.stderr
         for name in ("t", "claude-stamp-tmux", "cursor-beam"):
             assert (home / "bin" / name).resolve() == t / "bin" / name
-    assert (t / "adapter.txt").read_text().splitlines() == [
-        str(home / ".zshrc.local"), str(repo / "agents"), "1"
-    ]
+    assert not install_log.exists()
+    assert not (t / "adapter.txt").exists()
 
 
-def test_invalid_standalone_marker_stops_offline_relink(tmp_path):
+def test_invalid_standalone_marker_does_not_block_dotfiles_relink(tmp_path):
     home, repo = checkout(tmp_path)
     t = standalone(home)
+    (home / "bin").mkdir()
+    (home / "bin" / "t").symlink_to(t / "bin" / "t")
     (t / ".t-install-version").write_text("99\n")
     r = run_install(repo, home, DOTFILES_LINKS_ONLY="1", DOTFILES_NO_T="")
-    assert r.returncode != 0
-    assert "standalone t is missing" in r.stderr
-    assert not (home / "bin" / "t").exists()
+    assert r.returncode == 0, r.stderr
+    assert (home / ".zshrc").resolve() == repo / ".zshrc"
+    assert (home / "bin" / "t").resolve() == t / "bin" / "t"
     assert not (t / "adapter.txt").exists()
 
 
@@ -157,6 +164,17 @@ def test_removal_preflight_bootstraps_release_without_checkout(tmp_path):
     assert len((tmp_path / "curl.log").read_text().splitlines()) == 1
 
 
+def test_post_split_preflight_needs_no_standalone_t_or_network(tmp_path):
+    home, repo = checkout(tmp_path)
+    removal_ref(repo)
+    git("merge", "--ff-only", "origin/main", cwd=repo)
+    env, _ = release_stub(tmp_path, home)
+    r = preflight(home, repo, **env)
+    assert r.returncode == 0, r.stderr
+    assert not (tmp_path / "curl.log").exists()
+    assert not (home / "bin" / "t").exists()
+
+
 def test_old_owned_link_migrates_during_links_only_relink(tmp_path):
     home, repo = checkout(tmp_path)
     (home / "bin").mkdir()
@@ -175,7 +193,8 @@ def test_links_only_without_owned_link_stays_offline(tmp_path):
     home, repo = checkout(tmp_path)
     env, _ = release_stub(tmp_path, home)
     r = run_install(repo, home, DOTFILES_LINKS_ONLY="1", DOTFILES_NO_T="", **env)
-    assert r.returncode != 0
+    assert r.returncode == 0, r.stderr
+    assert (home / ".zshrc").resolve() == repo / ".zshrc"
     assert not (tmp_path / "curl.log").exists()
 
 

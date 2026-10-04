@@ -12,7 +12,8 @@ agent settings, and desktop handoff. This repository consumes that project.
 
 | Command | Purpose |
 | --- | --- |
-| `dots` | Update canonical dotfiles main and standalone t, reconcile links, reload |
+| `dots` | Update dotfiles, reconcile its links, reload |
+| `t update` | Update the independently installed session toolkit |
 | `dots --all` | Update here, then run dots on every configured remote host |
 | `dots --dev` | Make the dotfiles session worktree you are standing in live |
 | `dots --relink` | Reconcile the selected dotfiles links without fetching |
@@ -27,8 +28,8 @@ agent settings, and desktop handoff. This repository consumes that project.
 ## Sleep and connection recovery
 
 ```sh
-nosleep                       # keep awake; closing the lid locks the screen
-nosleep --no-lock              # keep unlocked on lid close; dim the display
+nosleep                       # keep awake; closing the laptop locks the screen
+nosleep --no-lock              # keep unlocked when the laptop closes; dim display
 nosleep --no-lock --forever    # keep awake and unlocked until Ctrl-C
 ```
 
@@ -42,10 +43,10 @@ shows the short option reference.
 nosleep — KEEPING MAC AWAKE
 
 Live status
-  Sleep     Blocked · lid open, checks are advisory
+  Sleep     Blocked · while laptop screen is raised
   Agents    Sampling activity… need a second check
   Internet  Online · checked 0s ago
-  Lid       Open
+  Laptop    Open · screen raised
   Display   Held on · no idle dimming
   Locking   No lock requested · existing locks stay locked
   Next      Check in 30s
@@ -53,14 +54,14 @@ Live status
 Configuration
   On open   Display on + keep an unlocked session unlocked
   On close  Display off + lock screen (unless docked)
-  Policy    Lid shut · 15m grace, then 3 retries
+  Policy    Sleep after 15m idle/offline and 3 failed retries (laptop closed)
 
   Stop      Ctrl-C · release sleep hold
 ```
 
 Live status refreshes every two seconds with current checks, display/lock actions,
-and a countdown to the next check. Configuration shows the selected lid behavior
-and grace/retry settings, which stay fixed as the lid opens and closes.
+and a countdown to the next check. Configuration shows what happens when you
+open or close the laptop and the conditions that allow sleep.
 Agents shows activity observed at the last check, then switches to quiet
 with a last-seen time when activity stops. Internet shows the latest connection
 result; Sleep and Next show remaining grace or the pending retry when needed.
@@ -71,21 +72,23 @@ periods, grace and retries, and red for lost connectivity or sleep-protection
 warnings. Bold labels and muted policy/help text keep the current state prominent.
 Use `NO_COLOR=1 nosleep` for an unstyled snapshot with live updates.
 
-Display and Locking report this run's display hold and lock requests. With the lid open,
-`nosleep` keeps the display on and inhibits idle
-locking, so an unlocked session can stay unlocked. It never unlocks an existing
-lock. Closing the lid normally requests a screen lock and turns the display off;
+Display and Locking report this run's display hold and lock requests. An open
+laptop means its screen is raised; a closed laptop has its screen folded down.
+While the laptop is open, `nosleep` keeps the display on and inhibits idle locking,
+so an unlocked session can stay unlocked. It never unlocks an existing lock.
+Closing the laptop normally requests a screen lock and turns the display off;
 opening it restores the display hold, with a reminder that unlocking is manual.
 `nosleep --no-lock` instead dims the built-in display and requests no lock, keeping
 an already-unlocked session available. Docked clamshell mode keeps the external
-display on and skips the lid-close lock/dim action. On close shows the selected
+display on and skips the lock/dim action when you close the laptop. On close shows the selected
 behavior separately from the sleep grace and retry Policy.
 
-`nosleep` keeps the Mac awake until Ctrl-C while the lid is open. It reports missing
-agent activity or internet connectivity as advisories. With the lid shut, missing
-signals get a 15-minute grace period, then three more checks after 30, 60, and
-120 seconds before sleep is restored. The lid still locks or dims as usual during
-backoff. Opening the lid cancels pending retries; closing it starts a fresh retry
+`nosleep` keeps the Mac awake until Ctrl-C while the laptop is open. Failed activity
+or internet checks only produce warnings in that state. Automatic sleep is allowed
+only when the laptop is closed and activity or internet connectivity remains absent
+through the 15-minute grace period and three extra checks (after 30, 60, and 120 seconds).
+Closing the laptop still locks or dims its display during retries.
+Opening the laptop cancels pending retries; closing it starts a fresh retry
 budget. Recovery resets the retry budget; a restored connection also restarts
 activity sampling and grace so an agent has time to resume.
 
@@ -146,10 +149,9 @@ release installation base.
 
 The `$HOME` symlinks point into the selected installations. Editing a development
 worktree is not live until its PR merges and you update, or you explicitly select
-it with `dots --dev` / `t update --dev`. Ordinary `dots` returns dotfiles and t to
-their released versions. `dots --dev` and `--relink` leave t's selection alone.
-An ordinary `t update` refreshes the selected release or checkout and preserves
-dirty worktree edits.
+it with `dots --dev` / `t update --dev`. Ordinary `dots` updates dotfiles only;
+standalone t keeps its selected version and owns its updates. Run `t update`
+separately to refresh its release or checkout while preserving dirty worktree edits.
 
 `dots --all` is the rollout step after a merged PR; nothing polls GitHub for merges.
 Inspect its per-host results: an unreachable host is reported and must be retried.
@@ -162,7 +164,8 @@ the standalone installation works. If it cannot, it stops before removing the
 old executable. Recovery does not require a working command: run the public
 [`t` release installer](https://github.com/agenthangar/t#install), then rerun
 `dots`. A machine running an intermediate dotfiles bridge that refuses its
-preflight before updating also needs this one-time installation.
+preflight before updating also needs this one-time installation. Once migrated,
+normal `dots` updates and relinks do not run the t installer, `t update`, or Homebrew.
 
 ## Private configuration and policy
 

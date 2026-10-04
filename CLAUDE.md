@@ -21,9 +21,9 @@ engine, tests, and release process. Dotfiles installs and consumes it through
 
 `dots --dev` temporarily points dotfiles links at the dotfiles worktree in
 `$PWD`. `t update --dev` independently selects a t worktree. Plain `dots`
-returns dotfiles to canonical `main` and invokes `command t update` before
-reloading the shell, refreshing the selected t release or checkout. `dots --relink`
-only reconciles current links and leaves the selected t source alone.
+returns dotfiles to canonical `main`, reconciles its links, and reloads the shell.
+After the bundled-to-standalone migration, `dots` never runs `t update` or the
+t installer during ordinary updates/relinks. Update t separately with `t update`.
 
 These are separate live surfaces. `_dots_live_tree` resolves the dotfiles
 target from the actual `~/.zshrc` link. The dotfiles adapter exports that
@@ -69,9 +69,10 @@ Do not replace this sequence with a destructive worktree removal or reset.
 downloads the public t release bootstrap script to a temporary file; that
 script verifies the release archive's SHA-256 checksum before installing under
 `~/.local/share/t/releases/` (or `$T_INSTALL_DIR`). An existing valid checkout
-stays selected. An explicit invalid `DOTFILES_T_HOME` is an error. Before
-fast-forwarding to a release without bundled t, `_dots_t_preflight`
-installs or repairs standalone t. If it fails, it stops while the outgoing
+stays selected. An explicit invalid `DOTFILES_T_HOME` is an error during setup or
+migration. Only when the outgoing checkout still contains bundled `bin/t` and
+the incoming release removes it does `_dots_t_preflight` install or repair
+standalone t. If it fails, it stops while the outgoing
 dotfiles code and links still work. A machine already running an intermediate
 bridge with an older preflight can need one manual run of the public installer
 before `dots`; no new dotfiles code can execute until that preflight passes.

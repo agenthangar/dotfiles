@@ -34,8 +34,8 @@ nosleep --no-lock --forever    # keep awake and unlocked until Ctrl-C
 ```
 
 `--no-lock` preserves an already-unlocked session; it cannot unlock an existing
-lock. `-d` and `--dim` still work as compatibility aliases. `nosleep --help`
-shows the short option reference.
+lock. `--dim` (or `-d`) selects the same behavior: dim the built-in display on
+close and skip locking. `nosleep --help` shows the short option reference.
 
 `nosleep` shows a live snapshot instead of a long startup message:
 
@@ -48,26 +48,24 @@ Live status
   Next      Check in 30s
 
 Configuration
-            Current                  │ Change on next run
-  Sleep     Blocked                  │ Ctrl-C to release
-  Display   On; off when closed      │ --no-lock to dim
-  Dim       Off                      │ --no-lock to enable
-  Locking   When closed              │ --no-lock to disable
+  Sleep:    Blocked                   (--forever: until Ctrl-C)
+  Display:  On; off when closed       (--dim: dim on close)
+  Dim:      Off                       (--dim; also skips locking)
+  Locking:  When closed               (--no-lock: disable)
 
-  Mode      Auto sleep (lid closed)  │ --forever for manual stop
-  Grace     15m idle/offline         │ --grace <seconds>
-  Checks    30s                      │ --every <seconds>
-  Retries   3                        │ --retries <count>
-  Backoff   30s, doubles to 5m       │ --backoff <seconds>
+  Grace:    15m idle/offline          (--grace <seconds>)
+  Checks:   30s                       (--every <seconds>)
+  Retries:  3                         (--retries <count>)
+  Backoff:  30s, doubles to 5m        (--backoff <seconds>)
 
   Stop      Ctrl-C · release sleep hold
 ```
 
 Live status refreshes every two seconds with current activity and connection checks
 and a countdown to the next check. Configuration shows the sleep, display, dimming, and
-locking behavior selected for this run. An aligned, muted Change column keeps each
-helper beside its setting. Timing controls have individual rows; restart with the
-shown flag to change them. In `--forever` mode, unused timing controls are marked inactive.
+locking behavior selected for this run. Short, muted flag hints sit beside each
+setting. Timing controls have individual rows; restart with the shown flag to
+change them. In `--forever` mode, unused timing controls are marked inactive.
 Agents shows activity observed at the last check, then switches to quiet
 with a last-seen time when activity stops. Internet shows the latest connection
 result; Next shows remaining grace or the pending retry when needed. Failures to

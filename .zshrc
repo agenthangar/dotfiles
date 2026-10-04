@@ -198,14 +198,15 @@ prview() {
 
 # nosleep — keep your Mac awake
 #
-# Usage: nosleep [--no-lock] [--forever] [options]
+# Usage: nosleep [--dim | --no-lock] [--forever] [options]
 #
 # Display stays on until you close the laptop or stop nosleep.
 # Closing the laptop: lock + display off.
 # While closed: 15m idle/offline + 3 failed retries allows sleep.
 #
 # Options:
-#   --no-lock        keep unlocked when closed; dim the built-in display
+#   -d, --dim        dim the built-in display when closed; skip locking
+#   --no-lock        same as --dim; keep an unlocked session unlocked
 #   -f, --forever    stay awake until Ctrl-C; skip activity/network checks
 #   --grace <secs>   wait before retries (default 900)
 #   --every <secs>   time between checks (default 30)
@@ -217,11 +218,12 @@ prview() {
 nosleep() {
   [[ "$1" == -h || "$1" == --help ]] && { _help_for nosleep; return 0; }
   local forever=0 dim=0 grace=900 every=30 retries=3 backoff=30
+  local -a dim_options=()
   while (( $# )); do
     case $1 in
       -h|--help) _help_for nosleep; return 0 ;;
       -f|--forever) forever=1 ;;
-      --no-lock|-d|--dim) dim=1 ;; # old dim flags remain compatibility aliases
+      --no-lock|-d|--dim) dim=1; dim_options+=("$1") ;;
       --grace|--every|--retries|--backoff)
         (( $# >= 2 )) || { echo "nosleep: $1 needs a value" >&2; return 2; }
         case $1 in
@@ -454,20 +456,20 @@ _nosleep_status_clear() {
 }
 _nosleep_status() {
   local agent_text network_text next_text notice_text
-  local mode_text='Auto sleep (lid closed)' mode_help='--forever for manual stop'
-  local display_help='--no-lock to dim' dim_help='--no-lock to enable' lock_help='--no-lock to disable'
+  local sleep_text='Blocked' sleep_help='--forever: until Ctrl-C'
+  local display_help='--dim: dim on close' dim_help='--dim; also skips locking' lock_help='--no-lock: disable'
+  local dim_flags="${(j: :)${(u)dim_options}}"
   local grace_text every_text backoff_text retries_text=$retries item
   local display_text='On; off when closed' dim_text='Off' lock_text='When closed'
-  local remaining signal_age line width=$(( ${COLUMNS:-80} - 1 )) row=0 styled=0 value primary detail
-  local heading_style='1;32' agent_style=33 network_style=36 next_style=36
-  local lock_style=33 notice_style=33
+  local remaining signal_age line width=$(( ${COLUMNS:-80} - 1 )) row=0 styled=0 value primary detail config_first config_last
+  local heading_style=1 agent_style=33 network_style=36 next_style=36
+  local sleep_style=0 notice_style=33
   local -a rows styles config_labels config_values config_helpers config_styles
   (( _NOSLEEP_TTY )) && [[ -z ${NO_COLOR:-} ]] && styled=1
   if (( dim )); then
-    display_text='On; dim when closed' display_help='omit --no-lock for off'
-    dim_text='When closed' dim_help='omit --no-lock to disable'
-    lock_text='Keep unlocked' lock_help='omit --no-lock to enable'
-    lock_style=36
+    display_text='On; dim when closed' display_help="omit $dim_flags"
+    dim_text='When closed' dim_help="omit $dim_flags"
+    lock_text='No lock requested' lock_help="omit $dim_flags"
   fi
   if (( dim && lid_shut && lid_was )) && [[ -z $_NOSLEEP_BRIGHT ]]; then
     notice_text='Could not dim · display remains held on'
@@ -476,7 +478,7 @@ _nosleep_status() {
     agent_style=2 network_style=2 next_style=2
     agent_text='Not checked (--forever)' network_text='Not checked (--forever)'
     next_text='No checks (--forever)'
-    mode_text='Manual stop' mode_help='omit --forever for auto'
+    sleep_text='Blocked until Ctrl-C' sleep_help='omit --forever for checks'
   else
     if (( ! probes )); then
       agent_text='Checking activity…'
@@ -520,7 +522,8 @@ _nosleep_status() {
     fi
   fi
   if (( ! sleep_held )); then
-    heading_style='1;31' notice_style='1;31'
+    heading_style='1;31' notice_style='1;31' sleep_style='1;31'
+    sleep_text='Hold unavailable'
     notice_text='Sleep protection unavailable · closing may allow sleep'
   fi
   rows=('nosleep'
@@ -543,23 +546,25 @@ _nosleep_status() {
     retries_text+=' (inactive)'
     _nosleep_duration "$backoff"; backoff_text="$REPLY (inactive)"
   fi
-  config_labels=(Sleep Display Dim Locking '' Mode Grace Checks Retries Backoff)
-  config_values=('Blocked' "$display_text" "$dim_text" "$lock_text" ''
-                 "$mode_text" "$grace_text" "$every_text" "$retries_text" "$backoff_text")
-  config_helpers=('Ctrl-C to release' "$display_help" "$dim_help" "$lock_help" ''
-                  "$mode_help" '--grace <seconds>' '--every <seconds>' '--retries <count>' '--backoff <seconds>')
-  config_styles=(36 36 36 "$lock_style" 0 36 36 36 36 36)
-  rows+=('' 'Configuration' '            Current                  │ Change on next run')
-  styles+=(0 '1;36' 2)
+  config_labels=(Sleep Display Dim Locking '' Grace Checks Retries Backoff)
+  config_values=("$sleep_text" "$display_text" "$dim_text" "$lock_text" ''
+                 "$grace_text" "$every_text" "$retries_text" "$backoff_text")
+  config_helpers=("$sleep_help" "$display_help" "$dim_help" "$lock_help" ''
+                  '--grace <seconds>' '--every <seconds>' '--retries <count>' '--backoff <seconds>')
+  config_styles=("$sleep_style" 0 0 0 0 0 0 0 0)
+  rows+=('' 'Configuration')
+  styles+=(0 1)
+  config_first=$(( ${#rows} + 1 ))
   for (( item = 1; item <= ${#config_labels}; ++item )); do
     if [[ -n ${config_labels[item]} ]]; then
-      printf -v line '  %-8s  %-24s │ %s' "${config_labels[item]}" "${config_values[item]}" "${config_helpers[item]}"
+      printf -v line '  %-8s  %-24s  (%s)' "${config_labels[item]}:" "${config_values[item]}" "${config_helpers[item]}"
     else
       line=''
     fi
     rows+=("$line")
     styles+=("${config_styles[item]}")
   done
+  config_last=${#rows}
   rows+=('' '  Stop      Ctrl-C · release sleep hold')
   styles+=(0 2)
   _nosleep_status_clear
@@ -577,9 +582,9 @@ _nosleep_status() {
       printf '\e[%sm%s\e[0m\n' "${styles[row]}" "$line"
     else
       value=${line[13,-1]}
-      if [[ $value == *' │ '* ]]; then
-        primary=${value%% │ *}
-        detail=${value#"$primary"}
+      if (( row >= config_first && row <= config_last )); then
+        primary=${value[1,24]}
+        detail=${value[25,-1]}
         printf '\e[1m%s\e[0m\e[%sm%s\e[0m\e[2m%s\e[0m\n' "${line[1,12]}" "${styles[row]}" "$primary" "$detail"
       else
         primary=${value%% · *}

@@ -287,14 +287,14 @@ def test_zsh_nosleep_plain_snapshot_shows_sampling_then_idle(nosleep_loop):
     result, _ = nosleep_loop("--every 2", FAKE_LID_AT="99999", FAKE_STOP_AT="1006")
     output = result.stdout
     assert "nosleep — KEEPING MAC AWAKE" in output
-    for label in ("Sleep", "Display", "Locking", "Policy", "Agents", "Internet", "Next", "Stop"):
+    for label in ("Sleep", "Display", "Dim", "Locking", "Policy", "Agents", "Internet", "Next", "Stop"):
         assert re.search(rf"(?m)^  {label}\b", output), label
     snapshot = output.split("nosleep — KEEPING MAC AWAKE", 1)[1].split("  Stop", 1)[0]
     live, config = snapshot.split("Configuration", 1)
     assert "Live status" in live
     for label in ("Agents", "Internet", "Next"):
         assert re.search(rf"(?m)^  {label}\b", live), label
-    for label in ("Sleep", "Display", "Locking", "Policy"):
+    for label in ("Sleep", "Display", "Dim", "Locking", "Policy"):
         assert not re.search(rf"(?m)^  {label}\b", live), label
         assert re.search(rf"(?m)^  {label}\b", config), label
     assert not re.search(r"(?m)^  Laptop\b", output)

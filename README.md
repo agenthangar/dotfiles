@@ -49,7 +49,8 @@ Live status
 
 Configuration
   Sleep     Blocked while nosleep runs
-  Display   On · off when closed (unless docked)
+  Display   On · off when closed
+  Dim       Off
   Locking   Lock when closed (unless docked)
   Policy    Sleep after 15m idle/offline and 3 failed retries (laptop closed)
 
@@ -57,7 +58,7 @@ Configuration
 ```
 
 Live status refreshes every two seconds with current activity and connection checks
-and a countdown to the next check. Configuration shows the sleep, display, and
+and a countdown to the next check. Configuration shows the sleep, display, dimming, and
 locking behavior selected for this run.
 Agents shows activity observed at the last check, then switches to quiet
 with a last-seen time when activity stops. Internet shows the latest connection
@@ -77,7 +78,7 @@ opening it restores the display hold. Unlocking is manual.
 `nosleep --no-lock` instead dims the built-in display and requests no lock, keeping
 an already-unlocked session available. Docked clamshell mode keeps the external
 display on and skips the lock/dim action when you close the laptop. The Configuration
-rows show the selected display and locking behavior alongside the sleep policy.
+rows show the selected display, dimming, and locking behavior alongside the sleep policy.
 
 `nosleep` keeps the Mac awake until Ctrl-C while the laptop is open. Failed activity
 or internet checks only produce warnings in that state. Automatic sleep is allowed

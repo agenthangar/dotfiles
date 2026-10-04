@@ -454,7 +454,7 @@ _nosleep_status_clear() {
 }
 _nosleep_status() {
   local heading='KEEPING MAC AWAKE' agent_text network_text next_text policy_text notice_text
-  local display_text='On · off when closed (unless docked)' lock_text='Lock when closed (unless docked)'
+  local display_text='On · off when closed' dim_text='Off' lock_text='Lock when closed (unless docked)'
   local remaining signal_age line width=$(( ${COLUMNS:-80} - 1 )) row=0 styled=0 value primary detail
   local heading_style='1;32' agent_style=33 network_style=36 next_style=36
   local lock_style=33 notice_style=33
@@ -463,7 +463,8 @@ _nosleep_status() {
   _nosleep_duration "$grace"
   policy_text="Sleep after $REPLY idle/offline and $retries failed retries (laptop closed)"
   if (( dim )); then
-    display_text='On · dim when closed (unless docked)'
+    display_text='On'
+    dim_text='When closed (unless docked)'
     lock_text='Keep unlocked (--no-lock)'
     lock_style=36
   fi
@@ -537,11 +538,12 @@ _nosleep_status() {
         'Configuration'
         '  Sleep     Blocked while nosleep runs'
         "  Display   $display_text"
+        "  Dim       $dim_text"
         "  Locking   $lock_text"
         "  Policy    $policy_text"
         ''
         '  Stop      Ctrl-C · release sleep hold')
-  styles+=(0 '1;36' 36 36 "$lock_style" 2 0 2)
+  styles+=(0 '1;36' 36 36 36 "$lock_style" 2 0 2)
   _nosleep_status_clear
   for line in "${rows[@]}"; do
     (( ++row ))

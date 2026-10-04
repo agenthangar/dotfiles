@@ -287,12 +287,20 @@ def test_zsh_nosleep_plain_snapshot_shows_sampling_then_idle(nosleep_loop):
     result, _ = nosleep_loop("--every 2", FAKE_LID_AT="99999", FAKE_STOP_AT="1006")
     output = result.stdout
     assert "nosleep — KEEPING MAC AWAKE" in output
-    for label in ("Sleep", "Agents", "Internet", "Laptop", "Next", "On close", "Stop"):
+    for label in ("Sleep", "Display", "Locking", "Policy", "Agents", "Internet", "Next", "Stop"):
         assert re.search(rf"(?m)^  {label}\b", output), label
+    snapshot = output.split("nosleep — KEEPING MAC AWAKE", 1)[1].split("  Stop", 1)[0]
+    live, config = snapshot.split("Configuration", 1)
+    assert "Live status" in live
+    for label in ("Agents", "Internet", "Next"):
+        assert re.search(rf"(?m)^  {label}\b", live), label
+    for label in ("Sleep", "Display", "Locking", "Policy"):
+        assert not re.search(rf"(?m)^  {label}\b", live), label
+        assert re.search(rf"(?m)^  {label}\b", config), label
+    assert not re.search(r"(?m)^  Laptop\b", output)
     assert "Sampling activity" in output
     assert "No activity detected" in output
     assert re.search(r"(?m)^  Internet\b.*Online", output)
-    assert re.search(r"(?m)^  Laptop\b.*Open · screen raised", output)
     assert "Ctrl-C" in output
     assert "exit=130 at=1006" in output
 
@@ -308,7 +316,6 @@ def test_zsh_nosleep_snapshot_shows_offline_grace_and_retry(nosleep_loop):
     result, _ = nosleep_loop("--grace 4 --every 2 --backoff 2", FAKE_ONLINE="0",
                              FAKE_STOP_AT="1008")
     assert re.search(r"(?m)^  Internet\b.*Offline", result.stdout)
-    assert re.search(r"(?m)^  Laptop\b.*Closed · screen folded down", result.stdout)
     assert re.search(r"(?m)^  Next\b.*Retry 1/3 in 2s", result.stdout)
     assert "exit=130 at=1008" in result.stdout
 

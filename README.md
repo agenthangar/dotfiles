@@ -45,6 +45,10 @@ with a last-seen time when activity stops. Internet shows the latest connection
 result; Sleep and Next show remaining grace or the pending retry when needed.
 `--forever` explicitly marks agent and internet checks as disabled. Redirected
 output and basic terminals get plain snapshots at each check, without cursor codes.
+Interactive terminals use green for healthy states, amber for sampling, quiet
+periods, grace and retries, and red for lost connectivity or sleep-protection
+warnings. Bold labels and muted policy/help text keep the current state prominent.
+Use `NO_COLOR=1 nosleep` for an unstyled snapshot with live updates.
 
 `nosleep` keeps the Mac awake until Ctrl-C while the lid is open. It reports missing
 agent activity or internet connectivity as advisories. With the lid shut, missing

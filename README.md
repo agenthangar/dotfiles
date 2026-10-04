@@ -26,6 +26,16 @@ agent settings, and desktop handoff. This repository consumes that project.
 
 ## Sleep and connection recovery
 
+```sh
+nosleep                       # keep awake; closing the lid locks the screen
+nosleep --no-lock              # keep unlocked on lid close; dim the display
+nosleep --no-lock --forever    # keep awake and unlocked until Ctrl-C
+```
+
+`--no-lock` preserves an already-unlocked session; it cannot unlock an existing
+lock. `-d` and `--dim` still work as compatibility aliases. `nosleep --help`
+shows the short option reference.
+
 `nosleep` shows a live snapshot instead of a long startup message:
 
 ```text
@@ -58,7 +68,7 @@ Display and Locking describe the configured behavior. With the lid open,
 locking, so an unlocked session can stay unlocked. It never unlocks an existing
 lock. Closing the lid normally requests a screen lock and turns the display off;
 opening it restores the display hold, with a reminder that unlocking is manual.
-`nosleep --dim` instead dims the built-in display and requests no lock, keeping
+`nosleep --no-lock` instead dims the built-in display and requests no lock, keeping
 an already-unlocked session available. Docked clamshell mode keeps the external
 display on and skips the lid-close lock/dim action. On close shows the selected
 behavior separately from the sleep grace and retry Policy.

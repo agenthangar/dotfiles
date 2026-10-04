@@ -43,28 +43,26 @@ shows the short option reference.
 nosleep — KEEPING MAC AWAKE
 
 Live status
-  Sleep     Blocked · while laptop screen is raised
   Agents    Sampling activity… need a second check
   Internet  Online · checked 0s ago
-  Laptop    Open · screen raised
-  Display   Held on · no idle dimming
-  Locking   No lock requested · existing locks stay locked
   Next      Check in 30s
 
 Configuration
-  On open   Display on + keep an unlocked session unlocked
-  On close  Display off + lock screen (unless docked)
+  Sleep     Blocked while nosleep runs
+  Display   On · off when closed (unless docked)
+  Locking   Lock when closed (unless docked)
   Policy    Sleep after 15m idle/offline and 3 failed retries (laptop closed)
 
   Stop      Ctrl-C · release sleep hold
 ```
 
-Live status refreshes every two seconds with current checks, display/lock actions,
-and a countdown to the next check. Configuration shows what happens when you
-open or close the laptop and the conditions that allow sleep.
+Live status refreshes every two seconds with current activity and connection checks
+and a countdown to the next check. Configuration shows the sleep, display, and
+locking behavior selected for this run.
 Agents shows activity observed at the last check, then switches to quiet
 with a last-seen time when activity stops. Internet shows the latest connection
-result; Sleep and Next show remaining grace or the pending retry when needed.
+result; Next shows remaining grace or the pending retry when needed. Failures to
+hold sleep off or dim the display appear as a Notice when relevant.
 `--forever` explicitly marks agent and internet checks as disabled. Redirected
 output and basic terminals get plain snapshots at each check, without cursor codes.
 Interactive terminals use green for healthy states, amber for sampling, quiet
@@ -72,16 +70,14 @@ periods, grace and retries, and red for lost connectivity or sleep-protection
 warnings. Bold labels and muted policy/help text keep the current state prominent.
 Use `NO_COLOR=1 nosleep` for an unstyled snapshot with live updates.
 
-Display and Locking report this run's display hold and lock requests. An open
-laptop means its screen is raised; a closed laptop has its screen folded down.
 While the laptop is open, `nosleep` keeps the display on and inhibits idle locking,
 so an unlocked session can stay unlocked. It never unlocks an existing lock.
 Closing the laptop normally requests a screen lock and turns the display off;
-opening it restores the display hold, with a reminder that unlocking is manual.
+opening it restores the display hold. Unlocking is manual.
 `nosleep --no-lock` instead dims the built-in display and requests no lock, keeping
 an already-unlocked session available. Docked clamshell mode keeps the external
-display on and skips the lock/dim action when you close the laptop. On close shows the selected
-behavior separately from the sleep grace and retry Policy.
+display on and skips the lock/dim action when you close the laptop. The Configuration
+rows show the selected display and locking behavior alongside the sleep policy.
 
 `nosleep` keeps the Mac awake until Ctrl-C while the laptop is open. Failed activity
 or internet checks only produce warnings in that state. Automatic sleep is allowed

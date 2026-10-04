@@ -200,8 +200,8 @@ prview() {
 #
 # Usage: nosleep [--no-lock] [--forever] [options]
 #
-# Laptop open (screen raised): display stays on until Ctrl-C.
-# Laptop closed (screen folded down): lock + display off, unless docked.
+# Display stays on until you close the laptop or stop nosleep.
+# Closing the laptop: lock + display off, unless docked.
 # While closed: 15m idle/offline + 3 failed retries allows sleep.
 #
 # Options:
@@ -301,7 +301,7 @@ nosleep() {
   local retry_count=0 retry_delay=$backoff retry_for='' missing online=1 was_online=1 refreshed_at=0
   # Presentation tracks observed signals separately from the grace timestamps,
   # which are seeded at startup and reset on reconnect without observing work.
-  local busy_now=0 detected_at=0 online_checked_at=0 sleep_held=1 show_snapshot=1 status_shown=0 lock_requested=0
+  local busy_now=0 detected_at=0 online_checked_at=0 sleep_held=1 show_snapshot=1 status_shown=0
   busy_at=$online_at
   while :; do
     # A signal delivered inside a helper returns from that helper, not this loop.
@@ -319,7 +319,6 @@ nosleep() {
     if _nosleep_lid_closed; then
       if (( ! lid_was )); then
         if (( dim )); then _nosleep_dim; else _nosleep_hold -ims; _nosleep_lock; fi
-        (( dim )) || lock_requested=1
         lid_was=1
       fi
     else
@@ -454,47 +453,25 @@ _nosleep_status_clear() {
   fi
 }
 _nosleep_status() {
-  local heading='KEEPING MAC AWAKE' sleep_text agent_text network_text lid_text next_text close_text policy_text
-  local display_text='Held on · no idle dimming' lock_text='No lock requested · existing locks stay locked'
+  local heading='KEEPING MAC AWAKE' agent_text network_text next_text policy_text notice_text
+  local display_text='On · off when closed (unless docked)' lock_text='Lock when closed (unless docked)'
   local remaining signal_age line width=$(( ${COLUMNS:-80} - 1 )) row=0 styled=0 value primary detail
-  local heading_style='1;32' sleep_style=32 agent_style=33 network_style=36 next_style=36
-  local display_style=32 lock_style=36 close_style=33
+  local heading_style='1;32' agent_style=33 network_style=36 next_style=36
+  local lock_style=33 notice_style=33
   local -a rows styles
   (( _NOSLEEP_TTY )) && [[ -z ${NO_COLOR:-} ]] && styled=1
   _nosleep_duration "$grace"
   policy_text="Sleep after $REPLY idle/offline and $retries failed retries (laptop closed)"
-  close_text='Display off + lock screen (unless docked)'
   if (( dim )); then
-    close_text='Dim built-in display + no lock (--no-lock; unless docked)'
-    close_style=36
+    display_text='On · dim when closed (unless docked)'
+    lock_text='Keep unlocked (--no-lock)'
+    lock_style=36
   fi
-  if (( lock_requested )); then
-    lock_text='Lock requested when laptop closed · unlock manually'
-    lock_style=33
+  if (( dim && lid_shut && lid_was )) && [[ -z $_NOSLEEP_BRIGHT ]]; then
+    notice_text='Could not dim · display remains held on'
   fi
-  lid_text='Open · screen raised'
-  if (( lid_shut )); then
-    lid_text='Closed · screen folded down'
-    if (( lid_was )); then
-      display_text='Off requested · laptop closed'
-      display_style=36
-      if (( dim )); then
-        display_text='Dimmed · built-in display stays powered (--no-lock)'
-        if [[ -z $_NOSLEEP_BRIGHT ]]; then
-          display_text='Could not dim · display remains held on'
-          display_style=33
-        fi
-      fi
-    else
-      lid_text='Closed · docked'
-      display_text='Held on · external display'
-    fi
-  fi
-  sleep_text='Blocked · while laptop screen is raised'
-  (( lid_shut )) && sleep_text='Blocked · checking activity and internet'
   if (( forever )); then
     agent_style=2 network_style=2 next_style=2
-    sleep_text='Blocked until Ctrl-C (--forever)'
     agent_text='Not checked (--forever)' network_text='Not checked (--forever)'
     next_text='No checks (--forever)'
     policy_text='Keep awake until Ctrl-C (--forever)'
@@ -527,44 +504,44 @@ _nosleep_status() {
     next_text="Check in $REPLY"
     (( ! probes )) && next_text='Taking the first sample…'
     if (( retry_count )); then
-      sleep_style=33 next_style=33
-      sleep_text="Blocked · waiting for $retry_for"
-      next_text="Retry $retry_count/$retries in $REPLY"
+      next_style=33
+      next_text="Retry $retry_count/$retries in $REPLY · waiting for $retry_for"
     elif (( lid_shut && probes && (! online || ! busy_now) )); then
-      sleep_style=33
+      next_style=33
       signal_age=$(( now - busy_at ))
       if (( ! online && (busy_now || now - online_at > signal_age) )); then
         signal_age=$(( now - online_at ))
       fi
       remaining=$(( grace - signal_age ))
       _nosleep_duration "$remaining"
-      sleep_text="Blocked · grace $REPLY left"
+      next_text+=" · grace $REPLY left"
     fi
   fi
   if (( ! sleep_held )); then
-    heading_style='1;31' sleep_style='1;31'
+    heading_style='1;31' notice_style='1;31'
     heading='CHECK SLEEP PROTECTION'
-    sleep_text='Warning · closing the laptop may allow sleep'
+    notice_text='Sleep protection unavailable · closing may allow sleep'
   fi
   rows=("nosleep — $heading"
         ''
         'Live status'
-        "  Sleep     $sleep_text"
         "  Agents    $agent_text"
         "  Internet  $network_text"
-        "  Laptop    $lid_text"
+        "  Next      $next_text")
+  styles=("$heading_style" 0 '1;36' "$agent_style" "$network_style" "$next_style")
+  if [[ -n $notice_text ]]; then
+    rows+=("  Notice    $notice_text")
+    styles+=("$notice_style")
+  fi
+  rows+=(''
+        'Configuration'
+        '  Sleep     Blocked while nosleep runs'
         "  Display   $display_text"
         "  Locking   $lock_text"
-        "  Next      $next_text"
-        ''
-        'Configuration'
-        '  On open   Display on + keep an unlocked session unlocked'
-        "  On close  $close_text"
         "  Policy    $policy_text"
         ''
         '  Stop      Ctrl-C · release sleep hold')
-  styles=("$heading_style" 0 '1;36' "$sleep_style" "$agent_style" "$network_style" 0
-          "$display_style" "$lock_style" "$next_style" 0 '1;36' 36 "$close_style" 2 0 2)
+  styles+=(0 '1;36' 36 36 "$lock_style" 2 0 2)
   _nosleep_status_clear
   for line in "${rows[@]}"; do
     (( ++row ))

@@ -31,11 +31,14 @@ agent settings, and desktop handoff. This repository consumes that project.
 ```text
 nosleep — KEEPING MAC AWAKE
   Sleep     Blocked · lid open, checks are advisory
+  Display   Keep on · no idle dimming
+  Locking   Keep unlocked · if already unlocked
+  Lid       Open
   Agents    Sampling activity… need a second check
   Internet  Online · checked 0s ago
-  Lid       Open · display stays on
   Next      Check in 30s
-  On close  Lock screen · 15m grace, then 3 retries
+  On close  Display off + lock screen (unless docked)
+  Policy    Lid shut · 15m grace, then 3 retries
   Stop      Ctrl-C · release sleep hold
 ```
 
@@ -49,6 +52,16 @@ Interactive terminals use green for healthy states, amber for sampling, quiet
 periods, grace and retries, and red for lost connectivity or sleep-protection
 warnings. Bold labels and muted policy/help text keep the current state prominent.
 Use `NO_COLOR=1 nosleep` for an unstyled snapshot with live updates.
+
+Display and Locking describe the configured behavior. With the lid open,
+`nosleep` keeps the display on and inhibits idle
+locking, so an unlocked session can stay unlocked. It never unlocks an existing
+lock. Closing the lid normally requests a screen lock and turns the display off;
+opening it restores the display hold, with a reminder that unlocking is manual.
+`nosleep --dim` instead dims the built-in display and requests no lock, keeping
+an already-unlocked session available. Docked clamshell mode keeps the external
+display on and skips the lid-close lock/dim action. On close shows the selected
+behavior separately from the sleep grace and retry Policy.
 
 `nosleep` keeps the Mac awake until Ctrl-C while the lid is open. It reports missing
 agent activity or internet connectivity as advisories. With the lid shut, missing

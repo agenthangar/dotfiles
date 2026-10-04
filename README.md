@@ -40,20 +40,28 @@ shows the short option reference.
 
 ```text
 nosleep — KEEPING MAC AWAKE
+
+Live status
   Sleep     Blocked · lid open, checks are advisory
-  Display   Keep on · no idle dimming
-  Locking   Keep unlocked · if already unlocked
-  Lid       Open
   Agents    Sampling activity… need a second check
   Internet  Online · checked 0s ago
+  Lid       Open
+  Display   Held on · no idle dimming
+  Locking   No lock requested · existing locks stay locked
   Next      Check in 30s
+
+Configuration
+  On open   Display on + keep an unlocked session unlocked
   On close  Display off + lock screen (unless docked)
   Policy    Lid shut · 15m grace, then 3 retries
+
   Stop      Ctrl-C · release sleep hold
 ```
 
-The snapshot refreshes in place every two seconds, with a countdown to the next
-check. Agents shows activity observed at the last check, then switches to quiet
+Live status refreshes every two seconds with current checks, display/lock actions,
+and a countdown to the next check. Configuration shows the selected lid behavior
+and grace/retry settings, which stay fixed as the lid opens and closes.
+Agents shows activity observed at the last check, then switches to quiet
 with a last-seen time when activity stops. Internet shows the latest connection
 result; Sleep and Next show remaining grace or the pending retry when needed.
 `--forever` explicitly marks agent and internet checks as disabled. Redirected
@@ -63,7 +71,7 @@ periods, grace and retries, and red for lost connectivity or sleep-protection
 warnings. Bold labels and muted policy/help text keep the current state prominent.
 Use `NO_COLOR=1 nosleep` for an unstyled snapshot with live updates.
 
-Display and Locking describe the configured behavior. With the lid open,
+Display and Locking report this run's display hold and lock requests. With the lid open,
 `nosleep` keeps the display on and inhibits idle
 locking, so an unlocked session can stay unlocked. It never unlocks an existing
 lock. Closing the lid normally requests a screen lock and turns the display off;

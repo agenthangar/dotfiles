@@ -455,7 +455,7 @@ _nosleep_status_clear() {
 }
 _nosleep_status() {
   local heading='KEEPING MAC AWAKE' sleep_text agent_text network_text lid_text next_text close_text policy_text
-  local display_text='Keep on · no idle dimming' lock_text='Keep unlocked · if already unlocked'
+  local display_text='Held on · no idle dimming' lock_text='No lock requested · existing locks stay locked'
   local remaining signal_age line width=$(( ${COLUMNS:-80} - 1 )) row=0 styled=0 value primary detail
   local heading_style='1;32' sleep_style=32 agent_style=33 network_style=36 next_style=36
   local display_style=32 lock_style=36 close_style=33
@@ -465,7 +465,7 @@ _nosleep_status() {
   policy_text="Lid shut · $REPLY grace, then $retries retries"
   close_text='Display off + lock screen (unless docked)'
   if (( dim )); then
-    close_text='Dim built-in display + no lock (--no-lock)'
+    close_text='Dim built-in display + no lock (--no-lock; unless docked)'
     close_style=36
   fi
   if (( lock_requested )); then
@@ -476,7 +476,7 @@ _nosleep_status() {
   if (( lid_shut )); then
     lid_text='Closed'
     if (( lid_was )); then
-      display_text='Turn off · requested on lid close'
+      display_text='Off requested · on lid close'
       display_style=36
       if (( dim )); then
         display_text='Dimmed · built-in display stays powered (--no-lock)'
@@ -487,9 +487,7 @@ _nosleep_status() {
       fi
     else
       lid_text='Closed · docked'
-      display_text='Keep on · external display'
-      close_text='Docked · keep display on; no lid-close lock'
-      close_style=36
+      display_text='Held on · external display'
     fi
   fi
   sleep_text='Blocked · lid open, checks are advisory'
@@ -549,18 +547,24 @@ _nosleep_status() {
     sleep_text='Warning · lid sleep protection unavailable'
   fi
   rows=("nosleep — $heading"
+        ''
+        'Live status'
         "  Sleep     $sleep_text"
-        "  Display   $display_text"
-        "  Locking   $lock_text"
-        "  Lid       $lid_text"
         "  Agents    $agent_text"
         "  Internet  $network_text"
+        "  Lid       $lid_text"
+        "  Display   $display_text"
+        "  Locking   $lock_text"
         "  Next      $next_text"
+        ''
+        'Configuration'
+        '  On open   Display on + keep an unlocked session unlocked'
         "  On close  $close_text"
         "  Policy    $policy_text"
+        ''
         '  Stop      Ctrl-C · release sleep hold')
-  styles=("$heading_style" "$sleep_style" "$display_style" "$lock_style" 0
-          "$agent_style" "$network_style" "$next_style" "$close_style" 2 2)
+  styles=("$heading_style" 0 '1;36' "$sleep_style" "$agent_style" "$network_style" 0
+          "$display_style" "$lock_style" "$next_style" 0 '1;36' 36 "$close_style" 2 0 2)
   _nosleep_status_clear
   for line in "${rows[@]}"; do
     (( ++row ))
@@ -572,7 +576,7 @@ _nosleep_status() {
     # Keep the words as well as their colors; plain output carries the same meaning.
     if (( ! styled )); then
       print -r -- "$line"
-    elif (( row == 1 || row > ${#rows} - 2 || width < 13 )); then
+    elif [[ $line != '  '* || ${styles[row]} == 2 ]] || (( width < 13 )); then
       printf '\e[%sm%s\e[0m\n' "${styles[row]}" "$line"
     else
       value=${line[13,-1]}

@@ -26,6 +26,26 @@ agent settings, and desktop handoff. This repository consumes that project.
 
 ## Sleep and connection recovery
 
+`nosleep` shows a live snapshot instead of a long startup message:
+
+```text
+nosleep — KEEPING MAC AWAKE
+  Sleep     Blocked · lid open, checks are advisory
+  Agents    Sampling activity… need a second check
+  Internet  Online · checked 0s ago
+  Lid       Open · display stays on
+  Next      Check in 30s
+  On close  Lock screen · 15m grace, then 3 retries
+  Stop      Ctrl-C · release sleep hold
+```
+
+The snapshot refreshes in place every two seconds, with a countdown to the next
+check. Agents shows activity observed at the last check, then switches to quiet
+with a last-seen time when activity stops. Internet shows the latest connection
+result; Sleep and Next show remaining grace or the pending retry when needed.
+`--forever` explicitly marks agent and internet checks as disabled. Redirected
+output and basic terminals get plain snapshots at each check, without cursor codes.
+
 `nosleep` keeps the Mac awake until Ctrl-C while the lid is open. It reports missing
 agent activity or internet connectivity as advisories. With the lid shut, missing
 signals get a 15-minute grace period, then three more checks after 30, 60, and

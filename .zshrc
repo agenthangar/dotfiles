@@ -239,9 +239,12 @@ nosleep() {
   # unwound (verified — a local pid read as empty there, leaving caffeinate running
   # and the restore firing twice).
   typeset -g _NOSLEEP_CAF='' _NOSLEEP_DONE=0 _NOSLEEP_WHO='' _NOSLEEP_BRIGHT=''
+  typeset -g _NOSLEEP_STATUS_ROWS=0 _NOSLEEP_TTY=0
+  [[ -t 1 && ${TERM:-dumb} != dumb ]] && _NOSLEEP_TTY=1
   _NOSLEEP_NET=() _NOSLEEP_NET_AT=()
   _nosleep_restore() {
     (( _NOSLEEP_DONE )) && return 0; _NOSLEEP_DONE=1
+    _nosleep_status_clear
     [[ -n $_NOSLEEP_CAF ]] && kill "$_NOSLEEP_CAF" 2>/dev/null
     # a --dim run ending behind a closed lid: put the brightness back for whoever opens it,
     # and sleep the display — staying logged in was this run's promise, not the next one's
@@ -249,7 +252,9 @@ nosleep() {
       _nosleep_undim
       _nosleep_lid_closed && pmset displaysleepnow 2>/dev/null
     fi
-    sudo -n pmset -a disablesleep 0 2>/dev/null || sudo pmset -a disablesleep 0
+    if sudo -n pmset -a disablesleep 0 2>/dev/null || sudo pmset -a disablesleep 0; then
+      echo "nosleep: stopped — sleep hold released"
+    fi
   }
   trap '_nosleep_restore' EXIT
   trap '_nosleep_restore; return 130' INT TERM
@@ -286,13 +291,9 @@ nosleep() {
   # Always take two activity samples, even with --grace 0, before judging idleness.
   local now busy_at online_at=$EPOCHSECONDS why checked_at=0 next_check=0 lid_was=0 lid_shut=0 lid_shut_was=0 pinged_at=0 probes=0
   local retry_count=0 retry_delay=$backoff retry_for='' missing online=1 was_online=1 refreshed_at=0
-  local lid_does='display held on, lid close locks'
-  (( dim )) && lid_does='staying logged in, lid close dims'
-  if (( forever )); then
-    echo "nosleep: holding sleep off until Ctrl-C ($lid_does)"
-  else
-    echo "nosleep: holding sleep off with the lid open; agent and network checks are advisories (lid shut: grace ${grace}s + $retries retries, $lid_does, Ctrl-C to stop)"
-  fi
+  # Presentation tracks observed signals separately from the grace timestamps,
+  # which are seeded at startup and reset on reconnect without observing work.
+  local busy_now=0 detected_at=0 online_checked_at=0 sleep_held=1 show_snapshot=1 status_shown=0
   busy_at=$online_at
   while :; do
     # A signal delivered inside a helper returns from that helper, not this loop.
@@ -305,6 +306,7 @@ nosleep() {
       # Recheck immediately on closure; opening the lid cancels a pending retry.
       next_check=0 retry_count=0 retry_delay=$backoff retry_for=''
       lid_shut_was=$lid_shut
+      show_snapshot=1
     fi
     if _nosleep_lid_closed; then
       if (( ! lid_was )); then
@@ -336,15 +338,26 @@ nosleep() {
         # is global, and the survivor's caffeinate still holds IDLE sleep off, so nothing
         # looks wrong until the lid closes and the Mac sleeps). Re-arm rather than fight
         # over exits: while this run lives, the flag is its invariant.
-        [[ -t 1 ]] && printf '\r\e[K'
+        _nosleep_status_clear
         if sudo -n pmset -a disablesleep 1 2>/dev/null; then
+          sleep_held=1
           echo "nosleep: the sleep-disable flag was reset under this run (another nosleep exiting?) — re-armed"
         else
+          sleep_held=0
           echo "nosleep: the sleep-disable flag was reset under this run and sudo could not re-arm it — a closed lid would sleep the Mac" >&2
         fi
+        show_snapshot=1
+      else
+        sleep_held=1
       fi
     fi
+    # Show the hold immediately, even while the first connectivity probe runs.
+    if (( _NOSLEEP_TTY && ! status_shown )); then
+      _nosleep_status
+      status_shown=1
+    fi
     if (( ! forever && now >= next_check )); then
+      show_snapshot=1
       checked_at=$now
       next_check=$(( checked_at + every ))
       online=0
@@ -356,29 +369,31 @@ nosleep() {
           # agent fresh baselines, grace and retries instead of exiting on stale work.
           busy_at=$online_at
           _NOSLEEP_NET=() _NOSLEEP_NET_AT=()
-          probes=0 retry_count=0 retry_delay=$backoff retry_for=''
-          [[ -t 1 ]] && printf '\r\e[K'
+          probes=0 retry_count=0 retry_delay=$backoff retry_for='' detected_at=0
+          _nosleep_status_clear
           echo "nosleep: network recovered — restarting agent activity sampling and grace"
         fi
       elif (( was_online )); then
-        [[ -t 1 ]] && printf '\r\e[K'
+        _nosleep_status_clear
         echo "nosleep: connection lost — holding awake while macOS auto-join can reconnect"
       fi
+      online_checked_at=$EPOCHSECONDS
       was_online=$online
-      _nosleep_busy_at; (( REPLY )) && busy_at=$REPLY
+      _nosleep_busy_at
+      busy_now=$REPLY
+      (( busy_now )) && busy_at=$busy_now detected_at=$busy_now
       (( _NOSLEEP_DONE )) && return 130
       now=$EPOCHSECONDS
       (( ++probes ))
       missing=''
       if (( ! online && (! lid_shut || now - online_at > grace) )); then
         missing=network why="the network has been down for $(( now - online_at ))s"
-      elif (( probes > 1 && ! REPLY && (! lid_shut || now - busy_at > grace) )); then
+      elif (( probes > 1 && ! busy_now && (! lid_shut || now - busy_at > grace) )); then
         missing=activity why="no local agent activity for $(( now - busy_at ))s"
       fi
       if [[ -n $missing ]]; then
         if (( ! lid_shut )); then
-          [[ -t 1 ]] && printf '\r\e[K'
-          echo "nosleep: advisory — $why; lid open, sleep stays blocked"
+          (( _NOSLEEP_TTY )) || echo "nosleep: advisory — $why; lid open, sleep stays blocked"
           retry_count=0 retry_delay=$backoff retry_for=''
         else
           # A different missing signal gets its own retry budget. Network recovery
@@ -386,42 +401,133 @@ nosleep() {
           if [[ $retry_for != $missing ]]; then
             retry_count=0 retry_delay=$backoff retry_for=$missing
           fi
-          [[ -t 1 ]] && printf '\r\e[K'
           if (( retry_count >= retries )); then
+            _nosleep_status_clear
             echo "nosleep: letting go — $why; $retries retries exhausted"
             _nosleep_restore
             return 0
           fi
           (( ++retry_count ))
           next_check=$(( now + retry_delay ))
-          echo "nosleep: $why — retry $retry_count/$retries in ${retry_delay}s (sleep stays blocked)"
+          (( _NOSLEEP_TTY )) || echo "nosleep: $why — retry $retry_count/$retries in ${retry_delay}s (sleep stays blocked)"
           retry_delay=$(( retry_delay < 150 ? retry_delay * 2 : 300 ))
         fi
       else
         if (( retry_count )); then
-          [[ -t 1 ]] && printf '\r\e[K'
+          _nosleep_status_clear
           echo "nosleep: activity recovered — resuming normal checks"
         fi
         retry_count=0 retry_delay=$backoff retry_for=''
       fi
-      if [[ -t 1 ]]; then
-        if (( retry_count )); then
-          printf '\r\e[K  waiting for %s · retry %d/%d in %ds · sleep stays blocked' "$retry_for" "$retry_count" "$retries" $(( next_check - now ))
-        elif [[ -n $missing ]]; then
-          printf '\r\e[K  advisory: %s · lid open · sleep stays blocked' "$why"
-        elif [[ -n $_NOSLEEP_WHO ]]; then
-          printf '\r\e[K  %s active %ds ago · network ok %ds ago' "$_NOSLEEP_WHO" $(( now - busy_at )) $(( now - online_at ))
-        elif (( probes == 1 )); then
-          # The first network probe only records baselines, even mid-turn. It is
-          # not evidence of idleness (and sleep is already held during sampling).
-          printf '\r\e[K  sampling agent activity (next check in %ds) · network ok %ds ago' "$every" $(( now - online_at ))
-        else
-          printf '\r\e[K  no agent activity detected yet (grace remaining %ds) · network ok %ds ago' $(( grace > now - busy_at ? grace - (now - busy_at) : 0 )) $(( now - online_at ))
-        fi
-      fi
+    fi
+    if (( _NOSLEEP_TTY || show_snapshot )); then
+      _nosleep_status
+      status_shown=1 show_snapshot=0
     fi
     sleep 2
   done
+}
+# _nosleep_status uses the control loop's dynamically scoped locals. It only
+# formats observed state; it never probes, resets grace, or changes power policy.
+_nosleep_duration() {
+  local seconds=$(( $1 > 0 ? $1 : 0 ))
+  REPLY="${seconds}s"
+  if (( seconds >= 60 )); then
+    REPLY="$(( seconds / 60 ))m"
+    (( seconds % 60 )) && REPLY+=" $(( seconds % 60 ))s"
+  fi
+  return 0
+}
+_nosleep_status_clear() {
+  if (( ${_NOSLEEP_STATUS_ROWS:-0} )); then
+    printf '\e[%dA\r\e[J' "$_NOSLEEP_STATUS_ROWS"
+    _NOSLEEP_STATUS_ROWS=0
+  fi
+}
+_nosleep_status() {
+  local heading='KEEPING MAC AWAKE' sleep_text agent_text network_text lid_text next_text close_text
+  local remaining signal_age line width=$(( ${COLUMNS:-80} - 1 ))
+  local -a rows
+  _nosleep_duration "$grace"
+  close_text="Lock screen · $REPLY grace, then $retries retries"
+  (( dim )) && close_text="Dim display · $REPLY grace, then $retries retries"
+  lid_text='Open · display stays on'
+  if (( lid_shut )); then
+    lid_text='Closed · docked display stays on'
+    if (( lid_was )); then
+      lid_text='Closed · screen locked, display off'
+      if (( dim )); then
+        lid_text='Closed · logged in, display dimmed'
+        [[ -z $_NOSLEEP_BRIGHT ]] && lid_text='Closed · logged in, display could not dim'
+      fi
+    fi
+  fi
+  sleep_text='Blocked · lid open, checks are advisory'
+  (( lid_shut )) && sleep_text='Blocked · monitoring agent work'
+  if (( forever )); then
+    sleep_text='Blocked until Ctrl-C (--forever)'
+    agent_text='Not checked (--forever)' network_text='Not checked (--forever)'
+    next_text='No checks (--forever)'
+    close_text='Lock screen · keep awake until Ctrl-C'
+    (( dim )) && close_text='Dim display · keep awake until Ctrl-C'
+  else
+    if (( ! probes )); then
+      agent_text='Checking activity…'
+    elif (( busy_now )); then
+      _nosleep_duration $(( now - detected_at ))
+      agent_text="Active · ${_NOSLEEP_WHO:-local agent} (checked $REPLY ago)"
+    elif (( probes == 1 )); then
+      agent_text='Sampling activity… need a second check'
+    elif (( detected_at )); then
+      _nosleep_duration $(( now - detected_at ))
+      agent_text="Quiet · ${_NOSLEEP_WHO:-local agent} last active $REPLY ago"
+    else
+      agent_text='No activity detected'
+    fi
+    network_text='Checking connection…'
+    if (( online_checked_at )); then
+      _nosleep_duration $(( now - online_checked_at ))
+      network_text="Online · checked $REPLY ago"
+      (( online )) || network_text="Offline · checked $REPLY ago"
+    fi
+    _nosleep_duration $(( next_check - now ))
+    next_text="Check in $REPLY"
+    (( ! probes )) && next_text='Taking the first sample…'
+    if (( retry_count )); then
+      sleep_text="Blocked · waiting for $retry_for"
+      next_text="Retry $retry_count/$retries in $REPLY"
+    elif (( lid_shut && probes && (! online || ! busy_now) )); then
+      signal_age=$(( now - busy_at ))
+      if (( ! online && (busy_now || now - online_at > signal_age) )); then
+        signal_age=$(( now - online_at ))
+      fi
+      remaining=$(( grace - signal_age ))
+      _nosleep_duration "$remaining"
+      sleep_text="Blocked · grace $REPLY left"
+    fi
+  fi
+  if (( ! sleep_held )); then
+    heading='CHECK SLEEP PROTECTION'
+    sleep_text='Warning · lid sleep protection unavailable'
+  fi
+  rows=("nosleep — $heading"
+        "  Sleep     $sleep_text"
+        "  Agents    $agent_text"
+        "  Internet  $network_text"
+        "  Lid       $lid_text"
+        "  Next      $next_text"
+        "  On close  $close_text"
+        '  Stop      Ctrl-C · release sleep hold')
+  _nosleep_status_clear
+  for line in "${rows[@]}"; do
+    # Leave one column spare to avoid terminal autowrap breaking cursor-up redraws.
+    if (( _NOSLEEP_TTY && width > 0 && ${#line} > width )); then
+      line="${line[1,$(( width - 1 ))]}…"
+    fi
+    print -r -- "$line"
+  done
+  (( _NOSLEEP_TTY )) && _NOSLEEP_STATUS_ROWS=${#rows}
+  return 0
 }
 # _nosleep_lid_shut — physical lid state, including docked clamshell mode.
 # Macs without a lid are treated like an open laptop: checks remain advisories.
@@ -467,7 +573,7 @@ _nosleep_lock() {
   # unconnected external ports too, so it tracks the driver, not the backlight — a mouse
   # nudge that relights the panel behind the lid falls back to the timer.
   pmset displaysleepnow 2>/dev/null
-  [[ -t 1 ]] && printf '\r\e[K'                      # nosleep's status line leaves no newline
+  _nosleep_status_clear
   echo "nosleep: lid closed — screen locked, display off"
 }
 # _nosleep_brightness [level] — the BUILT-IN display's brightness (0–1): prints it, and
@@ -502,7 +608,7 @@ PY
 _nosleep_dim() {
   local was
   was=$(_nosleep_brightness "${NOSLEEP_DIM_LEVEL:-0}") && [[ -z $_NOSLEEP_BRIGHT ]] && _NOSLEEP_BRIGHT=$was
-  [[ -t 1 ]] && printf '\r\e[K'
+  _nosleep_status_clear
   if [[ -n $was ]]; then
     echo "nosleep: lid closed — staying logged in, display dimmed"
   else

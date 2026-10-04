@@ -603,7 +603,8 @@ typeset -gA NOSLEEP_APPS
 # PreventUserIdleSystemSleep named: "Electron"`. Display-only assertions (the ChatGPT
 # app's "Capturing") and user-activity pings are not work and do not count.
 _nosleep_app_asserting() {
-  local line owner; reply=()
+  # Match pmset's ASCII structure as bytes; descriptions need not be valid UTF-8.
+  local LC_ALL=C line owner; reply=()
   while IFS= read -r line; do
     [[ $line =~ '^[[:space:]]*pid [0-9]+\(([^)]+)\):.*(PreventUserIdleSystemSleep|PreventSystemSleep|NoIdleSleepAssertion) named' ]] || continue
     owner=${match[1]}

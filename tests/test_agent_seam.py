@@ -578,6 +578,38 @@ def test_zsh_nosleep_app_power_assertions_read_as_working(nosleep, tmp_path):
     assert int(when) > 1_700_000_000 and who == "Claude app"
 
 
+@pytest.mark.parametrize("assertion", [
+    "PreventUserIdleSystemSleep", "PreventSystemSleep", "NoIdleSleepAssertion",
+])
+def test_zsh_nosleep_app_assertions_tolerate_invalid_utf8(nosleep, tmp_path, assertion):
+    locales = subprocess.check_output(["locale", "-a"], text=True).splitlines()
+    utf8_locale = next((name for name in locales if name.lower().replace("-", "").endswith(".utf8")), None)
+    if utf8_locale is None:
+        pytest.skip("a UTF-8 locale is required to exercise macOS regex decoding")
+    stub = tmp_path / "stubbin" / "pmset"
+    stub.write_text(ASSERTIONS_STUB)
+    stub.chmod(0o755)
+    listing = tmp_path / "assert.txt"
+    # pmset can include non-UTF-8 bytes anywhere, even on unrelated lines or in
+    # the description of an assertion we must still recognize as active work.
+    listing.write_bytes(
+        b'Listed by owning process:\n'
+        b'   pid 10(other\xff): [0x1] 00:00:03 PreventSystemSleep named: "other"\n'
+        b'   pid 20(ChatGPT): [0x2] 00:00:03 NoDisplaySleepAssertion named: "Capturing\xff"\n'
+        + f'   pid 30(Claude): [0x3] 00:00:03 {assertion} named: "'.encode()
+        + b'Electron\xff"\n'
+        b'   pid 40(ChatGPT): [0x4] 00:00:03 UserIsActive named: "activity\xff"\n')
+    nosleep.table.write_text("1 0 launchd\n")
+    result = nosleep('_nosleep_busy_at; print -r -- "$REPLY|$_NOSLEEP_WHO"; print -r -- "$LC_ALL"',
+                     FAKE_ASSERT=str(listing), LC_ALL=utf8_locale)
+    assert result.returncode == 0
+    assert result.stderr == ""
+    activity, restored_locale = result.stdout.splitlines()
+    when, who = activity.split("|")
+    assert int(when) > 1_700_000_000 and who == "Claude app"
+    assert restored_locale == utf8_locale
+
+
 def test_zsh_nosleep_desktop_claude_caffeinate_is_labelled_the_app(nosleep):
     # the Claude app's Code sessions run the same binary, caffeinate child and all
     claude = "/Users/me/Library/Application Support/Claude/claude-code/2.1.281/claude.app/Contents/MacOS/claude"

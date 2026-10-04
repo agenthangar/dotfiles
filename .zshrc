@@ -446,8 +446,10 @@ _nosleep_status_clear() {
 }
 _nosleep_status() {
   local heading='KEEPING MAC AWAKE' sleep_text agent_text network_text lid_text next_text close_text
-  local remaining signal_age line width=$(( ${COLUMNS:-80} - 1 ))
-  local -a rows
+  local remaining signal_age line width=$(( ${COLUMNS:-80} - 1 )) row=0 styled=0 value primary detail
+  local heading_style='1;32' sleep_style=32 agent_style=33 network_style=36 lid_style=0 next_style=36
+  local -a rows styles
+  (( _NOSLEEP_TTY )) && [[ -z ${NO_COLOR:-} ]] && styled=1
   _nosleep_duration "$grace"
   close_text="Lock screen · $REPLY grace, then $retries retries"
   (( dim )) && close_text="Dim display · $REPLY grace, then $retries retries"
@@ -458,13 +460,17 @@ _nosleep_status() {
       lid_text='Closed · screen locked, display off'
       if (( dim )); then
         lid_text='Closed · logged in, display dimmed'
-        [[ -z $_NOSLEEP_BRIGHT ]] && lid_text='Closed · logged in, display could not dim'
+        if [[ -z $_NOSLEEP_BRIGHT ]]; then
+          lid_text='Closed · logged in, display could not dim'
+          lid_style=33
+        fi
       fi
     fi
   fi
   sleep_text='Blocked · lid open, checks are advisory'
   (( lid_shut )) && sleep_text='Blocked · monitoring agent work'
   if (( forever )); then
+    agent_style=2 network_style=2 next_style=2
     sleep_text='Blocked until Ctrl-C (--forever)'
     agent_text='Not checked (--forever)' network_text='Not checked (--forever)'
     next_text='No checks (--forever)'
@@ -474,6 +480,7 @@ _nosleep_status() {
     if (( ! probes )); then
       agent_text='Checking activity…'
     elif (( busy_now )); then
+      agent_style=32
       _nosleep_duration $(( now - detected_at ))
       agent_text="Active · ${_NOSLEEP_WHO:-local agent} (checked $REPLY ago)"
     elif (( probes == 1 )); then
@@ -488,15 +495,21 @@ _nosleep_status() {
     if (( online_checked_at )); then
       _nosleep_duration $(( now - online_checked_at ))
       network_text="Online · checked $REPLY ago"
-      (( online )) || network_text="Offline · checked $REPLY ago"
+      network_style=32
+      if (( ! online )); then
+        network_text="Offline · checked $REPLY ago"
+        network_style=31
+      fi
     fi
     _nosleep_duration $(( next_check - now ))
     next_text="Check in $REPLY"
     (( ! probes )) && next_text='Taking the first sample…'
     if (( retry_count )); then
+      sleep_style=33 next_style=33
       sleep_text="Blocked · waiting for $retry_for"
       next_text="Retry $retry_count/$retries in $REPLY"
     elif (( lid_shut && probes && (! online || ! busy_now) )); then
+      sleep_style=33
       signal_age=$(( now - busy_at ))
       if (( ! online && (busy_now || now - online_at > signal_age) )); then
         signal_age=$(( now - online_at ))
@@ -507,6 +520,7 @@ _nosleep_status() {
     fi
   fi
   if (( ! sleep_held )); then
+    heading_style='1;31' sleep_style='1;31'
     heading='CHECK SLEEP PROTECTION'
     sleep_text='Warning · lid sleep protection unavailable'
   fi
@@ -518,13 +532,26 @@ _nosleep_status() {
         "  Next      $next_text"
         "  On close  $close_text"
         '  Stop      Ctrl-C · release sleep hold')
+  styles=("$heading_style" "$sleep_style" "$agent_style" "$network_style" "$lid_style" "$next_style" 2 2)
   _nosleep_status_clear
   for line in "${rows[@]}"; do
+    (( ++row ))
     # Leave one column spare to avoid terminal autowrap breaking cursor-up redraws.
     if (( _NOSLEEP_TTY && width > 0 && ${#line} > width )); then
       line="${line[1,$(( width - 1 ))]}…"
     fi
-    print -r -- "$line"
+    # Style only after clipping visible text so ANSI sequences never consume columns.
+    # Keep the words as well as their colors; plain output carries the same meaning.
+    if (( ! styled )); then
+      print -r -- "$line"
+    elif (( row == 1 || row >= 7 || width < 13 )); then
+      printf '\e[%sm%s\e[0m\n' "${styles[row]}" "$line"
+    else
+      value=${line[13,-1]}
+      primary=${value%% · *}
+      detail=${value#"$primary"}
+      printf '\e[1m%s\e[0m\e[%sm%s\e[0m%s\n' "${line[1,12]}" "${styles[row]}" "$primary" "$detail"
+    fi
   done
   (( _NOSLEEP_TTY )) && _NOSLEEP_STATUS_ROWS=${#rows}
   return 0

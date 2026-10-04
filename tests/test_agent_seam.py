@@ -367,7 +367,7 @@ def test_zsh_nosleep_tty_narrow_terminal_clips_each_dashboard_row(nosleep_loop):
 
 def test_zsh_nosleep_dumb_tty_uses_plain_snapshots(nosleep_loop):
     result, _ = nosleep_loop("--every 2", FAKE_STOP_AT="1004", _tty=True, TERM="dumb")
-    assert result.stdout.splitlines().count("nosleep") >= 2
+    assert result.stdout.replace("\r", "").count("nosleep\n") >= 2
     assert "\x1b[" not in result.stdout
     assert "exit=130 at=1004" in result.stdout
 

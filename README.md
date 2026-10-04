@@ -47,21 +47,27 @@ Live status
   Internet  Online · checked 0s ago
   Next      Check in 30s
 
-Configuration · restart with flags to change
-  Sleep     Blocked · Ctrl-C to release
-  Display   On · close lid: off; --no-lock: dim
-  Dim       Off · --no-lock to enable
-  Locking   Lock when closed · --no-lock to disable
-  Policy    15m idle/offline + 3 retries (closed) · --forever to disable
-            --grace 900 --retries 3 (delay in seconds, retry count)
-            --every 30 --backoff 30 (check/retry interval in seconds)
+Configuration
+            Current                  │ Change on next run
+  Sleep     Blocked                  │ Ctrl-C to release
+  Display   On; off when closed      │ --no-lock to dim
+  Dim       Off                      │ --no-lock to enable
+  Locking   When closed              │ --no-lock to disable
+
+  Mode      Auto sleep (lid closed)  │ --forever for manual stop
+  Grace     15m idle/offline         │ --grace <seconds>
+  Checks    30s                      │ --every <seconds>
+  Retries   3                        │ --retries <count>
+  Backoff   30s, doubles to 5m       │ --backoff <seconds>
 
   Stop      Ctrl-C · release sleep hold
 ```
 
 Live status refreshes every two seconds with current activity and connection checks
 and a countdown to the next check. Configuration shows the sleep, display, dimming, and
-locking behavior selected for this run, with hints for changing each setting.
+locking behavior selected for this run. An aligned, muted Change column keeps each
+helper beside its setting. Timing controls have individual rows; restart with the
+shown flag to change them. In `--forever` mode, unused timing controls are marked inactive.
 Agents shows activity observed at the last check, then switches to quiet
 with a last-seen time when activity stops. Internet shows the latest connection
 result; Next shows remaining grace or the pending retry when needed. Failures to
@@ -70,7 +76,7 @@ hold sleep off or dim the display appear as a Notice when relevant.
 output and basic terminals get plain snapshots at each check, without cursor codes.
 Interactive terminals use green for healthy states, amber for sampling, quiet
 periods, grace and retries, and red for lost connectivity or sleep-protection
-warnings. Bold labels and muted policy/help text keep the current state prominent.
+warnings. Bold labels and muted helper text keep the current state prominent.
 Use `NO_COLOR=1 nosleep` for an unstyled snapshot with live updates.
 
 While the laptop is open, `nosleep` keeps the display on and inhibits idle locking,

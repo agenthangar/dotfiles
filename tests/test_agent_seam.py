@@ -247,7 +247,10 @@ def nosleep_loop(zsh, tmp_path):
             print -r -- "busy $EPOCHSECONDS baselines=${#_NOSLEEP_NET_AT}" >> "$LOOP_LOG"
             (( busy_probe < ${#busy_results} )) && (( ++busy_probe ))
             REPLY=0
-            (( busy_results[busy_probe] )) && REPLY=$EPOCHSECONDS
+            if (( busy_results[busy_probe] )); then
+                REPLY=$EPOCHSECONDS
+                _NOSLEEP_WHO=codex
+            fi
             _NOSLEEP_NET_AT=( 42 $EPOCHSECONDS )
             (( EPOCHSECONDS += ${FAKE_BUSY_SECONDS:-0} ))
         }
@@ -259,15 +262,102 @@ def nosleep_loop(zsh, tmp_path):
     '''
 
     def call(args="", **env):
-        result = zsh(setup + f'\nnosleep {args}; rc=$?; print -r -- "exit=$rc at=$EPOCHSECONDS"',
+        tty = env.pop("_tty", False)
+        columns = env.pop("_columns", None)
+        if tty:
+            env.setdefault("TERM", "xterm-256color")
+        size = f"COLUMNS={int(columns)}; " if columns is not None else ""
+        result = zsh(setup + f'\n{size}nosleep {args}; rc=$?; print -r -- "exit=$rc at=$EPOCHSECONDS"',
                      LOOP_LOG=str(log), FAKE_ONLINE=env.pop("FAKE_ONLINE", "1"),
                      FAKE_BUSY=env.pop("FAKE_BUSY", "0"),
-                     FAKE_LID_AT=env.pop("FAKE_LID_AT", "1000"), **env)
+                     FAKE_LID_AT=env.pop("FAKE_LID_AT", "1000"), _tty=tty, **env)
         assert result.returncode == 0, result.stdout + result.stderr
         assert not result.stderr, result.stderr
         return result, log.read_text().splitlines() if log.exists() else []
 
     return call
+
+
+def test_zsh_nosleep_plain_snapshot_shows_sampling_then_idle(nosleep_loop):
+    result, _ = nosleep_loop("--every 2", FAKE_LID_AT="99999", FAKE_STOP_AT="1006")
+    output = result.stdout
+    assert "nosleep — KEEPING MAC AWAKE" in output
+    for label in ("Sleep", "Agents", "Internet", "Lid", "Next", "On close", "Stop"):
+        assert re.search(rf"(?m)^  {label}\b", output), label
+    assert "Sampling activity" in output
+    assert "No activity detected" in output
+    assert re.search(r"(?m)^  Internet\b.*Online", output)
+    assert re.search(r"(?m)^  Lid\b.*Open", output)
+    assert "Ctrl-C" in output
+    assert "exit=130 at=1006" in output
+
+
+def test_zsh_nosleep_snapshot_distinguishes_active_from_last_seen(nosleep_loop):
+    result, _ = nosleep_loop("--every 2", FAKE_BUSY="1 0 0", FAKE_STOP_AT="1006")
+    assert re.search(r"(?m)^  Agents\b.*Active.*codex", result.stdout)
+    assert re.search(r"(?m)^  Agents\b.*Quiet.*codex.*last active", result.stdout)
+    assert "exit=130 at=1006" in result.stdout
+
+
+def test_zsh_nosleep_snapshot_shows_offline_grace_and_retry(nosleep_loop):
+    result, _ = nosleep_loop("--grace 4 --every 2 --backoff 2", FAKE_ONLINE="0",
+                             FAKE_STOP_AT="1008")
+    assert re.search(r"(?m)^  Internet\b.*Offline", result.stdout)
+    assert re.search(r"(?m)^  Lid\b.*Closed", result.stdout)
+    assert re.search(r"(?m)^  Next\b.*Retry 1/3 in 2s", result.stdout)
+    assert "exit=130 at=1008" in result.stdout
+
+
+def test_zsh_nosleep_forever_snapshot_does_not_claim_to_check_signals(nosleep_loop):
+    result, log = nosleep_loop("--forever", FAKE_STOP_AT="1004")
+    assert "nosleep — KEEPING MAC AWAKE" in result.stdout
+    assert re.search(r"(?m)^  Agents\b.*Not checked.*--forever", result.stdout)
+    assert re.search(r"(?m)^  Internet\b.*Not checked.*--forever", result.stdout)
+    assert re.search(r"(?m)^  Next\b.*No checks.*--forever", result.stdout)
+    assert not any(line.startswith(("online ", "busy ")) for line in log)
+
+
+def test_zsh_nosleep_tty_countdown_redraws_between_checks(nosleep_loop):
+    result, _ = nosleep_loop(FAKE_LID_AT="99999", FAKE_STOP_AT="1004", _tty=True)
+    assert "nosleep — KEEPING MAC AWAKE" in result.stdout
+    assert re.search(r"Check in 30s", result.stdout)
+    assert re.search(r"Check in 28s", result.stdout)
+    assert "\x1b[" in result.stdout
+    assert "exit=130 at=1004" in result.stdout
+
+
+def test_zsh_nosleep_tty_grace_counts_down(nosleep_loop):
+    result, _ = nosleep_loop("--grace 4 --every 2", FAKE_STOP_AT="1004", _tty=True)
+    assert "grace 4s left" in result.stdout
+    assert "grace 2s left" in result.stdout
+    assert "Retry 1/" not in result.stdout
+
+
+def test_zsh_nosleep_tty_retry_counts_down_and_releases_once(nosleep_loop):
+    result, log = nosleep_loop("--grace 0 --every 2 --backoff 4", FAKE_STOP_AT="1006",
+                              _tty=True)
+    assert "Retry 1/3 in 4s" in result.stdout
+    assert "Retry 1/3 in 2s" in result.stdout
+    assert result.stdout.count("nosleep: stopped — sleep hold released") == 1
+    assert [line for line in log if "disablesleep 0" in line] == [
+        "sudo 1006 -n pmset -a disablesleep 0"]
+    assert "exit=130 at=1006" in result.stdout
+
+
+def test_zsh_nosleep_tty_narrow_terminal_clips_each_dashboard_row(nosleep_loop):
+    result, _ = nosleep_loop(FAKE_STOP_AT="1002", _tty=True, _columns=40)
+    visible = re.sub(r"\x1b\[[0-9;]*[A-Za-z]", "", result.stdout)
+    dashboard = [line for line in visible.splitlines() if line.startswith(("nosleep —", "  "))]
+    assert dashboard
+    assert any(line.endswith("…") for line in dashboard)
+    assert all(len(line) <= 39 for line in dashboard), dashboard
+
+
+def test_zsh_nosleep_dumb_tty_uses_plain_snapshots(nosleep_loop):
+    result, _ = nosleep_loop("--every 2", FAKE_STOP_AT="1004", _tty=True, TERM="dumb")
+    assert result.stdout.count("nosleep — KEEPING MAC AWAKE") >= 2
+    assert "\x1b[" not in result.stdout
+    assert "exit=130 at=1004" in result.stdout
 
 
 @pytest.mark.parametrize("offline", [False, True])

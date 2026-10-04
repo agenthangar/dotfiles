@@ -51,7 +51,7 @@ Configuration
   Sleep     Blocked while nosleep runs
   Display   On · off when closed
   Dim       Off
-  Locking   Lock when closed (unless docked)
+  Locking   Lock when closed
   Policy    Sleep after 15m idle/offline and 3 failed retries (laptop closed)
 
   Stop      Ctrl-C · release sleep hold

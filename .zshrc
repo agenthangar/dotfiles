@@ -201,7 +201,7 @@ prview() {
 # Usage: nosleep [--no-lock] [--forever] [options]
 #
 # Display stays on until you close the laptop or stop nosleep.
-# Closing the laptop: lock + display off, unless docked.
+# Closing the laptop: lock + display off.
 # While closed: 15m idle/offline + 3 failed retries allows sleep.
 #
 # Options:
@@ -454,7 +454,7 @@ _nosleep_status_clear() {
 }
 _nosleep_status() {
   local heading='KEEPING MAC AWAKE' agent_text network_text next_text policy_text notice_text
-  local display_text='On · off when closed' dim_text='Off' lock_text='Lock when closed (unless docked)'
+  local display_text='On · off when closed' dim_text='Off' lock_text='Lock when closed'
   local remaining signal_age line width=$(( ${COLUMNS:-80} - 1 )) row=0 styled=0 value primary detail
   local heading_style='1;32' agent_style=33 network_style=36 next_style=36
   local lock_style=33 notice_style=33
@@ -464,7 +464,7 @@ _nosleep_status() {
   policy_text="Sleep after $REPLY idle/offline and $retries failed retries (laptop closed)"
   if (( dim )); then
     display_text='On'
-    dim_text='When closed (unless docked)'
+    dim_text='When closed'
     lock_text='Keep unlocked (--no-lock)'
     lock_style=36
   fi

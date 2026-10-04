@@ -229,7 +229,8 @@ def nosleep_loop(zsh, tmp_path):
         caffeinate() { return 0; }
         _nosleep_hold() { print -r -- "hold $EPOCHSECONDS $*" >> "$LOOP_LOG"; }
         _nosleep_lock() { print -r -- "lock $EPOCHSECONDS" >> "$LOOP_LOG"; }
-        _nosleep_lid_closed() { (( EPOCHSECONDS >= ${FAKE_LID_AT:-99999} )); }
+        _nosleep_lid_shut() { (( EPOCHSECONDS >= ${FAKE_LID_AT:-99999} && EPOCHSECONDS < ${FAKE_LID_OPEN_AT:-99999} )); }
+        _nosleep_lid_closed() { _nosleep_lid_shut; }
         _nosleep_pmset_held() {
             if (( ! pmset_reset && EPOCHSECONDS >= ${FAKE_RESET_AT:-99999} )); then
                 pmset_reset=1
@@ -260,12 +261,45 @@ def nosleep_loop(zsh, tmp_path):
     def call(args="", **env):
         result = zsh(setup + f'\nnosleep {args}; rc=$?; print -r -- "exit=$rc at=$EPOCHSECONDS"',
                      LOOP_LOG=str(log), FAKE_ONLINE=env.pop("FAKE_ONLINE", "1"),
-                     FAKE_BUSY=env.pop("FAKE_BUSY", "0"), **env)
+                     FAKE_BUSY=env.pop("FAKE_BUSY", "0"),
+                     FAKE_LID_AT=env.pop("FAKE_LID_AT", "1000"), **env)
         assert result.returncode == 0, result.stdout + result.stderr
         assert not result.stderr, result.stderr
         return result, log.read_text().splitlines() if log.exists() else []
 
     return call
+
+
+@pytest.mark.parametrize("offline", [False, True])
+def test_zsh_nosleep_open_lid_reports_missing_signals_without_releasing(nosleep_loop, offline):
+    result, log = nosleep_loop("--grace 0 --every 2 --retries 0",
+                               FAKE_LID_AT="99999", FAKE_STOP_AT="1010",
+                               FAKE_ONLINE="0" if offline else "1")
+    assert "nosleep: advisory — " in result.stdout
+    assert "lid open, sleep stays blocked" in result.stdout
+    assert "retry " not in result.stdout and "letting go" not in result.stdout
+    assert "exit=130 at=1010" in result.stdout
+    assert [line for line in log if "disablesleep 0" in line] == [
+        "sudo 1010 -n pmset -a disablesleep 0"]
+
+
+def test_zsh_nosleep_closing_lid_starts_retries_after_open_lid_advisories(nosleep_loop):
+    result, log = nosleep_loop("--grace 0 --every 2 --backoff 2 --retries 1",
+                               FAKE_LID_AT="1010")
+    assert "nosleep: advisory — no local agent activity" in result.stdout
+    assert "no local agent activity for 10s — retry 1/1 in 2s" in result.stdout
+    assert "1 retries exhausted" in result.stdout
+    assert "exit=0 at=1012" in result.stdout
+    assert "lock 1010" in log
+
+
+def test_zsh_nosleep_opening_lid_cancels_pending_retry(nosleep_loop):
+    result, log = nosleep_loop("--grace 0 --every 2 --backoff 2 --retries 1",
+                               FAKE_LID_OPEN_AT="1004", FAKE_STOP_AT="1010")
+    assert "retry 1/1 in 2s" in result.stdout
+    assert "nosleep: advisory — no local agent activity" in result.stdout
+    assert "letting go" not in result.stdout
+    assert "exit=130 at=1010" in result.stdout
 
 
 @pytest.mark.parametrize("offline", [False, True])
@@ -323,10 +357,10 @@ def test_zsh_nosleep_slow_successful_probe_does_not_expire_zero_grace(nosleep_lo
 
 
 def test_zsh_nosleep_lid_sudo_and_interrupt_work_during_backoff(nosleep_loop):
-    result, log = nosleep_loop("--grace 0", FAKE_LID_AT="1110", FAKE_STOP_AT="1200",
+    result, log = nosleep_loop("--grace 0", FAKE_LID_AT="1010", FAKE_STOP_AT="1200",
                                FAKE_RESET_AT="1160")
     assert "retry 3/3 in 120s" in result.stdout
-    assert "lock 1110" in log  # between checks at 1060 and 1120
+    assert "lock 1010" in log  # lid handling continues between signal checks
     assert "sudo 1180 -n -v" in log  # keep sudo alive during the 120s wait
     assert "sudo 1180 -n pmset -a disablesleep 1" in log  # re-arm during backoff too
     assert "exit=130 at=1200" in result.stdout
@@ -551,6 +585,13 @@ def test_zsh_nosleep_lid_closed_only_when_macos_would_sleep_on_it(nosleep):
     assert not closed()                                                                      # no lid at all
 
 
+def test_zsh_nosleep_physical_lid_state_includes_docked_clamshell(nosleep):
+    nosleep.lid.write_text('"AppleClamshellCausesSleep" = No\n"AppleClamshellState" = Yes\n')
+    assert nosleep('_nosleep_lid_shut; echo $?').stdout.strip() == "0"
+    nosleep.lid.write_text('"AppleClamshellState" = No\n')
+    assert nosleep('_nosleep_lid_shut; echo $?').stdout.strip() == "1"
+
+
 ASSERTIONS_STUB = r"""#!/bin/bash
 # pmset -g assertions → the fixture's per-process listing ($FAKE_ASSERT)
 [[ "$1 $2" == "-g assertions" && -f "${FAKE_ASSERT:-}" ]] && cat "$FAKE_ASSERT"
@@ -652,7 +693,8 @@ int main(int argc, char **argv) {
         try:
             for _ in range(30):
                 listing = subprocess.run(["pmset", "-g", "assertions"],
-                                         check=True, capture_output=True, text=True).stdout
+                                         check=True, capture_output=True, text=True,
+                                         errors="replace").stdout
                 if any(f"pid {proc.pid}({binary.name}):" in line and assertion in line
                        for line in listing.splitlines()):
                     break

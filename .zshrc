@@ -161,7 +161,7 @@ prview() {
   '
 }
 
-# nosleep — keep the Mac awake while a local agent is working and the network is up
+# nosleep — keep the Mac awake with the lid open; monitor agent work behind a shut lid
 #
 # Usage: nosleep [-f|--forever] [-d|--dim] [--grace <secs>] [--every <secs>]
 #                [--retries <count>] [--backoff <secs>]
@@ -185,17 +185,19 @@ prview() {
 # simply how the Mac sits). With --dim the session stays logged in behind the lid too:
 # the display hold and the user-activity ping carry on while it is shut, and a lid close dims the
 # built-in panel to NOSLEEP_DIM_LEVEL (default 0) and restores it when the lid opens —
-# computer-use agents need an unlocked, lit session to see and click. It keeps holding only
-# while BOTH signals stay fresh: internet (an HTTPS exchange with
+# computer-use agents need an unlocked, lit session to see and click. With the lid
+# open, failed checks are advisories and nosleep runs until Ctrl-C. With the lid shut,
+# it keeps holding only while BOTH signals stay fresh: internet (an HTTPS exchange with
 # api.anthropic.com or api.openai.com) and tokens burning — a local claude, codex, cursor-agent or
 # Claude/ChatGPT app mid-turn (Claude Code runs its own caffeinate while a turn is
 # in flight; for every agent, bytes moving on its sockets since the last check — at least
 # NOSLEEP_NET_MIN a probe, 48 KiB, and NOSLEEP_NET_BPS over longer gaps, 1 KiB/s,
 # both overridable in ~/.zshrc.local). Network activity needs two samples: the first
 # check records counters, and the next (after --every seconds) can detect work.
-# Sleep stays blocked while sampling and retrying. After grace expires, checks retry
-# after 30, 60 and 120 seconds by default before restoring sleep and exiting. Recovery
-# resets the retry budget; reconnecting also restarts activity sampling and its grace.
+# Sleep stays blocked while sampling and retrying. Behind a shut lid, after grace
+# expires, checks retry after 30, 60 and 120 seconds by default before restoring
+# sleep and exiting. Recovery resets the retry budget; reconnecting also restarts
+# activity sampling and its grace.
 # Lid handling and sudo refresh continue throughout the backoff.
 #
 # Reconnection uses macOS auto-join: in System Settings > Wi-Fi, enable Automatically
@@ -282,14 +284,14 @@ nosleep() {
   # LAST-SEEN timestamps preserve grace across failed probes. Once a signal expires,
   # schedule bounded retries without sleeping through lid changes or sudo refresh.
   # Always take two activity samples, even with --grace 0, before judging idleness.
-  local now busy_at online_at=$EPOCHSECONDS why checked_at=0 next_check=0 lid_was=0 pinged_at=0 probes=0
+  local now busy_at online_at=$EPOCHSECONDS why checked_at=0 next_check=0 lid_was=0 lid_shut=0 lid_shut_was=0 pinged_at=0 probes=0
   local retry_count=0 retry_delay=$backoff retry_for='' missing online=1 was_online=1 refreshed_at=0
   local lid_does='display held on, lid close locks'
   (( dim )) && lid_does='staying logged in, lid close dims'
   if (( forever )); then
     echo "nosleep: holding sleep off until Ctrl-C ($lid_does)"
   else
-    echo "nosleep: holding sleep off while a local agent (claude · codex · cursor-agent · the Claude/ChatGPT apps) is working and the network is up (grace ${grace}s + $retries retries, $lid_does, Ctrl-C to stop)"
+    echo "nosleep: holding sleep off with the lid open; agent and network checks are advisories (lid shut: grace ${grace}s + $retries retries, $lid_does, Ctrl-C to stop)"
   fi
   busy_at=$online_at
   while :; do
@@ -297,6 +299,13 @@ nosleep() {
     # Teardown has already run; never re-arm power assertions on the next tick.
     (( _NOSLEEP_DONE )) && return 130
     now=$EPOCHSECONDS
+    lid_shut=0
+    _nosleep_lid_shut && lid_shut=1
+    if (( lid_shut != lid_shut_was )); then
+      # Recheck immediately on closure; opening the lid cancels a pending retry.
+      next_check=0 retry_count=0 retry_delay=$backoff retry_for=''
+      lid_shut_was=$lid_shut
+    fi
     if _nosleep_lid_closed; then
       if (( ! lid_was )); then
         if (( dim )); then _nosleep_dim; else _nosleep_hold -ims; _nosleep_lock; fi
@@ -361,27 +370,33 @@ nosleep() {
       now=$EPOCHSECONDS
       (( ++probes ))
       missing=''
-      if (( ! online && now - online_at > grace )); then
+      if (( ! online && (! lid_shut || now - online_at > grace) )); then
         missing=network why="the network has been down for $(( now - online_at ))s"
-      elif (( probes > 1 && ! REPLY && now - busy_at > grace )); then
+      elif (( probes > 1 && ! REPLY && (! lid_shut || now - busy_at > grace) )); then
         missing=activity why="no local agent activity for $(( now - busy_at ))s"
       fi
       if [[ -n $missing ]]; then
-        # A different missing signal gets its own retry budget. Network recovery
-        # above also resets activity, since agents often stop sending while offline.
-        if [[ $retry_for != $missing ]]; then
-          retry_count=0 retry_delay=$backoff retry_for=$missing
+        if (( ! lid_shut )); then
+          [[ -t 1 ]] && printf '\r\e[K'
+          echo "nosleep: advisory — $why; lid open, sleep stays blocked"
+          retry_count=0 retry_delay=$backoff retry_for=''
+        else
+          # A different missing signal gets its own retry budget. Network recovery
+          # above also resets activity, since agents often stop sending while offline.
+          if [[ $retry_for != $missing ]]; then
+            retry_count=0 retry_delay=$backoff retry_for=$missing
+          fi
+          [[ -t 1 ]] && printf '\r\e[K'
+          if (( retry_count >= retries )); then
+            echo "nosleep: letting go — $why; $retries retries exhausted"
+            _nosleep_restore
+            return 0
+          fi
+          (( ++retry_count ))
+          next_check=$(( now + retry_delay ))
+          echo "nosleep: $why — retry $retry_count/$retries in ${retry_delay}s (sleep stays blocked)"
+          retry_delay=$(( retry_delay < 150 ? retry_delay * 2 : 300 ))
         fi
-        [[ -t 1 ]] && printf '\r\e[K'
-        if (( retry_count >= retries )); then
-          echo "nosleep: letting go — $why; $retries retries exhausted"
-          _nosleep_restore
-          return 0
-        fi
-        (( ++retry_count ))
-        next_check=$(( now + retry_delay ))
-        echo "nosleep: $why — retry $retry_count/$retries in ${retry_delay}s (sleep stays blocked)"
-        retry_delay=$(( retry_delay < 150 ? retry_delay * 2 : 300 ))
       else
         if (( retry_count )); then
           [[ -t 1 ]] && printf '\r\e[K'
@@ -392,6 +407,8 @@ nosleep() {
       if [[ -t 1 ]]; then
         if (( retry_count )); then
           printf '\r\e[K  waiting for %s · retry %d/%d in %ds · sleep stays blocked' "$retry_for" "$retry_count" "$retries" $(( next_check - now ))
+        elif [[ -n $missing ]]; then
+          printf '\r\e[K  advisory: %s · lid open · sleep stays blocked' "$why"
         elif [[ -n $_NOSLEEP_WHO ]]; then
           printf '\r\e[K  %s active %ds ago · network ok %ds ago' "$_NOSLEEP_WHO" $(( now - busy_at )) $(( now - online_at ))
         elif (( probes == 1 )); then
@@ -405,6 +422,13 @@ nosleep() {
     fi
     sleep 2
   done
+}
+# _nosleep_lid_shut — physical lid state, including docked clamshell mode.
+# Macs without a lid are treated like an open laptop: checks remain advisories.
+_nosleep_lid_shut() {
+  local out
+  out=$(ioreg -r -k AppleClamshellState -d 1 2>/dev/null) || return 1
+  [[ $out == *'"AppleClamshellState" = Yes'* ]]
 }
 # _nosleep_hold <caffeinate flags> — (re)start nosleep's own caffeinate with these flags,
 # stopping the previous one; its pid lives in the global _NOSLEEP_CAF for the restore.

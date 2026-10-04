@@ -26,11 +26,13 @@ agent settings, and desktop handoff. This repository consumes that project.
 
 ## Sleep and connection recovery
 
-`nosleep` keeps the Mac awake while a local agent is working. Missing activity or
-internet connectivity gets a 15-minute grace period, then three more checks after
-30, 60, and 120 seconds before sleep is restored. The lid still locks or dims as
-usual during backoff. Recovery resets the retry budget; a restored connection
-also restarts activity sampling and grace so an agent has time to resume.
+`nosleep` keeps the Mac awake until Ctrl-C while the lid is open. It reports missing
+agent activity or internet connectivity as advisories. With the lid shut, missing
+signals get a 15-minute grace period, then three more checks after 30, 60, and
+120 seconds before sleep is restored. The lid still locks or dims as usual during
+backoff. Opening the lid cancels pending retries; closing it starts a fresh retry
+budget. Recovery resets the retry budget; a restored connection also restarts
+activity sampling and grace so an agent has time to resume.
 
 ```sh
 nosleep --grace 900 --retries 3 --backoff 30

@@ -8,6 +8,7 @@ import select
 import shlex
 import shutil
 import subprocess
+import sys
 import time
 
 import pytest
@@ -608,6 +609,62 @@ def test_zsh_nosleep_app_assertions_tolerate_invalid_utf8(nosleep, tmp_path, ass
     when, who = activity.split("|")
     assert int(when) > 1_700_000_000 and who == "Claude app"
     assert restored_locale == utf8_locale
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="requires real macOS power assertions")
+def test_zsh_nosleep_reads_live_macos_power_assertions(zsh, tmp_path):
+    # Give the test its own process name so other caffeinate users cannot make a
+    # broken parser pass. The helper creates only temporary, user-level assertions.
+    source = tmp_path / "assertion.c"
+    binary = tmp_path / f"ns{os.getpid():x}"
+    source.write_text(r"""
+#include <IOKit/pwr_mgt/IOPMLib.h>
+#include <CoreFoundation/CoreFoundation.h>
+#include <unistd.h>
+int main(int argc, char **argv) {
+    IOPMAssertionID assertion;
+    CFStringRef kind = argc > 1 && argv[1][0] == 'd'
+        ? kIOPMAssertionTypePreventUserIdleDisplaySleep
+        : kIOPMAssertionTypePreventUserIdleSystemSleep;
+    IOReturn status = IOPMAssertionCreateWithName(kind, kIOPMAssertionLevelOn,
+                                                  CFSTR("nosleep macOS test"), &assertion);
+    if (status != kIOReturnSuccess) return 1;
+    sleep(30);
+    IOPMAssertionRelease(assertion);
+    return 0;
+}""")
+    subprocess.run(["cc", "-framework", "IOKit", "-framework", "CoreFoundation",
+                    str(source), "-o", str(binary)], check=True, capture_output=True, text=True)
+
+    def detected():
+        result = zsh(f'NOSLEEP_APPS=({binary.name} probe); '
+                     '_nosleep_app_asserting; print -r -- "rc=$? labels=${(j:, :)reply}"')
+        assert result.returncode == 0 and not result.stderr, result.stderr
+        return result.stdout.strip()
+
+    assert detected() == "rc=1 labels="
+    for mode, assertion, expected in (
+        ("display", "PreventUserIdleDisplaySleep", "rc=1 labels="),
+        ("system", "PreventUserIdleSystemSleep", "rc=0 labels=probe"),
+    ):
+        proc = subprocess.Popen([str(binary), mode], stdout=subprocess.DEVNULL,
+                                stderr=subprocess.PIPE)
+        try:
+            for _ in range(30):
+                listing = subprocess.run(["pmset", "-g", "assertions"],
+                                         check=True, capture_output=True, text=True).stdout
+                if any(f"pid {proc.pid}({binary.name}):" in line and assertion in line
+                       for line in listing.splitlines()):
+                    break
+                assert proc.poll() is None, proc.stderr.read().decode(errors="replace")
+                time.sleep(0.1)
+            else:
+                pytest.fail(f"macOS did not report the test process's {assertion} assertion")
+            assert detected() == expected
+        finally:
+            proc.terminate()
+            proc.wait(timeout=5)
+    assert detected() == "rc=1 labels="
 
 
 def test_zsh_nosleep_desktop_claude_caffeinate_is_labelled_the_app(nosleep):

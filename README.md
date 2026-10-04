@@ -150,8 +150,9 @@ zsh -n .zshrc
 ```
 
 Tests exercise the shell utilities and installation/migration under sandbox HOME,
-XDG directories, and tmux sockets. CI also runs shellcheck, gitleaks, the private
-PII scan, and dependency audit behind the required `CI` gate. The Python t suite
-and its 97% coverage requirement moved to the standalone repository.
+XDG directories, and tmux sockets. A macOS CI job also creates real sleep assertions
+and checks `nosleep` against live `pmset` output on PRs and weekly. CI runs shellcheck,
+gitleaks, the private PII scan, and dependency audit behind the required `CI` gate.
+The Python t suite and its 97% coverage requirement moved to the standalone repository.
 
 MIT — [LICENSE](LICENSE). This remains a personal setup; [contributing](CONTRIBUTING.md).

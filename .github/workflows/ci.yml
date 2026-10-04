@@ -14,6 +14,8 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  schedule:
+    - cron: '19 8 * * 1'  # detect macOS runner updates between PRs
 
 permissions:
   contents: read
@@ -142,6 +144,26 @@ jobs:
       - name: Run shell integration tests
         run: pytest
 
+  # Exercise the actual pmset output on macOS. The test creates short-lived sleep
+  # assertions and checks that nosleep sees system sleep but ignores display sleep.
+  macos-nosleep:
+    name: macOS nosleep
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install test deps
+        run: pip install -r requirements-dev.txt
+
+      - name: Check the live macOS power assertion contract
+        run: |
+          test "$(uname -s)" = Darwin
+          python -m pytest -q tests/test_agent_seam.py -k live_macos_power_assertions
+
   # Audit the CI/dev dependencies (requirements-dev.txt) for known CVEs. This is
   # the only dependency manifest in the repo — install.sh stays dependency-free,
   # so there is nothing else to scan — but these deps still run in the Actions
@@ -170,7 +192,7 @@ jobs:
   ci:
     name: CI
     if: always()
-    needs: [shellcheck, gitleaks, pii-scan, pytest, pip-audit]
+    needs: [shellcheck, gitleaks, pii-scan, pytest, macos-nosleep, pip-audit]
     runs-on: ubuntu-latest
     steps:
       - name: Verify all required jobs passed

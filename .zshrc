@@ -453,19 +453,19 @@ _nosleep_status_clear() {
   fi
 }
 _nosleep_status() {
-  local heading='KEEPING MAC AWAKE' agent_text network_text next_text policy_text notice_text
-  local display_text='On · off when closed' dim_text='Off' lock_text='Lock when closed'
+  local agent_text network_text next_text policy_text notice_text
+  local display_text='On · close lid: off; --no-lock: dim' dim_text='Off · --no-lock to enable' lock_text='Lock when closed · --no-lock to disable'
   local remaining signal_age line width=$(( ${COLUMNS:-80} - 1 )) row=0 styled=0 value primary detail
   local heading_style='1;32' agent_style=33 network_style=36 next_style=36
   local lock_style=33 notice_style=33
   local -a rows styles
   (( _NOSLEEP_TTY )) && [[ -z ${NO_COLOR:-} ]] && styled=1
   _nosleep_duration "$grace"
-  policy_text="Sleep after $REPLY idle/offline and $retries failed retries (laptop closed)"
+  policy_text="$REPLY idle/offline + $retries retries (closed) · --forever to disable"
   if (( dim )); then
-    display_text='On'
-    dim_text='When closed'
-    lock_text='Keep unlocked (--no-lock)'
+    display_text='On · close lid to dim; omit --no-lock for off'
+    dim_text='When closed · omit --no-lock to disable'
+    lock_text='Keep unlocked · omit --no-lock to enable'
     lock_style=36
   fi
   if (( dim && lid_shut && lid_was )) && [[ -z $_NOSLEEP_BRIGHT ]]; then
@@ -475,7 +475,7 @@ _nosleep_status() {
     agent_style=2 network_style=2 next_style=2
     agent_text='Not checked (--forever)' network_text='Not checked (--forever)'
     next_text='No checks (--forever)'
-    policy_text='Keep awake until Ctrl-C (--forever)'
+    policy_text='Until Ctrl-C · omit --forever for activity checks'
   else
     if (( ! probes )); then
       agent_text='Checking activity…'
@@ -520,10 +520,9 @@ _nosleep_status() {
   fi
   if (( ! sleep_held )); then
     heading_style='1;31' notice_style='1;31'
-    heading='CHECK SLEEP PROTECTION'
     notice_text='Sleep protection unavailable · closing may allow sleep'
   fi
-  rows=("nosleep — $heading"
+  rows=('nosleep'
         ''
         'Live status'
         "  Agents    $agent_text"
@@ -535,15 +534,17 @@ _nosleep_status() {
     styles+=("$notice_style")
   fi
   rows+=(''
-        'Configuration'
-        '  Sleep     Blocked while nosleep runs'
+        'Configuration · restart with flags to change'
+        '  Sleep     Blocked · Ctrl-C to release'
         "  Display   $display_text"
         "  Dim       $dim_text"
         "  Locking   $lock_text"
         "  Policy    $policy_text"
+        "            --grace $grace --retries $retries (delay in seconds, retry count)"
+        "            --every $every --backoff $backoff (check/retry interval in seconds)"
         ''
         '  Stop      Ctrl-C · release sleep hold')
-  styles+=(0 '1;36' 36 36 36 "$lock_style" 2 0 2)
+  styles+=(0 '1;36' 36 36 36 "$lock_style" 2 2 2 0 2)
   _nosleep_status_clear
   for line in "${rows[@]}"; do
     (( ++row ))

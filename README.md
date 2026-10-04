@@ -40,26 +40,28 @@ shows the short option reference.
 `nosleep` shows a live snapshot instead of a long startup message:
 
 ```text
-nosleep — KEEPING MAC AWAKE
+nosleep
 
 Live status
   Agents    Sampling activity… need a second check
   Internet  Online · checked 0s ago
   Next      Check in 30s
 
-Configuration
-  Sleep     Blocked while nosleep runs
-  Display   On · off when closed
-  Dim       Off
-  Locking   Lock when closed
-  Policy    Sleep after 15m idle/offline and 3 failed retries (laptop closed)
+Configuration · restart with flags to change
+  Sleep     Blocked · Ctrl-C to release
+  Display   On · close lid: off; --no-lock: dim
+  Dim       Off · --no-lock to enable
+  Locking   Lock when closed · --no-lock to disable
+  Policy    15m idle/offline + 3 retries (closed) · --forever to disable
+            --grace 900 --retries 3 (delay in seconds, retry count)
+            --every 30 --backoff 30 (check/retry interval in seconds)
 
   Stop      Ctrl-C · release sleep hold
 ```
 
 Live status refreshes every two seconds with current activity and connection checks
 and a countdown to the next check. Configuration shows the sleep, display, dimming, and
-locking behavior selected for this run.
+locking behavior selected for this run, with hints for changing each setting.
 Agents shows activity observed at the last check, then switches to quiet
 with a last-seen time when activity stops. Internet shows the latest connection
 result; Next shows remaining grace or the pending retry when needed. Failures to

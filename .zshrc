@@ -170,10 +170,10 @@ prview() {
 # and the panel would stay lit behind the lid until the displaysleep timer; the Mac
 # keeps running throughout (not when docked to an external display: macOS never
 # slept on that lid close, so there is no lock to replace, and the closed lid is
-# simply how the Mac sits). With --no-lock an unlocked session stays available behind the lid too:
-# the display hold and the user-activity ping carry on while it is shut, and a lid close dims the
-# built-in panel to NOSLEEP_DIM_LEVEL (default 0) and restores it when the lid opens —
-# computer-use agents need an unlocked, lit session to see and click. With the lid
+# simply how the Mac sits). --dim keeps the display hold and user-activity ping
+# while shut, dims to NOSLEEP_DIM_LEVEL (default 0), and restores brightness on open.
+# It still requests a lock. --no-lock independently skips that request; use both
+# flags for computer-use agents that need an unlocked, lit session. With the lid
 # open, failed checks are advisories and nosleep runs until Ctrl-C. With the lid shut,
 # it keeps holding only while BOTH signals stay fresh: internet (an HTTPS exchange with
 # api.anthropic.com or api.openai.com) and tokens burning — a local claude, codex, cursor-agent or
@@ -196,34 +196,58 @@ prview() {
 # Wi-Fi radio, change saved networks, or store passwords.
 # For a persistent, unconditional block use `sleep-manager disable` instead.
 
+# Keep configuration as validated data; never evaluate the saved file as shell code.
+_nosleep_config() { python3 "$_DOTS_SOURCE_ROOT/lib/nosleep_config.py" "$@"; }
+
 # nosleep — keep your Mac awake
 #
-# Usage: nosleep [--dim | --no-lock] [--forever] [options]
+# Usage: nosleep [options]
+#        nosleep config [--show | --edit]
 #
-# Display stays on until you close the laptop or stop nosleep.
-# Closing the laptop: lock + display off.
-# While closed: 15m idle/offline + 3 failed retries allows sleep.
+# The display stays on while open. On close: lock + display off by default.
+# While closed, idle/offline grace and failed retries release the sleep hold.
 #
 # Options:
-#   -d, --dim        dim the built-in display when closed; skip locking
-#   --no-lock        same as --dim; keep an unlocked session unlocked
+#   -d, --dim        dim on close instead of turning the display off
+#   --no-dim        turn the display off on close (default)
+#   --no-lock       do not request a lock on close
+#   --lock          request a lock on close (default)
 #   -f, --forever    stay awake until Ctrl-C; skip activity/network checks
+#   --no-forever     enable activity/network checks (default)
 #   --grace <secs>   wait before retries (default 900)
 #   --every <secs>   time between checks (default 30)
 #   --retries <n>    checks after grace expires (0–10, default 3)
 #   --backoff <secs>  first retry wait; doubles to 300s (default 30)
 #
-# --no-lock keeps an unlocked session unlocked; it cannot unlock the Mac.
-# Example: nosleep --no-lock --forever
+# Defaults: nosleep config. Flags override saved settings for this run.
+# Dimming and locking are independent. --no-lock never unlocks the Mac.
+# Example: nosleep --dim --no-lock --forever
 nosleep() {
+  [[ "$1" == config ]] && { shift; _nosleep_config "$@"; return $?; }
   [[ "$1" == -h || "$1" == --help ]] && { _help_for nosleep; return 0; }
-  local forever=0 dim=0 grace=900 every=30 retries=3 backoff=30
-  local -a dim_options=()
+  local forever=0 dim=0 lock=1 grace=900 every=30 retries=3 backoff=30 defaults setting value
+  defaults=$(_nosleep_config --values) || return $?
+  for setting in ${(f)defaults}; do
+    value=${setting#*=}
+    case ${setting%%=*} in
+      dim) dim=$value ;;
+      lock) lock=$value ;;
+      forever) forever=$value ;;
+      grace) grace=$value ;;
+      every) every=$value ;;
+      retries) retries=$value ;;
+      backoff) backoff=$value ;;
+    esac
+  done
   while (( $# )); do
     case $1 in
       -h|--help) _help_for nosleep; return 0 ;;
       -f|--forever) forever=1 ;;
-      --no-lock|-d|--dim) dim=1; dim_options+=("$1") ;;
+      --no-forever) forever=0 ;;
+      -d|--dim) dim=1 ;;
+      --no-dim) dim=0 ;;
+      --no-lock) lock=0 ;;
+      --lock) lock=1 ;;
       --grace|--every|--retries|--backoff)
         (( $# >= 2 )) || { echo "nosleep: $1 needs a value" >&2; return 2; }
         case $1 in
@@ -250,17 +274,20 @@ nosleep() {
   # and the restore firing twice).
   typeset -g _NOSLEEP_CAF='' _NOSLEEP_DONE=0 _NOSLEEP_WHO='' _NOSLEEP_BRIGHT=''
   typeset -g _NOSLEEP_STATUS_ROWS=0 _NOSLEEP_TTY=0
+  typeset -g _NOSLEEP_LOCK_FAILED=0 _NOSLEEP_DISPLAY_FAILED=0 _NOSLEEP_DIM_FAILED=0 _NOSLEEP_RESTORE_FAILED=0
   [[ -t 1 && ${TERM:-dumb} != dumb ]] && _NOSLEEP_TTY=1
   _NOSLEEP_NET=() _NOSLEEP_NET_AT=()
   _nosleep_restore() {
     (( _NOSLEEP_DONE )) && return 0; _NOSLEEP_DONE=1
     _nosleep_status_clear
     [[ -n $_NOSLEEP_CAF ]] && kill "$_NOSLEEP_CAF" 2>/dev/null
-    # a --no-lock run ending behind a closed lid: put the brightness back for whoever opens it,
-    # and sleep the display — staying logged in was this run's promise, not the next one's
-    if [[ -n $_NOSLEEP_BRIGHT ]]; then
-      _nosleep_undim
-      _nosleep_lid_closed && pmset displaysleepnow 2>/dev/null
+    # Restore a dimmed panel even when stopping behind a closed lid, then release
+    # the display hold. Locking is independent of brightness restoration.
+    if [[ -n $_NOSLEEP_BRIGHT ]] && ! _nosleep_undim; then
+      print -u2 -- 'nosleep: could not restore display brightness'
+    fi
+    if _nosleep_lid_closed; then
+      _nosleep_display_off || print -u2 -- 'nosleep: could not turn the display off'
     fi
     if sudo -n pmset -a disablesleep 0 2>/dev/null || sudo pmset -a disablesleep 0; then
       echo "nosleep: stopped — sleep hold released"
@@ -293,7 +320,7 @@ nosleep() {
   # The display is held on while the lid is open (-dims) — "the screen stays on unless
   # the lid is closed" (2026-09-25: the old -ims let pmset's 10-min battery displaysleep
   # blank the screen mid-turn). A lid close swaps to -ims so the display assertion never
-  # fights _nosleep_lock's display sleep behind the lid; --no-lock keeps -dims throughout.
+  # fights display sleep behind the lid; --dim keeps -dims throughout.
   _nosleep_hold -dims
 
   # LAST-SEEN timestamps preserve grace across failed probes. Once a signal expires,
@@ -320,16 +347,17 @@ nosleep() {
     fi
     if _nosleep_lid_closed; then
       if (( ! lid_was )); then
-        if (( dim )); then _nosleep_dim; else _nosleep_hold -ims; _nosleep_lock; fi
+        _nosleep_close_display
         lid_was=1
       fi
     else
-      if (( lid_was )); then
-        if (( dim )); then _nosleep_undim; else _nosleep_hold -dims; fi
-      fi
+      (( lid_was && ! dim )) && _nosleep_hold -dims
+      # Retry a transient restore failure on later open-lid ticks and at exit.
+      [[ -n $_NOSLEEP_BRIGHT ]] && { _nosleep_undim || true; }
       lid_was=0
+      _NOSLEEP_LOCK_FAILED=0 _NOSLEEP_DISPLAY_FAILED=0 _NOSLEEP_DIM_FAILED=0
     fi
-    # the ping runs while the display is meant to be on: lid open, or any time under --no-lock
+    # The ping runs while the display is held on: lid open, or under --dim.
     # (behind a shut lid a user-activity ping would relight the panel _nosleep_lock slept)
     if (( (dim || ! lid_was) && now - pinged_at >= every )); then
       pinged_at=$now
@@ -337,7 +365,7 @@ nosleep() {
       # a user-activity ping resets that (and would relight a panel that slept anyway)
       caffeinate -u -t 1 2>/dev/null &!
       # auto-brightness (the ambient sensor behind a shut lid) can move the level back
-      (( lid_was )) && _nosleep_brightness "${NOSLEEP_DIM_LEVEL:-0}" >/dev/null
+      (( lid_was )) && { _nosleep_dim || true; }
     fi
     # Keep the sudo timestamp warm even during long retries (or --forever).
     if (( now - refreshed_at >= 30 )); then
@@ -457,28 +485,29 @@ _nosleep_status_clear() {
 _nosleep_status() {
   local agent_text network_text next_text notice_text
   local sleep_text='Blocked' sleep_help='--forever: until Ctrl-C'
-  local display_help='--dim: dim on close' dim_help='--dim; also skips locking' lock_help='--no-lock: disable'
-  local dim_flags="${(j: :)${(u)dim_options}}"
+  local display_help='--dim: dim when closed' dim_help='--dim: dim when closed' lock_help='--no-lock: skip lock'
   local grace_text every_text backoff_text retries_text=$retries item
-  local display_text='On; off when closed' dim_text='Off' lock_text='When closed'
+  local display_text='On; off when closed' dim_text='Disabled' lock_text='Lock when closed'
   local remaining signal_age line width=$(( ${COLUMNS:-80} - 1 )) row=0 styled=0 value primary detail config_first config_last
   local heading_style=1 agent_style=33 network_style=36 next_style=36
   local sleep_style=0 notice_style=33
   local -a rows styles config_labels config_values config_helpers config_styles
   (( _NOSLEEP_TTY )) && [[ -z ${NO_COLOR:-} ]] && styled=1
   if (( dim )); then
-    display_text='On; dim when closed' display_help="omit $dim_flags"
-    dim_text='When closed' dim_help="omit $dim_flags"
-    lock_text='No lock requested' lock_help="omit $dim_flags"
+    display_text='On; dim when closed' display_help='--no-dim: off when closed'
+    dim_text='When closed' dim_help='--no-dim: disable dimming'
   fi
-  if (( dim && lid_shut && lid_was )) && [[ -z $_NOSLEEP_BRIGHT ]]; then
+  if (( ! lock )); then
+    lock_text='No lock requested' lock_help='--lock: lock when closed'
+  fi
+  if (( dim && lid_shut && lid_was && _NOSLEEP_DIM_FAILED )); then
     notice_text='Could not dim · display remains held on'
   fi
   if (( forever )); then
     agent_style=2 network_style=2 next_style=2
     agent_text='Not checked (--forever)' network_text='Not checked (--forever)'
     next_text='No checks (--forever)'
-    sleep_text='Blocked until Ctrl-C' sleep_help='omit --forever for checks'
+    sleep_text='Blocked until Ctrl-C' sleep_help='--no-forever: check activity'
   else
     if (( ! probes )); then
       agent_text='Checking activity…'
@@ -521,6 +550,17 @@ _nosleep_status() {
       next_text+=" · grace $REPLY left"
     fi
   fi
+  if (( _NOSLEEP_RESTORE_FAILED )); then
+    notice_text='Could not restore display brightness · retrying'
+  fi
+  if (( _NOSLEEP_DISPLAY_FAILED )); then
+    notice_text='Could not turn the display off'
+  fi
+  if (( _NOSLEEP_LOCK_FAILED )); then
+    [[ -n $notice_text ]] && notice_text+=' · '
+    notice_text+='Screen lock failed'
+    notice_style='1;31'
+  fi
   if (( ! sleep_held )); then
     heading_style='1;31' notice_style='1;31' sleep_style='1;31'
     sleep_text='Hold unavailable'
@@ -537,7 +577,7 @@ _nosleep_status() {
     rows+=("  Notice    $notice_text")
     styles+=("$notice_style")
   fi
-  _nosleep_duration "$grace"; grace_text="$REPLY idle/offline"
+  _nosleep_duration "$grace"; grace_text="$REPLY idle/offline (closed)"
   _nosleep_duration "$every"; every_text=$REPLY
   _nosleep_duration "$backoff"; backoff_text="$REPLY, doubles to 5m"
   if (( forever )); then
@@ -565,8 +605,8 @@ _nosleep_status() {
     styles+=("${config_styles[item]}")
   done
   config_last=${#rows}
-  rows+=('' '  Stop      Ctrl-C · release sleep hold')
-  styles+=(0 2)
+  rows+=('' '  Defaults  nosleep config' '  Stop      Ctrl-C · release sleep hold')
+  styles+=(0 2 2)
   _nosleep_status_clear
   for line in "${rows[@]}"; do
     (( ++row ))
@@ -625,23 +665,38 @@ _nosleep_lid_closed() {
   out=$(ioreg -r -k AppleClamshellState -d 1 2>/dev/null) || return 1
   [[ $out == *'"AppleClamshellState" = Yes'* && $out == *'"AppleClamshellCausesSleep" = Yes'* ]]
 }
-# _nosleep_lock — lock the screen now. SACLockScreenImmediate is the call behind the
-# Apple-menu Lock Screen item: instant, and it needs no Accessibility grant (the
-# ctrl-cmd-q keystroke route does). It is a private framework; if the call fails, the
-# display sleep below still lands and the screen-lock delay turns it into a lock.
+# Locking and display treatment are independent: --dim still locks unless
+# --no-lock is selected. Helpers return status so failures are visible.
 _nosleep_lock() {
   python3 -c 'import ctypes; ctypes.CDLL("/System/Library/PrivateFrameworks/login.framework/login").SACLockScreenImmediate()' 2>/dev/null
-  # Then sleep the display: with sleep disabled a closed lid neither sleeps the Mac nor
-  # darkens its panel — the backlight stays lit behind the lid until pmset's displaysleep
-  # timer (10 min). displaysleepnow puts it to sleep at once while the Mac keeps running
-  # (caffeinate + the flag hold system sleep; opening the lid wakes the display). Lock
-  # first, so what the lid-open wake shows is the login window. No "is the panel lit?"
-  # re-check while closed: IOMobileFramebufferShim's CurrentPowerState reads 1 for the
-  # unconnected external ports too, so it tracks the driver, not the backlight — a mouse
-  # nudge that relights the panel behind the lid falls back to the timer.
-  pmset displaysleepnow 2>/dev/null
+}
+_nosleep_display_off() { pmset displaysleepnow 2>/dev/null; }
+_nosleep_close_display() {
+  local lock_result='no lock requested' display_result='display off'
+  _NOSLEEP_LOCK_FAILED=0 _NOSLEEP_DISPLAY_FAILED=0
+  if (( lock )); then
+    if _nosleep_lock; then
+      lock_result='screen locked'
+    else
+      lock_result='screen lock failed'
+      _NOSLEEP_LOCK_FAILED=1
+    fi
+  fi
+  if (( dim )); then
+    if _nosleep_dim; then
+      display_result='display dimmed'
+    else
+      display_result='could not dim display'
+    fi
+  else
+    _nosleep_hold -ims
+    if ! _nosleep_display_off; then
+      display_result='could not turn display off'
+      _NOSLEEP_DISPLAY_FAILED=1
+    fi
+  fi
   _nosleep_status_clear
-  echo "nosleep: laptop closed — screen locked, display off"
+  print -r -- "nosleep: laptop closed — $lock_result, $display_result"
 }
 # _nosleep_brightness [level] — the BUILT-IN display's brightness (0–1): prints it, and
 # with a level sets it first (prints the level it was at before). DisplayServices is the
@@ -668,24 +723,25 @@ for d in ids[:n.value]:
 sys.exit(1)
 PY
 }
-# _nosleep_dim / _nosleep_undim — --no-lock's lid close and lid open: dim the built-in panel
-# to NOSLEEP_DIM_LEVEL remembering the level it was at (_NOSLEEP_BRIGHT, global so the
-# EXIT-trap restore sees it), then put that level back. No lock, no display sleep: the
-# session stays logged in and lit for whatever agent is driving it.
+# Save the built-in panel's brightness once, dim it, and restore on open/exit.
+# This helper has no locking or display-sleep side effects.
 _nosleep_dim() {
   local was
-  was=$(_nosleep_brightness "${NOSLEEP_DIM_LEVEL:-0}") && [[ -z $_NOSLEEP_BRIGHT ]] && _NOSLEEP_BRIGHT=$was
-  _nosleep_status_clear
-  if [[ -n $was ]]; then
-    echo "nosleep: laptop closed — no lock requested, display dimmed"
-  else
-    echo "nosleep: laptop closed — no lock requested (could not dim the built-in display)" >&2
-  fi
+  _NOSLEEP_DIM_FAILED=1
+  was=$(_nosleep_brightness "${NOSLEEP_DIM_LEVEL:-0}") || return 1
+  [[ -n $was ]] || return 1
+  _NOSLEEP_DIM_FAILED=0
+  [[ -n $_NOSLEEP_BRIGHT ]] || _NOSLEEP_BRIGHT=$was
+  return 0
 }
 _nosleep_undim() {
   [[ -n $_NOSLEEP_BRIGHT ]] || return 0
-  _nosleep_brightness "$_NOSLEEP_BRIGHT" >/dev/null
+  if ! _nosleep_brightness "$_NOSLEEP_BRIGHT" >/dev/null; then
+    _NOSLEEP_RESTORE_FAILED=1
+    return 1
+  fi
   _NOSLEEP_BRIGHT=''
+  _NOSLEEP_RESTORE_FAILED=0
 }
 # _nosleep_pmset_held — true while pmset's disablesleep flag is set (one ~10 ms read).
 # The flag is what keeps a CLOSED lid from sleeping the Mac; caffeinate alone holds

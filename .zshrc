@@ -200,12 +200,12 @@ prview() {
 #
 # Usage: nosleep [--no-lock] [--forever] [options]
 #
-# Lid open: display stays on; Ctrl-C stops nosleep.
-# Lid closed: lock + display off (unless docked); monitor agent work.
-# Missing activity or internet with lid closed: 15m grace, then 3 retries.
+# Laptop open (screen raised): display stays on until Ctrl-C.
+# Laptop closed (screen folded down): lock + display off, unless docked.
+# While closed: 15m idle/offline + 3 failed retries allows sleep.
 #
 # Options:
-#   --no-lock        keep unlocked on lid close; dim the display instead
+#   --no-lock        keep unlocked when closed; dim the built-in display
 #   -f, --forever    stay awake until Ctrl-C; skip activity/network checks
 #   --grace <secs>   wait before retries (default 900)
 #   --every <secs>   time between checks (default 30)
@@ -353,7 +353,7 @@ nosleep() {
           echo "nosleep: the sleep-disable flag was reset under this run (another nosleep exiting?) — re-armed"
         else
           sleep_held=0
-          echo "nosleep: the sleep-disable flag was reset under this run and sudo could not re-arm it — a closed lid would sleep the Mac" >&2
+          echo "nosleep: the sleep-disable flag was reset under this run and sudo could not re-arm it — closing the laptop would let it sleep" >&2
         fi
         show_snapshot=1
       else
@@ -402,7 +402,7 @@ nosleep() {
       fi
       if [[ -n $missing ]]; then
         if (( ! lid_shut )); then
-          (( _NOSLEEP_TTY )) || echo "nosleep: advisory — $why; lid open, sleep stays blocked"
+          (( _NOSLEEP_TTY )) || echo "nosleep: advisory — $why; laptop open, sleep stays blocked"
           retry_count=0 retry_delay=$backoff retry_for=''
         else
           # A different missing signal gets its own retry budget. Network recovery
@@ -462,21 +462,21 @@ _nosleep_status() {
   local -a rows styles
   (( _NOSLEEP_TTY )) && [[ -z ${NO_COLOR:-} ]] && styled=1
   _nosleep_duration "$grace"
-  policy_text="Lid shut · $REPLY grace, then $retries retries"
+  policy_text="Sleep after $REPLY idle/offline and $retries failed retries (laptop closed)"
   close_text='Display off + lock screen (unless docked)'
   if (( dim )); then
     close_text='Dim built-in display + no lock (--no-lock; unless docked)'
     close_style=36
   fi
   if (( lock_requested )); then
-    lock_text='Lock requested on close · no automatic unlock'
+    lock_text='Lock requested when laptop closed · unlock manually'
     lock_style=33
   fi
-  lid_text='Open'
+  lid_text='Open · screen raised'
   if (( lid_shut )); then
-    lid_text='Closed'
+    lid_text='Closed · screen folded down'
     if (( lid_was )); then
-      display_text='Off requested · on lid close'
+      display_text='Off requested · laptop closed'
       display_style=36
       if (( dim )); then
         display_text='Dimmed · built-in display stays powered (--no-lock)'
@@ -490,8 +490,8 @@ _nosleep_status() {
       display_text='Held on · external display'
     fi
   fi
-  sleep_text='Blocked · lid open, checks are advisory'
-  (( lid_shut )) && sleep_text='Blocked · monitoring agent work'
+  sleep_text='Blocked · while laptop screen is raised'
+  (( lid_shut )) && sleep_text='Blocked · checking activity and internet'
   if (( forever )); then
     agent_style=2 network_style=2 next_style=2
     sleep_text='Blocked until Ctrl-C (--forever)'
@@ -544,7 +544,7 @@ _nosleep_status() {
   if (( ! sleep_held )); then
     heading_style='1;31' sleep_style='1;31'
     heading='CHECK SLEEP PROTECTION'
-    sleep_text='Warning · lid sleep protection unavailable'
+    sleep_text='Warning · closing the laptop may allow sleep'
   fi
   rows=("nosleep — $heading"
         ''
@@ -552,7 +552,7 @@ _nosleep_status() {
         "  Sleep     $sleep_text"
         "  Agents    $agent_text"
         "  Internet  $network_text"
-        "  Lid       $lid_text"
+        "  Laptop    $lid_text"
         "  Display   $display_text"
         "  Locking   $lock_text"
         "  Next      $next_text"
@@ -633,7 +633,7 @@ _nosleep_lock() {
   # nudge that relights the panel behind the lid falls back to the timer.
   pmset displaysleepnow 2>/dev/null
   _nosleep_status_clear
-  echo "nosleep: lid closed — screen locked, display off"
+  echo "nosleep: laptop closed — screen locked, display off"
 }
 # _nosleep_brightness [level] — the BUILT-IN display's brightness (0–1): prints it, and
 # with a level sets it first (prints the level it was at before). DisplayServices is the
@@ -669,9 +669,9 @@ _nosleep_dim() {
   was=$(_nosleep_brightness "${NOSLEEP_DIM_LEVEL:-0}") && [[ -z $_NOSLEEP_BRIGHT ]] && _NOSLEEP_BRIGHT=$was
   _nosleep_status_clear
   if [[ -n $was ]]; then
-    echo "nosleep: lid closed — no lock requested, display dimmed"
+    echo "nosleep: laptop closed — no lock requested, display dimmed"
   else
-    echo "nosleep: lid closed — no lock requested (could not dim the built-in display)" >&2
+    echo "nosleep: laptop closed — no lock requested (could not dim the built-in display)" >&2
   fi
 }
 _nosleep_undim() {
@@ -1167,13 +1167,8 @@ dots() {
     update_failed=1
   fi
   _dots_tmux_apply
-  # A normal dots update refreshes the standalone release or canonical main
-  # checkout before the new shell integration is sourced. Development and relink
-  # modes above intentionally keep the selected t source.
-  if [[ -z ${DOTFILES_NO_T:-} ]] && ! command t update; then
-    print -u2 -r -- "dots: t update failed; run the standalone t installer or its checkout's install.sh to repair it."
-    update_failed=1
-  fi
+  # Standalone t has its own updater. Only the bundled-to-standalone migration
+  # above belongs to dots; routine dotfiles updates must not invoke t or Homebrew.
   source ~/.zshrc
   return $update_failed
 }

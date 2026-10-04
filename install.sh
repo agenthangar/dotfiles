@@ -249,13 +249,14 @@ link() {
 # would be a link doctor reports as drifted and the links-only relink never fixes —
 # a relink that fires on every single `dots` forever.
 # t is an independent installation. Full setup bootstraps a verified release;
-# ordinary relinks remain offline and use a validated installation.
+# ordinary relinks leave standalone t alone. Only an old dotfiles-owned link
+# needs t installation work during a links-only run.
 # shellcheck source=lib/t-integration.sh
 source "$DOTFILES_DIR/lib/t-integration.sh"
 if [[ -z "${DOTFILES_NO_T:-}" ]]; then
     if [[ -n "${DOTFILES_LINKS_ONLY:-}" ]]; then
-        _dots_t_install "$LINK_SRC" || {
-            if [[ -z "${DOTFILES_T_HOME:-}" ]] && _dots_t_legacy_link "$LINK_SRC"; then
+        if _dots_t_legacy_link "$LINK_SRC" && ! _dots_t_install "$LINK_SRC"; then
+            if [[ -z "${DOTFILES_T_HOME:-}" ]]; then
                 echo 'dots: migrating bundled t to its standalone release' >&2
                 _dots_t_environment "$LINK_SRC"
                 if ! _dots_t_release_install || ! _dots_t_install "$LINK_SRC"; then
@@ -266,7 +267,7 @@ if [[ -z "${DOTFILES_NO_T:-}" ]]; then
                 echo 'dots: standalone t is missing; run install.sh for full setup' >&2
                 exit 1
             fi
-        }
+        fi
     else
         _dots_t_bootstrap "$LINK_SRC"
     fi

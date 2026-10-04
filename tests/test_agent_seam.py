@@ -287,12 +287,12 @@ def test_zsh_nosleep_plain_snapshot_shows_sampling_then_idle(nosleep_loop):
     result, _ = nosleep_loop("--every 2", FAKE_LID_AT="99999", FAKE_STOP_AT="1006")
     output = result.stdout
     assert "nosleep — KEEPING MAC AWAKE" in output
-    for label in ("Sleep", "Agents", "Internet", "Lid", "Next", "On close", "Stop"):
+    for label in ("Sleep", "Agents", "Internet", "Laptop", "Next", "On close", "Stop"):
         assert re.search(rf"(?m)^  {label}\b", output), label
     assert "Sampling activity" in output
     assert "No activity detected" in output
     assert re.search(r"(?m)^  Internet\b.*Online", output)
-    assert re.search(r"(?m)^  Lid\b.*Open", output)
+    assert re.search(r"(?m)^  Laptop\b.*Open · screen raised", output)
     assert "Ctrl-C" in output
     assert "exit=130 at=1006" in output
 
@@ -308,7 +308,7 @@ def test_zsh_nosleep_snapshot_shows_offline_grace_and_retry(nosleep_loop):
     result, _ = nosleep_loop("--grace 4 --every 2 --backoff 2", FAKE_ONLINE="0",
                              FAKE_STOP_AT="1008")
     assert re.search(r"(?m)^  Internet\b.*Offline", result.stdout)
-    assert re.search(r"(?m)^  Lid\b.*Closed", result.stdout)
+    assert re.search(r"(?m)^  Laptop\b.*Closed · screen folded down", result.stdout)
     assert re.search(r"(?m)^  Next\b.*Retry 1/3 in 2s", result.stdout)
     assert "exit=130 at=1008" in result.stdout
 
@@ -371,7 +371,7 @@ def test_zsh_nosleep_open_lid_reports_missing_signals_without_releasing(nosleep_
                                FAKE_LID_AT="99999", FAKE_STOP_AT="1010",
                                FAKE_ONLINE="0" if offline else "1")
     assert "nosleep: advisory — " in result.stdout
-    assert "lid open, sleep stays blocked" in result.stdout
+    assert "laptop open, sleep stays blocked" in result.stdout
     assert "retry " not in result.stdout and "letting go" not in result.stdout
     assert "exit=130 at=1010" in result.stdout
     assert [line for line in log if "disablesleep 0" in line] == [
@@ -662,7 +662,7 @@ def test_zsh_nosleep_lock_locks_then_sleeps_the_display(nosleep, tmp_path):
     calls = log.read_text().splitlines()
     assert len(calls) == 2 and "SACLockScreenImmediate" in calls[0]     # lock first …
     assert calls[1] == "pmset displaysleepnow"                          # … then the display off
-    assert r.stdout.strip() == "nosleep: lid closed — screen locked, display off"
+    assert r.stdout.strip() == "nosleep: laptop closed — screen locked, display off"
 
 
 def test_zsh_nosleep_lid_closed_only_when_macos_would_sleep_on_it(nosleep):
@@ -824,8 +824,8 @@ def test_zsh_nosleep_dim_dims_then_restores_the_builtin_panel(nosleep, tmp_path)
                 '_nosleep_dim; echo "saved=$_NOSLEEP_BRIGHT"; '
                 '_nosleep_undim; echo "saved=[$_NOSLEEP_BRIGHT]"',
                 DIM_LOG=str(log), NOSLEEP_DIM_LEVEL="0.05")
-    assert r.stdout.splitlines() == ["nosleep: lid closed — no lock requested, display dimmed", "saved=0.6200",
-                                     "nosleep: lid closed — no lock requested, display dimmed", "saved=0.6200",
+    assert r.stdout.splitlines() == ["nosleep: laptop closed — no lock requested, display dimmed", "saved=0.6200",
+                                     "nosleep: laptop closed — no lock requested, display dimmed", "saved=0.6200",
                                      "saved=[]"]
     # a second dim (auto-brightness re-applied) never overwrites the level to restore
     assert log.read_text().splitlines() == ["- 0.05", "- 0.05", "- 0.6200"]
@@ -835,7 +835,7 @@ def test_zsh_nosleep_dim_dims_then_restores_the_builtin_panel(nosleep, tmp_path)
 def test_zsh_nosleep_no_lock_dims_without_locking_and_restores_on_open(nosleep_loop, option):
     result, log = nosleep_loop(f"{option} --every 2", FAKE_LID_AT="1002",
                                FAKE_LID_OPEN_AT="1006", FAKE_STOP_AT="1008")
-    assert "lid closed — no lock requested, display dimmed" in result.stdout
+    assert "laptop closed — no lock requested, display dimmed" in result.stdout
     assert "exit=130 at=1008" in result.stdout
     assert [line for line in log if line.startswith("hold ")] == ["hold 1000 -dims"]
     assert not any(line.startswith("lock ") for line in log)

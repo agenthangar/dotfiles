@@ -110,13 +110,18 @@ def _pty_config(isolated, inputs, *args, expected_rc=0, columns=100, lines=24):
                     break
             os.write(master, keys)
         deadline = time.monotonic() + 5
-        while process.poll() is None and time.monotonic() < deadline:
+        while time.monotonic() < deadline:
             if select.select([master], [], [], 0.1)[0]:
                 try:
-                    output.extend(os.read(master, 4096))
+                    chunk = os.read(master, 4096)
                 except OSError:
+                    break  # Linux reports EIO when the slave closes, before waitpid may reap it.
+                if not chunk:
                     break
-        rc = process.poll()
+                output.extend(chunk)
+            elif process.poll() is not None:
+                break
+        rc = process.wait(timeout=max(0.1, deadline - time.monotonic()))
         assert rc == expected_rc, output.decode(errors="replace")
         os.set_blocking(master, False)
         while select.select([master], [], [], 0)[0]:

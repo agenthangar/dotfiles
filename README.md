@@ -43,7 +43,9 @@ nosleep config --edit          # edit defaults with VISUAL/EDITOR
 Display behavior and locking are independent. `--display-off` turns the display
 off on close (the default). `--display-on` (or `-d`) keeps it awake without
 changing brightness. `--dim` (or `-dim`) also keeps it awake, but dims the built-in
-panel. The last display option wins; `-d` now means display-on, not dim.
+panel. An explicit `--dim` or `-dim` always enables display-on and dimming,
+regardless of flag order. `-d` does not clear dimming; by itself it leaves
+brightness unchanged.
 `--no-dim` remains an alias for `--display-off`. Locking stays enabled by default; disable it with `--no-lock`
 or a saved preference. `--no-lock` skips nosleep's explicit lock request. It never unlocks an existing lock or
 changes macOS's own automatic locking settings. Locking requires authentication
@@ -55,8 +57,10 @@ changes, then review and save. Cancel leaves defaults unchanged. Defaults live
 in `${XDG_CONFIG_HOME:-~/.config}/nosleep/config.json`, apply to the next run,
 and stay local to that machine. Command-line flags override them for one run.
 The display setting cycles through Off, On, and Dim (`display_on` and `dim`
-in JSON); dimming implies display-on. Use `--display-on` to override saved dimming,
-`--display-off` to turn it off, or `--lock` / `--no-forever` to override the other modes.
+in JSON); dimming implies display-on. Use `--display-off` to override saved
+dimming, or `--display-off -d` to keep the display on without saved dimming.
+An explicit `--dim` still takes precedence over these overrides. Use `--lock` /
+`--no-forever` to override the other modes.
 Timing defaults use `--grace`, `--every`, `--retries`, and
 `--backoff`. `nosleep --help` highlights options that change the built-in defaults.
 Configuration commands never change power settings or an already-running instance.

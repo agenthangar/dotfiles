@@ -214,8 +214,8 @@ _nosleep_config() { python3 "$_DOTS_SOURCE_ROOT/lib/nosleep_config.py" "$@"; }
 #   nosleep config [--show | --edit]
 #
 # ON CLOSE
-#   -d, --display-on    Keep the display on without dimming
-#       --dim, -dim     Dim the display; implies --display-on
+#   -d, --display-on    Keep the display on
+#       --dim, -dim     Dim and keep display on, regardless of flag order
 #       --no-lock       Do not lock the screen
 #
 # FLAGS
@@ -231,7 +231,7 @@ _nosleep_config() { python3 "$_DOTS_SOURCE_ROOT/lib/nosleep_config.py" "$@"; }
 nosleep() {
   [[ "$1" == config ]] && { shift; _nosleep_config "$@"; return $?; }
   [[ "$1" == -h || "$1" == --help ]] && { _help_for nosleep; return 0; }
-  local forever=0 display_on=0 dim=0 lock=1 grace=900 every=30 retries=3 backoff=30 defaults setting value
+  local forever=0 display_on=0 dim=0 dim_requested=0 lock=1 grace=900 every=30 retries=3 backoff=30 defaults setting value
   defaults=$(_nosleep_config --values) || return $?
   for setting in ${(f)defaults}; do
     value=${setting#*=}
@@ -251,8 +251,8 @@ nosleep() {
       -h|--help) _help_for nosleep; return 0 ;;
       -f|--forever) forever=1 ;;
       --no-forever) forever=0 ;;
-      -d|--display-on) display_on=1 dim=0 ;;
-      --dim|-dim) display_on=1 dim=1 ;;
+      -d|--display-on) display_on=1 ;;
+      --dim|-dim) dim_requested=1 ;;
       --display-off|--no-dim) display_on=0 dim=0 ;;
       --no-lock) lock=0 ;;
       --lock) lock=1 ;;
@@ -269,6 +269,9 @@ nosleep() {
     esac
     shift
   done
+  # Explicit dimming implies display-on, independent of other display flags.
+  (( dim_requested )) && dim=1
+  (( dim )) && display_on=1
   [[ $grace == <-> && $every == <-> && $every -gt 0 ]] || { echo "nosleep: --grace/--every take a number of seconds" >&2; return 2; }
   [[ $retries == <-> && $retries -le 10 && $backoff == <-> && $backoff -ge 1 && $backoff -le 300 ]] || {
     echo "nosleep: --retries must be 0–10 and --backoff must be 1–300 seconds" >&2; return 2

@@ -43,7 +43,7 @@ def test_defaults_and_values_do_not_write(isolated):
     _, path = isolated
     result = run_config(isolated, "--values")
     assert result.returncode == 0
-    assert result.stdout.splitlines() == ["dim=0", "lock=1", "forever=0", "grace=900",
+    assert result.stdout.splitlines() == ["dim=0", "display_on=0", "lock=1", "forever=0", "grace=900",
                                           "every=30", "retries=3", "backoff=30"]
     shown = run_config(isolated, "--show")
     assert shown.returncode == 0
@@ -52,7 +52,7 @@ def test_defaults_and_values_do_not_write(isolated):
 
 
 @pytest.mark.parametrize("bad", [
-    {"dim": 1}, {"lock": "no"}, {"every": 0}, {"retries": 11},
+    {"dim": 1}, {"display_on": 1}, {"lock": "no"}, {"every": 0}, {"retries": 11},
     {"backoff": 301}, {"grace": -1}, {"unknown": True}, [],
 ])
 def test_invalid_config_blocks_all_modes(isolated, bad):
@@ -142,25 +142,25 @@ def _pty_config(isolated, inputs, *args, expected_rc=0, columns=100, lines=24):
 
 def test_tty_menu_cancel_then_save_independent_dim_and_lock(isolated):
     _, path = isolated
-    _pty_config(isolated, [(b"Local settings", b"\r"),
+    _pty_config(isolated, [(b"Local settings", b"\r\r"),
                            (b"dim on close", b"q"),
                            (b"Unsaved changes", b"d")])
     assert not path.exists()
-    _pty_config(isolated, [(b"Local settings", b"\r"),
+    _pty_config(isolated, [(b"Local settings", b"\r\r"),
                            (b"dim on close", b"j" * 8 + b"\r"),
                            (b"Review changes", b"y")])
     saved = json.loads(path.read_text())
     assert saved["dim"] is True and saved["lock"] is True
-    assert run_config(isolated, "--values").stdout.startswith("dim=1\nlock=1\n")
+    assert run_config(isolated, "--values").stdout.startswith("dim=1\ndisplay_on=1\nlock=1\n")
 
 
 def test_unsaved_confirmation_supports_arrow_selection(isolated):
     _, path = isolated
-    _pty_config(isolated, [(b"Local settings", b"\r"),
+    _pty_config(isolated, [(b"Local settings", b"\r\r"),
                            (b"dim on close", b"q"),
                            (b"Unsaved changes", b"\x1b[B\x1b[B\r")])
     assert not path.exists()
-    _pty_config(isolated, [(b"Local settings", b"\r"),
+    _pty_config(isolated, [(b"Local settings", b"\r\r"),
                            (b"dim on close", b"q"),
                            (b"Unsaved changes", b"\x1b[B\r"),
                            (b"Review changes", b"y")])
@@ -220,3 +220,26 @@ def test_short_narrow_tty_stacks_values_and_interrupt_restores_terminal(isolated
             process.kill()
             process.wait()
         os.close(master)
+
+
+def test_tty_menu_saves_display_on_without_dimming(isolated):
+    _, path = isolated
+    _pty_config(isolated, [(b"Local settings", b"\r"),
+                           (b"keep on when closed", b"s"),
+                           (b"Review changes", b"y")])
+    saved = json.loads(path.read_text())
+    assert saved["display_on"] is True and saved["dim"] is False
+    assert "Display   On" in run_config(isolated, "--show").stdout
+
+
+@pytest.mark.parametrize("saved,mode", [
+    ({"dim": True}, "Dim"),
+    ({"dim": True, "display_on": False}, "Dim"),
+    ({"display_on": True}, "On"),
+])
+def test_saved_display_modes_and_legacy_dim(isolated, saved, mode):
+    _, path = isolated
+    path.parent.mkdir(parents=True)
+    path.write_text(json.dumps(saved))
+    assert f"Display   {mode}" in run_config(isolated, "--show").stdout
+    assert "display_on=1" in run_config(isolated, "--values").stdout

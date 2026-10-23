@@ -30,6 +30,7 @@ agent settings, and desktop handoff. This repository consumes that project.
 ```sh
 nosleep                       # closing the lid locks and turns the display off
 nosleep --display-off          # explicitly turn the display off on close
+nosleep -d                     # closing the lid locks and keeps the display on
 nosleep --dim                  # closing the lid locks and dims the display
 nosleep --no-lock              # display off on close, without requesting a lock
 nosleep --dim --no-lock         # dim on close, without requesting a lock
@@ -39,9 +40,11 @@ nosleep config --show          # print effective defaults
 nosleep config --edit          # edit defaults with VISUAL/EDITOR
 ```
 
-Dimming and locking are independent. `--display-off` turns the display off on
-close (the default); `--dim` (or `-d`) dims it instead. `--no-dim` remains an alias
-for `--display-off`. Locking stays enabled by default; disable it with `--no-lock`
+Display behavior and locking are independent. `--display-off` turns the display
+off on close (the default). `--display-on` (or `-d`) keeps it awake without
+changing brightness. `--dim` (or `-dim`) also keeps it awake, but dims the built-in
+panel. The last display option wins; `-d` now means display-on, not dim.
+`--no-dim` remains an alias for `--display-off`. Locking stays enabled by default; disable it with `--no-lock`
 or a saved preference. `--no-lock` skips nosleep's explicit lock request. It never unlocks an existing lock or
 changes macOS's own automatic locking settings. Locking requires authentication
 to use the session again; dimming only changes display brightness. With the
@@ -50,9 +53,11 @@ built-in defaults, `nosleep --dim` does both when the lid closes.
 `nosleep config` follows `t config`: select a setting with arrow keys, stage
 changes, then review and save. Cancel leaves defaults unchanged. Defaults live
 in `${XDG_CONFIG_HOME:-~/.config}/nosleep/config.json`, apply to the next run,
-and stay local to that machine. Command-line flags override them for one run;
-use `--display-off`, `--lock`, or `--no-forever` to override saved dimming, no-lock,
-or forever settings. Timing defaults use `--grace`, `--every`, `--retries`, and
+and stay local to that machine. Command-line flags override them for one run.
+The display setting cycles through Off, On, and Dim (`display_on` and `dim`
+in JSON); dimming implies display-on. Use `--display-on` to override saved dimming,
+`--display-off` to turn it off, or `--lock` / `--no-forever` to override the other modes.
+Timing defaults use `--grace`, `--every`, `--retries`, and
 `--backoff`. `nosleep --help` highlights options that change the built-in defaults.
 Configuration commands never change power settings or an already-running instance.
 
@@ -104,7 +109,8 @@ While the laptop is open, `nosleep` keeps the display on and inhibits idle locki
 so an unlocked session can stay unlocked. It never unlocks an existing lock.
 Closing the laptop normally requests a screen lock and turns the display off;
 opening it restores the display hold. Unlocking is manual.
-`nosleep --dim` instead dims the built-in display on close. The independent
+`nosleep --display-on` keeps the display awake on close without dimming;
+`nosleep --dim` keeps it awake and dims the built-in panel. The independent
 locking setting controls whether it also requests a lock; `--no-lock` skips it. Docked clamshell mode keeps the external
 display on and skips the lock/dim action when you close the laptop. The On close
 section shows the selected display and locking behavior.

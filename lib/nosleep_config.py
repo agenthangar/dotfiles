@@ -17,6 +17,7 @@ import tty
 
 DEFAULTS = {
     "dim": False,
+    "display_on": False,
     "lock": True,
     "forever": False,
     "grace": 900,
@@ -48,7 +49,7 @@ def validate(data):
         raise ValueError("unknown setting: " + ", ".join(sorted(unknown)))
     result = DEFAULTS.copy()
     result.update(data)
-    for key in ("dim", "lock", "forever"):
+    for key in ("dim", "display_on", "lock", "forever"):
         if type(result[key]) is not bool:
             raise ValueError(f"{key} must be true or false")
     limits = {"grace": (0, None), "every": (1, None),
@@ -58,6 +59,8 @@ def validate(data):
         if type(value) is not int or value < minimum or (maximum is not None and value > maximum):
             bound = f"{minimum}..{maximum}" if maximum is not None else f">={minimum}"
             raise ValueError(f"{key} must be an integer {bound}")
+    # Existing dim-only configurations retain their display hold.
+    result["display_on"] = result["display_on"] or result["dim"]
     return result
 
 
@@ -104,7 +107,7 @@ def write(path, before, values):
 def describe(values):
     return [
         "", "On close",
-        f"  Display   {'Dim' if values['dim'] else 'Off'}",
+        f"  Display   {display_mode(values)}",
         f"  Locking   {'Lock screen' if values['lock'] else 'No lock requested'}",
         "", "Monitoring" + (" (timing settings inactive)" if values['forever'] else ""),
         f"  Mode      {'Disabled (run until Ctrl-C)' if values['forever'] else 'Activity and internet checks'}",
@@ -238,9 +241,14 @@ class Rail:
             return value, str(exc)
 
 
+def display_mode(values):
+    return "Dim" if values["dim"] else "On" if values["display_on"] else "Off"
+
+
 def _choice(name, values):
     value = values[name]
-    if name == "dim": return "dim on close" if value else "off on close"
+    if name == "dim":
+        return {"Off": "off on close", "On": "keep on when closed", "Dim": "dim on close"}[display_mode(values)]
     if name == "lock": return "lock on close" if value else "skip locking"
     if name == "forever": return "disabled (run until Ctrl-C)" if value else "activity and internet checks"
     return f"{value}{'s' if name != 'retries' else ''}"
@@ -248,7 +256,7 @@ def _choice(name, values):
 
 def menu(values):
     edited = values.copy()
-    names = list(DEFAULTS) + ["defaults", "save", "cancel"]
+    names = list(LABELS) + ["defaults", "save", "cancel"]
     selected = 0
     ui = Rail()
     sys.stdout.write("\n  nosleep config\n      Settings for this Mac · changes stay pending until saved.\n\n")
@@ -256,8 +264,8 @@ def menu(values):
     try:
         flash = ""
         while True:
-            pending = sum(edited[name] != values[name] for name in DEFAULTS)
-            body = [(name, LABELS[name], _choice(name, edited)) for name in DEFAULTS]
+            pending = sum(_choice(name, edited) != _choice(name, values) for name in LABELS)
+            body = [(name, LABELS[name], _choice(name, edited)) for name in LABELS]
             body += [("defaults", "Restore defaults", None),
                      ("save", "Save changes", f"{pending} pending"),
                      ("cancel", "Cancel", None)]
@@ -273,7 +281,11 @@ def menu(values):
             name = "save" if pressed == "s" else names[selected] if pressed == "enter" else "cancel" if pressed in ("q", "esc", "cancel") else None
             if name is None:
                 flash = "No binding for that key"
-            elif name in ("dim", "lock", "forever"):
+            elif name == "dim":
+                mode = display_mode(edited)
+                edited["display_on"] = mode != "Dim"
+                edited["dim"] = mode == "On"
+            elif name in ("lock", "forever"):
                 edited[name] = not edited[name]
             elif name in DEFAULTS:
                 edited[name], flash = ui.prompt_int(name, edited[name])
@@ -316,7 +328,7 @@ def menu(values):
                     ui.commit(["  ◇  settings unchanged", ""])
                     return edited
                 changes = [(name, LABELS[name], f"{_choice(name, values)} → {_choice(name, edited)}")
-                           for name in DEFAULTS if values[name] != edited[name]]
+                           for name in LABELS if _choice(name, values) != _choice(name, edited)]
                 review_focus = 0
                 while True:
                     ui.frame("Review changes", changes, review_focus, pending,

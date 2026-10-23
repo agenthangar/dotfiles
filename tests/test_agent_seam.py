@@ -197,9 +197,11 @@ exit 0
 def nosleep(zsh, tmp_path):
     """The zsh fixture with a ps stub answering the whole-table form the probe reads, a
     nettop stub answering from $FAKE_NETTOP (cumulative per-process byte rows) and an
-    ioreg stub answering the lid's IOPMrootDomain lines from $FAKE_IOREG."""
+    ioreg stub answering the lid's IOPMrootDomain lines from $FAKE_IOREG.
+    Power assertions are empty unless supplied through $FAKE_ASSERT."""
     bins = tmp_path / "stubbin"
-    for name, body in (("ps", PS_TABLE_STUB), ("nettop", NETTOP_STUB), ("ioreg", IOREG_STUB)):
+    for name, body in (("ps", PS_TABLE_STUB), ("nettop", NETTOP_STUB),
+                       ("ioreg", IOREG_STUB), ("pmset", ASSERTIONS_STUB)):
         f = bins / name
         f.write_text(body)
         f.chmod(0o755)
@@ -304,9 +306,9 @@ def test_zsh_nosleep_plain_snapshot_shows_sampling_then_idle(nosleep_loop):
     snapshot = output.split("nosleep\n", 1)[1].split("  Stop", 1)[0]
     live, config = snapshot.split("On close", 1)
     assert "Live status" in live
-    for label in ("Agents", "Internet", "Next"):
+    for label in ("Sleep", "Agents", "Internet", "Next"):
         assert re.search(rf"(?m)^  {label}\b", live), label
-    for label in ("Sleep", "Display", "Locking", "Grace", "Checks", "Retries", "Backoff"):
+    for label in ("Display", "Locking", "Grace", "Checks", "Retries", "Backoff"):
         assert not re.search(rf"(?m)^  {label}\b", live), label
         assert re.search(rf"(?m)^  {label}\b", config), label
     assert not re.search(r"(?m)^  (Laptop|Dim)\b", output)
@@ -362,7 +364,7 @@ def test_zsh_nosleep_tty_retry_counts_down_and_releases_once(nosleep_loop):
                               _tty=True)
     assert "Retry 1/3 in 4s" in result.stdout
     assert "Retry 1/3 in 2s" in result.stdout
-    assert result.stdout.count("nosleep: stopped — sleep hold released") == 1
+    assert result.stdout.count("nosleep: stopped") == 1
     assert [line for line in log if "disablesleep 0" in line] == [
         "sudo 1006 -n pmset -a disablesleep 0"]
     assert "exit=130 at=1006" in result.stdout

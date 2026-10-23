@@ -27,8 +27,8 @@ DEFAULTS = {
 LABELS = {
     "dim": "Display when lid closes",
     "lock": "Lock when lid closes",
-    "forever": "Sleep hold",
-    "grace": "Idle/offline grace",
+    "forever": "Monitoring",
+    "grace": "Grace period",
     "every": "Check interval",
     "retries": "Retries",
     "backoff": "Retry delay",
@@ -106,11 +106,10 @@ def describe(values):
         "", "On close",
         f"  Display   {'Dim' if values['dim'] else 'Off'}",
         f"  Locking   {'Lock screen' if values['lock'] else 'No lock requested'}",
-        "", "Sleep hold",
-        f"  Sleep     {'Blocked until Ctrl-C' if values['forever'] else 'Blocked while open; checked when closed'}",
-        "", "Checks & retries" + (" (inactive with --forever)" if values['forever'] else ""),
+        "", "Monitoring" + (" (timing settings inactive)" if values['forever'] else ""),
+        f"  Mode      {'Disabled (run until Ctrl-C)' if values['forever'] else 'Activity and internet checks'}",
         f"  Checks    {values['every']}s",
-        f"  Grace     {values['grace']}s idle/offline (closed)",
+        f"  Grace     {values['grace']}s before retrying",
         f"  Retries   {values['retries']}",
         f"  Backoff   {values['backoff']}s, doubles to 300s",
     ]
@@ -189,7 +188,7 @@ class Rail:
             footer = [f"      {self.style(self.clip(primary or hint, 6), '33')}"]
         physical = []
         for index, (_, label, value) in enumerate(body):
-            section = {0: "LID BEHAVIOR", 3: "ACTIVITY CHECKS", 7: "FINISH"}.get(index) if len(body) == 10 else None
+            section = {0: "ON CLOSE", 2: "MONITORING", 7: "FINISH"}.get(index) if len(body) == 10 else None
             if section:
                 physical.append((f"  {self.style('│', '33')}   {self.style(section, '1;36')}", None))
             if width < 60 and value is not None:
@@ -243,7 +242,7 @@ def _choice(name, values):
     value = values[name]
     if name == "dim": return "dim on close" if value else "off on close"
     if name == "lock": return "lock on close" if value else "skip locking"
-    if name == "forever": return "until Ctrl-C" if value else "release after idle/offline while closed"
+    if name == "forever": return "disabled (run until Ctrl-C)" if value else "activity and internet checks"
     return f"{value}{'s' if name != 'retries' else ''}"
 
 

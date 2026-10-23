@@ -43,8 +43,9 @@ Dimming and locking are independent. `--display-off` turns the display off on
 close (the default); `--dim` (or `-d`) dims it instead. `--no-dim` remains an alias
 for `--display-off`. Locking stays enabled by default; disable it with `--no-lock`
 or a saved preference. `--no-lock` skips nosleep's explicit lock request. It never unlocks an existing lock or
-changes macOS's own automatic locking settings. For the former dim-and-no-lock
-behavior, use both `--dim --no-lock`.
+changes macOS's own automatic locking settings. Locking requires authentication
+to use the session again; dimming only changes display brightness. With the
+built-in defaults, `nosleep --dim` does both when the lid closes.
 
 `nosleep config` follows `t config`: select a setting with arrow keys, stage
 changes, then review and save. Cancel leaves defaults unchanged. Defaults live
@@ -61,6 +62,7 @@ Configuration commands never change power settings or an already-running instanc
 nosleep
 
 Live status
+  Sleep     Prevented
   Agents    Sampling activity… need a second check
   Internet  Online · checked 0s ago
   Next      Check in 30s
@@ -69,24 +71,23 @@ On close
   Display   Off
   Locking   Lock screen
 
-Sleep hold
-  Sleep     Blocked while open; checked when closed
-
-Checks & retries
+Monitoring
+  Mode      Activity and internet checks
   Checks    30s
-  Grace     15m idle/offline (closed)
+  Grace     15m before retrying
   Retries   3
   Backoff   30s, doubles to 5m
 
   Options   nosleep --help · nosleep config
-  Stop      Ctrl-C · release sleep hold
+  Stop      Ctrl-C
 ```
 
 Live status refreshes every two seconds with current activity and connection checks
-and a countdown to the next check. On close shows the selected display and locking
-behavior. Sleep hold shows the running sleep policy; Checks & retries groups its
-timing settings. Use `nosleep --help` for one-run options or `nosleep config` to
-save defaults. In `--forever` mode, unused timing controls are marked inactive.
+and a countdown to the next check. Sleep reports whether sleep prevention is
+active. On close shows the selected display and locking behavior. Monitoring
+shows the activity checks and timing settings. Use `nosleep --help` for one-run
+options or `nosleep config` to save defaults. In `--forever` mode, unused timing
+controls are marked inactive.
 Agents shows activity observed at the last check, then switches to quiet
 with a last-seen time when activity stops. Internet shows the latest connection
 result; Next shows remaining grace or the pending retry when needed. Failures to

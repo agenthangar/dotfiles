@@ -213,7 +213,8 @@ def test_short_narrow_tty_stacks_values_and_interrupt_restores_terminal(isolated
                     output.extend(os.read(master, 4096))
                 except OSError:
                     break
-        assert process.poll() == 0, output.decode(errors="replace")
+        # Linux may report PTY closure before waitpid observes process exit.
+        assert process.wait(timeout=max(0.1, deadline - time.monotonic())) == 0, output.decode(errors="replace")
         assert not path.exists()
     finally:
         if process.poll() is None:

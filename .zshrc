@@ -37,7 +37,9 @@ autoload -Uz compinit && compinit
 #   line 1                     "<name> — <tagline>"     → name bold
 #   Usage: …                   the "Usage:" label bold
 #   Section name:              a capitalized heading ending in a colon → header
+#   SECTION NAME               an uppercase heading → header
 #   <2sp><term>  <2+sp><desc>  two-column row → term cyan, desc dim, auto-aligned
+#   <6sp>--flag               long-only flag aligned below short/long flag pairs
 #   anything else              printed verbatim (paragraphs, blank spacer lines)
 # Color is emitted only when stdout is a TTY (so `cmd -h | cat` stays plain).
 _help_for() {
@@ -71,11 +73,13 @@ _help_style() {
     {
       raw[NR] = $0
       kvline = 0; contline = 0
-      if ($0 ~ /^  [^ ]/) {
+      if ($0 ~ /^  [^ ]/ || $0 ~ /^      --/) {
         body = substr($0, 3)
+        prefix = ""
+        if (body ~ /^    --/) { prefix = "    "; body = substr(body, 5) }
         if (match(body, / {2,}/)) {
           iskv[NR]  = 1; kvline = 1
-          kterm[NR] = substr(body, 1, RSTART - 1)
+          kterm[NR] = prefix substr(body, 1, RSTART - 1)
           kdesc[NR] = substr(body, RSTART + RLENGTH)
           if (length(kterm[NR]) > maxw) maxw = length(kterm[NR])
         }
@@ -102,7 +106,7 @@ _help_style() {
           printf "%*s%s%s%s\n", maxw + 4, "", d, cont[n], r
         } else if (line ~ /^Usage:/) {
           printf "%s%s%s%s\n", b, "Usage:", r, substr(line, 7)
-        } else if (line ~ /^[A-Z][A-Za-z &-]*:$/) {
+        } else if (line ~ /^[A-Z][A-Za-z &-]*:$/ || line ~ /^[A-Z][A-Z &-]+$/) {
           printf "%s%s%s\n", b, line, r
         } else {
           print line
@@ -199,28 +203,30 @@ prview() {
 # Keep configuration as validated data; never evaluate the saved file as shell code.
 _nosleep_config() { python3 "$_DOTS_SOURCE_ROOT/lib/nosleep_config.py" "$@"; }
 
-# nosleep — keep your Mac awake
+# nosleep — prevent system sleep
 #
-# Usage: nosleep [options]
-#        nosleep config [--show | --edit]
+# Closing the lid locks the screen and turns off the display by default.
+# Activity and connection checks allow sleep only while the lid is closed.
 #
-# On close:
-#   -d, --dim         dim the display instead of turning it off
-#   --no-lock         skip the screen lock
-#   Default: display off, screen locked. These options are independent.
+# USAGE
+#   nosleep [flags]
+#   nosleep config [--show | --edit]
 #
-# Sleep hold:
-#   -f, --forever     stay awake until Ctrl-C; skip activity/network checks
-#   Default: allow sleep after idle/offline retries only when closed.
+# ON CLOSE
+#   -d, --dim           Dim the display instead of turning it off
+#       --no-lock       Do not lock the screen
 #
-# Checks & retries:
-#   --every <secs>    check interval                 (default: 30s)
-#   --grace <secs>    idle/offline grace             (default: 900s)
-#   --retries <n>     retries after grace, 0–10      (default: 3)
-#   --backoff <secs>  retry delay, doubles to 300s   (default: 30s)
+# FLAGS
+#   -f, --forever       Keep awake until Ctrl-C; skip checks
+#       --every SECS    Check interval in seconds (default 30)
+#       --grace SECS    Wait before retries when idle or offline (default 900)
+#       --retries N     Retry limit, 0–10 (default 3)
+#       --backoff SECS  Retry delay; doubles to 300 seconds (default 30)
+#   -h, --help          Show help
 #
-# Defaults: nosleep config. Flags override saved settings for this run.
-# Example: nosleep --dim --no-lock --forever
+# EXAMPLES
+#   nosleep --forever
+#   nosleep config --show
 nosleep() {
   [[ "$1" == config ]] && { shift; _nosleep_config "$@"; return $?; }
   [[ "$1" == -h || "$1" == --help ]] && { _help_for nosleep; return 0; }
@@ -289,7 +295,7 @@ nosleep() {
       _nosleep_display_off || print -u2 -- 'nosleep: could not turn the display off'
     fi
     if sudo -n pmset -a disablesleep 0 2>/dev/null || sudo pmset -a disablesleep 0; then
-      echo "nosleep: stopped — sleep hold released"
+      echo "nosleep: stopped"
     fi
   }
   trap '_nosleep_restore' EXIT
@@ -483,7 +489,7 @@ _nosleep_status_clear() {
 }
 _nosleep_status() {
   local agent_text network_text next_text notice_text
-  local sleep_text='Blocked while open; checked when closed'
+  local sleep_text='Prevented' monitoring_text='Activity and internet checks'
   local grace_text every_text backoff_text retries_text=$retries item
   local display_text='Off' lock_text='Lock screen'
   local remaining signal_age line width=$(( ${COLUMNS:-80} - 1 )) row=0 styled=0 value primary detail
@@ -504,7 +510,7 @@ _nosleep_status() {
     agent_style=2 network_style=2 next_style=2
     agent_text='Not checked (--forever)' network_text='Not checked (--forever)'
     next_text='No checks (--forever)'
-    sleep_text='Blocked until Ctrl-C'
+    sleep_text='Prevented until Ctrl-C' monitoring_text='Disabled (--forever)'
   else
     if (( ! probes )); then
       agent_text='Checking activity…'
@@ -560,21 +566,22 @@ _nosleep_status() {
   fi
   if (( ! sleep_held )); then
     heading_style='1;31' notice_style='1;31' sleep_style='1;31'
-    sleep_text='Hold unavailable'
+    sleep_text='Not prevented'
     notice_text='Sleep protection unavailable · closing may allow sleep'
   fi
   rows=('nosleep'
         ''
         'Live status'
+        "  Sleep     $sleep_text"
         "  Agents    $agent_text"
         "  Internet  $network_text"
         "  Next      $next_text")
-  styles=("$heading_style" 0 '1;36' "$agent_style" "$network_style" "$next_style")
+  styles=("$heading_style" 0 '1;36' "$sleep_style" "$agent_style" "$network_style" "$next_style")
   if [[ -n $notice_text ]]; then
     rows+=("  Notice    $notice_text")
     styles+=("$notice_style")
   fi
-  _nosleep_duration "$grace"; grace_text="$REPLY idle/offline (closed)"
+  _nosleep_duration "$grace"; grace_text="$REPLY before retrying"
   _nosleep_duration "$every"; every_text=$REPLY
   _nosleep_duration "$backoff"; backoff_text="$REPLY, doubles to 5m"
   if (( forever )); then
@@ -583,10 +590,10 @@ _nosleep_status() {
     retries_text+=' (inactive)'
     _nosleep_duration "$backoff"; backoff_text="$REPLY (inactive)"
   fi
-  config_labels=('On close' Display Locking '' 'Sleep hold' Sleep '' 'Checks & retries' Checks Grace Retries Backoff)
-  config_values=('' "$display_text" "$lock_text" '' '' "$sleep_text" '' ''
+  config_labels=('On close' Display Locking '' Monitoring Mode Checks Grace Retries Backoff)
+  config_values=('' "$display_text" "$lock_text" '' '' "$monitoring_text"
                  "$every_text" "$grace_text" "$retries_text" "$backoff_text")
-  config_styles=('1;36' 0 0 0 '1;36' "$sleep_style" 0 '1;36' 0 0 0 0)
+  config_styles=('1;36' 0 0 0 '1;36' 0 0 0 0 0)
   rows+=('')
   styles+=(0)
   for (( item = 1; item <= ${#config_labels}; ++item )); do
@@ -598,7 +605,7 @@ _nosleep_status() {
     rows+=("$line")
     styles+=("${config_styles[item]}")
   done
-  rows+=('' '  Options   nosleep --help · nosleep config' '  Stop      Ctrl-C · release sleep hold')
+  rows+=('' '  Options   nosleep --help · nosleep config' '  Stop      Ctrl-C')
   styles+=(0 2 2)
   _nosleep_status_clear
   for line in "${rows[@]}"; do

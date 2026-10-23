@@ -299,17 +299,17 @@ def test_zsh_nosleep_plain_snapshot_shows_sampling_then_idle(nosleep_loop):
     result, _ = nosleep_loop("--every 2", FAKE_LID_AT="99999", FAKE_STOP_AT="1006")
     output = result.stdout
     assert "nosleep\n" in output
-    for label in ("Sleep", "Display", "Dim", "Locking", "Grace", "Checks", "Retries", "Backoff", "Agents", "Internet", "Next", "Stop"):
+    for label in ("Sleep", "Display", "Locking", "Grace", "Checks", "Retries", "Backoff", "Agents", "Internet", "Next", "Stop"):
         assert re.search(rf"(?m)^  {label}\b", output), label
     snapshot = output.split("nosleep\n", 1)[1].split("  Stop", 1)[0]
     live, config = snapshot.split("Configuration", 1)
     assert "Live status" in live
     for label in ("Agents", "Internet", "Next"):
         assert re.search(rf"(?m)^  {label}\b", live), label
-    for label in ("Sleep", "Display", "Dim", "Locking", "Grace", "Checks", "Retries", "Backoff"):
+    for label in ("Sleep", "Display", "Locking", "Grace", "Checks", "Retries", "Backoff"):
         assert not re.search(rf"(?m)^  {label}\b", live), label
         assert re.search(rf"(?m)^  {label}\b", config), label
-    assert not re.search(r"(?m)^  Laptop\b", output)
+    assert not re.search(r"(?m)^  (Laptop|Dim)\b", output)
     assert "Sampling activity" in output
     assert "No activity detected" in output
     assert re.search(r"(?m)^  Internet\b.*Online", output)
@@ -858,7 +858,8 @@ def test_zsh_nosleep_undim_keeps_saved_brightness_until_restore_succeeds(nosleep
     "options,locked,dimmed",
     [("", True, False), ("--dim", True, True),
      ("--no-lock", False, False), ("--dim --no-lock", False, True),
-     ("-d", True, True)],
+     ("-d", True, True), ("--display-off", True, False),
+     ("--dim --display-off", True, False), ("--display-off --dim", True, True)],
 )
 def test_zsh_nosleep_lid_close_options_are_independent(nosleep_loop, options, locked, dimmed):
     result, log = nosleep_loop(f"{options} --every 2", FAKE_LID_AT="1002",
@@ -866,6 +867,7 @@ def test_zsh_nosleep_lid_close_options_are_independent(nosleep_loop, options, lo
     outcome = "display dimmed" if dimmed else "display off"
     lock_state = "screen locked" if locked else "no lock requested"
     assert f"laptop closed — {lock_state}, {outcome}" in result.stdout
+    assert re.search(rf"(?m)^  Display: +{'Dim' if dimmed else 'Off'} on close", result.stdout)
     assert "exit=130 at=1008" in result.stdout
     assert [line for line in log if line.startswith("lock ")] == (["lock 1002"] if locked else [])
     assert [line for line in log if line.startswith("display-off ")] == ([] if dimmed else ["display-off 1002"])
@@ -927,7 +929,8 @@ def test_zsh_nosleep_stop_after_initial_dim_failure_sleeps_closed_display(noslee
     assert not any(line.endswith("0.6200") for line in log)
 
 
-def test_zsh_nosleep_config_defaults_and_cli_overrides(nosleep_loop):
+@pytest.mark.parametrize("display_option", ["--display-off", "--no-dim"])
+def test_zsh_nosleep_config_defaults_and_cli_overrides(nosleep_loop, display_option):
     config = nosleep_loop.home / ".config" / "nosleep" / "config.json"
     config.parent.mkdir(parents=True)
     config.write_text(json.dumps({"dim": True, "lock": False, "forever": True}))
@@ -938,7 +941,7 @@ def test_zsh_nosleep_config_defaults_and_cli_overrides(nosleep_loop):
     assert "display-off 1004" in log  # teardown sleeps the still-closed display
     assert "brightness 1000 0" in log
 
-    result, log = nosleep_loop("--no-dim --lock --no-forever --every 2", FAKE_STOP_AT="1004")
+    result, log = nosleep_loop(f"{display_option} --lock --no-forever --every 2", FAKE_STOP_AT="1004")
     assert "screen locked, display off" in result.stdout
     assert "lock 1000" in log and "display-off 1000" in log
     assert not any(line.startswith("brightness ") for line in log)

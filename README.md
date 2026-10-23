@@ -29,17 +29,19 @@ agent settings, and desktop handoff. This repository consumes that project.
 
 ```sh
 nosleep                       # closing the lid locks and turns the display off
-nosleep --dim                 # closing the lid locks and dims the display
+nosleep --display-off          # explicitly turn the display off on close
+nosleep --dim                  # closing the lid locks and dims the display
 nosleep --no-lock              # display off on close, without requesting a lock
-nosleep --dim --no-lock        # dim on close, without requesting a lock
+nosleep --dim --no-lock         # dim on close, without requesting a lock
 nosleep --forever              # keep awake until Ctrl-C; skip activity checks
 nosleep config                # arrow-key menu for this machine's defaults
 nosleep config --show          # print effective defaults
 nosleep config --edit          # edit defaults with VISUAL/EDITOR
 ```
 
-Dimming and locking are independent. `--dim` (or `-d`) only changes the display
-behavior on close. Locking stays enabled by default; disable it with `--no-lock`
+Dimming and locking are independent. `--display-off` turns the display off on
+close (the default); `--dim` (or `-d`) dims it instead. `--no-dim` remains an alias
+for `--display-off`. Locking stays enabled by default; disable it with `--no-lock`
 or a saved preference. `--no-lock` skips nosleep's explicit lock request. It never unlocks an existing lock or
 changes macOS's own automatic locking settings. For the former dim-and-no-lock
 behavior, use both `--dim --no-lock`.
@@ -48,7 +50,7 @@ behavior, use both `--dim --no-lock`.
 changes, then review and save. Cancel leaves defaults unchanged. Defaults live
 in `${XDG_CONFIG_HOME:-~/.config}/nosleep/config.json`, apply to the next run,
 and stay local to that machine. Command-line flags override them for one run;
-use `--no-dim`, `--lock`, or `--no-forever` to override saved dimming, no-lock,
+use `--display-off`, `--lock`, or `--no-forever` to override saved dimming, no-lock,
 or forever settings. Timing defaults use `--grace`, `--every`, `--retries`, and
 `--backoff`. `nosleep --help` lists all options. Configuration commands never
 change power settings or an already-running instance.
@@ -65,8 +67,7 @@ Live status
 
 Configuration
   Sleep:    Blocked                   (--forever: until Ctrl-C)
-  Display:  On; off when closed       (--dim: dim when closed)
-  Dim:      Disabled                  (--dim: dim when closed)
+  Display:  Off on close              (--dim: dim on close)
   Locking:  Lock when closed          (--no-lock: skip lock)
 
   Grace:    15m idle/offline (closed)  (--grace <seconds>)
@@ -79,8 +80,9 @@ Configuration
 ```
 
 Live status refreshes every two seconds with current activity and connection checks
-and a countdown to the next check. Configuration shows the sleep, display, dimming, and
-locking behavior selected for this run. Short, muted flag hints sit beside each
+and a countdown to the next check. Configuration shows the sleep policy and the
+display and locking behavior selected for lid close, rather than the current
+display state. Short, muted flag hints sit beside each
 setting. Timing controls have individual rows; restart with the shown flag to
 change them. In `--forever` mode, unused timing controls are marked inactive.
 Agents shows activity observed at the last check, then switches to quiet
@@ -101,7 +103,7 @@ opening it restores the display hold. Unlocking is manual.
 `nosleep --dim` instead dims the built-in display on close. The independent
 locking setting controls whether it also requests a lock; `--no-lock` skips it. Docked clamshell mode keeps the external
 display on and skips the lock/dim action when you close the laptop. The Configuration
-rows show the selected display, dimming, and locking behavior alongside the sleep policy.
+rows show the selected display and locking behavior alongside the sleep policy.
 
 `nosleep` keeps the Mac awake until Ctrl-C while the laptop is open. Failed activity
 or internet checks only produce warnings in that state. Automatic sleep is allowed

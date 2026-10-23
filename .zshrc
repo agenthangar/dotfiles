@@ -207,17 +207,17 @@ _nosleep_config() { python3 "$_DOTS_SOURCE_ROOT/lib/nosleep_config.py" "$@"; }
 # The display stays on while open. On close: lock + display off by default.
 # While closed, idle/offline grace and failed retries release the sleep hold.
 #
-# Options:
-#   -d, --dim        dim on close instead of turning the display off
-#   --no-dim        turn the display off on close (default)
-#   --no-lock       do not request a lock on close
-#   --lock          request a lock on close (default)
-#   -f, --forever    stay awake until Ctrl-C; skip activity/network checks
-#   --no-forever     enable activity/network checks (default)
-#   --grace <secs>   wait before retries (default 900)
-#   --every <secs>   time between checks (default 30)
-#   --retries <n>    checks after grace expires (0–10, default 3)
-#   --backoff <secs>  first retry wait; doubles to 300s (default 30)
+# On close:
+#   --display-off / --dim (-d)    turn off / dim the display (default: off)
+#   --lock / --no-lock            lock / skip locking (default: lock)
+#
+# Activity checks:
+#   --forever (-f) / --no-forever  skip / enable checks (default: enabled)
+#                                --forever keeps awake until Ctrl-C
+#   --grace <secs>                idle/offline grace (default: 900s)
+#   --every <secs>                check interval (default: 30s)
+#   --retries <n>                 retries after grace (0–10; default: 3)
+#   --backoff <secs>              retry delay, doubles to 300s (default: 30s)
 #
 # Defaults: nosleep config. Flags override saved settings for this run.
 # Dimming and locking are independent. --no-lock never unlocks the Mac.
@@ -245,7 +245,7 @@ nosleep() {
       -f|--forever) forever=1 ;;
       --no-forever) forever=0 ;;
       -d|--dim) dim=1 ;;
-      --no-dim) dim=0 ;;
+      --display-off|--no-dim) dim=0 ;;
       --no-lock) lock=0 ;;
       --lock) lock=1 ;;
       --grace|--every|--retries|--backoff)
@@ -485,17 +485,16 @@ _nosleep_status_clear() {
 _nosleep_status() {
   local agent_text network_text next_text notice_text
   local sleep_text='Blocked' sleep_help='--forever: until Ctrl-C'
-  local display_help='--dim: dim when closed' dim_help='--dim: dim when closed' lock_help='--no-lock: skip lock'
+  local display_help='--dim: dim on close' lock_help='--no-lock: skip lock'
   local grace_text every_text backoff_text retries_text=$retries item
-  local display_text='On; off when closed' dim_text='Disabled' lock_text='Lock when closed'
+  local display_text='Off on close' lock_text='Lock when closed'
   local remaining signal_age line width=$(( ${COLUMNS:-80} - 1 )) row=0 styled=0 value primary detail config_first config_last
   local heading_style=1 agent_style=33 network_style=36 next_style=36
   local sleep_style=0 notice_style=33
   local -a rows styles config_labels config_values config_helpers config_styles
   (( _NOSLEEP_TTY )) && [[ -z ${NO_COLOR:-} ]] && styled=1
   if (( dim )); then
-    display_text='On; dim when closed' display_help='--no-dim: off when closed'
-    dim_text='When closed' dim_help='--no-dim: disable dimming'
+    display_text='Dim on close' display_help='--display-off: off on close'
   fi
   if (( ! lock )); then
     lock_text='No lock requested' lock_help='--lock: lock when closed'
@@ -586,12 +585,12 @@ _nosleep_status() {
     retries_text+=' (inactive)'
     _nosleep_duration "$backoff"; backoff_text="$REPLY (inactive)"
   fi
-  config_labels=(Sleep Display Dim Locking '' Grace Checks Retries Backoff)
-  config_values=("$sleep_text" "$display_text" "$dim_text" "$lock_text" ''
+  config_labels=(Sleep Display Locking '' Grace Checks Retries Backoff)
+  config_values=("$sleep_text" "$display_text" "$lock_text" ''
                  "$grace_text" "$every_text" "$retries_text" "$backoff_text")
-  config_helpers=("$sleep_help" "$display_help" "$dim_help" "$lock_help" ''
+  config_helpers=("$sleep_help" "$display_help" "$lock_help" ''
                   '--grace <seconds>' '--every <seconds>' '--retries <count>' '--backoff <seconds>')
-  config_styles=("$sleep_style" 0 0 0 0 0 0 0 0)
+  config_styles=("$sleep_style" 0 0 0 0 0 0 0)
   rows+=('' 'Configuration')
   styles+=(0 1)
   config_first=$(( ${#rows} + 1 ))

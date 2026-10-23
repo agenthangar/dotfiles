@@ -103,7 +103,7 @@ def write(path, before, values):
 
 def describe(values):
     return [
-        f"  Display     {'dim on close' if values['dim'] else 'off on close'}    (--dim / --no-dim)",
+        f"  Display     {'dim on close' if values['dim'] else 'off on close'}    (--display-off / --dim)",
         f"  Lock        {'on close' if values['lock'] else 'skip on close'}    (--lock / --no-lock)",
         f"  Sleep hold  {'until Ctrl-C' if values['forever'] else 'release after idle/offline while closed'}    (--forever / --no-forever)",
         f"  Grace       {values['grace']}s    (--grace SECONDS)",

@@ -103,13 +103,16 @@ def write(path, before, values):
 
 def describe(values):
     return [
-        f"  Display     {'dim on close' if values['dim'] else 'off on close'}    (--display-off / --dim)",
-        f"  Lock        {'on close' if values['lock'] else 'skip on close'}    (--lock / --no-lock)",
-        f"  Sleep hold  {'until Ctrl-C' if values['forever'] else 'release after idle/offline while closed'}    (--forever / --no-forever)",
-        f"  Grace       {values['grace']}s    (--grace SECONDS)",
-        f"  Check       {values['every']}s    (--every SECONDS)",
-        f"  Retries     {values['retries']}    (--retries COUNT)",
-        f"  Backoff     {values['backoff']}s    (--backoff SECONDS)",
+        "", "On close",
+        f"  Display   {'Dim' if values['dim'] else 'Off'}",
+        f"  Locking   {'Lock screen' if values['lock'] else 'No lock requested'}",
+        "", "Sleep hold",
+        f"  Sleep     {'Blocked until Ctrl-C' if values['forever'] else 'Blocked while open; checked when closed'}",
+        "", "Checks & retries" + (" (inactive with --forever)" if values['forever'] else ""),
+        f"  Checks    {values['every']}s",
+        f"  Grace     {values['grace']}s idle/offline (closed)",
+        f"  Retries   {values['retries']}",
+        f"  Backoff   {values['backoff']}s, doubles to 300s",
     ]
 
 

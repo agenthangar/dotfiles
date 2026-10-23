@@ -302,7 +302,7 @@ def test_zsh_nosleep_plain_snapshot_shows_sampling_then_idle(nosleep_loop):
     for label in ("Sleep", "Display", "Locking", "Grace", "Checks", "Retries", "Backoff", "Agents", "Internet", "Next", "Stop"):
         assert re.search(rf"(?m)^  {label}\b", output), label
     snapshot = output.split("nosleep\n", 1)[1].split("  Stop", 1)[0]
-    live, config = snapshot.split("Configuration", 1)
+    live, config = snapshot.split("On close", 1)
     assert "Live status" in live
     for label in ("Agents", "Internet", "Next"):
         assert re.search(rf"(?m)^  {label}\b", live), label
@@ -867,7 +867,7 @@ def test_zsh_nosleep_lid_close_options_are_independent(nosleep_loop, options, lo
     outcome = "display dimmed" if dimmed else "display off"
     lock_state = "screen locked" if locked else "no lock requested"
     assert f"laptop closed — {lock_state}, {outcome}" in result.stdout
-    assert re.search(rf"(?m)^  Display: +{'Dim' if dimmed else 'Off'} on close", result.stdout)
+    assert re.search(rf"(?m)^  Display +{'Dim' if dimmed else 'Off'}$", result.stdout)
     assert "exit=130 at=1008" in result.stdout
     assert [line for line in log if line.startswith("lock ")] == (["lock 1002"] if locked else [])
     assert [line for line in log if line.startswith("display-off ")] == ([] if dimmed else ["display-off 1002"])

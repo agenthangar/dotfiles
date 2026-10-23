@@ -52,8 +52,8 @@ in `${XDG_CONFIG_HOME:-~/.config}/nosleep/config.json`, apply to the next run,
 and stay local to that machine. Command-line flags override them for one run;
 use `--display-off`, `--lock`, or `--no-forever` to override saved dimming, no-lock,
 or forever settings. Timing defaults use `--grace`, `--every`, `--retries`, and
-`--backoff`. `nosleep --help` lists all options. Configuration commands never
-change power settings or an already-running instance.
+`--backoff`. `nosleep --help` highlights options that change the built-in defaults.
+Configuration commands never change power settings or an already-running instance.
 
 `nosleep` shows a live snapshot instead of a long startup message:
 
@@ -65,26 +65,28 @@ Live status
   Internet  Online · checked 0s ago
   Next      Check in 30s
 
-Configuration
-  Sleep:    Blocked                   (--forever: until Ctrl-C)
-  Display:  Off on close              (--dim: dim on close)
-  Locking:  Lock when closed          (--no-lock: skip lock)
+On close
+  Display   Off
+  Locking   Lock screen
 
-  Grace:    15m idle/offline (closed)  (--grace <seconds>)
-  Checks:   30s                       (--every <seconds>)
-  Retries:  3                         (--retries <count>)
-  Backoff:  30s, doubles to 5m        (--backoff <seconds>)
+Sleep hold
+  Sleep     Blocked while open; checked when closed
 
-  Defaults  nosleep config
+Checks & retries
+  Checks    30s
+  Grace     15m idle/offline (closed)
+  Retries   3
+  Backoff   30s, doubles to 5m
+
+  Options   nosleep --help · nosleep config
   Stop      Ctrl-C · release sleep hold
 ```
 
 Live status refreshes every two seconds with current activity and connection checks
-and a countdown to the next check. Configuration shows the sleep policy and the
-display and locking behavior selected for lid close, rather than the current
-display state. Short, muted flag hints sit beside each
-setting. Timing controls have individual rows; restart with the shown flag to
-change them. In `--forever` mode, unused timing controls are marked inactive.
+and a countdown to the next check. On close shows the selected display and locking
+behavior. Sleep hold shows the running sleep policy; Checks & retries groups its
+timing settings. Use `nosleep --help` for one-run options or `nosleep config` to
+save defaults. In `--forever` mode, unused timing controls are marked inactive.
 Agents shows activity observed at the last check, then switches to quiet
 with a last-seen time when activity stops. Internet shows the latest connection
 result; Next shows remaining grace or the pending retry when needed. Failures to
@@ -93,7 +95,8 @@ hold sleep off, lock, dim, or restore brightness appear as a Notice when relevan
 output and basic terminals get plain snapshots at each check, without cursor codes.
 Interactive terminals use green for healthy states, amber for sampling, quiet
 periods, grace and retries, and red for lost connectivity or sleep-protection
-warnings. Bold labels and muted helper text keep the current state prominent.
+warnings. Bold labels, cyan section headings, and a muted footer keep the current
+state prominent.
 Use `NO_COLOR=1 nosleep` for an unstyled snapshot with live updates.
 
 While the laptop is open, `nosleep` keeps the display on and inhibits idle locking,
@@ -102,8 +105,8 @@ Closing the laptop normally requests a screen lock and turns the display off;
 opening it restores the display hold. Unlocking is manual.
 `nosleep --dim` instead dims the built-in display on close. The independent
 locking setting controls whether it also requests a lock; `--no-lock` skips it. Docked clamshell mode keeps the external
-display on and skips the lock/dim action when you close the laptop. The Configuration
-rows show the selected display and locking behavior alongside the sleep policy.
+display on and skips the lock/dim action when you close the laptop. The On close
+section shows the selected display and locking behavior.
 
 `nosleep` keeps the Mac awake until Ctrl-C while the laptop is open. Failed activity
 or internet checks only produce warnings in that state. Automatic sleep is allowed

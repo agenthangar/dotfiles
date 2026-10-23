@@ -36,7 +36,7 @@ autoload -Uz compinit && compinit
 # free:
 #   line 1                     "<name> — <tagline>"     → name bold
 #   Usage: …                   the "Usage:" label bold
-#   Word:                      a capitalized word + colon on its own line → header
+#   Section name:              a capitalized heading ending in a colon → header
 #   <2sp><term>  <2+sp><desc>  two-column row → term cyan, desc dim, auto-aligned
 #   anything else              printed verbatim (paragraphs, blank spacer lines)
 # Color is emitted only when stdout is a TTY (so `cmd -h | cat` stays plain).
@@ -54,14 +54,14 @@ _help_for() {
 # no-arg/error paths (which list the actual ${(k)DEV_REPOS}, not a static comment)
 # render identically to `-h`. Reads plain text on stdin and styles it by the same
 # conventions documented above _help_for: line 1 "<name> — <tagline>" bolds the
-# name; a "Usage:" line bolds the label; a bare "Word:" line is a section header;
+# name; a "Usage:" line bolds the label; a bare "Section name:" is a header;
 # 2-space-indented "term  <2+sp>desc" rows become cyan/dim two-column rows, their
 # descriptions auto-aligned to the widest term. Color only when stdout is a TTY —
 # and because this is the LAST stage of every help pipe, `-t 1` here is the real
 # terminal test (so `cmd -h | cat` still comes out plain).
 _help_style() {
   local b='' d='' c='' r=''
-  [[ -t 1 ]] && { b=$'\e[1m' d=$'\e[2m' c=$'\e[36m' r=$'\e[0m'; }
+  [[ -t 1 && -z ${NO_COLOR:-} && ${TERM:-} != dumb ]] && { b=$'\e[1m' d=$'\e[2m' c=$'\e[36m' r=$'\e[0m'; }
   awk -v b="$b" -v d="$d" -v c="$c" -v r="$r" '
     # Pass 1: buffer every line, detecting two-column rows and the widest term so
     # descriptions can align to a common column regardless of input spacing. A line
@@ -102,7 +102,7 @@ _help_style() {
           printf "%*s%s%s%s\n", maxw + 4, "", d, cont[n], r
         } else if (line ~ /^Usage:/) {
           printf "%s%s%s%s\n", b, "Usage:", r, substr(line, 7)
-        } else if (line ~ /^[A-Z][A-Za-z]*:$/) {
+        } else if (line ~ /^[A-Z][A-Za-z &-]*:$/) {
           printf "%s%s%s\n", b, line, r
         } else {
           print line
@@ -204,23 +204,22 @@ _nosleep_config() { python3 "$_DOTS_SOURCE_ROOT/lib/nosleep_config.py" "$@"; }
 # Usage: nosleep [options]
 #        nosleep config [--show | --edit]
 #
-# The display stays on while open. On close: lock + display off by default.
-# While closed, idle/offline grace and failed retries release the sleep hold.
-#
 # On close:
-#   --display-off / --dim (-d)    turn off / dim the display (default: off)
-#   --lock / --no-lock            lock / skip locking (default: lock)
+#   -d, --dim         dim the display instead of turning it off
+#   --no-lock         skip the screen lock
+#   Default: display off, screen locked. These options are independent.
 #
-# Activity checks:
-#   --forever (-f) / --no-forever  skip / enable checks (default: enabled)
-#                                --forever keeps awake until Ctrl-C
-#   --grace <secs>                idle/offline grace (default: 900s)
-#   --every <secs>                check interval (default: 30s)
-#   --retries <n>                 retries after grace (0–10; default: 3)
-#   --backoff <secs>              retry delay, doubles to 300s (default: 30s)
+# Sleep hold:
+#   -f, --forever     stay awake until Ctrl-C; skip activity/network checks
+#   Default: allow sleep after idle/offline retries only when closed.
+#
+# Checks & retries:
+#   --every <secs>    check interval                 (default: 30s)
+#   --grace <secs>    idle/offline grace             (default: 900s)
+#   --retries <n>     retries after grace, 0–10      (default: 3)
+#   --backoff <secs>  retry delay, doubles to 300s   (default: 30s)
 #
 # Defaults: nosleep config. Flags override saved settings for this run.
-# Dimming and locking are independent. --no-lock never unlocks the Mac.
 # Example: nosleep --dim --no-lock --forever
 nosleep() {
   [[ "$1" == config ]] && { shift; _nosleep_config "$@"; return $?; }
@@ -484,20 +483,19 @@ _nosleep_status_clear() {
 }
 _nosleep_status() {
   local agent_text network_text next_text notice_text
-  local sleep_text='Blocked' sleep_help='--forever: until Ctrl-C'
-  local display_help='--dim: dim on close' lock_help='--no-lock: skip lock'
+  local sleep_text='Blocked while open; checked when closed'
   local grace_text every_text backoff_text retries_text=$retries item
-  local display_text='Off on close' lock_text='Lock when closed'
-  local remaining signal_age line width=$(( ${COLUMNS:-80} - 1 )) row=0 styled=0 value primary detail config_first config_last
+  local display_text='Off' lock_text='Lock screen'
+  local remaining signal_age line width=$(( ${COLUMNS:-80} - 1 )) row=0 styled=0 value primary detail
   local heading_style=1 agent_style=33 network_style=36 next_style=36
   local sleep_style=0 notice_style=33
-  local -a rows styles config_labels config_values config_helpers config_styles
+  local -a rows styles config_labels config_values config_styles
   (( _NOSLEEP_TTY )) && [[ -z ${NO_COLOR:-} ]] && styled=1
   if (( dim )); then
-    display_text='Dim on close' display_help='--display-off: off on close'
+    display_text='Dim'
   fi
   if (( ! lock )); then
-    lock_text='No lock requested' lock_help='--lock: lock when closed'
+    lock_text='No lock requested'
   fi
   if (( dim && lid_shut && lid_was && _NOSLEEP_DIM_FAILED )); then
     notice_text='Could not dim · display remains held on'
@@ -506,7 +504,7 @@ _nosleep_status() {
     agent_style=2 network_style=2 next_style=2
     agent_text='Not checked (--forever)' network_text='Not checked (--forever)'
     next_text='No checks (--forever)'
-    sleep_text='Blocked until Ctrl-C' sleep_help='--no-forever: check activity'
+    sleep_text='Blocked until Ctrl-C'
   else
     if (( ! probes )); then
       agent_text='Checking activity…'
@@ -585,26 +583,22 @@ _nosleep_status() {
     retries_text+=' (inactive)'
     _nosleep_duration "$backoff"; backoff_text="$REPLY (inactive)"
   fi
-  config_labels=(Sleep Display Locking '' Grace Checks Retries Backoff)
-  config_values=("$sleep_text" "$display_text" "$lock_text" ''
-                 "$grace_text" "$every_text" "$retries_text" "$backoff_text")
-  config_helpers=("$sleep_help" "$display_help" "$lock_help" ''
-                  '--grace <seconds>' '--every <seconds>' '--retries <count>' '--backoff <seconds>')
-  config_styles=("$sleep_style" 0 0 0 0 0 0 0)
-  rows+=('' 'Configuration')
-  styles+=(0 1)
-  config_first=$(( ${#rows} + 1 ))
+  config_labels=('On close' Display Locking '' 'Sleep hold' Sleep '' 'Checks & retries' Checks Grace Retries Backoff)
+  config_values=('' "$display_text" "$lock_text" '' '' "$sleep_text" '' ''
+                 "$every_text" "$grace_text" "$retries_text" "$backoff_text")
+  config_styles=('1;36' 0 0 0 '1;36' "$sleep_style" 0 '1;36' 0 0 0 0)
+  rows+=('')
+  styles+=(0)
   for (( item = 1; item <= ${#config_labels}; ++item )); do
-    if [[ -n ${config_labels[item]} ]]; then
-      printf -v line '  %-8s  %-24s  (%s)' "${config_labels[item]}:" "${config_values[item]}" "${config_helpers[item]}"
+    if [[ -n ${config_values[item]} ]]; then
+      printf -v line '  %-8s  %s' "${config_labels[item]}" "${config_values[item]}"
     else
-      line=''
+      line=${config_labels[item]}
     fi
     rows+=("$line")
     styles+=("${config_styles[item]}")
   done
-  config_last=${#rows}
-  rows+=('' '  Defaults  nosleep config' '  Stop      Ctrl-C · release sleep hold')
+  rows+=('' '  Options   nosleep --help · nosleep config' '  Stop      Ctrl-C · release sleep hold')
   styles+=(0 2 2)
   _nosleep_status_clear
   for line in "${rows[@]}"; do
@@ -621,15 +615,9 @@ _nosleep_status() {
       printf '\e[%sm%s\e[0m\n' "${styles[row]}" "$line"
     else
       value=${line[13,-1]}
-      if (( row >= config_first && row <= config_last )); then
-        primary=${value[1,24]}
-        detail=${value[25,-1]}
-        printf '\e[1m%s\e[0m\e[%sm%s\e[0m\e[2m%s\e[0m\n' "${line[1,12]}" "${styles[row]}" "$primary" "$detail"
-      else
-        primary=${value%% · *}
-        detail=${value#"$primary"}
-        printf '\e[1m%s\e[0m\e[%sm%s\e[0m%s\n' "${line[1,12]}" "${styles[row]}" "$primary" "$detail"
-      fi
+      primary=${value%% · *}
+      detail=${value#"$primary"}
+      printf '\e[1m%s\e[0m\e[%sm%s\e[0m%s\n' "${line[1,12]}" "${styles[row]}" "$primary" "$detail"
     fi
   done
   (( _NOSLEEP_TTY )) && _NOSLEEP_STATUS_ROWS=${#rows}

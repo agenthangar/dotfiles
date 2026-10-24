@@ -1,0 +1,53 @@
+#!/usr/bin/env bash
+# Bootstrap the writable checkout used by install.sh and dots.
+set -euo pipefail
+
+usage() {
+    cat <<'EOF'
+Usage: dotfiles-setup [DIRECTORY]
+
+Clone dotfiles into DIRECTORY (default: ~/code/dotfiles), then run its installer.
+An existing clean canonical clone on main is reused. The installer backs up
+existing shell files, links configuration into HOME, and installs dependencies.
+
+Update configuration afterward with dots. Homebrew upgrades only this setup tool.
+EOF
+}
+
+case "${1:-}" in
+    -h|--help) usage; exit 0 ;;
+    -*) usage >&2; exit 2 ;;
+esac
+if [[ $# -gt 1 ]]; then
+    usage >&2
+    exit 2
+fi
+
+destination="${1:-$HOME/code/dotfiles}"
+upstream=https://github.com/agenthangar/dotfiles.git
+
+fail() {
+    printf 'dotfiles-setup: %s\n' "$*" >&2
+    exit 1
+}
+
+if [[ -e "$destination" || -L "$destination" ]]; then
+    [[ -d "$destination/.git" ]] || fail "destination must be a canonical Git clone: $destination"
+    origin=$(git -C "$destination" config --get remote.origin.url || true)
+    case "$origin" in
+        https://github.com/agenthangar/dotfiles|https://github.com/agenthangar/dotfiles.git|git@github.com:agenthangar/dotfiles.git|ssh://git@github.com/agenthangar/dotfiles.git) ;;
+        *) fail "destination origin is not agenthangar/dotfiles: $destination" ;;
+    esac
+    [[ "$(git -C "$destination" symbolic-ref --short -q HEAD || true)" == main ]] \
+        || fail "destination must be on main: $destination"
+    [[ -z "$(git -C "$destination" status --porcelain)" ]] \
+        || fail "destination has local changes; commit or stash them first: $destination"
+else
+    mkdir -p "$(dirname "$destination")"
+    git clone --branch main -- "$upstream" "$destination"
+fi
+
+[[ -f "$destination/install.sh" && -f "$destination/.zshrc" ]] \
+    || fail "destination is missing the dotfiles installer or shell configuration"
+printf 'Setting up dotfiles from %s\n' "$destination"
+exec bash "$destination/install.sh"

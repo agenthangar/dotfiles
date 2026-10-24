@@ -152,6 +152,22 @@ These auto-join settings are per-machine and are not changed by `dots --all`.
 
 ## Install
 
+With Homebrew:
+
+```sh
+brew install agenthangar/tap/dotfiles
+dotfiles-setup
+```
+
+Homebrew installs the setup command. Run it explicitly to create
+`~/code/dotfiles` and apply the configuration; use `dotfiles-setup /path/to/dotfiles`
+for another location. Setup can reuse a clean canonical clone on `main` with
+the `agenthangar/dotfiles` origin. It refuses worktrees, unrelated repositories,
+and local changes. The formula lives in the shared
+[AgentHangar tap](https://github.com/agenthangar/homebrew-tap).
+
+Alternatively, clone and install directly:
+
 ```sh
 git clone https://github.com/agenthangar/dotfiles.git ~/code/dotfiles
 ~/code/dotfiles/install.sh
@@ -167,6 +183,11 @@ Homebrew tools come from [Brewfile](Brewfile); the brew step skips on other plat
 Existing shell files are backed up before linking. SSH config is preserved: an
 Include for this repository's snippet is appended rather than replacing the file.
 Machine configuration is a private regular file at `~/.zshrc.local`.
+
+After setup, use `dots` to update the configuration. `brew upgrade
+agenthangar/tap/dotfiles` updates only the setup command. `brew uninstall dotfiles`
+removes that command; it leaves the writable checkout and your configured shell
+in place.
 
 `DOTFILES_NO_T=1` skips standalone t setup for shell-only or sandbox installations.
 `DOTFILES_T_HOME` selects an existing supported t installation. A normal

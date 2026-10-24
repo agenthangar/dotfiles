@@ -38,7 +38,7 @@ jobs:
       - name: Run shellcheck
         run: |
           files=(install.sh)
-          for f in bin/* .githooks/* lib/*.sh; do
+          for f in bin/* .githooks/* lib/*.sh scripts/dotfiles-setup; do
             head -1 "$f" | grep -qE '^#!.*\b(bash|sh)$' && files+=("$f")
           done
           printf 'linting: %s\n' "${files[*]}"

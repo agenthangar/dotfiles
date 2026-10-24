@@ -52,6 +52,12 @@ def _seed_worktree(path):
         f = path / "bin" / b
         f.write_text("#!/bin/sh\n")
         f.chmod(0o755)
+    (path / "bin/dots").write_bytes((REPO_ROOT / "bin/dots").read_bytes())
+    (path / "bin/dots").chmod(0o755)
+    (path / "scripts").mkdir(exist_ok=True)
+    (path / "scripts/dotfiles-setup").write_bytes(
+        (REPO_ROOT / "scripts/dotfiles-setup").read_bytes()
+    )
     for c in ("tpush.md", "tpop.md"):
         (path / "claude" / "commands" / c).write_text("x\n")
     (path / "codex" / "prompts").mkdir(parents=True, exist_ok=True)

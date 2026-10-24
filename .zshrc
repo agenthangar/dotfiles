@@ -1020,7 +1020,9 @@ _dots_legacy_present() {
 
 # dots — update your LIVE dotfiles to origin/main and reload zsh
 #
-# Usage: dots [--all | --dev | --relink]
+# Usage: dots install [DIRECTORY]
+#        dots update [--all | --dev | --relink]
+#        dots [--all | --dev | --relink] (compatible update alias)
 #
 # There is ONE canonical checkout (normally ~/code/dotfiles), parked on `main`, and it
 # IS the live surface — the $HOME symlinks point straight at it. Default `dots`
@@ -1053,7 +1055,17 @@ _DOTS_SOURCE_ROOT=${${(%):-%N}:A:h}
 [[ -r $_DOTS_SOURCE_ROOT/lib/t-integration.sh ]] && source "$_DOTS_SOURCE_ROOT/lib/t-integration.sh"
 
 dots() {
-  [[ "$1" == -h || "$1" == --help ]] && { _help_for dots; return 0; }
+  case "$1" in
+    install|help|-h|--help)
+      "$_DOTS_SOURCE_ROOT/bin/dots" "$@"
+      return $? ;;
+    update) shift ;;
+  esac
+  case "$1" in
+    -h|--help) "$_DOTS_SOURCE_ROOT/bin/dots" update --help; return $? ;;
+    ""|--all|-a|--dev|-d|--relink) ;;
+    *) print -u2 -r -- "dots: unknown command or option: $1 (see dots --help)"; return 2 ;;
+  esac
   # --all: the local run first (it re-sources ~/.zshrc, so what fans out is the
   # just-updated dots-sync), then `dots` on every host. dots-sync never runs `dots
   # --all` remotely, so the fan-out cannot echo back.

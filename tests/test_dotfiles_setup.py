@@ -9,7 +9,7 @@ import pytest
 from test_install_migration import _seed_worktree
 
 ROOT = Path(__file__).resolve().parent.parent
-SETUP = ROOT / "scripts/dotfiles-setup"
+SETUP = ROOT / "bin/dots"
 UPSTREAM = "https://github.com/agenthangar/dotfiles.git"
 
 
@@ -50,7 +50,7 @@ def sandbox(tmp_path):
 
 
 def run_setup(env, *args):
-    return subprocess.run([str(SETUP), *map(str, args)], env=env, capture_output=True, text=True)
+    return subprocess.run([str(SETUP), "install", *map(str, args)], env=env, capture_output=True, text=True)
 
 
 def test_fresh_install_and_repeat_preserve_local_config(sandbox):
@@ -97,7 +97,7 @@ def test_refuse_incompatible_destination(sandbox, problem):
             (destination / ".zshrc").write_text("keep local edits")
     result = run_setup(env, destination)
     assert result.returncode == 1
-    assert "dotfiles-setup:" in result.stderr
+    assert "dots install:" in result.stderr
     assert not (home / ".zshrc").exists()
     if problem == "dirty":
         assert (destination / ".zshrc").read_text() == "keep local edits"
@@ -118,3 +118,84 @@ def test_installer_failure_is_propagated(sandbox):
     git("-C", source, "-c", "core.hooksPath=/dev/null", "commit", "-m", "failing installer")
     assert run_setup(env).returncode == 42
     assert not (home / ".zshrc").exists()
+
+
+def test_legacy_alias_and_symlinked_command(sandbox):
+    home, _, env, _ = sandbox
+    legacy = subprocess.run(
+        [str(ROOT / "scripts/dotfiles-setup"), "--help"],
+        env=env, capture_output=True, text=True,
+    )
+    assert legacy.returncode == 0
+    assert "Usage: dots install" in legacy.stdout
+    linked = home / "dots"
+    linked.symlink_to(SETUP)
+    result = subprocess.run([str(linked), "install"], env=env, capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+    assert (home / "bin/dots").resolve() == home / "code/dotfiles/bin/dots"
+
+
+def test_update_before_install_fails_without_recursing(sandbox):
+    _, _, env, _ = sandbox
+    result = subprocess.run(
+        [str(SETUP), "update"], env=env, capture_output=True, text=True, timeout=10,
+    )
+    assert result.returncode == 1
+    assert "run dots install first" in result.stderr
+
+
+def test_executable_update_forwards_arguments_and_status(sandbox):
+    home, _, env, _ = sandbox
+    (home / ".zshrc").write_text('dots() { print -r -- "args=$*"; return 17; }\n')
+    result = subprocess.run(
+        [str(SETUP), "update", "--relink"], env=env, capture_output=True, text=True,
+    )
+    assert result.returncode == 17
+    assert "args=--relink" in result.stdout
+
+
+def shell_dots(env, *args):
+    return subprocess.run(
+        ["zsh", "-f", "-c", 'source "$1"; shift; dots "$@"',
+         "test", str(ROOT / ".zshrc"), *args],
+        env=env, capture_output=True, text=True, timeout=30,
+    )
+
+
+def test_existing_zsh_function_dispatches_install(sandbox):
+    home, _, env, _ = sandbox
+    result = shell_dots(env, "install")
+    assert result.returncode == 0, result.stderr
+    assert (home / ".zshrc").resolve() == home / "code/dotfiles/.zshrc"
+
+
+@pytest.mark.parametrize("args", [("update", "--relink"), ("--relink",)])
+def test_shell_update_and_legacy_flags_reconcile_links(sandbox, args):
+    home, _, env, _ = sandbox
+    assert run_setup(env).returncode == 0
+    (home / "bin/csync").unlink()
+    result = shell_dots(env, *args)
+    assert result.returncode == 0, result.stderr
+    assert (home / "bin/csync").is_symlink()
+
+
+@pytest.mark.parametrize("args", [("--help",), ("install", "--help"), ("update", "--help")])
+def test_help_works_before_and_after_shell_integration(sandbox, args):
+    _, _, env, _ = sandbox
+    for result in (
+        subprocess.run([str(SETUP), *args], env=env, capture_output=True, text=True),
+        shell_dots(env, *args),
+    ):
+        assert result.returncode == 0, result.stderr
+        assert "Usage: dots" in result.stdout
+
+
+def test_unknown_command_is_not_treated_as_update(sandbox):
+    home, _, env, _ = sandbox
+    for result in (
+        subprocess.run([str(SETUP), "typo"], env=env, capture_output=True, text=True),
+        shell_dots(env, "typo"),
+    ):
+        assert result.returncode == 2
+        assert "unknown command" in result.stderr
+    assert not (home / "code").exists()

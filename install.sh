@@ -281,6 +281,7 @@ link_all() {
     link "$LINK_SRC/bin/pii-scan"         "$HOME/bin/pii-scan"
     link "$LINK_SRC/bin/clip-bridge"      "$HOME/bin/clip-bridge"
     link "$LINK_SRC/bin/dots-sync"        "$HOME/bin/dots-sync"
+    link "$LINK_SRC/bin/dots"             "$HOME/bin/dots"
     # `t todo` is retired: its /todo command file no longer exists, so the managed
     # link that pointed at it is removed rather than left dangling (a dangling link
     # here shows up in Claude's command list as a broken /todo).

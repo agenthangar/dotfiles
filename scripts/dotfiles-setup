@@ -1,16 +1,16 @@
 #!/usr/bin/env bash
-# Bootstrap the writable checkout used by install.sh and dots.
+# Shared install implementation; dotfiles-setup remains a compatibility alias.
 set -euo pipefail
 
 usage() {
     cat <<'EOF'
-Usage: dotfiles-setup [DIRECTORY]
+Usage: dots install [DIRECTORY]
 
 Clone dotfiles into DIRECTORY (default: ~/code/dotfiles), then run its installer.
 An existing clean canonical clone on main is reused. The installer backs up
 existing shell files, links configuration into HOME, and installs dependencies.
 
-Update configuration afterward with dots. Homebrew upgrades only this setup tool.
+Update configuration afterward with dots update. Homebrew upgrades the command.
 EOF
 }
 
@@ -27,7 +27,7 @@ destination="${1:-$HOME/code/dotfiles}"
 upstream=https://github.com/agenthangar/dotfiles.git
 
 fail() {
-    printf 'dotfiles-setup: %s\n' "$*" >&2
+    printf 'dots install: %s\n' "$*" >&2
     exit 1
 }
 
@@ -50,4 +50,5 @@ fi
 [[ -f "$destination/install.sh" && -f "$destination/.zshrc" ]] \
     || fail "destination is missing the dotfiles installer or shell configuration"
 printf 'Setting up dotfiles from %s\n' "$destination"
-exec bash "$destination/install.sh"
+bash "$destination/install.sh"
+printf '\nOpen a new shell or run: source ~/.zshrc\nUpdate later with: dots update\n'

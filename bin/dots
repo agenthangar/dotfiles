@@ -7,7 +7,7 @@ usage() {
 Usage: dots <command>
 
 Commands:
-  install [DIRECTORY]        Set up dotfiles (default: ~/code/dotfiles)
+  install                   Apply the installed Homebrew package
   update [--all|--dev|--relink]
                              Update the installed configuration
 
@@ -22,8 +22,8 @@ Run dots install --help for installation details.
 EOF
 }
 
-# Resolve the same installer for Homebrew, checkout, and symlinked commands.
-setup_script() {
+# Resolve the payload for Homebrew, checkout, and symlinked commands.
+payload_root() {
     local script=${BASH_SOURCE[0]} directory root
     while [[ -L "$script" ]]; do
         directory=$(cd -P "$(dirname "$script")" && pwd)
@@ -31,8 +31,16 @@ setup_script() {
         [[ "$script" == /* ]] || script="$directory/$script"
     done
     root=$(cd -P "$(dirname "$script")/.." && pwd)
-    printf '%s\n' "$root/scripts/dotfiles-setup"
+    printf '%s\n' "$root"
 }
+
+root=$(payload_root)
+if [[ -f "$root/.dotfiles-package" ]]; then
+    # shellcheck source=lib/package.sh
+    source "$root/lib/package.sh"
+    dots_package_main "$root" "$@"
+    exit $?
+fi
 
 first_run=0
 [[ $# -eq 0 ]] && first_run=1
@@ -40,7 +48,7 @@ case "${1:-}" in
     help|-h|--help) usage; exit 0 ;;
     install)
         shift
-        exec bash "$(setup_script)" "$@"
+        exec bash "$root/scripts/dotfiles-setup" "$@"
         ;;
     update) shift ;;
     ""|--all|-a|--dev|-d|--relink) ;;
@@ -70,4 +78,4 @@ exec zsh -f -c '
         exit 1
     fi
     dots "$@"
-' dots "$(setup_script)" "$first_run" "$@"
+' dots "$root/scripts/dotfiles-setup" "$first_run" "$@"

@@ -11,56 +11,50 @@ canonical checkout, installer, zsh plugin, hooks, prompts, agent settings
 engine, tests, and release process. Dotfiles installs and consumes it through
 `lib/t-integration.sh`; do not add a second implementation here.
 
-## Live checkouts
+## Packaged runtime (default)
 
-| Checkout | Role |
-| --- | --- |
-| `~/code/dotfiles` on `main` | Canonical dotfiles checkout and usual live target of `~/.zshrc` and other managed links |
-| Selected t release or `~/code/t` checkout | Standalone t installation; it owns `~/bin/t`, hook/transfer links, and agent integrations |
-| `~/code/.worktrees/<repo>/<slot>` | Per-session development work; never use a canonical checkout for a task |
+Homebrew distributes the complete runtime under its `opt/dotfiles/libexec` path.
+The formula writes `.dotfiles-package` (that stable absolute path) and
+`.dotfiles-version`. They are package metadata, never tracked in this repository.
+No user-side checkout is required or created by the packaged command.
 
-`dots --dev` temporarily points dotfiles links at the dotfiles worktree in
-`$PWD`. `t update --dev` independently selects a t worktree. Plain `dots`
-returns dotfiles to canonical `main`, reconciles its links, and reloads the shell.
-After the bundled-to-standalone migration, `dots` never runs `t update` or the
-t installer during ordinary updates/relinks. Update t separately with `t update`.
+`bin/dots` recognizes that metadata before loading any existing shell functions.
+`lib/package.sh` runs full account setup on first use, delegates updates to
+`brew upgrade agenthangar/tap/dotfiles`, then execs the new command through the
+stable path after Homebrew may have removed the old Cellar directory. `--relink`
+is offline; `--all` fans out through the configured t hosts after local success.
 
-These are separate live surfaces. `_dots_live_tree` resolves the dotfiles
-target from the actual `~/.zshrc` link. The dotfiles adapter exports that
-resolved source as `T_DOTFILES_LIVE_TREE`; t's own worktree guard protects
-both its selected and canonical code trees as well as that dotfiles tree.
-The dotfiles pre-commit hook refuses a commit on canonical `main`.
+`install.sh` skips Git resolution, migration, and repository configuration for
+packages. It writes a real `.zshrc` loader, preserving existing regular contents
+and backing up old checkout symlinks. The loader and managed utility links target
+Homebrew's stable path. A real loader prevents t or another integration from
+appending to files inside the Cellar. `~/.config/dotfiles/package` records the
+runtime location; `installed` records completion of full account setup. Relinking
+alone must not mark full setup complete. `.zshrc` reloads when the package version
+changes and reads command help from the runtime, not the small loader.
 
-## What `dots` must preserve
+Private configuration remains in `~/.zshrc.local` and other account-owned files.
+Migrating to the package must not reset or delete an existing source checkout.
+Package dependencies belong in the Homebrew formula; packaged setup does not
+run `brew bundle`. Standalone t keeps its separate installation and updater.
 
-`dots` resolves both the current live tree and canonical checkout, fetches
-`origin/main`, fast-forwards only when safe, reconciles links, reapplies
-`~/.tmux.conf` to an existing tmux server, and reloads `~/.zshrc`. A dirty,
-diverged, or non-main canonical tree is reported rather than reset. On
-`--all`, the local run finishes before `bin/dots-sync` fans out to configured
-hosts; inspect each host result because one unavailable host does not imply
-success.
+Every runtime release needs a corresponding version/URL/SHA-256 bump in
+`agenthangar/homebrew-tap` before rollout. Its formula tests must install the real
+payload in a sandbox HOME with no checkout. Merge and monitor both repositories,
+then use `dots --all` and inspect each configured host's result.
 
-`dots --dev` accepts only a real dotfiles session worktree containing a
-runnable installer. It refuses the canonical checkout and other repositories.
-`DOTFILES_LINK_DEV=1` selects that worktree; an ordinary install or update
-selects the canonical checkout. `DOTFILES_LINKS_ONLY=1` normally stays offline
-and relinks from the selected source without running full setup. Its sole
-network exception recognizes the old dotfiles-owned `~/bin/t` symlink after
-pre-split `dots` fast-forwards past bundled t, then installs a verified release.
-Keep new dotfiles
-links inside `link_all()` so both full installs and link reconciliation see
-them. `DOTFILES_NO_TMUX=1` prevents sandbox install tests from touching a
-real tmux server through an inherited socket.
+## Optional source development
 
-An older two-tree layout used a separate `main` worktree at
-`~/.local/share/dotfiles-main` (or `$DOTFILES_MAIN_WT`). The migration in
-`install.sh` must keep the old linked tree readable until the new links are
-ready: salvage edits and untracked files, detach holders of `main`, move
-`main` to the canonical checkout, fast-forward, relink, then clean up the
-legacy worktree last. Its capability probe prevents an old released
-`install.sh` from attempting that migration during a `--dev` preview.
-Do not replace this sequence with a destructive worktree removal or reset.
+Continue development in per-session worktrees, never canonical main. Source
+installs without package metadata retain the legacy checkout workflow:
+`./install.sh` selects canonical main, `DOTFILES_LINK_DEV=1` selects the worktree,
+and `DOTFILES_LINKS_ONLY=1` reconciles links offline. Source-installed `dots`
+fast-forwards canonical main only when clean and safe. Preserve its legacy layout
+migration, salvage, and bundled-t cutover protections.
+
+From a packaged installation, preview a source worktree with
+`DOTFILES_LINK_DEV=1 DOTFILES_NO_BREW=1 ./install.sh`. Return via the explicit
+Homebrew `dots install` command. `t` remains an independent installation.
 
 ## Standalone t bridge
 

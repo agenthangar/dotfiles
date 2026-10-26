@@ -49,7 +49,7 @@ _help_for() {
     $0 ~ "^" fn "\\(\\)"  { printf "%s", blk; found = 1; exit }
                           { blk = "" }
     END                   { exit !found }
-  ' ~/.zshrc | sed 's/^# \{0,1\}//' | _help_style
+  ' "${_DOTS_PACKAGE_ROOT:-$_DOTS_SOURCE_ROOT}/.zshrc" | sed 's/^# \{0,1\}//' | _help_style
 }
 
 # _help_style — the gh-style RENDERER, split out from _help_for so the dynamic
@@ -965,6 +965,10 @@ _dots_tmux_apply() {
 # rather than "dotfiles" by name. Used by dots, by _dev_repo_prepare (never switch the
 # live tree's branch) and by the worktree sweep (never reap the live tree).
 _dots_live_tree() {
+  if [[ -n ${_DOTS_PACKAGE_ROOT:-} ]]; then
+    print -r -- "$_DOTS_PACKAGE_ROOT"
+    return
+  fi
   local z=$HOME/.zshrc d
   [[ -L $z ]] || return 1
   d=${z:A:h}
@@ -1052,9 +1056,23 @@ _dots_legacy_present() {
 # flips live back to the canonical checkout. Skips brew bundle.
 # Load the standalone t bridge from this shell's own dotfiles source.
 _DOTS_SOURCE_ROOT=${${(%):-%N}:A:h}
+_DOTS_PACKAGE_ROOT=
+_DOTS_PACKAGE_VERSION=
+if [[ -r $_DOTS_SOURCE_ROOT/.dotfiles-package ]]; then
+  _DOTS_PACKAGE_ROOT=$(<"$_DOTS_SOURCE_ROOT/.dotfiles-package")
+  _DOTS_PACKAGE_VERSION=$(<"$_DOTS_PACKAGE_ROOT/.dotfiles-version")
+fi
 [[ -r $_DOTS_SOURCE_ROOT/lib/t-integration.sh ]] && source "$_DOTS_SOURCE_ROOT/lib/t-integration.sh"
 
 dots() {
+  if [[ -n ${_DOTS_PACKAGE_ROOT:-} ]]; then
+    "$_DOTS_PACKAGE_ROOT/bin/dots" "$@"
+    local result=$?
+    if (( result == 0 )); then
+      case "$*" in *help*|*-h*) ;; *) source ~/.zshrc ;; esac
+    fi
+    return $result
+  fi
   case "$1" in
     install|help|-h|--help)
       "$_DOTS_SOURCE_ROOT/bin/dots" "$@"
@@ -1266,6 +1284,13 @@ _DOTS_REF_FILE=${${:-$HOME/.zshrc}:A:h}/.git/refs/heads/main
 _DOTS_LOADED_REF=
 [[ -n $_DOTS_REF_FILE && -r $_DOTS_REF_FILE ]] && _DOTS_LOADED_REF=$(<$_DOTS_REF_FILE)
 _dots_reload_if_moved() {
+  if [[ -n ${_DOTS_PACKAGE_ROOT:-} ]]; then
+    [[ -z ${DOTS_NO_AUTORELOAD:-} && -r $_DOTS_PACKAGE_ROOT/.dotfiles-version ]] || return 0
+    if [[ $(<"$_DOTS_PACKAGE_ROOT/.dotfiles-version") != $_DOTS_PACKAGE_VERSION ]]; then
+      source ~/.zshrc
+    fi
+    return 0
+  fi
   [[ -z ${DOTS_NO_AUTORELOAD:-} && -n $_DOTS_REF_FILE && -r $_DOTS_REF_FILE ]] || return 0
   local now=$(<$_DOTS_REF_FILE)
   [[ $now == $_DOTS_LOADED_REF ]] && return 0
@@ -1377,7 +1402,7 @@ help() {
         c=0; next
       }
       { c=0 }
-    ' ~/.zshrc)"}; do
+    ' "${_DOTS_PACKAGE_ROOT:-$_DOTS_SOURCE_ROOT}/.zshrc")"}; do
     sig=${line%% — *}; name=${sig%% *}; info[$name]=$line
   done
   for f in ~/bin/*(N); do

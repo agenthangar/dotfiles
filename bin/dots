@@ -16,24 +16,31 @@ Update options:
   --dev, -d                  Use the dotfiles worktree in this directory
   --relink                   Refresh installed links without fetching
 
-Bare dots and dots --all/--dev/--relink remain aliases for update.
+Run dots with no arguments to set up a new account or update an existing one.
+dots --all/--dev/--relink remain aliases for update.
 Run dots install --help for installation details.
 EOF
 }
 
+# Resolve the same installer for Homebrew, checkout, and symlinked commands.
+setup_script() {
+    local script=${BASH_SOURCE[0]} directory root
+    while [[ -L "$script" ]]; do
+        directory=$(cd -P "$(dirname "$script")" && pwd)
+        script=$(readlink "$script")
+        [[ "$script" == /* ]] || script="$directory/$script"
+    done
+    root=$(cd -P "$(dirname "$script")/.." && pwd)
+    printf '%s\n' "$root/scripts/dotfiles-setup"
+}
+
+first_run=0
+[[ $# -eq 0 ]] && first_run=1
 case "${1:-}" in
     help|-h|--help) usage; exit 0 ;;
     install)
         shift
-        # Follow both Homebrew and ~/bin links to this command's own payload.
-        script=${BASH_SOURCE[0]}
-        while [[ -L "$script" ]]; do
-            directory=$(cd -P "$(dirname "$script")" && pwd)
-            script=$(readlink "$script")
-            [[ "$script" == /* ]] || script="$directory/$script"
-        done
-        root=$(cd -P "$(dirname "$script")/.." && pwd)
-        exec bash "$root/scripts/dotfiles-setup" "$@"
+        exec bash "$(setup_script)" "$@"
         ;;
     update) shift ;;
     ""|--all|-a|--dev|-d|--relink) ;;
@@ -51,10 +58,16 @@ esac
 # into this executable. Interactive zsh calls the function directly and reloads
 # itself; other callers update through this child shell.
 exec zsh -f -c '
+    setup=$1
+    first_run=$2
+    shift 2
     [[ -r "$HOME/.zshrc" ]] && source "$HOME/.zshrc"
     if (( ! $+functions[dots] )); then
+        if [[ "$first_run" == 1 ]]; then
+            exec bash "$setup"
+        fi
         print -u2 -- "dots: shell integration not found; run dots install first"
         exit 1
     fi
     dots "$@"
-' dots "$@"
+' dots "$(setup_script)" "$first_run" "$@"

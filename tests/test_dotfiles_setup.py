@@ -199,3 +199,40 @@ def test_unknown_command_is_not_treated_as_update(sandbox):
         assert result.returncode == 2
         assert "unknown command" in result.stderr
     assert not (home / "code").exists()
+
+
+def test_bare_dots_sets_up_fresh_account(sandbox):
+    home, _, env, _ = sandbox
+    result = subprocess.run([str(SETUP)], env=env, capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+    assert (home / ".zshrc").resolve() == home / "code/dotfiles/.zshrc"
+
+
+def test_bare_symlinked_dots_uses_shared_installer(sandbox):
+    home, _, env, _ = sandbox
+    linked = home / "brew-dots"
+    linked.symlink_to(SETUP)
+    result = subprocess.run([str(linked)], env=env, capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+    assert (home / "bin/dots").is_symlink()
+
+
+def test_bare_dots_updates_installed_account(sandbox):
+    home, _, env, _ = sandbox
+    (home / ".zshrc").write_text('dots() { print -r -- "updated:$#"; return 17; }\n')
+    result = subprocess.run([str(SETUP)], env=env, capture_output=True, text=True)
+    assert result.returncode == 17
+    assert "updated:0" in result.stdout
+    assert not (home / "code").exists()
+
+
+def test_bare_dots_preserves_installer_safety_checks(sandbox):
+    home, _, env, _ = sandbox
+    destination = home / "code/dotfiles"
+    destination.mkdir(parents=True)
+    (destination / "keep").write_text("local data")
+    result = subprocess.run([str(SETUP)], env=env, capture_output=True, text=True)
+    assert result.returncode == 1
+    assert "canonical Git clone" in result.stderr
+    assert (destination / "keep").read_text() == "local data"
+    assert not (home / ".zshrc").exists()

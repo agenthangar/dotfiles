@@ -12,6 +12,7 @@ agent settings, and desktop handoff. This repository consumes that project.
 
 | Command | Purpose |
 | --- | --- |
+| `dots` | Set up a new account, or update an existing installation |
 | `dots install` | Install dotfiles into this account |
 | `dots update` / `dots` | Update dotfiles, reconcile its links, reload |
 | `t update` | Update the independently installed session toolkit |
@@ -168,11 +169,12 @@ With Homebrew:
 
 ```sh
 brew install agenthangar/tap/dotfiles
-"$(brew --prefix agenthangar/tap/dotfiles)/bin/dots" install
+"$(brew --prefix agenthangar/tap/dotfiles)/bin/dots"
 ```
 
-Homebrew installs the `dots` command. `dots install` creates
-`~/code/dotfiles` and applies the configuration; use `dots install /path/to/dotfiles`
+Homebrew installs the `dots` command; it does not apply shell configuration itself.
+Run `dots` to create `~/code/dotfiles` and apply the configuration on a new account,
+or update the existing installation. Use `dots install /path/to/dotfiles`
 for another location. The full path above selects the Homebrew command even if
 an older `dots` shell function or checkout command is already loaded, matching
 the Homebrew installation pattern used by t. Setup can reuse a clean canonical
@@ -200,7 +202,8 @@ Machine configuration is a private regular file at `~/.zshrc.local`.
 
 After setup, open a new shell or run `source ~/.zshrc`. Use `dots update` to update
 the configuration; bare `dots` and the existing `dots --all`, `--dev`, and `--relink`
-forms still work. `brew upgrade agenthangar/tap/dotfiles` updates the packaged CLI.
+forms still work. `brew upgrade agenthangar/tap/dotfiles` updates the packaged CLI;
+run `dots` afterward to update the active configuration through the same update path.
 `brew uninstall dotfiles` removes the Homebrew package; the writable checkout,
 its `~/bin/dots` link, and your configured shell remain in place.
 `dotfiles-setup` remains a compatibility alias for `dots install`.

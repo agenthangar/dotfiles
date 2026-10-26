@@ -43,6 +43,7 @@ def _seed_worktree(path):
 
     (path / "lib").mkdir(exist_ok=True)
     (path / "lib" / "t-integration.sh").write_bytes((REPO_ROOT / "lib" / "t-integration.sh").read_bytes())
+    (path / "lib" / "sudo-trust.sh").write_bytes((REPO_ROOT / "lib" / "sudo-trust.sh").read_bytes())
     (path / "install.sh").write_bytes(INSTALL_SH.read_bytes())
     (path / "install.sh").chmod(0o755)
     (path / ".zshrc").write_text("# zshrc\n")

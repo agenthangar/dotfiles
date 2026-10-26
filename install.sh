@@ -389,6 +389,11 @@ if [[ -n "${DOTFILES_LINKS_ONLY:-}" ]]; then
     exit 0
 fi
 
+# Full interactive installs offer narrowly scoped, persistent sleep permissions.
+# shellcheck source=lib/sudo-trust.sh
+source "$DOTFILES_DIR/lib/sudo-trust.sh"
+install_sudo_trust
+
 # tmux reads ~/.tmux.conf only at SERVER START, so the link above is inert for an
 # already-running server until re-sourced. Apply it here (dots' default path does
 # the same via _dots_tmux_apply) so no rollout needs a manual `tmux source-file`.

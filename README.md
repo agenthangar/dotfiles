@@ -28,6 +28,17 @@ agent settings, and desktop handoff. This repository consumes that project.
 
 ## Sleep and connection recovery
 
+Full interactive macOS installs ask whether to trust dotfiles sleep controls
+with persistent passwordless sudo (default: No). Accepting allows only the exact
+`pmset` commands used to disable sleep, re-enable sleep, and restore
+`sleep-manager` defaults. Programs running as your account can also use these
+permissions. The installer validates the rule with `visudo` and installs it as
+a root-owned file at `/etc/sudoers.d/dotfiles-sleep-$(id -u)`; removing that file
+with sudo revokes the grant. Authentication may be requested during setup.
+Declining leaves the usual password prompts in place. Unattended installs,
+Linux installs, and links-only updates skip this prompt; `DOTFILES_NO_SUDO=1`
+also skips it. Re-running the installer leaves an identical rule alone.
+
 ```sh
 nosleep                       # closing the lid locks and turns the display off
 nosleep --display-off          # explicitly turn the display off on close

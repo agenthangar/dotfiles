@@ -17,7 +17,7 @@ agent settings, and desktop handoff. This repository consumes that project.
 | `dots update` / `dots` | Update dotfiles, reconcile its links, reload |
 | `t update` | Update the independently installed session toolkit |
 | `dots --all` | Update here, then run dots on every configured remote host |
-| `dots --dev` | Make the dotfiles session worktree you are standing in live |
+| `dots --relink` | Reapply installed configuration without network access |
 | `dots --relink` | Reconcile the selected dotfiles links without fetching |
 | `help` / `h` | List shell and installed commands |
 | `csync` | Optional two-way iCloud sync of agent transcripts and plans |
@@ -165,83 +165,70 @@ These auto-join settings are per-machine and are not changed by `dots --all`.
 
 ## Install
 
-With Homebrew:
-
 ```sh
-brew install agenthangar/tap/dotfiles
-"$(brew --prefix agenthangar/tap/dotfiles)/bin/dots"
+brew tap agenthangar/tap
+brew install dots
+dots
 ```
 
-Homebrew installs the `dots` command; it does not apply shell configuration itself.
-Run `dots` to create `~/code/dotfiles` and apply the configuration on a new account,
-or update the existing installation. Use `dots install /path/to/dotfiles`
-for another location. The full path above selects the Homebrew command even if
-an older `dots` shell function or checkout command is already loaded, matching
-the Homebrew installation pattern used by t. Setup can reuse a clean canonical
-clone on `main` with the `agenthangar/dotfiles` origin. It refuses worktrees, unrelated repositories,
-and local changes. The formula lives in the shared
-[AgentHangar tap](https://github.com/agenthangar/homebrew-tap).
+Homebrew installs the complete configuration, utilities, and templates. No Git
+checkout is required. The first `dots` applies that installed package to your
+account; subsequent `dots` or `dots update` commands upgrade it through Homebrew
+and reconcile your configuration. `dots --relink` applies the installed files
+without network access. `dots install` reruns full account setup, including the
+optional sudo-trust prompt. Homebrew manages the runtime dependencies.
 
-Alternatively, clone and install directly:
+After setup, open a new shell or run `source ~/.zshrc`. Your `.zshrc` is a real
+file containing a small loader; it sources the package through Homebrew's stable
+`opt` path. Managed utility links use the same stable path, so Homebrew can remove
+old package versions safely. Local settings remain in `~/.zshrc.local` and other
+private configuration files. Existing SSH configuration is preserved.
+
+To migrate an older checkout-based installation, upgrade the package and invoke
+its command explicitly once (an older shell function may otherwise take priority):
 
 ```sh
-git clone https://github.com/agenthangar/dotfiles.git ~/code/dotfiles
-~/code/dotfiles/install.sh
+brew upgrade agenthangar/tap/dotfiles
+"$(brew --prefix agenthangar/tap/dotfiles)/bin/dots" install
+source ~/.zshrc
 ```
 
-The installer keeps the canonical clone on `main`, links its managed files into
-HOME, and installs the latest verified [t release](https://github.com/agenthangar/t/releases)
-when needed. The release lives under `~/.local/share/t/releases/` by default;
-an existing supported t checkout is preserved. t owns its executable links,
-prompts, and additive agent integrations.
-Homebrew tools come from [Brewfile](Brewfile); the brew step skips on other platforms.
+The old `.zshrc` symlink is backed up before creating the loader. Existing regular
+shell files keep their contents. The old repository and its local edits are left
+in place, but are no longer needed to run or update dotfiles. The package does not
+accept a checkout destination. `dotfiles-setup` is an alias for `dots install`.
 
-Existing shell files are backed up before linking. SSH config is preserved: an
-Include for this repository's snippet is appended rather than replacing the file.
-Machine configuration is a private regular file at `~/.zshrc.local`.
+`brew upgrade dots` updates the same runtime used by `dots`; `dots --relink`
+reconciles any new managed links afterward. `brew uninstall dots` removes the
+runtime but leaves your private settings and loader in place.
 
-After setup, open a new shell or run `source ~/.zshrc`. Use `dots update` to update
-the configuration; bare `dots` and the existing `dots --all`, `--dev`, and `--relink`
-forms still work. `brew upgrade agenthangar/tap/dotfiles` updates the packaged CLI;
-run `dots` afterward to update the active configuration through the same update path.
-`brew uninstall dotfiles` removes the Homebrew package; the writable checkout,
-its `~/bin/dots` link, and your configured shell remain in place.
-`dotfiles-setup` remains a compatibility alias for `dots install`.
+The full installer also configures the standalone [t release](https://github.com/agenthangar/t/releases)
+when needed, without requiring a t checkout. Existing supported t installations
+are preserved. `DOTFILES_NO_T=1` skips that integration; `DOTFILES_T_HOME` selects
+an existing t installation and `T_INSTALL_DIR` can move its release directory.
+Routine dotfiles updates leave t's installation alone.
 
-`DOTFILES_NO_T=1` skips standalone t setup for shell-only or sandbox installations.
-`DOTFILES_T_HOME` selects an existing supported t installation. A normal
-links-only refresh stays offline; the sole exception migrates a dangling
-`~/bin/t` link owned by the former bundled dotfiles command to a verified t
-release. Use full `install.sh` for first setup. `T_INSTALL_DIR` can move the
-release installation base.
-
-## Two repositories, independent installations
+## Distribution and development
 
 | Source | Managed surface |
 | --- | --- |
-| `~/code/dotfiles` on main | `~/.zshrc`, `~/.tmux.conf`, personal utility bins, SSH snippet |
-| Selected t release or `~/code/t` checkout | `~/bin/t`, hook/transfer helpers, t prompts and shell plugin |
-| `~/code/.worktrees/<repo>/<slot>` | Isolated development, never canonical main |
+| Homebrew dotfiles package | Shell configuration, utility bins, tmux and SSH snippets |
+| Standalone t installation | t command, hooks, prompts and shell plugin |
+| Optional dotfiles checkout/worktrees | Source development only |
 
-The `$HOME` symlinks point into the selected installations. Editing a development
-worktree is not live until its PR merges and you update, or you explicitly select
-it with `dots --dev` / `t update --dev`. Ordinary `dots` updates dotfiles only;
-standalone t keeps its selected version and owns its updates. Run `t update`
-separately to refresh its release or checkout while preserving dirty worktree edits.
+`dots --all` updates locally and on the configured t hosts. Inspect every host's
+result. Open shells reload when the installed package version changes.
 
-`dots --all` is the rollout step after a merged PR; nothing polls GitHub for merges.
-Inspect its per-host results: an unreachable host is reported and must be retried.
-Open shells reload when the selected code changes. Never develop or commit in a
-canonical main checkout: those files are your running configuration.
+Developers may still install from a Git checkout using `./install.sh`; that legacy
+mode retains its canonical-main and worktree protections. To preview a development
+worktree from a package-based installation, run
+`DOTFILES_LINK_DEV=1 DOTFILES_NO_BREW=1 ./install.sh` there. Return to the package
+with the explicit Homebrew `dots install` command above. Checkouts are optional,
+never created by the packaged command.
 
-The t migration bridge validates `.t-install-version` before allowing t to own
-its links. Before pulling a dotfiles release that removes bundled t, it confirms
-the standalone installation works. If it cannot, it stops before removing the
-old executable. Recovery does not require a working command: run the public
-[`t` release installer](https://github.com/agenthangar/t#install), then rerun
-`dots`. A machine running an intermediate dotfiles bridge that refuses its
-preflight before updating also needs this one-time installation. Once migrated,
-normal `dots` updates and relinks do not run the t installer, `t update`, or Homebrew.
+Runtime changes must be released in the
+[Homebrew tap](https://github.com/agenthangar/homebrew-tap) with a new formula
+version and verified source archive digest before `dots --all` can distribute them.
 
 ## Private configuration and policy
 

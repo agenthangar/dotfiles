@@ -55,8 +55,17 @@ resolve_primary() {
     ( cd "$cdir/.." && pwd )
 }
 
-PRIMARY="$(resolve_primary || true)"
-if [[ -z "$PRIMARY" || ! -d "$PRIMARY/.git" ]]; then
+PACKAGE_ROOT=""
+if [[ -f "$DOTFILES_DIR/.dotfiles-package" ]]; then
+    PACKAGE_ROOT=$(cat "$DOTFILES_DIR/.dotfiles-package")
+    [[ "$PACKAGE_ROOT" == /* && -f "$PACKAGE_ROOT/.dotfiles-package" ]] || {
+        echo 'install.sh: invalid Homebrew package location' >&2
+        exit 1
+    }
+fi
+PRIMARY=""
+[[ -n "$PACKAGE_ROOT" ]] || PRIMARY="$(resolve_primary || true)"
+if [[ -z "$PACKAGE_ROOT" && ( -z "$PRIMARY" || ! -d "$PRIMARY/.git" ) ]]; then
     # A directory .git is exactly what distinguishes the primary checkout from a
     # linked worktree (whose .git is a FILE). Without this we could silently link
     # $HOME at something that is not a checkout at all.
@@ -209,7 +218,9 @@ EOF
 # caller chose to run — and stop right after link_all. It skips the layout
 # migration. The only network exception is an owned legacy ~/bin/t link left by
 # a pre-split dots command that fast-forwarded before calling this installer.
-if [[ -n "${DOTFILES_LINKS_ONLY:-}" ]]; then
+if [[ -n "$PACKAGE_ROOT" ]]; then
+    LINK_SRC="$PACKAGE_ROOT"
+elif [[ -n "${DOTFILES_LINKS_ONLY:-}" ]]; then
     LINK_SRC="$DOTFILES_DIR"
 elif [[ -n "${DOTFILES_LINK_DEV:-}" ]]; then
     LINK_SRC="$DOTFILES_DIR"
@@ -253,7 +264,7 @@ link() {
 # needs t installation work during a links-only run.
 # shellcheck source=lib/t-integration.sh
 source "$DOTFILES_DIR/lib/t-integration.sh"
-if [[ -z "${DOTFILES_NO_T:-}" ]]; then
+if [[ -z "${DOTFILES_NO_T:-}" && -z "$PACKAGE_ROOT" ]]; then
     if [[ -n "${DOTFILES_LINKS_ONLY:-}" ]]; then
         if _dots_t_legacy_link "$LINK_SRC" && ! _dots_t_install "$LINK_SRC"; then
             if [[ -z "${DOTFILES_T_HOME:-}" ]]; then
@@ -274,7 +285,33 @@ if [[ -z "${DOTFILES_NO_T:-}" ]]; then
 fi
 
 link_all() {
-    link "$LINK_SRC/.zshrc"               "$HOME/.zshrc"
+    local backup
+    if [[ -n "$PACKAGE_ROOT" ]]; then
+        # A real loader keeps tools that append shell integration out of the
+        # Homebrew Cellar. Existing checkout links are preserved as backups.
+        if [[ -L "$HOME/.zshrc" ]]; then
+            backup="$HOME/.zshrc.before-homebrew"
+            [[ ! -e "$backup" && ! -L "$backup" ]] || backup=$(mktemp "$backup.XXXXXXXX")
+            mv "$HOME/.zshrc" "$backup"
+            echo "Saved previous shell link -> $backup"
+        fi
+        mkdir -p "$HOME/.config/dotfiles"
+        printf '%s\n' "$PACKAGE_ROOT" > "$HOME/.config/dotfiles/package"
+        if ! grep -qF '# >>> dotfiles Homebrew >>>' "$HOME/.zshrc" 2>/dev/null; then
+            cat >> "$HOME/.zshrc" <<'EOF'
+
+# >>> dotfiles Homebrew >>>
+if [[ -r "$HOME/.config/dotfiles/package" ]]; then
+    _dots_package_rc="$(<"$HOME/.config/dotfiles/package")/.zshrc"
+    [[ ! -r "$_dots_package_rc" ]] || source "$_dots_package_rc"
+    unset _dots_package_rc
+fi
+# <<< dotfiles Homebrew <<<
+EOF
+        fi
+    else
+        link "$LINK_SRC/.zshrc"           "$HOME/.zshrc"
+    fi
     link "$LINK_SRC/.tmux.conf"           "$HOME/.tmux.conf"
     link "$LINK_SRC/bin/sleep-manager"    "$HOME/bin/sleep-manager"
     link "$LINK_SRC/bin/csync"            "$HOME/bin/csync"
@@ -305,6 +342,10 @@ link_all() {
 }
 
 link_all
+
+if [[ -n "$PACKAGE_ROOT" && -z "${DOTFILES_LINKS_ONLY:-}" && -z "${DOTFILES_NO_T:-}" ]]; then
+    _dots_t_bootstrap "$LINK_SRC"
+fi
 
 # pr-watch — RETIRED. It was an autonomous PR fixer on a launchd StartInterval timer:
 # every 5 minutes it polled for a CONFLICTING / CI-failed PR and spawned a detached
@@ -457,19 +498,21 @@ fi
 # stores user.name/email and other runtime state there) — NOT a symlink, same
 # reasoning as ~/.claude/settings.json. Only set it when neither pull.ff nor
 # pull.rebase is already configured, so a deliberate per-machine choice is kept.
-if [[ -z "$(git config --global --get pull.ff || true)" \
-   && -z "$(git config --global --get pull.rebase || true)" ]]; then
-    git config --global pull.ff only
-    echo "Set global pull.ff -> only (git pull fast-forwards or aborts; no divergent-branch hint)"
-else
-    echo "Global pull strategy already set — leaving ~/.gitconfig as-is"
-fi
+if [[ -z "$PACKAGE_ROOT" ]]; then
+    if [[ -z "$(git config --global --get pull.ff || true)" \
+       && -z "$(git config --global --get pull.rebase || true)" ]]; then
+        git config --global pull.ff only
+        echo "Set global pull.ff -> only (git pull fast-forwards or aborts; no divergent-branch hint)"
+    else
+        echo "Global pull strategy already set — leaving ~/.gitconfig as-is"
+    fi
 
-# Point this repo's git at the tracked hooks so the PII pre-commit guard runs.
-# Repo-local config (not a $HOME symlink); safe to re-run. The hook fails open
-# when the private denylist is absent, so machines without it still commit.
-git -C "$PRIMARY" config core.hooksPath .githooks
-echo "Set core.hooksPath -> .githooks (PII pre-commit guard)"
+    # Point this repo's git at the tracked hooks so the PII pre-commit guard runs.
+    # Repo-local config (not a $HOME symlink); safe to re-run. The hook fails open
+    # when the private denylist is absent, so machines without it still commit.
+    git -C "$PRIMARY" config core.hooksPath .githooks
+    echo "Set core.hooksPath -> .githooks (PII pre-commit guard)"
+fi
 
 # Materialize the private PII denylist when supplied (Cloud Agents / CI parity).
 # Set PII_SCRUB_RULES to the scrub-rules.json contents in the agent environment.
@@ -498,7 +541,9 @@ fi
 # Idempotent — brew bundle skips anything already installed. Skipped entirely if
 # Homebrew is absent; the config degrades gracefully without these. Set
 # DOTFILES_NO_BREW=1 to skip it too (used by `dots --dev` for a fast relink).
-if [[ -n "${DOTFILES_NO_BREW:-}" ]]; then
+if [[ -n "$PACKAGE_ROOT" ]]; then
+    echo "Homebrew manages this package's dependencies."
+elif [[ -n "${DOTFILES_NO_BREW:-}" ]]; then
     echo "DOTFILES_NO_BREW set — skipping Brewfile."
 elif command -v brew >/dev/null 2>&1; then
     echo "Installing Homebrew packages from Brewfile..."
@@ -517,5 +562,9 @@ fi
 # LAST real action: by now $HOME points at $PRIMARY, so removing the legacy trees
 # cannot strand a symlink. No-op unless migrate_to_single_tree found something.
 cleanup_legacy_main_worktrees
+
+if [[ -n "$PACKAGE_ROOT" ]]; then
+    : > "$HOME/.config/dotfiles/installed"
+fi
 
 echo "Done."

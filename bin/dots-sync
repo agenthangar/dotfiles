@@ -22,6 +22,21 @@ case "${1:-}" in
   *) echo "dots-sync: unknown argument: $1 (-h for help)" >&2; exit 2 ;;
 esac
 
+script=${BASH_SOURCE[0]}
+while [[ -L "$script" ]]; do
+  directory=$(cd -P "$(dirname "$script")" && pwd)
+  script=$(readlink "$script")
+  [[ "$script" == /* ]] || script="$directory/$script"
+done
+payload=$(cd "$(dirname "$script")/.." && pwd)
+if [[ -f "$payload/.dotfiles-package" && "$do_local" == 1 ]]; then
+  if [[ "$do_hosts" == 0 ]]; then
+    exec "$payload/bin/dots" update
+  else
+    exec "$payload/bin/dots" --all
+  fi
+fi
+
 T_CONFIG="${XDG_CONFIG_HOME:-$HOME/.config}/t/config.sh"
 SSH="${DOTS_SYNC_SSH:-ssh}"          # tests point it at a stub
 ts() { date '+%F %T'; }

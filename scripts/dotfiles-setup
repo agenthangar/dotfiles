@@ -2,6 +2,17 @@
 # Shared install implementation; dotfiles-setup remains a compatibility alias.
 set -euo pipefail
 
+script=${BASH_SOURCE[0]}
+while [[ -L "$script" ]]; do
+    directory=$(cd -P "$(dirname "$script")" && pwd)
+    script=$(readlink "$script")
+    [[ "$script" == /* ]] || script="$directory/$script"
+done
+root=$(cd "$(dirname "$script")/.." && pwd)
+if [[ -f "$root/.dotfiles-package" ]]; then
+    exec "$root/bin/dots" install "$@"
+fi
+
 usage() {
     cat <<'EOF'
 Usage: dots install [DIRECTORY]

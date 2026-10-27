@@ -47,6 +47,8 @@ nosleep -d dim -l off          # dim without requesting a lock
 nosleep -c none                # keep awake until Ctrl-C; skip all checks
 nosleep -d dim -l off -c agent # dim, no lock, check only agent activity
 nosleep -c internet            # check only internet connectivity
+nosleep --require one          # keep awake while busy OR online
+nosleep --require 2            # require both enabled checks to pass
 nosleep config                # arrow-key menu for this machine's defaults
 nosleep config --show          # print effective defaults
 nosleep config --edit          # edit defaults with VISUAL/EDITOR
@@ -174,7 +176,7 @@ section shows the selected display and locking behavior.
 
 `nosleep` keeps the Mac awake until Ctrl-C while the laptop is open. Failed activity
 or internet checks only produce warnings in that state. Automatic sleep is allowed
-only when the laptop is closed and activity or internet connectivity remains absent
+only when the laptop is closed and, by default, activity or internet connectivity remains absent
 through the 15-minute grace period and three extra checks (after 30, 60, and 120 seconds).
 Closing the laptop still locks or dims its display during retries.
 Opening the laptop cancels pending retries; closing it starts a fresh retry
@@ -184,6 +186,16 @@ activity sampling and grace so an agent has time to resume.
 ```sh
 nosleep --grace 900 --retries 3 --backoff 30
 ```
+
+`--require all` (the default) keeps awake while all enabled checks pass.
+`--require one` keeps awake while any enabled check passes; `--require N`
+requires at least N enabled checks to pass. Passing means agent activity is busy
+or internet connectivity is online. Each failing check retains its grace period
+(and activity needs two samples) before it counts against the requirement.
+All enabled checks continue to run, even after enough pass. Counts must be positive
+and cannot exceed the final enabled check count when monitoring is active.
+The requirement is a one-run CLI option; it is inactive with `--checks none` or
+`--forever`, which keep awake until Ctrl-C.
 
 `--every` sets the normal check interval (30 seconds). `--backoff` sets the first
 retry delay (1–300 seconds), which doubles up to five minutes; `--retries` accepts

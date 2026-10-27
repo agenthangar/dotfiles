@@ -222,6 +222,8 @@ _nosleep_config() { python3 "$_DOTS_SOURCE_ROOT/lib/nosleep_config.py" "$@"; }
 # CHECKS
 #   -c, --checks MODE   all | agent | internet | none (until Ctrl-C)
 #                      Replaces saved checks and clears forever
+#   --require VALUE    Passing checks needed to keep awake: one | all | N
+#                      Default all; passing means agent busy or internet online
 #
 # CHECK SETTINGS
 #   -e, --every SECS    Check interval in seconds (default 30)
@@ -232,6 +234,7 @@ _nosleep_config() { python3 "$_DOTS_SOURCE_ROOT/lib/nosleep_config.py" "$@"; }
 #
 # EXAMPLES
 #   nosleep -d dim -l off -c agent -e10
+#   nosleep --require one             # stay awake while busy OR online
 #   nosleep --display=on --lock=off --checks=none
 #
 # SHORTCUTS
@@ -246,7 +249,7 @@ nosleep() {
   [[ "$1" == config ]] && { shift; _nosleep_config "$@"; return $?; }
   [[ "$1" == -h || "$1" == --help ]] && { _help_for nosleep; return 0; }
   local forever=0 display_on=0 dim=0 dim_requested=0 lock=1 grace=900 every=30 retries=3 backoff=30 defaults setting value
-  local agent=1 internet=1 monitoring=1
+  local agent=1 internet=1 monitoring=1 requirement=all required_count=0 enabled_count=0
   defaults=$(_nosleep_config --values) || return $?
   for setting in ${(f)defaults}; do
     value=${setting#*=}
@@ -294,7 +297,7 @@ nosleep() {
     else
       nosleep_args+=("$arg")
       # Keep a long option's value intact too, including malformed negatives.
-      if [[ $arg == --(every|grace|retries|backoff) ]] && (( $# )); then
+      if [[ $arg == --(every|grace|retries|backoff|require) ]] && (( $# )); then
         nosleep_args+=("$1")
         shift
       fi
@@ -360,6 +363,13 @@ nosleep() {
           off) lock=0 ;;
           *) echo 'nosleep: --lock takes on or off' >&2; return 2 ;;
         esac ;;
+      --require|--require=*)
+        if [[ $1 == *=* ]]; then
+          requirement=${1#*=}
+        else
+          (( $# >= 2 )) || { echo 'nosleep: --require needs one, all, or a positive count' >&2; return 2; }
+          requirement=$2; shift
+        fi ;;
       -g|--grace|-e|--every|-r|--retries|-b|--backoff)
         (( $# >= 2 )) || { echo "nosleep: $1 needs a value" >&2; return 2; }
         case $1 in
@@ -378,6 +388,25 @@ nosleep() {
   (( dim_requested )) && dim=1
   (( dim )) && display_on=1
   monitoring=$(( ! forever && (agent || internet) ))
+  enabled_count=$(( agent + internet ))
+  case $requirement in
+    one) required_count=1 ;;
+    all) required_count=$enabled_count ;;
+    *)
+      # Normalize as text before arithmetic: even huge input must not wrap around.
+      if [[ $requirement =~ '^0*([1-9][0-9]*)$' ]]; then
+        requirement=$match[1]
+      else
+        echo 'nosleep: --require takes one, all, or a positive count' >&2; return 2
+      fi
+      if (( monitoring )) && [[ $requirement != 1 && $requirement != 2 ]]; then
+        echo 'nosleep: --require exceeds the number of enabled checks' >&2; return 2
+      fi
+      (( monitoring )) && required_count=$requirement ;;
+  esac
+  if (( monitoring && required_count > enabled_count )); then
+    echo 'nosleep: --require exceeds the number of enabled checks' >&2; return 2
+  fi
   [[ $grace == <-> && $every == <-> && $every -gt 0 ]] || { echo "nosleep: --grace/--every take a number of seconds" >&2; return 2; }
   [[ $retries == <-> && $retries -le 10 && $backoff == <-> && $backoff -ge 1 && $backoff -le 300 ]] || {
     echo "nosleep: --retries must be 0–10 and --backoff must be 1–300 seconds" >&2; return 2
@@ -445,6 +474,7 @@ nosleep() {
   # Always take two activity samples, even with --grace 0, before judging idleness.
   local now busy_at online_at=$EPOCHSECONDS why checked_at=0 next_check=0 lid_was=0 lid_shut=0 lid_shut_was=0 pinged_at=0 probes=0
   local retry_count=0 retry_delay=$backoff retry_for='' missing online=1 was_online=1 refreshed_at=0
+  local failed_agent=0 failed_internet=0 effective_passes=0
   # Presentation tracks observed signals separately from the grace timestamps,
   # which are seeded at startup and reset on reconnect without observing work.
   local busy_now=0 detected_at=0 online_checked_at=0 sleep_held=1 show_snapshot=1 status_shown=0
@@ -549,10 +579,15 @@ nosleep() {
       now=$EPOCHSECONDS
       (( ++probes ))
       missing=''
-      if (( internet && ! online && (! lid_shut || now - online_at > grace) )); then
-        missing=network why="the network has been down for $(( now - online_at ))s"
-      elif (( agent && probes > 1 && ! busy_now && (! lid_shut || now - busy_at > grace) )); then
-        missing=activity why="no local agent activity for $(( now - busy_at ))s"
+      failed_internet=$(( internet && ! online && (! lid_shut || now - online_at > grace) ))
+      failed_agent=$(( agent && probes > 1 && ! busy_now && (! lid_shut || now - busy_at > grace) ))
+      effective_passes=$(( enabled_count - failed_agent - failed_internet ))
+      if (( effective_passes < required_count )); then
+        if (( failed_internet )); then
+          missing=network why="the network has been down for $(( now - online_at ))s"
+        else
+          missing=activity why="no local agent activity for $(( now - busy_at ))s"
+        fi
       fi
       if [[ -n $missing ]]; then
         if (( ! lid_shut )); then
@@ -611,6 +646,7 @@ _nosleep_status() {
   local agent_text network_text next_text notice_text
   local sleep_text='Prevented' monitoring_text='Activity and internet checks'
   local grace_text every_text backoff_text retries_text=$retries item
+  local requirement_text="$requirement (need $required_count of $enabled_count)"
   local display_text='Off' lock_text='Lock screen'
   local remaining signal_age line width=$(( ${COLUMNS:-80} - 1 )) row=0 styled=0 value primary detail
   local heading_style=1 agent_style=33 network_style=36 next_style=36
@@ -670,12 +706,16 @@ _nosleep_status() {
     if (( retry_count )); then
       next_style=33
       next_text="Retry $retry_count/$retries in $REPLY · waiting for $retry_for"
-    elif (( lid_shut && probes && ((internet && ! online) || (agent && ! busy_now)) )); then
+    elif (( lid_shut && probes && (agent * !!busy_now + internet * online < required_count) )); then
       next_style=33
       signal_age=0
       (( agent && ! busy_now )) && signal_age=$(( now - busy_at ))
       if (( internet && ! online && now - online_at > signal_age )); then
         signal_age=$(( now - online_at ))
+      fi
+      # Requiring one of two checks means both grace periods must expire.
+      if (( required_count == 1 && enabled_count == 2 )); then
+        signal_age=$(( now - busy_at < now - online_at ? now - busy_at : now - online_at ))
       fi
       remaining=$(( grace - signal_age ))
       _nosleep_duration "$remaining"
@@ -723,10 +763,11 @@ _nosleep_status() {
     retries_text+=' (inactive)'
     _nosleep_duration "$backoff"; backoff_text="$REPLY (inactive)"
   fi
-  config_labels=('On close' Display Locking '' Checks Mode '' 'Check settings' Interval Grace Retries Backoff)
-  config_values=('' "$display_text" "$lock_text" '' '' "$monitoring_text" '' ''
+  (( ! monitoring )) && requirement_text="$requirement (inactive)"
+  config_labels=('On close' Display Locking '' Checks Mode Require '' 'Check settings' Interval Grace Retries Backoff)
+  config_values=('' "$display_text" "$lock_text" '' '' "$monitoring_text" "$requirement_text" '' ''
                  "$every_text" "$grace_text" "$retries_text" "$backoff_text")
-  config_styles=('1;36' 0 0 0 '1;36' 0 0 '1;36' 0 0 0 0)
+  config_styles=('1;36' 0 0 0 '1;36' 0 0 0 '1;36' 0 0 0 0)
   rows+=('')
   styles+=(0)
   for (( item = 1; item <= ${#config_labels}; ++item )); do

@@ -12,6 +12,8 @@ Work in a per-session worktree on `dev/<repo>-<slot>` (`t open <repo>`), or a `c
 
 When a change is ready, commit, push, and open a PR to `main`. **Always enable squash auto-merge immediately after opening a PR** with `gh pr merge <number> --auto --squash`; no additional user confirmation is needed. After opening or pushing more commits, verify `gh pr view <number> --json state,autoMergeRequest,mergeable,mergeStateStatus`: the PR must either be merged already or have auto-merge enabled. Resolve conflicts and re-enable auto-merge if needed. Monitor checks through merge and fix failures; do not leave a ready PR waiting for a manual merge. For runtime changes, also release the merged source through `agenthangar/homebrew-tap` (version, archive URL, verified SHA-256, and any required payload/dependency changes). Monitor its PR through merge. Then run `zsh -lic 'dots --all'` to update the installed package and configured remote hosts. Homebrew users must not need a source checkout; keep legacy source installation available for development.
 
+Bugfix-only releases must increment only the patch version (for example, `0.8.0` → `0.8.1`). Reserve minor version increments for new features.
+
 ## Cursor Cloud specific instructions
 
 ### Environment shape

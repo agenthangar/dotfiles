@@ -205,6 +205,7 @@ prview() {
 
 # Keep configuration as validated data; never evaluate the saved file as shell code.
 _nosleep_config() { python3 "$_DOTS_SOURCE_ROOT/lib/nosleep_config.py" "$@"; }
+source "${${(%):-%x}:A:h}/lib/nosleep-fallback.zsh"
 
 # nosleep — prevent system sleep
 #
@@ -214,6 +215,7 @@ _nosleep_config() { python3 "$_DOTS_SOURCE_ROOT/lib/nosleep_config.py" "$@"; }
 # USAGE
 #   nosleep [flags]
 #   nosleep config [--show | --edit]
+#   nosleep hotspot setup   Save hotspot credentials locally in Keychain
 #
 # ON CLOSE
 #   -d, --display MODE  off | on | dim
@@ -230,6 +232,14 @@ _nosleep_config() { python3 "$_DOTS_SOURCE_ROOT/lib/nosleep_config.py" "$@"; }
 #   -g, --grace SECS    Wait before retries when idle or offline (default 900)
 #   -r, --retries N     Retry limit, 0–10 (default 3)
 #   -b, --backoff SECS  Retry delay; doubles to 300 seconds (default 30)
+#
+# HOTSPOT FALLBACK
+#   --hotspot          Join configured broadcasting hotspot after an outage
+#   --no-hotspot       Disable fallback for this run (default off)
+#   --hotspot-ssid SSID Exact Wi-Fi name; password comes from Keychain
+#   --hotspot-after SEC Continuous outage delay (default 300)
+#   --hotspot-timeout SEC Attempt/recovery limit, 1–300 (default 30)
+#                      Inactive without internet checks or with --forever.
 #   -h, --help          Show help
 #
 # EXAMPLES
@@ -247,9 +257,15 @@ _nosleep_config() { python3 "$_DOTS_SOURCE_ROOT/lib/nosleep_config.py" "$@"; }
 #   Modes take separate or =values; numeric settings allow attached values.
 nosleep() {
   [[ "$1" == config ]] && { shift; _nosleep_config "$@"; return $?; }
+  if [[ "$1" == hotspot ]]; then
+    [[ $# == 2 && $2 == setup ]] || { print -u2 -- 'usage: nosleep hotspot setup'; return 2; }
+    python3 "$_DOTS_SOURCE_ROOT/lib/nosleep_hotspot.py" setup
+    return $?
+  fi
   [[ "$1" == -h || "$1" == --help ]] && { _help_for nosleep; return 0; }
   local forever=0 display_on=0 dim=0 dim_requested=0 lock=1 grace=900 every=30 retries=3 backoff=30 defaults setting value
   local agent=1 internet=1 monitoring=1 requirement=all required_count=0 enabled_count=0
+  local hotspot=0 hotspot_ssid='' hotspot_after=300 hotspot_timeout=30
   defaults=$(_nosleep_config --values) || return $?
   for setting in ${(f)defaults}; do
     value=${setting#*=}
@@ -264,6 +280,10 @@ nosleep() {
       every) every=$value ;;
       retries) retries=$value ;;
       backoff) backoff=$value ;;
+      hotspot) hotspot=$value ;;
+      hotspot_ssid) hotspot_ssid=$value ;;
+      hotspot_after) hotspot_after=$value ;;
+      hotspot_timeout) hotspot_timeout=$value ;;
     esac
   done
   # Expand short-option groups before parsing. Value-taking options consume the
@@ -297,7 +317,7 @@ nosleep() {
     else
       nosleep_args+=("$arg")
       # Keep a long option's value intact too, including malformed negatives.
-      if [[ $arg == --(every|grace|retries|backoff|require) ]] && (( $# )); then
+      if [[ $arg == --(every|grace|retries|backoff|require|hotspot-ssid|hotspot-after|hotspot-timeout) ]] && (( $# )); then
         nosleep_args+=("$1")
         shift
       fi
@@ -328,6 +348,20 @@ nosleep() {
       -A|--no-agent) agent=0 ;;
       -i|--internet) internet=1 ;;
       -I|--no-internet) internet=0 ;;
+      --hotspot) hotspot=1 ;;
+      --no-hotspot) hotspot=0 ;;
+      --hotspot-ssid|--hotspot-after|--hotspot-timeout|--hotspot-ssid=*|--hotspot-after=*|--hotspot-timeout=*)
+        arg=${1%%=*}
+        if [[ $1 == *=* ]]; then value=${1#*=}
+        else
+          (( $# >= 2 )) || { print -u2 -- "nosleep: $1 needs a value"; return 2; }
+          value=$2; shift
+        fi
+        case $arg in
+          --hotspot-ssid) hotspot_ssid=$value ;;
+          --hotspot-after) hotspot_after=$value ;;
+          --hotspot-timeout) hotspot_timeout=$value ;;
+        esac ;;
       -d|--display|-d=*|--display=*)
         if [[ $1 == *=* ]]; then
           value=${1#*=}
@@ -411,6 +445,12 @@ nosleep() {
   [[ $retries == <-> && $retries -le 10 && $backoff == <-> && $backoff -ge 1 && $backoff -le 300 ]] || {
     echo "nosleep: --retries must be 0–10 and --backoff must be 1–300 seconds" >&2; return 2
   }
+  [[ $hotspot_after == <-> && ${#hotspot_after} -le 10 && $hotspot_after -le 2147483647 && $hotspot_timeout == <-> && ${#hotspot_timeout} -le 3 && $hotspot_timeout -ge 1 && $hotspot_timeout -le 300 ]] || {
+    print -u2 -- 'nosleep: hotspot delay must be nonnegative and timeout must be 1–300 seconds'; return 2
+  }
+  if (( hotspot )); then
+    python3 "$_DOTS_SOURCE_ROOT/lib/nosleep_hotspot.py" validate --ssid="$hotspot_ssid" || return 2
+  fi
 
   # Teardown is idempotent: it runs from the INT trap, the EXIT trap (zsh scopes a
   # function's EXIT trap to the function, so it fires on every return path), and
@@ -420,12 +460,14 @@ nosleep() {
   # and the restore firing twice).
   typeset -g _NOSLEEP_CAF='' _NOSLEEP_DONE=0 _NOSLEEP_WHO='' _NOSLEEP_BRIGHT=''
   typeset -g _NOSLEEP_STATUS_ROWS=0 _NOSLEEP_TTY=0
+  typeset -g _NOSLEEP_HOTSPOT_PID=''
   typeset -g _NOSLEEP_LOCK_FAILED=0 _NOSLEEP_DISPLAY_FAILED=0 _NOSLEEP_DIM_FAILED=0 _NOSLEEP_RESTORE_FAILED=0
   [[ -t 1 && ${TERM:-dumb} != dumb ]] && _NOSLEEP_TTY=1
   _NOSLEEP_NET=() _NOSLEEP_NET_AT=()
   _nosleep_restore() {
     (( _NOSLEEP_DONE )) && return 0; _NOSLEEP_DONE=1
     _nosleep_status_clear
+    _nosleep_fallback_cancel
     [[ -n $_NOSLEEP_CAF ]] && kill "$_NOSLEEP_CAF" 2>/dev/null
     # Restore a dimmed panel even when stopping behind a closed lid, then release
     # the display hold. Locking is independent of brightness restoration.
@@ -475,6 +517,7 @@ nosleep() {
   local now busy_at online_at=$EPOCHSECONDS why checked_at=0 next_check=0 lid_was=0 lid_shut=0 lid_shut_was=0 pinged_at=0 probes=0
   local retry_count=0 retry_delay=$backoff retry_for='' missing online=1 was_online=1 refreshed_at=0
   local failed_agent=0 failed_internet=0 effective_passes=0
+  local fallback_outage_at=-1 fallback_started_at=-1 fallback_deadline=0 fallback_done=0
   # Presentation tracks observed signals separately from the grace timestamps,
   # which are seeded at startup and reset on reconnect without observing work.
   local busy_now=0 detected_at=0 online_checked_at=0 sleep_held=1 show_snapshot=1 status_shown=0
@@ -541,6 +584,7 @@ nosleep() {
       _nosleep_status
       status_shown=1
     fi
+    _nosleep_fallback_tick
     if (( monitoring && now >= next_check )); then
       show_snapshot=1
       checked_at=$now
@@ -567,8 +611,12 @@ nosleep() {
           _nosleep_status_clear
           echo "nosleep: connection lost — holding awake while macOS auto-join can reconnect"
         fi
+        (( _NOSLEEP_DONE )) && return 130
         online_checked_at=$EPOCHSECONDS
         was_online=$online
+        now=$EPOCHSECONDS
+        _nosleep_fallback_observe
+        _nosleep_fallback_tick observed
       fi
       if (( agent )); then
         _nosleep_busy_at
@@ -600,15 +648,22 @@ nosleep() {
             retry_count=0 retry_delay=$backoff retry_for=$missing
           fi
           if (( retry_count >= retries )); then
-            _nosleep_status_clear
-            echo "nosleep: letting go — $why; $retries retries exhausted"
-            _nosleep_restore
-            return 0
+            # Activity can exhaust before network grace. Every offline release
+            # must allow the configured outage delay and bounded fallback first.
+            if _nosleep_fallback_holds; then
+              (( next_check > now + 30 )) && next_check=$(( now + 30 ))
+            else
+              _nosleep_status_clear
+              echo "nosleep: letting go — $why; $retries retries exhausted"
+              _nosleep_restore
+              return 0
+            fi
+          else
+            (( ++retry_count ))
+            next_check=$(( now + retry_delay ))
+            (( _NOSLEEP_TTY )) || echo "nosleep: $why — retry $retry_count/$retries in ${retry_delay}s (sleep stays blocked)"
+            retry_delay=$(( retry_delay < 150 ? retry_delay * 2 : 300 ))
           fi
-          (( ++retry_count ))
-          next_check=$(( now + retry_delay ))
-          (( _NOSLEEP_TTY )) || echo "nosleep: $why — retry $retry_count/$retries in ${retry_delay}s (sleep stays blocked)"
-          retry_delay=$(( retry_delay < 150 ? retry_delay * 2 : 300 ))
         fi
       else
         if (( retry_count )); then
@@ -750,6 +805,26 @@ _nosleep_status() {
         "  Internet  $network_text"
         "  Next      $next_text")
   styles=("$heading_style" 0 '1;36' "$sleep_style" "$agent_style" "$network_style" "$next_style")
+  local hotspot_text='Off' hotspot_style=2
+  if (( hotspot )); then
+    hotspot_style=0
+    if (( ! monitoring || ! internet )); then
+      hotspot_text='Inactive (requires internet checks)'
+    elif (( fallback_done )); then
+      hotspot_text='Attempt complete · no verified internet recovery'
+    elif (( fallback_started_at >= 0 )); then
+      _nosleep_duration $(( fallback_deadline - now ))
+      hotspot_text="Joining/rechecking internet · $REPLY left"
+    elif (( fallback_outage_at >= 0 )); then
+      _nosleep_duration $(( hotspot_after - now + fallback_outage_at ))
+      hotspot_text="Waiting for continuous outage · $REPLY left"
+    else
+      _nosleep_duration "$hotspot_after"
+      hotspot_text="Ready · after $REPLY offline"
+    fi
+  fi
+  rows+=("  Hotspot   $hotspot_text")
+  styles+=("$hotspot_style")
   if [[ -n $notice_text ]]; then
     rows+=("  Notice    $notice_text")
     styles+=("$notice_style")

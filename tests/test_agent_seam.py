@@ -227,6 +227,19 @@ def nosleep_loop(zsh, tmp_path):
         zmodload -u zsh/datetime
         typeset -gi EPOCHSECONDS=1000 online_probe=0 busy_probe=0 pmset_reset=0 restore_attempts=0
         typeset -a online_results=( ${=FAKE_ONLINE} ) busy_results=( ${=FAKE_BUSY} )
+        if [[ -n ${FAKE_HOTSPOT:-} ]]; then
+            _nosleep_config() {
+                python3 "$_DOTS_SOURCE_ROOT/lib/nosleep_config.py" "$@" || return $?
+                print -r -- "hotspot=$FAKE_HOTSPOT"
+                print -r -- 'hotspot_ssid=Fake hotspot'
+                print -r -- "hotspot_after=${FAKE_HOTSPOT_AFTER:-300}"
+                print -r -- "hotspot_timeout=${FAKE_HOTSPOT_TIMEOUT:-30}"
+            }
+            _nosleep_hotspot_connect() { return 1; }
+        fi
+        if [[ ${FAKE_HOTSPOT_BACKEND:-} == hang ]]; then
+            _nosleep_hotspot_connect() { exec /bin/sleep 60; }
+        fi
         sudo() { print -r -- "sudo $EPOCHSECONDS $*" >> "$LOOP_LOG"; }
         ps() { return 0; }
         caffeinate() { return 0; }
@@ -257,6 +270,7 @@ def nosleep_loop(zsh, tmp_path):
         }
         _nosleep_online() {
             print -r -- "online $EPOCHSECONDS" >> "$LOOP_LOG"
+            if (( EPOCHSECONDS >= ${FAKE_SIGNAL_PROBE_AT:-99999} )); then kill -TERM $$; fi
             (( online_probe < ${#online_results} )) && (( ++online_probe ))
             (( online_results[online_probe] ))
         }
@@ -273,6 +287,8 @@ def nosleep_loop(zsh, tmp_path):
         }
         sleep() {
             (( EPOCHSECONDS += $1 ))
+            [[ -n ${FAKE_HOTSPOT_BACKEND:-} && -n $_NOSLEEP_HOTSPOT_PID ]] &&
+                print -r -- "child $EPOCHSECONDS $_NOSLEEP_HOTSPOT_PID" >> "$LOOP_LOG"
             if (( EPOCHSECONDS >= ${FAKE_STOP_AT:-99999} )); then kill -TERM $$; fi
             if (( EPOCHSECONDS > 5000 )); then print -u2 "virtual clock limit"; exit 99; fi
         }
@@ -1325,3 +1341,158 @@ def test_zsh_nosleep_one_requirement_open_lid_cancels_retry(nosleep_loop):
     assert "retry 1/1" in result.stdout
     assert "laptop open, sleep stays blocked" in result.stdout
     assert "letting go" not in result.stdout
+
+
+def test_nosleep_fallback_waits_five_minutes_before_bounded_attempt(nosleep_loop):
+    result, log = nosleep_loop("-A -g0 -e2 -r0", FAKE_HOTSPOT="1", FAKE_ONLINE="0")
+    assert result.stdout.count("attempting hotspot fallback") == 1
+    assert "exit=0 at=1330" in result.stdout
+    assert "online 1300" in log and "online 1330" in log
+    assert "sudo 1330 -n pmset -a disablesleep 0" in log
+    before, _ = nosleep_loop("-A -g0 -e2 -r0", FAKE_HOTSPOT="1", FAKE_ONLINE="0",
+                             FAKE_STOP_AT="1298")
+    assert "attempting hotspot fallback" not in before.stdout
+    assert "letting go" not in before.stdout
+
+
+@pytest.mark.parametrize("args", ["-A -g0 -e3600 -r0", "-A -g0 -e2 -r1 -b300"])
+def test_nosleep_fallback_deadline_overrides_large_intervals_and_activity_release(nosleep_loop, args):
+    result, log = nosleep_loop(args, FAKE_HOTSPOT="1", FAKE_HOTSPOT_AFTER="4",
+                               FAKE_HOTSPOT_TIMEOUT="6", FAKE_ONLINE="0")
+    assert result.stdout.count("attempting hotspot fallback") == 1
+    assert "online 1004" in log
+    assert "exit=0 at=1010" in result.stdout
+
+
+def test_nosleep_fallback_also_gates_activity_release_before_network_grace_expires(nosleep_loop):
+    result, _ = nosleep_loop("-g4 -e2 -r0", FAKE_HOTSPOT="1", FAKE_HOTSPOT_AFTER="6",
+                             FAKE_HOTSPOT_TIMEOUT="6", FAKE_ONLINE="1 1 0")
+    assert result.stdout.count("attempting hotspot fallback") == 1
+    assert "exit=0 at=1016" in result.stdout
+
+
+@pytest.mark.parametrize("online", ["1", "0 0 1"])
+def test_nosleep_fallback_skips_healthy_transient_and_due_tick_recovery(nosleep_loop, online):
+    result, _ = nosleep_loop("-A -g0 -e2 -r0", FAKE_HOTSPOT="1", FAKE_HOTSPOT_AFTER="4",
+                             FAKE_ONLINE=online, FAKE_STOP_AT="1014")
+    assert "attempting hotspot fallback" not in result.stdout
+    assert "letting go" not in result.stdout
+    assert "exit=130 at=1014" in result.stdout
+
+
+def test_nosleep_fallback_verified_recovery_resets_for_a_fresh_outage(nosleep_loop):
+    result, _ = nosleep_loop("-g0 -e2 -r0", FAKE_HOTSPOT="1", FAKE_HOTSPOT_AFTER="4",
+                             FAKE_HOTSPOT_TIMEOUT="6", FAKE_ONLINE="0 0 0 1 0 0 0",
+                             FAKE_STOP_AT="1016")
+    assert result.stdout.count("attempting hotspot fallback") == 2
+    assert "network recovered — restarting agent activity sampling and grace" in result.stdout
+    assert "letting go" not in result.stdout
+
+
+@pytest.mark.parametrize("extra", ["-I", "-f", "-c none"])
+def test_nosleep_fallback_inactive_without_internet_monitoring(nosleep_loop, extra):
+    result, _ = nosleep_loop(extra + " -g0 -e2 -r0", FAKE_HOTSPOT="1", FAKE_HOTSPOT_AFTER="0",
+                             FAKE_ONLINE="0", FAKE_BUSY="1", FAKE_STOP_AT="1010")
+    assert "attempting hotspot fallback" not in result.stdout
+    assert "exit=130 at=1010" in result.stdout
+
+
+def test_nosleep_fallback_preserves_open_lid_advisory_and_docked_closed_policy(nosleep_loop):
+    result, _ = nosleep_loop("-A -g0 -e2 -r0", FAKE_HOTSPOT="1", FAKE_HOTSPOT_AFTER="4",
+                             FAKE_HOTSPOT_TIMEOUT="6", FAKE_ONLINE="0", FAKE_LID_AT="99999",
+                             FAKE_STOP_AT="1014")
+    assert "laptop open, sleep stays blocked" in result.stdout
+    assert "letting go" not in result.stdout
+    result, _ = nosleep_loop("-A -g0 -e2 -r0", FAKE_HOTSPOT="1", FAKE_HOTSPOT_AFTER="4",
+                             FAKE_HOTSPOT_TIMEOUT="6", FAKE_ONLINE="0", FAKE_DOCKED="1")
+    assert "exit=0 at=1010" in result.stdout
+
+
+@pytest.mark.parametrize("backend", ["exec /bin/sleep 60", "return 1", "return 0"])
+def test_nosleep_fallback_helper_exit_cannot_claim_recovery_or_extend_deadline(zsh, backend):
+    result = zsh(r'''
+        setopt nomonitor
+        hotspot=1 monitoring=1 internet=1 online=0 hotspot_after=300 hotspot_timeout=30
+        fallback_outage_at=1000 fallback_started_at=-1 fallback_deadline=0 fallback_done=0
+        _NOSLEEP_HOTSPOT_PID='' now=1300 next_check=9000
+        _nosleep_status_clear() { :; }
+        _nosleep_hotspot_connect() { BACKEND; }
+        _nosleep_fallback_tick observed
+        child=$_NOSLEEP_HOTSPOT_PID
+        /bin/sleep 0.02
+        now=1310
+        _nosleep_fallback_tick
+        _nosleep_fallback_holds; print -r -- "holding=$?"
+        now=1330
+        _nosleep_fallback_tick
+        _nosleep_fallback_holds; print -r -- "holding=$? done=$fallback_done pid=$_NOSLEEP_HOTSPOT_PID"
+        kill -0 "$child" 2>/dev/null; print -r -- "alive=$?"
+    '''.replace("BACKEND", backend))
+    assert result.returncode == 0, result.stderr
+    assert "holding=0" in result.stdout
+    assert "holding=1 done=1 pid=" in result.stdout
+    assert "alive=1" in result.stdout
+    assert not result.stderr
+
+
+def test_nosleep_fallback_cleanup_ignores_unowned_pid(zsh):
+    result = zsh('_NOSLEEP_HOTSPOT_PID=$$; _nosleep_fallback_cancel; print -r -- survived')
+    assert result.returncode == 0 and result.stdout.strip() == "survived"
+
+
+def test_nosleep_fallback_interrupt_kills_only_owned_helper(nosleep_loop):
+    result, log = nosleep_loop("-A -g0 -e2 -r0", FAKE_HOTSPOT="1", FAKE_HOTSPOT_AFTER="4",
+                               FAKE_HOTSPOT_BACKEND="hang", FAKE_ONLINE="0", FAKE_STOP_AT="1010")
+    assert "exit=130 at=1010" in result.stdout
+    children = {int(line.split()[2]) for line in log if line.startswith("child ")}
+    assert len(children) == 1
+    with pytest.raises(ProcessLookupError):
+        os.kill(children.pop(), 0)
+
+
+def test_nosleep_fallback_signal_during_due_probe_cannot_launch_after_teardown(nosleep_loop):
+    result, log = nosleep_loop("-A -g0 -e2 -r0", FAKE_HOTSPOT="1", FAKE_HOTSPOT_AFTER="4",
+                               FAKE_HOTSPOT_BACKEND="hang", FAKE_ONLINE="0", FAKE_SIGNAL_PROBE_AT="1004")
+    assert "exit=130 at=1004" in result.stdout
+    assert "attempting hotspot fallback" not in result.stdout
+    assert not any(line.startswith("child ") for line in log)
+
+
+def test_nosleep_fallback_rechecks_internet_after_activity_crosses_deadline(nosleep_loop):
+    result, log = nosleep_loop("-g0 -e2 -r0", FAKE_HOTSPOT="1", FAKE_HOTSPOT_AFTER="4",
+                             FAKE_HOTSPOT_TIMEOUT="6", FAKE_HOTSPOT_BACKEND="hang",
+                             FAKE_BUSY_SECONDS="10", FAKE_ONLINE="0")
+    assert result.stdout.count("attempting hotspot fallback") == 1
+    assert "online 1024" in log
+    assert "exit=0 at=1034" in result.stdout
+
+
+def test_nosleep_fallback_recovery_during_slow_activity_prevents_stale_release(nosleep_loop):
+    result, log = nosleep_loop("-g0 -e2 -r0", FAKE_HOTSPOT="1", FAKE_HOTSPOT_AFTER="4",
+                               FAKE_HOTSPOT_TIMEOUT="6", FAKE_HOTSPOT_BACKEND="hang",
+                               FAKE_BUSY_SECONDS="10", FAKE_ONLINE="0 0 1", FAKE_STOP_AT="1036")
+    assert "online 1024" in log
+    assert "network recovered" in result.stdout
+    assert "letting go" not in result.stdout
+    assert "exit=130 at=1036" in result.stdout
+
+
+@pytest.mark.parametrize("args", ["--hotspot", "--hotspot-after -1", "--hotspot-timeout 0",
+                                  "--hotspot-timeout 301", "--hotspot-after 18446744073709551616",
+                                  "--hotspot --hotspot-ssid='bad\nname'"])
+def test_nosleep_hotspot_invalid_flags_never_touch_power(zsh, args):
+    result = zsh('sudo() { print unexpected-power; }; nosleep ' + args + '; print rc=$?')
+    assert "rc=2" in result.stdout and "unexpected-power" not in result.stdout
+
+
+def test_nosleep_hotspot_saved_preferences_and_cli_precedence(nosleep_loop):
+    path = nosleep_loop.home / ".config/nosleep/config.json"
+    path.parent.mkdir(parents=True)
+    saved = json.dumps({"hotspot": True, "hotspot_ssid": "-Test Phone", "hotspot_after": 4,
+                        "hotspot_timeout": 6})
+    path.write_text(saved)
+    result, _ = nosleep_loop("--no-hotspot -A -g0 -e2 -r0", FAKE_ONLINE="0")
+    assert "exit=0 at=1002" in result.stdout and "attempting hotspot" not in result.stdout
+    result, _ = nosleep_loop("--no-hotspot --hotspot --hotspot-after=20 -f", FAKE_STOP_AT="1010")
+    assert "Inactive (requires internet checks)" in result.stdout
+    assert path.read_text() == saved

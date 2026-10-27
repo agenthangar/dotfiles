@@ -135,14 +135,19 @@ def test_packaged_entrypoint_ignores_legacy_shell_update_function(package):
 
 
 def test_shell_function_and_help_work_without_git(package):
-    home, _, _, env = package
+    home, opt, _, env = package
     assert run(package).returncode == 0
     result = subprocess.run(['zsh', '-f', '-c',
-                             'source ~/.zshrc; dots --relink; nosleep --help; help'],
+                             'source ~/.zshrc; dots --relink; nosleep --help; help; '
+                             'nosleep config --show; '
+                             'python3 "$_DOTS_SOURCE_ROOT/lib/nosleep_hotspot.py" validate --ssid=Test'],
                             env=env, capture_output=True, text=True, timeout=30)
     assert result.returncode == 0, result.stderr
     assert 'Homebrew dotfiles applied' in result.stdout
     assert 'nosleep' in result.stdout
+    assert '--hotspot-after' in result.stdout and 'Hotspot fallback' in result.stdout
+    assert (opt / 'lib/nosleep_hotspot.py').is_file()
+    assert (opt / 'lib/nosleep-fallback.zsh').is_file()
     assert (home / '.zshrc').is_file()
 
 

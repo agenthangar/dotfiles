@@ -1002,8 +1002,9 @@ def test_zsh_nosleep_help_is_concise_and_does_not_change_power(zsh, args):
     assert not result.stderr
     assert "nosleep" in result.stdout
     assert "--no-lock" in result.stdout
-    assert "-d, --display-on" in result.stdout
-    assert "--dim, -dim" in result.stdout
+    assert "-d, --display MODE" in result.stdout
+    assert "-l, --lock MODE" in result.stdout
+    assert "-c, --checks MODE" in result.stdout
     assert "--forever" in result.stdout
     assert "unexpected sudo" not in result.stdout
     assert len(result.stdout.splitlines()) <= 50
@@ -1169,9 +1170,65 @@ def test_zsh_nosleep_invalid_groups_leave_power_untouched(zsh, args):
 def test_zsh_nosleep_help_and_status_separate_checks_from_settings(zsh, nosleep_loop):
     help_result = zsh('nosleep -dMLh')
     checks, settings = help_result.stdout.split("CHECKS\n", 1)[1].split("CHECK SETTINGS\n", 1)
-    assert "--no-agent" in checks and "--no-internet" in checks
+    assert "--checks MODE" in checks and "all | agent | internet | none" in checks
     assert "--grace" not in checks and "--grace" in settings
     result, _ = nosleep_loop("-AI", FAKE_STOP_AT="1004")
     checks, settings = result.stdout.split("\nChecks\n", 1)[1].split("\nCheck settings\n", 1)
     assert "Disabled" in checks and "Grace" not in checks
     assert "Interval" in settings and "(inactive)" in settings
+
+
+@pytest.mark.parametrize("args,display,locked", [
+    ("-d on -l off", "held on", False),
+    ("--display=dim --lock=on", "dimmed", True),
+    ("-d=off -l=off", "off", False),
+    ("-Ld=dim", "dimmed", False), ("-Ld dim", "dimmed", False),
+    ("--display dim --display on --lock on --lock off", "held on", False),
+    ("-m --display on", "held on", True),
+    ("--display on -m", "dimmed", True),
+    ("--display dim -D", "off", True),
+    ("-lc none -d off", "off", True),
+])
+def test_zsh_nosleep_mode_flags_replace_saved_display_and_lock(nosleep_loop, args, display, locked):
+    config = nosleep_loop.home / ".config" / "nosleep" / "config.json"
+    config.parent.mkdir(parents=True)
+    saved = json.dumps({"dim": True, "lock": True})
+    config.write_text(saved)
+    result, log = nosleep_loop(args + " -f", FAKE_STOP_AT="1004")
+    assert f"display {display}" in result.stdout
+    assert any(line.startswith("lock ") for line in log) == locked
+    assert any(line.startswith("brightness ") for line in log) == (display == "dimmed")
+    assert ("display-off 1000" in log) == (display == "off")
+    assert config.read_text() == saved
+
+
+@pytest.mark.parametrize("args,agent,internet", [
+    ("--checks all", True, True), ("-c agent", True, False),
+    ("-c=internet", False, True), ("--checks=none", False, False),
+    ("-Lc=agent", True, False), ("-Lc internet", False, True),
+    ("--checks none --checks agent", True, False),
+    ("-f --checks internet", False, True),
+    ("--checks all -I", True, False),
+])
+def test_zsh_nosleep_check_mode_replaces_saved_checks_and_forever(nosleep_loop, args, agent, internet):
+    config = nosleep_loop.home / ".config" / "nosleep" / "config.json"
+    config.parent.mkdir(parents=True)
+    saved = json.dumps({"agent": False, "internet": False, "forever": True})
+    config.write_text(saved)
+    result, log = nosleep_loop(args, FAKE_STOP_AT="1004")
+    assert any(line.startswith("busy ") for line in log) == agent
+    assert any(line.startswith("online ") for line in log) == internet
+    if not (agent or internet):
+        assert "No checks" in result.stdout and "(inactive)" in result.stdout
+    assert config.read_text() == saved
+
+
+@pytest.mark.parametrize("args", [
+    "--display", "--display --lock", "--display=", "-d=", "-d invalid",
+    "--display=invalid", "-l invalid", "--lock=", "-l=maybe",
+    "-c=", "--checks=bogus", "-c bogus", "-Ld=bogus", "-Lc=bogus",
+])
+def test_zsh_nosleep_invalid_modes_do_not_touch_power(zsh, args):
+    result = zsh(f'sudo() {{ print unexpected-power; }}; nosleep {args}; print rc=$?')
+    assert "rc=2" in result.stdout
+    assert "unexpected-power" not in result.stdout

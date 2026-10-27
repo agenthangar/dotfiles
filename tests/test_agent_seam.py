@@ -1232,3 +1232,96 @@ def test_zsh_nosleep_invalid_modes_do_not_touch_power(zsh, args):
     result = zsh(f'sudo() {{ print unexpected-power; }}; nosleep {args}; print rc=$?')
     assert "rc=2" in result.stdout
     assert "unexpected-power" not in result.stdout
+
+
+@pytest.mark.parametrize("requirement", ["one", "all", "1", "2"])
+@pytest.mark.parametrize("busy,online", [(0, 0), (0, 1), (1, 0), (1, 1)])
+def test_zsh_nosleep_requirement_truth_table(nosleep_loop, requirement, busy, online):
+    result, log = nosleep_loop(
+        f"--require {requirement} --grace 0 --every 2 --retries 0",
+        FAKE_BUSY=str(busy), FAKE_ONLINE=str(online), FAKE_STOP_AT="1006")
+    required = 1 if requirement in ("one", "1") else 2
+    releases = busy + online < required
+    assert ("letting go" in result.stdout) == releases
+    assert ("exit=0" in result.stdout) == releases
+    assert any(line.startswith("online ") for line in log)
+    assert any(line.startswith("busy ") for line in log)
+    assert re.search(rf"(?m)^  Require\b.*{requirement} \(need {required} of 2\)", result.stdout)
+    if not releases:
+        assert not re.search(r"(?m)^  Next\b.*(?:grace|Retry)", result.stdout)
+
+
+@pytest.mark.parametrize("requirement", ["one", "all", "1"])
+@pytest.mark.parametrize("check,disabled", [("agent", "online"), ("internet", "busy")])
+def test_zsh_nosleep_requirement_with_one_enabled_check(nosleep_loop, requirement, check, disabled):
+    result, log = nosleep_loop(
+        f"--require {requirement} --checks {check} --grace 0 --every 2 --retries 0",
+        FAKE_ONLINE="0", FAKE_STOP_AT="1006")
+    assert "letting go" in result.stdout
+    assert not any(line.startswith(disabled + " ") for line in log)
+
+
+@pytest.mark.parametrize("args", ["--require", "--require=", "--require 0", "--require 000",
+                                  "--require -1", "--require=+1", "--require any",
+                                  "--require 1.5", "--require 3", "--require 18446744073709551617",
+                                  "--require 2 -c agent", "-c internet --require=2",
+                                  "--forever --require 0"])
+def test_zsh_nosleep_invalid_requirement_does_not_change_power(zsh, args):
+    result = zsh('sudo() { echo unexpected-sudo; }; ' + f'nosleep {args}; echo rc=$?')
+    assert result.stdout.strip() == "rc=2"
+    assert "nosleep: --require" in result.stderr
+
+
+@pytest.mark.parametrize("args", ["--require=one", "--require=01", "--require=0002 --require one",
+                                  "--require 2 -c agent -c all --require one"])
+def test_zsh_nosleep_requirement_forms_and_final_option_order(nosleep_loop, args):
+    result, _ = nosleep_loop(args + " --grace 0 --every 2 --retries 0", FAKE_STOP_AT="1006")
+    assert "exit=130 at=1006" in result.stdout
+    assert "letting go" not in result.stdout
+
+
+@pytest.mark.parametrize("args", ["--checks none --require 2", "--require one -AI",
+                                  "--forever --require 99999999999999999999999999"])
+def test_zsh_nosleep_requirement_inactive_without_monitoring(nosleep_loop, args):
+    result, log = nosleep_loop(args, FAKE_STOP_AT="1006")
+    assert "exit=130 at=1006" in result.stdout
+    assert not any(line.startswith(("online ", "busy ")) for line in log)
+    assert re.search(r"(?m)^  Require\b.*inactive", result.stdout)
+
+
+def test_zsh_nosleep_one_requirement_waits_for_both_grace_periods(nosleep_loop):
+    result, _ = nosleep_loop("--require one --grace 4 --every 2 --retries 0",
+                             FAKE_ONLINE="0", FAKE_BUSY="1 1 0")
+    assert "exit=0 at=1008" in result.stdout
+    assert "the network has been down for 8s" in result.stdout
+
+
+def test_zsh_nosleep_one_requirement_still_needs_second_activity_sample(nosleep_loop):
+    result, log = nosleep_loop("--require one --grace 0 --every 2 --retries 0", FAKE_ONLINE="0")
+    assert "exit=0 at=1002" in result.stdout
+    assert len([line for line in log if line.startswith("busy ")]) == 2
+
+
+def test_zsh_nosleep_one_requirement_recovery_resets_retry(nosleep_loop):
+    result, _ = nosleep_loop("--require one --grace 0 --every 2 --backoff 2",
+                             FAKE_ONLINE="0", FAKE_BUSY="0 0 1 0", FAKE_STOP_AT="1010")
+    assert "activity recovered" in result.stdout
+    assert result.stdout.count("retry 1/3 in 2s") == 2
+    assert "exit=130 at=1010" in result.stdout
+
+
+def test_zsh_nosleep_one_requirement_reconnect_resets_sampling(nosleep_loop):
+    result, log = nosleep_loop("--require one --grace 0 --every 2 --backoff 2",
+                               FAKE_ONLINE="0 0 1", FAKE_STOP_AT="1008")
+    assert "network recovered — restarting agent activity sampling and grace" in result.stdout
+    assert "busy 1004 baselines=0" in log
+    assert result.stdout.count("retry 1/3") == 1
+    assert "exit=130 at=1008" in result.stdout
+
+
+def test_zsh_nosleep_one_requirement_open_lid_cancels_retry(nosleep_loop):
+    result, _ = nosleep_loop("--require one --grace 0 --every 2 --backoff 2 --retries 1",
+                             FAKE_ONLINE="0", FAKE_LID_OPEN_AT="1004", FAKE_STOP_AT="1008")
+    assert "retry 1/1" in result.stdout
+    assert "laptop open, sleep stays blocked" in result.stdout
+    assert "letting go" not in result.stdout

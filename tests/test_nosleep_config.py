@@ -43,7 +43,7 @@ def test_defaults_and_values_do_not_write(isolated):
     _, path = isolated
     result = run_config(isolated, "--values")
     assert result.returncode == 0
-    assert result.stdout.splitlines() == ["dim=0", "display_on=0", "lock=1", "forever=0", "grace=900",
+    assert result.stdout.splitlines() == ["dim=0", "display_on=0", "lock=1", "forever=0", "agent=1", "internet=1", "grace=900",
                                           "every=30", "retries=3", "backoff=30"]
     shown = run_config(isolated, "--show")
     assert shown.returncode == 0
@@ -53,7 +53,7 @@ def test_defaults_and_values_do_not_write(isolated):
 
 @pytest.mark.parametrize("bad", [
     {"dim": 1}, {"display_on": 1}, {"lock": "no"}, {"every": 0}, {"retries": 11},
-    {"backoff": 301}, {"grace": -1}, {"unknown": True}, [],
+    {"agent": 1}, {"internet": "off"}, {"backoff": 301}, {"grace": -1}, {"unknown": True}, [],
 ])
 def test_invalid_config_blocks_all_modes(isolated, bad):
     _, path = isolated
@@ -147,7 +147,7 @@ def test_tty_menu_cancel_then_save_independent_dim_and_lock(isolated):
                            (b"Unsaved changes", b"d")])
     assert not path.exists()
     _pty_config(isolated, [(b"Local settings", b"\r\r"),
-                           (b"dim on close", b"j" * 8 + b"\r"),
+                           (b"dim on close", b"s"),
                            (b"Review changes", b"y")])
     saved = json.loads(path.read_text())
     assert saved["dim"] is True and saved["lock"] is True
@@ -244,3 +244,34 @@ def test_saved_display_modes_and_legacy_dim(isolated, saved, mode):
     path.write_text(json.dumps(saved))
     assert f"Display   {mode}" in run_config(isolated, "--show").stdout
     assert "display_on=1" in run_config(isolated, "--values").stdout
+
+
+@pytest.mark.parametrize("agent,internet,mode", [
+    (True, True, "Activity and internet checks"),
+    (True, False, "Agent activity checks only"),
+    (False, True, "Internet checks only"),
+    (False, False, "Disabled (both checks off)"),
+])
+def test_saved_independent_check_modes(isolated, agent, internet, mode):
+    _, path = isolated
+    config.write(path, None, config.DEFAULTS | {"agent": agent, "internet": internet})
+    result = run_config(isolated, "--show")
+    assert mode in result.stdout
+    assert f"Agents    {'On' if agent else 'Off'}" in result.stdout
+    assert f"Internet  {'On' if internet else 'Off'}" in result.stdout
+    assert ("timing settings inactive" in result.stdout) == (not agent and not internet)
+
+
+def test_tty_menu_saves_individual_checks_and_forever_retains_preferences(isolated):
+    _, path = isolated
+    _pty_config(isolated, [(b"Local settings", b"jjj\rj\r"),
+                           (b"off", b"s"), (b"Review changes", b"y")])
+    saved = json.loads(path.read_text())
+    assert saved["agent"] is False and saved["internet"] is False
+    assert saved["forever"] is False
+    _pty_config(isolated, [(b"Local settings", b"jj\r"),
+                           (b"run until Ctrl-C", b"s"), (b"Review changes", b"y")])
+    saved = json.loads(path.read_text())
+    assert saved["forever"] is True
+    assert saved["agent"] is False and saved["internet"] is False
+    assert "Inactive (forever; saved off)" in run_config(isolated, "--show").stdout

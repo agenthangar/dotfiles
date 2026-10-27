@@ -20,6 +20,8 @@ DEFAULTS = {
     "display_on": False,
     "lock": True,
     "forever": False,
+    "agent": True,
+    "internet": True,
     "grace": 900,
     "every": 30,
     "retries": 3,
@@ -29,6 +31,8 @@ LABELS = {
     "dim": "Display when lid closes",
     "lock": "Lock when lid closes",
     "forever": "Monitoring",
+    "agent": "Agent activity checks",
+    "internet": "Internet checks",
     "grace": "Grace period",
     "every": "Check interval",
     "retries": "Retries",
@@ -49,7 +53,7 @@ def validate(data):
         raise ValueError("unknown setting: " + ", ".join(sorted(unknown)))
     result = DEFAULTS.copy()
     result.update(data)
-    for key in ("dim", "display_on", "lock", "forever"):
+    for key in ("dim", "display_on", "lock", "forever", "agent", "internet"):
         if type(result[key]) is not bool:
             raise ValueError(f"{key} must be true or false")
     limits = {"grace": (0, None), "every": (1, None),
@@ -104,13 +108,34 @@ def write(path, before, values):
             temporary.unlink(missing_ok=True)
 
 
+def monitoring_mode(values):
+    if values["forever"]:
+        return "Disabled (run until Ctrl-C)"
+    if values["agent"] and values["internet"]:
+        return "Activity and internet checks"
+    if values["agent"]:
+        return "Agent activity checks only"
+    if values["internet"]:
+        return "Internet checks only"
+    return "Disabled (both checks off)"
+
+
 def describe(values):
+    inactive = values["forever"] or not (values["agent"] or values["internet"])
+
+    def check_state(name):
+        if values["forever"]:
+            return f"Inactive (forever; saved {'on' if values[name] else 'off'})"
+        return "On" if values[name] else "Off"
+
     return [
         "", "On close",
         f"  Display   {display_mode(values)}",
         f"  Locking   {'Lock screen' if values['lock'] else 'No lock requested'}",
-        "", "Monitoring" + (" (timing settings inactive)" if values['forever'] else ""),
-        f"  Mode      {'Disabled (run until Ctrl-C)' if values['forever'] else 'Activity and internet checks'}",
+        "", "Monitoring" + (" (timing settings inactive)" if inactive else ""),
+        f"  Mode      {monitoring_mode(values)}",
+        f"  Agents    {check_state('agent')}",
+        f"  Internet  {check_state('internet')}",
         f"  Checks    {values['every']}s",
         f"  Grace     {values['grace']}s before retrying",
         f"  Retries   {values['retries']}",
@@ -250,7 +275,9 @@ def _choice(name, values):
     if name == "dim":
         return {"Off": "off on close", "On": "keep on when closed", "Dim": "dim on close"}[display_mode(values)]
     if name == "lock": return "lock on close" if value else "skip locking"
-    if name == "forever": return "disabled (run until Ctrl-C)" if value else "activity and internet checks"
+    if name == "forever": return "disabled (run until Ctrl-C)" if value else "use selected checks"
+    if name in ("agent", "internet"):
+        return ("on" if value else "off") + (" (inactive while monitoring disabled)" if values["forever"] else "")
     return f"{value}{'s' if name != 'retries' else ''}"
 
 
@@ -285,7 +312,7 @@ def menu(values):
                 mode = display_mode(edited)
                 edited["display_on"] = mode != "Dim"
                 edited["dim"] = mode == "On"
-            elif name in ("lock", "forever"):
+            elif name in ("lock", "forever", "agent", "internet"):
                 edited[name] = not edited[name]
             elif name in DEFAULTS:
                 edited[name], flash = ui.prompt_int(name, edited[name])

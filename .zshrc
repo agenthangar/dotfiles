@@ -180,7 +180,7 @@ prview() {
 # It still requests a lock. --no-lock independently skips that request; use both
 # flags for computer-use agents that need an unlocked, lit session. With the lid
 # open, failed checks are advisories and nosleep runs until Ctrl-C. With the lid shut,
-# it keeps holding only while BOTH signals stay fresh: internet (an HTTPS exchange with
+# by default it keeps holding only while BOTH signals stay fresh: internet (an HTTPS exchange with
 # api.anthropic.com or api.openai.com) and tokens burning — a local claude, codex, cursor-agent or
 # Claude/ChatGPT app mid-turn (Claude Code runs its own caffeinate while a turn is
 # in flight; for every agent, bytes moving on its sockets since the last check — at least
@@ -191,6 +191,8 @@ prview() {
 # expires, checks retry after 30, 60 and 120 seconds by default before restoring
 # sleep and exiting. Recovery resets the retry budget; reconnecting also restarts
 # activity sampling and its grace.
+# --no-agent and --no-internet independently skip those signals; with neither
+# enabled (or --forever), only lid handling and hold maintenance continue.
 # Lid handling and sudo refresh continue throughout the backoff.
 #
 # Reconnection uses macOS auto-join: in System Settings > Wi-Fi, enable Automatically
@@ -215,23 +217,34 @@ _nosleep_config() { python3 "$_DOTS_SOURCE_ROOT/lib/nosleep_config.py" "$@"; }
 #
 # ON CLOSE
 #   -d, --display-on    Keep the display on
-#       --dim, -dim     Dim and keep display on, regardless of flag order
-#       --no-lock       Do not lock the screen
+#   -D, --display-off   Turn the display off (also --no-dim)
+#   -m, --dim, -dim     Dim and keep display on, regardless of flag order
+#   -l, --lock          Lock the screen
+#   -L, --no-lock       Do not lock the screen
 #
 # FLAGS
 #   -f, --forever       Keep awake until Ctrl-C; skip checks
-#       --every SECS    Check interval in seconds (default 30)
-#       --grace SECS    Wait before retries when idle or offline (default 900)
-#       --retries N     Retry limit, 0–10 (default 3)
-#       --backoff SECS  Retry delay; doubles to 300 seconds (default 30)
+#   -F, --no-forever    Resume selected checks; overrides saved forever
+#   -c, --checks        Enable both checks and clear forever
+#   -C, --no-checks     Skip all checks (same as --forever)
+#   -a, --agent         Enable agent activity checks (default on)
+#   -A, --no-agent      Disable agent activity checks
+#   -i, --internet      Enable internet checks (default on)
+#   -I, --no-internet   Disable internet checks
+#   -e, --every SECS    Check interval in seconds (default 30)
+#   -g, --grace SECS    Wait before retries when idle or offline (default 900)
+#   -r, --retries N     Retry limit, 0–10 (default 3)
+#   -b, --backoff SECS  Retry delay; doubles to 300 seconds (default 30)
 #   -h, --help          Show help
 #
 # EXAMPLES
-#   nosleep -d --forever
+#   nosleep -m -L -I    Dim without locking; only check agent activity
+#   Use separate short flags. --forever overrides individual check settings.
 nosleep() {
   [[ "$1" == config ]] && { shift; _nosleep_config "$@"; return $?; }
   [[ "$1" == -h || "$1" == --help ]] && { _help_for nosleep; return 0; }
   local forever=0 display_on=0 dim=0 dim_requested=0 lock=1 grace=900 every=30 retries=3 backoff=30 defaults setting value
+  local agent=1 internet=1 monitoring=1
   defaults=$(_nosleep_config --values) || return $?
   for setting in ${(f)defaults}; do
     value=${setting#*=}
@@ -240,6 +253,8 @@ nosleep() {
       dim) dim=$value ;;
       lock) lock=$value ;;
       forever) forever=$value ;;
+      agent) agent=$value ;;
+      internet) internet=$value ;;
       grace) grace=$value ;;
       every) every=$value ;;
       retries) retries=$value ;;
@@ -249,20 +264,25 @@ nosleep() {
   while (( $# )); do
     case $1 in
       -h|--help) _help_for nosleep; return 0 ;;
-      -f|--forever) forever=1 ;;
-      --no-forever) forever=0 ;;
+      -f|--forever|-C|--no-checks) forever=1 ;;
+      -F|--no-forever) forever=0 ;;
+      -c|--checks) forever=0 agent=1 internet=1 ;;
+      -a|--agent) agent=1 ;;
+      -A|--no-agent) agent=0 ;;
+      -i|--internet) internet=1 ;;
+      -I|--no-internet) internet=0 ;;
       -d|--display-on) display_on=1 ;;
-      --dim|-dim) dim_requested=1 ;;
-      --display-off|--no-dim) display_on=0 dim=0 ;;
-      --no-lock) lock=0 ;;
-      --lock) lock=1 ;;
-      --grace|--every|--retries|--backoff)
+      -m|--dim|-dim) dim_requested=1 ;;
+      -D|--display-off|--no-dim) display_on=0 dim=0 ;;
+      -L|--no-lock) lock=0 ;;
+      -l|--lock) lock=1 ;;
+      -g|--grace|-e|--every|-r|--retries|-b|--backoff)
         (( $# >= 2 )) || { echo "nosleep: $1 needs a value" >&2; return 2; }
         case $1 in
-          --grace) grace=$2 ;;
-          --every) every=$2 ;;
-          --retries) retries=$2 ;;
-          --backoff) backoff=$2 ;;
+          -g|--grace) grace=$2 ;;
+          -e|--every) every=$2 ;;
+          -r|--retries) retries=$2 ;;
+          -b|--backoff) backoff=$2 ;;
         esac
         shift ;;
       *) echo "nosleep: unknown option '$1' (see nosleep -h)" >&2; return 2 ;;
@@ -272,6 +292,7 @@ nosleep() {
   # Explicit dimming implies display-on, independent of other display flags.
   (( dim_requested )) && dim=1
   (( dim )) && display_on=1
+  monitoring=$(( ! forever && (agent || internet) ))
   [[ $grace == <-> && $every == <-> && $every -gt 0 ]] || { echo "nosleep: --grace/--every take a number of seconds" >&2; return 2; }
   [[ $retries == <-> && $retries -le 10 && $backoff == <-> && $backoff -ge 1 && $backoff -le 300 ]] || {
     echo "nosleep: --retries must be 0–10 and --backoff must be 1–300 seconds" >&2; return 2
@@ -405,39 +426,47 @@ nosleep() {
       _nosleep_status
       status_shown=1
     fi
-    if (( ! forever && now >= next_check )); then
+    if (( monitoring && now >= next_check )); then
       show_snapshot=1
       checked_at=$now
       next_check=$(( checked_at + every ))
-      online=0
-      if _nosleep_online; then
-        online=1
-        online_at=$EPOCHSECONDS
-        if (( ! was_online )); then
-          # Offline silence cannot establish that the task finished. Give a resumed
-          # agent fresh baselines, grace and retries instead of exiting on stale work.
-          busy_at=$online_at
-          _NOSLEEP_NET=() _NOSLEEP_NET_AT=()
-          probes=0 retry_count=0 retry_delay=$backoff retry_for='' detected_at=0
+      if (( internet )); then
+        online=0
+        if _nosleep_online; then
+          online=1
+          online_at=$EPOCHSECONDS
+          if (( ! was_online )); then
+            # Offline silence cannot establish that the task finished. Give a resumed
+            # agent fresh baselines, grace and retries instead of exiting on stale work.
+            busy_at=$online_at
+            _NOSLEEP_NET=() _NOSLEEP_NET_AT=()
+            probes=0 retry_count=0 retry_delay=$backoff retry_for='' detected_at=0
+            _nosleep_status_clear
+            if (( agent )); then
+              echo "nosleep: network recovered — restarting agent activity sampling and grace"
+            else
+              echo "nosleep: network recovered — resuming internet checks"
+            fi
+          fi
+        elif (( was_online )); then
           _nosleep_status_clear
-          echo "nosleep: network recovered — restarting agent activity sampling and grace"
+          echo "nosleep: connection lost — holding awake while macOS auto-join can reconnect"
         fi
-      elif (( was_online )); then
-        _nosleep_status_clear
-        echo "nosleep: connection lost — holding awake while macOS auto-join can reconnect"
+        online_checked_at=$EPOCHSECONDS
+        was_online=$online
       fi
-      online_checked_at=$EPOCHSECONDS
-      was_online=$online
-      _nosleep_busy_at
-      busy_now=$REPLY
+      if (( agent )); then
+        _nosleep_busy_at
+        busy_now=$REPLY
+      fi
       (( busy_now )) && busy_at=$busy_now detected_at=$busy_now
       (( _NOSLEEP_DONE )) && return 130
       now=$EPOCHSECONDS
       (( ++probes ))
       missing=''
-      if (( ! online && (! lid_shut || now - online_at > grace) )); then
+      if (( internet && ! online && (! lid_shut || now - online_at > grace) )); then
         missing=network why="the network has been down for $(( now - online_at ))s"
-      elif (( probes > 1 && ! busy_now && (! lid_shut || now - busy_at > grace) )); then
+      elif (( agent && probes > 1 && ! busy_now && (! lid_shut || now - busy_at > grace) )); then
         missing=activity why="no local agent activity for $(( now - busy_at ))s"
       fi
       if [[ -n $missing ]]; then
@@ -520,7 +549,10 @@ _nosleep_status() {
     next_text='No checks (--forever)'
     sleep_text='Prevented until Ctrl-C' monitoring_text='Disabled (--forever)'
   else
-    if (( ! probes )); then
+    if (( ! agent )); then
+      agent_style=2 agent_text='Not checked (--no-agent)'
+      monitoring_text='Internet checks only'
+    elif (( ! probes )); then
       agent_text='Checking activity…'
     elif (( busy_now )); then
       agent_style=32
@@ -535,7 +567,10 @@ _nosleep_status() {
       agent_text='No activity detected'
     fi
     network_text='Checking connection…'
-    if (( online_checked_at )); then
+    if (( ! internet )); then
+      network_style=2 network_text='Not checked (--no-internet)'
+      monitoring_text='Agent activity checks only'
+    elif (( online_checked_at )); then
       _nosleep_duration $(( now - online_checked_at ))
       network_text="Online · checked $REPLY ago"
       network_style=32
@@ -550,15 +585,20 @@ _nosleep_status() {
     if (( retry_count )); then
       next_style=33
       next_text="Retry $retry_count/$retries in $REPLY · waiting for $retry_for"
-    elif (( lid_shut && probes && (! online || ! busy_now) )); then
+    elif (( lid_shut && probes && ((internet && ! online) || (agent && ! busy_now)) )); then
       next_style=33
-      signal_age=$(( now - busy_at ))
-      if (( ! online && (busy_now || now - online_at > signal_age) )); then
+      signal_age=0
+      (( agent && ! busy_now )) && signal_age=$(( now - busy_at ))
+      if (( internet && ! online && now - online_at > signal_age )); then
         signal_age=$(( now - online_at ))
       fi
       remaining=$(( grace - signal_age ))
       _nosleep_duration "$remaining"
       next_text+=" · grace $REPLY left"
+    fi
+    if (( ! monitoring )); then
+      next_style=2 next_text='No checks (both disabled)'
+      sleep_text='Prevented until Ctrl-C' monitoring_text='Disabled (both checks off)'
     fi
   fi
   if (( _NOSLEEP_RESTORE_FAILED )); then
@@ -592,7 +632,7 @@ _nosleep_status() {
   _nosleep_duration "$grace"; grace_text="$REPLY before retrying"
   _nosleep_duration "$every"; every_text=$REPLY
   _nosleep_duration "$backoff"; backoff_text="$REPLY, doubles to 5m"
-  if (( forever )); then
+  if (( ! monitoring )); then
     _nosleep_duration "$grace"; grace_text="$REPLY (inactive)"
     every_text+=' (inactive)'
     retries_text+=' (inactive)'

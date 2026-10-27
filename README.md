@@ -49,6 +49,8 @@ nosleep --no-lock              # display off on close, without requesting a lock
 nosleep --dim --no-lock         # dim on close, without requesting a lock
 nosleep --forever              # keep awake until Ctrl-C; skip activity checks
 nosleep -m -L -I               # dim, skip locking, check only agent activity
+nosleep -mLI                   # the same options in one group
+nosleep -dML                   # display on, no saved dimming, no lock
 nosleep -A                     # check only internet connectivity
 nosleep -A -I                  # disable both checks; keep awake until Ctrl-C
 nosleep config                # arrow-key menu for this machine's defaults
@@ -68,12 +70,16 @@ changes macOS's own automatic locking settings. Locking requires authentication
 to use the session again; dimming only changes display brightness. With the
 built-in defaults, `nosleep --dim` does both when the lid closes.
 
-Short flags are separate arguments (for example, `-m -L`, not `-mL`):
+Short flags can be grouped: `-mLI` is the same as `-m -L -I`.
+Value-taking flags consume the rest of their group or the next argument:
+`-mLIe10` and `-mLIe 10` both select a 10-second interval. Put further flags
+in a new argument after a value. The legacy `-dim` spelling still means only
+`--dim`; it does not enable the internet check.
 
 | Setting | Enable / select | Disable / opposite |
 | --- | --- | --- |
 | Display on | `-d`, `--display-on` | `-D`, `--display-off` |
-| Dim display | `-m`, `--dim` (also `-dim`) | `-D`, `--no-dim` (display off) |
+| Dim display | `-m`, `--dim` (also `-dim`) | `-M`, `--undim` (keep display mode) |
 | Lock on close | `-l`, `--lock` | `-L`, `--no-lock` |
 | Agent activity check | `-a`, `--agent` | `-A`, `--no-agent` |
 | Internet check | `-i`, `--internet` | `-I`, `--no-internet` |
@@ -81,7 +87,11 @@ Short flags are separate arguments (for example, `-m -L`, not `-mL`):
 | Run until Ctrl-C | `-f`, `--forever` | `-F`, `--no-forever` |
 
 Timing flags also have short forms: `-e` / `--every`, `-g` / `--grace`,
-`-r` / `--retries`, and `-b` / `--backoff`, each followed by a value.
+`-r` / `--retries`, and `-b` / `--backoff`, each taking a value.
+`-M` clears saved dimming without changing the display mode, so `-dML` keeps
+the panel on at its normal brightness without requesting a lock. Explicit
+`-m` / `--dim` still wins over `-M`, regardless of order. The older `--no-dim`
+alias retains its display-off behavior.
 Only enabled checks can trigger retries or allow automatic sleep. Disabling both
 keeps the Mac awake until Ctrl-C. `--forever` / `--no-checks` overrides individual
 check settings; `--no-forever` resumes the selected checks, while `--checks`
@@ -101,10 +111,13 @@ An explicit `--dim` still takes precedence over these overrides. Use `--lock` /
 Timing defaults use `--grace`, `--every`, `--retries`, and
 `--backoff`. `nosleep --help` highlights options that change the built-in defaults.
 Configuration commands never change power settings or an already-running instance.
-The menu has separate agent and internet toggles (`agent` and `internet` booleans
-in JSON, both defaulting to true). Monitoring can disable both temporarily without
-forgetting those preferences. Status shows which checks are disabled and marks
-timing settings inactive when neither check runs.
+The menu groups display and locking under **On close**, the automatic-check
+switch and individual agent/internet toggles under **Checks**, and their
+interval, grace threshold, retry limit, and backoff under **Check settings**.
+The toggles are `agent` and `internet` booleans in JSON, both defaulting to true.
+Automatic checks can be disabled without forgetting those preferences.
+Help, saved defaults, and live status use the same separation. Check settings
+are marked inactive when neither check runs.
 
 `nosleep` shows a live snapshot instead of a long startup message:
 
@@ -121,9 +134,11 @@ On close
   Display   Off
   Locking   Lock screen
 
-Monitoring
+Checks
   Mode      Activity and internet checks
-  Checks    30s
+
+Check settings
+  Interval  30s
   Grace     15m before retrying
   Retries   3
   Backoff   30s, doubles to 5m
@@ -134,8 +149,9 @@ Monitoring
 
 Live status refreshes every two seconds with current activity and connection checks
 and a countdown to the next check. Sleep reports whether sleep prevention is
-active. On close shows the selected display and locking behavior. Monitoring
-shows the activity checks and timing settings. Use `nosleep --help` for one-run
+active. On close shows the selected display and locking behavior. Checks
+shows the monitoring mode; Check settings shows its timing and retry thresholds.
+Use `nosleep --help` for one-run
 options or `nosleep config` to save defaults. In `--forever` mode, unused timing
 controls are marked inactive.
 Agents shows activity observed at the last check, then switches to quiet

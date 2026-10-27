@@ -301,14 +301,14 @@ def test_zsh_nosleep_plain_snapshot_shows_sampling_then_idle(nosleep_loop):
     result, _ = nosleep_loop("--every 2", FAKE_LID_AT="99999", FAKE_STOP_AT="1006")
     output = result.stdout
     assert "nosleep\n" in output
-    for label in ("Sleep", "Display", "Locking", "Grace", "Checks", "Retries", "Backoff", "Agents", "Internet", "Next", "Stop"):
+    for label in ("Sleep", "Display", "Locking", "Grace", "Interval", "Retries", "Backoff", "Agents", "Internet", "Next", "Stop"):
         assert re.search(rf"(?m)^  {label}\b", output), label
     snapshot = output.split("nosleep\n", 1)[1].split("  Stop", 1)[0]
     live, config = snapshot.split("On close", 1)
     assert "Live status" in live
     for label in ("Sleep", "Agents", "Internet", "Next"):
         assert re.search(rf"(?m)^  {label}\b", live), label
-    for label in ("Display", "Locking", "Grace", "Checks", "Retries", "Backoff"):
+    for label in ("Display", "Locking", "Grace", "Interval", "Retries", "Backoff"):
         assert not re.search(rf"(?m)^  {label}\b", live), label
         assert re.search(rf"(?m)^  {label}\b", config), label
     assert not re.search(r"(?m)^  (Laptop|Dim)\b", output)
@@ -1006,7 +1006,7 @@ def test_zsh_nosleep_help_is_concise_and_does_not_change_power(zsh, args):
     assert "--dim, -dim" in result.stdout
     assert "--forever" in result.stdout
     assert "unexpected sudo" not in result.stdout
-    assert len(result.stdout.splitlines()) <= 40
+    assert len(result.stdout.splitlines()) <= 50
 
 
 
@@ -1042,7 +1042,7 @@ def test_zsh_nosleep_saved_display_on_and_teardown(nosleep_loop):
 
 
 @pytest.mark.parametrize("short,long", [
-    ("-m", "--dim"), ("-D", "--display-off"), ("-d", "--display-on"),
+    ("-m", "--dim"), ("-M", "--undim"), ("-D", "--display-off"), ("-d", "--display-on"),
     ("-l", "--lock"), ("-L", "--no-lock"), ("-f", "--forever"),
     ("-F", "--no-forever"), ("-c", "--checks"), ("-C", "--no-checks"),
     ("-a", "--agent"), ("-A", "--no-agent"),
@@ -1128,3 +1128,50 @@ def test_zsh_nosleep_invalid_short_timing_flags_leave_power_untouched(zsh, args)
     result = zsh(f'sudo() {{ print unexpected-power; }}; nosleep {args}; print rc=$?')
     assert "rc=2" in result.stdout
     assert "unexpected-power" not in result.stdout
+
+
+@pytest.mark.parametrize("group,separate", [
+    ("-dML", "-d -M -L"), ("-mLI", "-m -L -I"),
+    ("-dMLIe2 -g0 -r1 -b2", "-d -M -L -I -e 2 -g 0 -r 1 -b 2"),
+    ("-mLIe 2 -g 0 -r 1 -b 2", "-m -L -I --every 2 --grace 0 --retries 1 --backoff 2"),
+    ("-cAI", "-c -A -I"), ("-CFac", "-C -F -a -c"),
+    ("-DdLl -f", "-D -d -L -l -f"),
+    ("-mMD -f", "-m -M -D -f"), ("-MmD -f", "-M -m -D -f"),
+    ("-I -dim", "--no-internet --dim"),
+])
+def test_zsh_nosleep_grouped_flags_match_separate_flags(nosleep_loop, group, separate):
+    grouped, group_log = nosleep_loop(group, FAKE_STOP_AT="1008")
+    expanded, separate_log = nosleep_loop(separate, FAKE_STOP_AT="1008")
+    assert grouped.stdout == expanded.stdout
+    assert group_log == separate_log
+
+
+@pytest.mark.parametrize("args", ["-dML", "-MdL", "--display-on --undim --no-lock"])
+def test_zsh_nosleep_undim_clears_saved_dimming_without_turning_display_off(nosleep_loop, args):
+    config = nosleep_loop.home / ".config" / "nosleep" / "config.json"
+    config.parent.mkdir(parents=True)
+    saved = json.dumps({"dim": True})
+    config.write_text(saved)
+    result, log = nosleep_loop(args + " -f", FAKE_STOP_AT="1004")
+    assert "no lock requested, display held on" in result.stdout
+    assert not any(line.startswith(("lock ", "brightness ")) for line in log)
+    assert [line for line in log if line.startswith("display-off ")] == ["display-off 1004"]
+    assert config.read_text() == saved
+
+
+@pytest.mark.parametrize("args", ["-dXe2", "-dMLg", "-de0", "-dMLb301", "-de2f", "-dg-1", "--grace -1"])
+def test_zsh_nosleep_invalid_groups_leave_power_untouched(zsh, args):
+    result = zsh(f'sudo() {{ print unexpected-power; }}; nosleep {args}; print rc=$?')
+    assert "rc=2" in result.stdout
+    assert "unexpected-power" not in result.stdout
+
+
+def test_zsh_nosleep_help_and_status_separate_checks_from_settings(zsh, nosleep_loop):
+    help_result = zsh('nosleep -dMLh')
+    checks, settings = help_result.stdout.split("CHECKS\n", 1)[1].split("CHECK SETTINGS\n", 1)
+    assert "--no-agent" in checks and "--no-internet" in checks
+    assert "--grace" not in checks and "--grace" in settings
+    result, _ = nosleep_loop("-AI", FAKE_STOP_AT="1004")
+    checks, settings = result.stdout.split("\nChecks\n", 1)[1].split("\nCheck settings\n", 1)
+    assert "Disabled" in checks and "Grace" not in checks
+    assert "Interval" in settings and "(inactive)" in settings

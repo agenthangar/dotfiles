@@ -212,8 +212,41 @@ Sharing), with a cellular plan that supports Personal Hotspot. See Apple's
 
 macOS attempts auto-join while `nosleep` waits. Hotspot auto-join applies when no
 known Wi-Fi is available; it may not leave connected Wi-Fi whose internet uplink
-is broken. `nosleep` does not toggle Wi-Fi, edit saved networks, or store passwords.
+is broken. `nosleep` does not toggle Wi-Fi or change those auto-join settings.
 These auto-join settings are per-machine and are not changed by `dots --all`.
+
+For an explicit fallback to an already broadcasting iPhone hotspot, run this once
+in an unlocked terminal on each Mac:
+
+```sh
+nosleep hotspot setup
+nosleep --hotspot-after 300     # five minutes of continuous internet outage
+nosleep --no-hotspot            # disable the saved fallback for this run
+```
+
+Setup asks for the exact Wi-Fi name and lets macOS `security` prompt for the
+password locally. It saves the password in this Mac's Keychain and enables the
+machine's private configuration only after setup succeeds. Passwords never appear
+in shell arguments, logs, or the JSON config. `nosleep config` can change the
+fallback toggle, Wi-Fi name, delay and attempt limit; changing the Wi-Fi name may
+require running setup again for its credentials. Flags override saved settings:
+`--hotspot`, `--no-hotspot`, `--hotspot-ssid NAME`, `--hotspot-after SECONDS`, and
+`--hotspot-timeout SECONDS` (1–300, default 30).
+
+After the delay, `nosleep` makes one directed join to that exact SSID with
+`networksetup`, even if the current Wi-Fi uplink is broken. This can work with the
+lid closed when the hotspot is advertising, Wi-Fi is already on, Keychain is
+accessible and macOS permits the Wi-Fi change. It does not scan all nearby phones
+or wake a dormant Instant Hotspot. Turn on Personal Hotspot's **Allow Others to
+Join** and keep it broadcasting nearby. A locked Keychain or permission policy
+can prevent joining; unlock the Mac and rerun setup to repair credentials.
+
+Internet checks verify recovery independently of a successful association.
+Automatic sleep waits for the outage delay and bounded attempt/recovery window,
+including when activity retries finish early. Recovery resets the timer for the
+next outage. Ctrl-C cancels the owned helper and releases the sleep hold.
+Fallback is inactive with `--forever`, `--no-internet`, or `--checks none`.
+It is off by default and is never enabled on other Macs by `dots --all`.
 
 ## Install
 

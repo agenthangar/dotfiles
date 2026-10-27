@@ -44,7 +44,8 @@ def test_defaults_and_values_do_not_write(isolated):
     result = run_config(isolated, "--values")
     assert result.returncode == 0
     assert result.stdout.splitlines() == ["dim=0", "display_on=0", "lock=1", "forever=0", "agent=1", "internet=1", "grace=900",
-                                          "every=30", "retries=3", "backoff=30"]
+                                          "every=30", "retries=3", "backoff=30", "hotspot=0",
+                                          "hotspot_ssid=", "hotspot_after=300", "hotspot_timeout=30"]
     shown = run_config(isolated, "--show")
     assert shown.returncode == 0
     assert "Lock" in shown.stdout and "Display" in shown.stdout
@@ -310,3 +311,34 @@ def test_settings_section_keyboard_navigation_edits_grace_without_toggling_check
     assert saved["grace"] == 42
     assert saved["agent"] is True and saved["internet"] is True
     assert saved["forever"] is False
+
+
+@pytest.mark.parametrize("bad", [{"hotspot": 1}, {"hotspot": True}, {"hotspot_ssid": 1},
+                                  {"hotspot_ssid": "x\x85y"}, {"hotspot_ssid": "📱" * 9},
+                                  {"hotspot_after": -1}, {"hotspot_after": 2147483648},
+                                  {"hotspot_timeout": 0}, {"hotspot_timeout": 301}])
+def test_hotspot_configuration_validation(isolated, bad):
+    _, path = isolated
+    path.parent.mkdir(parents=True)
+    path.write_text(json.dumps(bad))
+    assert run_config(isolated, "--values").returncode == 1
+
+
+def test_old_config_migrates_hotspot_defaults_without_writing(isolated):
+    _, path = isolated
+    path.parent.mkdir(parents=True)
+    path.write_text('{"every": 12}\n')
+    before = path.read_bytes()
+    result = run_config(isolated, "--values")
+    assert "hotspot=0" in result.stdout and "hotspot_after=300" in result.stdout
+    assert path.read_bytes() == before
+
+
+def test_menu_enables_preconfigured_hotspot_and_marks_inactive(isolated):
+    _, path = isolated
+    path.parent.mkdir(parents=True)
+    path.write_text(json.dumps({"hotspot_ssid": "Test Phone", "internet": False}))
+    _pty_config(isolated, [(b"Local settings", b"jjjjjjjjj\r"),
+                           (b"on (inactive)", b"s"), (b"Review changes", b"y")], lines=40)
+    assert json.loads(path.read_text())["hotspot"] is True
+    assert "Hotspot   on (inactive)" in run_config(isolated, "--show").stdout

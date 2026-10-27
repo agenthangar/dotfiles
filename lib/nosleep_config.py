@@ -13,6 +13,8 @@ import sys
 import tempfile
 import termios
 import tty
+import unicodedata
+
 
 
 DEFAULTS = {
@@ -26,6 +28,10 @@ DEFAULTS = {
     "every": 30,
     "retries": 3,
     "backoff": 30,
+    "hotspot": False,
+    "hotspot_ssid": "",
+    "hotspot_after": 300,
+    "hotspot_timeout": 30,
 }
 LABELS = {
     "dim": "Display when lid closes",
@@ -37,12 +43,23 @@ LABELS = {
     "every": "Check interval",
     "retries": "Retries",
     "backoff": "Retry delay",
+    "hotspot": "Hotspot fallback",
+    "hotspot_ssid": "Hotspot Wi-Fi name",
+    "hotspot_after": "Hotspot outage delay",
+    "hotspot_timeout": "Hotspot attempt limit",
 }
 
 
 def config_path():
     base = os.environ.get("XDG_CONFIG_HOME") or str(Path.home() / ".config")
     return Path(base).expanduser() / "nosleep" / "config.json"
+
+
+def validate_ssid(ssid):
+    if (not isinstance(ssid, str) or not ssid or len(ssid.encode("utf-8")) > 32
+            or any(unicodedata.category(char) == "Cc" for char in ssid)):
+        raise ValueError("hotspot_ssid must contain 1–32 UTF-8 bytes without control characters")
+    return ssid
 
 
 def validate(data):
@@ -53,11 +70,12 @@ def validate(data):
         raise ValueError("unknown setting: " + ", ".join(sorted(unknown)))
     result = DEFAULTS.copy()
     result.update(data)
-    for key in ("dim", "display_on", "lock", "forever", "agent", "internet"):
+    for key in ("dim", "display_on", "lock", "forever", "agent", "internet", "hotspot"):
         if type(result[key]) is not bool:
             raise ValueError(f"{key} must be true or false")
     limits = {"grace": (0, None), "every": (1, None),
-              "retries": (0, 10), "backoff": (1, 300)}
+              "retries": (0, 10), "backoff": (1, 300),
+              "hotspot_after": (0, 2147483647), "hotspot_timeout": (1, 300)}
     for key, (minimum, maximum) in limits.items():
         value = result[key]
         if type(value) is not int or value < minimum or (maximum is not None and value > maximum):
@@ -65,6 +83,10 @@ def validate(data):
             raise ValueError(f"{key} must be an integer {bound}")
     # Existing dim-only configurations retain their display hold.
     result["display_on"] = result["display_on"] or result["dim"]
+    if not isinstance(result["hotspot_ssid"], str):
+        raise ValueError("hotspot_ssid must be text")
+    if result["hotspot"] or result["hotspot_ssid"]:
+        validate_ssid(result["hotspot_ssid"])
     return result
 
 
@@ -141,6 +163,11 @@ def describe(values):
         f"  Grace     {values['grace']}s before retrying",
         f"  Retries   {values['retries']}",
         f"  Backoff   {values['backoff']}s, doubles to 300s",
+        "", "Hotspot fallback",
+        f"  Hotspot   {_choice('hotspot', values)}",
+        f"  Wi-Fi     {values['hotspot_ssid'] or 'Not configured; run nosleep hotspot setup'}",
+        f"  Delay     {values['hotspot_after']}s of continuous outage",
+        f"  Limit     {values['hotspot_timeout']}s per attempt",
     ]
 
 
@@ -266,6 +293,23 @@ class Rail:
         except (ValueError, OverflowError) as exc:
             return value, str(exc)
 
+    def prompt_ssid(self, value):
+        self.commit(["  ◇  Hotspot Wi-Fi name (passwords belong in nosleep hotspot setup)", "  │"])
+        termios.tcsetattr(self.fd, termios.TCSADRAIN, self.original)
+        sys.stdout.write("\x1b[?25h")
+        sys.stdout.flush()
+        try:
+            entered = input("      Wi-Fi name (blank keeps current): ")
+            return validate_ssid(entered) if entered else value, ""
+        except (EOFError, KeyboardInterrupt):
+            return value, ""
+        except ValueError as exc:
+            return value, str(exc)
+        finally:
+            tty.setcbreak(self.fd)
+            sys.stdout.write("\x1b[?25l")
+            sys.stdout.flush()
+
 
 def display_mode(values):
     return "Dim" if values["dim"] else "On" if values["display_on"] else "Off"
@@ -279,6 +323,12 @@ def _choice(name, values):
     if name == "forever": return "disabled (run until Ctrl-C)" if value else "use selected checks"
     if name in ("agent", "internet"):
         return ("on" if value else "off") + (" (inactive while monitoring disabled)" if values["forever"] else "")
+    if name == "hotspot":
+        return ("on" if value else "off") + (" (inactive)" if values["forever"] or not values["internet"] else "")
+    if name == "hotspot_ssid":
+        return value or "run nosleep hotspot setup"
+    if name.startswith("hotspot_"):
+        return f"{value}s" + (" (inactive)" if not values["hotspot"] or values["forever"] or not values["internet"] else "")
     inactive = values["forever"] or not (values["agent"] or values["internet"])
     return f"{value}{'s' if name != 'retries' else ''}" + (" (inactive)" if inactive else "")
 
@@ -309,6 +359,7 @@ def menu(values):
             inactive = edited["forever"] or not (edited["agent"] or edited["internet"])
             sections = {"dim": "ON CLOSE", "forever": "CHECKS",
                         "grace": "CHECK SETTINGS" + (" (inactive)" if inactive else ""),
+                        "hotspot": "HOTSPOT FALLBACK · setup stores password in Keychain",
                         "defaults": "FINISH"}
             ui.frame("Local settings", body, selected, pending, flash=flash, sections=sections)
             flash = ""
@@ -328,6 +379,13 @@ def menu(values):
                 edited["dim"] = mode == "On"
             elif name in ("lock", "forever", "agent", "internet"):
                 edited[name] = not edited[name]
+            elif name == "hotspot":
+                if not edited["hotspot"] and not edited["hotspot_ssid"]:
+                    flash = "Run nosleep hotspot setup first in an unlocked terminal"
+                else:
+                    edited[name] = not edited[name]
+            elif name == "hotspot_ssid":
+                edited[name], flash = ui.prompt_ssid(edited[name])
             elif name in DEFAULTS:
                 edited[name], flash = ui.prompt_int(name, edited[name])
             elif name == "defaults":

@@ -55,7 +55,7 @@ elif args[0] == "-setairportnetwork":
 
 def test_join_discovers_wifi_and_transfers_password_only_via_stdin(commands):
     (networksetup, security), log = commands
-    ssid = "📱 O'Brien;$(touch BAD)"
+    ssid = "📱 Test's;$(touch BAD)"
     hotspot.connect(ssid, networksetup=networksetup, security=security)
     rows = [json.loads(line) for line in log.read_text().splitlines()]
     assert rows[1] == ["-getairportpower", "en7"]

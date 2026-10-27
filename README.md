@@ -41,63 +41,58 @@ Linux installs, and links-only updates skip this prompt; `DOTFILES_NO_SUDO=1`
 also skips it. Re-running the installer leaves an identical rule alone.
 
 ```sh
-nosleep                       # closing the lid locks and turns the display off
-nosleep --display-off          # explicitly turn the display off on close
-nosleep -d                     # closing the lid locks and keeps the display on
-nosleep --dim                  # closing the lid locks and dims the display
-nosleep --no-lock              # display off on close, without requesting a lock
-nosleep --dim --no-lock         # dim on close, without requesting a lock
-nosleep --forever              # keep awake until Ctrl-C; skip activity checks
-nosleep -m -L -I               # dim, skip locking, check only agent activity
-nosleep -mLI                   # the same options in one group
-nosleep -dML                   # display on, no saved dimming, no lock
-nosleep -A                     # check only internet connectivity
-nosleep -A -I                  # disable both checks; keep awake until Ctrl-C
+nosleep                       # lock and turn the display off on lid close
+nosleep -d on                  # display on, normal brightness
+nosleep -d dim -l off          # dim without requesting a lock
+nosleep -c none                # keep awake until Ctrl-C; skip all checks
+nosleep -d dim -l off -c agent # dim, no lock, check only agent activity
+nosleep -c internet            # check only internet connectivity
 nosleep config                # arrow-key menu for this machine's defaults
 nosleep config --show          # print effective defaults
 nosleep config --edit          # edit defaults with VISUAL/EDITOR
 ```
 
-Display behavior and locking are independent. `--display-off` turns the display
-off on close (the default). `--display-on` (or `-d`) keeps it awake without
-changing brightness. `--dim` (`-m` or `-dim`) also keeps it awake, but dims the built-in
-panel. An explicit `--dim`, `-m`, or `-dim` always enables display-on and dimming,
-regardless of flag order. `-d` does not clear dimming; by itself it leaves
-brightness unchanged.
-`--no-dim` remains an alias for `--display-off`. Locking stays enabled by default; disable it with `--no-lock`
-or a saved preference. `--no-lock` skips nosleep's explicit lock request. It never unlocks an existing lock or
-changes macOS's own automatic locking settings. Locking requires authentication
-to use the session again; dimming only changes display brightness. With the
-built-in defaults, `nosleep --dim` does both when the lid closes.
+Related choices use one mode flag per setting:
 
-Short flags can be grouped: `-mLI` is the same as `-m -L -I`.
-Value-taking flags consume the rest of their group or the next argument:
-`-mLIe10` and `-mLIe 10` both select a 10-second interval. Put further flags
-in a new argument after a value. The legacy `-dim` spelling still means only
-`--dim`; it does not enable the internet check.
-
-| Setting | Enable / select | Disable / opposite |
+| Setting | Flag | Modes |
 | --- | --- | --- |
-| Display on | `-d`, `--display-on` | `-D`, `--display-off` |
-| Dim display | `-m`, `--dim` (also `-dim`) | `-M`, `--undim` (keep display mode) |
-| Lock on close | `-l`, `--lock` | `-L`, `--no-lock` |
-| Agent activity check | `-a`, `--agent` | `-A`, `--no-agent` |
-| Internet check | `-i`, `--internet` | `-I`, `--no-internet` |
-| All checks | `-c`, `--checks` | `-C`, `--no-checks` |
-| Run until Ctrl-C | `-f`, `--forever` | `-F`, `--no-forever` |
+| Display on lid close | `-d`, `--display` | `off`, `on`, `dim` |
+| Lock on lid close | `-l`, `--lock` | `on`, `off` |
+| Automatic checks | `-c`, `--checks` | `all`, `agent`, `internet`, `none` |
 
-Timing flags also have short forms: `-e` / `--every`, `-g` / `--grace`,
-`-r` / `--retries`, and `-b` / `--backoff`, each taking a value.
-`-M` clears saved dimming without changing the display mode, so `-dML` keeps
-the panel on at its normal brightness without requesting a lock. Explicit
-`-m` / `--dim` still wins over `-M`, regardless of order. The older `--no-dim`
-alias retains its display-off behavior.
-Only enabled checks can trigger retries or allow automatic sleep. Disabling both
-keeps the Mac awake until Ctrl-C. `--forever` / `--no-checks` overrides individual
-check settings; `--no-forever` resumes the selected checks, while `--checks`
-enables both and clears forever. For opposing flags, the last one wins, except
-explicit dimming always wins as described above. Lid/display handling, sleep
-protection, sudo refresh, and cleanup continue even when checks are disabled.
+Use a separate value or `=`: `-d dim`, `-d=dim`, and `--display=dim` are equivalent.
+A display mode replaces the whole display choice: `on` clears saved or earlier
+dimming, `off` turns the display off, and `dim` keeps it awake and dimmed.
+`--checks agent` selects only agent activity, replacing saved check choices and
+clearing forever; `none` disables both checks and holds until Ctrl-C.
+Repeating a mode applies the last selection. Display and locking remain independent.
+`--lock off` skips nosleep's lock request; it never unlocks an existing lock or
+changes macOS's own automatic locking settings. Dimming only changes brightness.
+
+Check settings remain separate: `-e` / `--every`, `-g` / `--grace`,
+`-r` / `--retries`, and `-b` / `--backoff`, each taking a number.
+Only enabled checks can trigger retries or allow automatic sleep. Lid/display
+handling, sleep protection, sudo refresh, and cleanup continue with checks disabled.
+
+Existing switches and groups still work. `-mLI` means dim, no lock, and no internet
+check; `-dML` means display on, no saved dimming, and no lock. Bare `-d` preserves
+saved dimming, while `-d on` explicitly clears it. Bare `-l` / `--lock` enables
+locking, and bare `-c` / `--checks` enables both checks and clears forever.
+The individual `-a` / `-A` and `-i` / `-I` check toggles are also retained.
+`-f` / `--forever` and `-C` / `--no-checks` override individual check settings;
+`-F` / `--no-forever` resumes the selected checks.
+
+Grouped numeric options accept attached or separate values: `-mLIe10` and
+`-mLIe 10` both use a 10-second interval. Mode values need a separate argument
+or `=`: `-Ld=dim` and `-Ld dim` combine no-lock with display dimming.
+Put further flags in a new argument after a value. The legacy `-dim` spelling
+still means only `--dim`; it does not enable the internet check.
+
+Among legacy display switches, `-m` / `--dim` / `-dim` wins regardless of order.
+`-M` / `--undim` clears saved dimming without changing the display mode;
+`-D` / `--display-off` / `--no-dim` turns the display off. A later
+`--display MODE` replaces the whole choice, including an earlier explicit dim
+request. A later legacy `--dim` requests dimming again.
 
 `nosleep config` follows `t config`: select a setting with arrow keys, stage
 changes, then review and save. Cancel leaves defaults unchanged. Defaults live
@@ -106,7 +101,8 @@ and stay local to that machine. Command-line flags override them for one run.
 The display setting cycles through Off, On, and Dim (`display_on` and `dim`
 in JSON); dimming implies display-on. Use `--display-off` to override saved
 dimming, or `--display-off -d` to keep the display on without saved dimming.
-An explicit `--dim` still takes precedence over these overrides. Use `--lock` /
+An explicit `--dim` still takes precedence over legacy overrides; `--display on`
+or `--display off` replaces it. Use `--lock on` /
 `--no-forever` to override the other modes.
 Timing defaults use `--grace`, `--every`, `--retries`, and
 `--backoff`. `nosleep --help` highlights options that change the built-in defaults.

@@ -216,22 +216,12 @@ _nosleep_config() { python3 "$_DOTS_SOURCE_ROOT/lib/nosleep_config.py" "$@"; }
 #   nosleep config [--show | --edit]
 #
 # ON CLOSE
-#   -d, --display-on    Keep the display on
-#   -D, --display-off   Turn the display off (also --no-dim)
-#   -m, --dim, -dim     Dim and keep display on, regardless of flag order
-#   -M, --undim         Clear saved dimming; keep the selected display mode
-#   -l, --lock          Lock the screen
-#   -L, --no-lock       Do not lock the screen
+#   -d, --display MODE  off | on | dim
+#   -l, --lock MODE     on | off
 #
 # CHECKS
-#   -f, --forever       Keep awake until Ctrl-C; skip checks
-#   -F, --no-forever    Resume selected checks; overrides saved forever
-#   -c, --checks        Enable both checks and clear forever
-#   -C, --no-checks     Skip all checks (same as --forever)
-#   -a, --agent         Enable agent activity checks (default on)
-#   -A, --no-agent      Disable agent activity checks
-#   -i, --internet      Enable internet checks (default on)
-#   -I, --no-internet   Disable internet checks
+#   -c, --checks MODE   all | agent | internet | none (until Ctrl-C)
+#                      Replaces saved checks and clears forever
 #
 # CHECK SETTINGS
 #   -e, --every SECS    Check interval in seconds (default 30)
@@ -241,10 +231,17 @@ _nosleep_config() { python3 "$_DOTS_SOURCE_ROOT/lib/nosleep_config.py" "$@"; }
 #   -h, --help          Show help
 #
 # EXAMPLES
-#   nosleep -dML        Display on, no dimming, no lock
-#   nosleep -mLIe10     Dim, no lock, agent checks only, every 10s
-#   Group short flags; values may be attached or separate. -dim stays an alias.
-#   --forever overrides individual check settings.
+#   nosleep -d dim -l off -c agent -e10
+#   nosleep --display=on --lock=off --checks=none
+#
+# SHORTCUTS
+#   Existing switches and groups still work: -dML, -mLI, -AI, -f / --forever.
+#   Bare -d / -l / -c mean display on / lock on / all checks.
+#   -m / --dim / -dim dim; -M / --undim clear saved dimming;
+#   -D / --display-off turn it off; -L / --no-lock skip locking.
+#   -a / -A and -i / -I enable/disable agent and internet checks.
+#   -C / --no-checks skips checks; -F / --no-forever resumes selected checks.
+#   Modes take separate or =values; numeric settings allow attached values.
 nosleep() {
   [[ "$1" == config ]] && { shift; _nosleep_config "$@"; return $?; }
   [[ "$1" == -h || "$1" == --help ]] && { _help_for nosleep; return 0; }
@@ -279,6 +276,10 @@ nosleep() {
       while [[ -n $group ]]; do
         flag=${group[1]}
         group=${group[2,-1]}
+        if [[ $flag == [dlc] && $group == \=* ]]; then
+          nosleep_args+=("-$flag$group")
+          break
+        fi
         nosleep_args+=("-$flag")
         if [[ $flag == [egrb] ]]; then
           if [[ -n $group ]]; then
@@ -305,17 +306,60 @@ nosleep() {
       -h|--help) _help_for nosleep; return 0 ;;
       -f|--forever|-C|--no-checks) forever=1 ;;
       -F|--no-forever) forever=0 ;;
-      -c|--checks) forever=0 agent=1 internet=1 ;;
+      -c|--checks|-c=*|--checks=*)
+        value=all
+        if [[ $1 == *=* ]]; then
+          value=${1#*=}
+        elif (( $# >= 2 )) && [[ $2 != -* ]]; then
+          value=$2; shift
+        fi
+        case $value in
+          all) agent=1 internet=1 ;;
+          agent) agent=1 internet=0 ;;
+          internet) agent=0 internet=1 ;;
+          none) agent=0 internet=0 ;;
+          *) echo 'nosleep: --checks takes all, agent, internet, or none' >&2; return 2 ;;
+        esac
+        forever=0 ;;
       -a|--agent) agent=1 ;;
       -A|--no-agent) agent=0 ;;
       -i|--internet) internet=1 ;;
       -I|--no-internet) internet=0 ;;
-      -d|--display-on) display_on=1 ;;
+      -d|--display|-d=*|--display=*)
+        if [[ $1 == *=* ]]; then
+          value=${1#*=}
+        elif (( $# >= 2 )) && [[ $2 != -* ]]; then
+          value=$2; shift
+        elif [[ $1 == -d ]]; then
+          # Preserve bare -d, including its saved-dimming behavior.
+          display_on=1; shift; continue
+        else
+          echo 'nosleep: --display needs off, on, or dim' >&2; return 2
+        fi
+        case $value in
+          off) display_on=0 dim=0 ;;
+          on) display_on=1 dim=0 ;;
+          dim) display_on=1 dim=1 ;;
+          *) echo 'nosleep: --display takes off, on, or dim' >&2; return 2 ;;
+        esac
+        dim_requested=0 ;;
+      --display-on) display_on=1 ;;
       -m|--dim|-dim) dim_requested=1 ;;
       -M|--undim) dim=0 ;;
       -D|--display-off|--no-dim) display_on=0 dim=0 ;;
       -L|--no-lock) lock=0 ;;
-      -l|--lock) lock=1 ;;
+      -l|--lock|-l=*|--lock=*)
+        value=on
+        if [[ $1 == *=* ]]; then
+          value=${1#*=}
+        elif (( $# >= 2 )) && [[ $2 != -* ]]; then
+          value=$2; shift
+        fi
+        case $value in
+          on) lock=1 ;;
+          off) lock=0 ;;
+          *) echo 'nosleep: --lock takes on or off' >&2; return 2 ;;
+        esac ;;
       -g|--grace|-e|--every|-r|--retries|-b|--backoff)
         (( $# >= 2 )) || { echo "nosleep: $1 needs a value" >&2; return 2; }
         case $1 in
@@ -329,7 +373,8 @@ nosleep() {
     esac
     shift
   done
-  # Explicit dimming implies display-on, independent of other display flags.
+  # Legacy --dim wins over legacy display switches. An explicit --display MODE
+  # replaces the whole display choice and clears any earlier legacy dim request.
   (( dim_requested )) && dim=1
   (( dim )) && display_on=1
   monitoring=$(( ! forever && (agent || internet) ))

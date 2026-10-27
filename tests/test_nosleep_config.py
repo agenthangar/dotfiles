@@ -275,3 +275,38 @@ def test_tty_menu_saves_individual_checks_and_forever_retains_preferences(isolat
     assert saved["forever"] is True
     assert saved["agent"] is False and saved["internet"] is False
     assert "Inactive (forever; saved off)" in run_config(isolated, "--show").stdout
+
+
+def test_config_show_separates_check_switches_from_settings(isolated):
+    output = run_config(isolated, "--show").stdout
+    checks, settings = output.split("\nChecks\n", 1)[1].split("\nCheck settings\n", 1)
+    assert "Agents    On" in checks and "Internet  On" in checks
+    assert "Grace" not in checks and "Interval" not in checks
+    assert "Grace" in settings and "Interval" in settings and "Retries" in settings
+
+
+def test_menu_sections_and_only_actual_toggle_edits_are_reviewed(isolated):
+    _, path = isolated
+    output = _pty_config(isolated, [(b"Local settings", b"jj\r"),
+                                    (b"(inactive)", b"s"),
+                                    (b"Review changes", b"y")], lines=40)
+    for heading in (b"ON CLOSE", b"CHECKS", b"CHECK SETTINGS", b"FINISH"):
+        assert heading in output
+    review = output.split(b"Review changes", 1)[1]
+    assert b"1 pending" in review
+    assert b"Grace period" not in review and b"Agent activity checks" not in review
+    saved = json.loads(path.read_text())
+    assert saved["forever"] is True
+    assert saved["grace"] == 900 and saved["agent"] is True
+
+
+def test_settings_section_keyboard_navigation_edits_grace_without_toggling_checks(isolated):
+    _, path = isolated
+    _pty_config(isolated, [(b"Local settings", b"jjjjj\r"),
+                           (b"New value", b"42\n"),
+                           (b"42s", b"s"),
+                           (b"Review changes", b"y")], columns=42, lines=10)
+    saved = json.loads(path.read_text())
+    assert saved["grace"] == 42
+    assert saved["agent"] is True and saved["internet"] is True
+    assert saved["forever"] is False

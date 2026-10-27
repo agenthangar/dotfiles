@@ -30,7 +30,7 @@ DEFAULTS = {
 LABELS = {
     "dim": "Display when lid closes",
     "lock": "Lock when lid closes",
-    "forever": "Monitoring",
+    "forever": "Automatic checks",
     "agent": "Agent activity checks",
     "internet": "Internet checks",
     "grace": "Grace period",
@@ -132,11 +132,12 @@ def describe(values):
         "", "On close",
         f"  Display   {display_mode(values)}",
         f"  Locking   {'Lock screen' if values['lock'] else 'No lock requested'}",
-        "", "Monitoring" + (" (timing settings inactive)" if inactive else ""),
+        "", "Checks",
         f"  Mode      {monitoring_mode(values)}",
         f"  Agents    {check_state('agent')}",
         f"  Internet  {check_state('internet')}",
-        f"  Checks    {values['every']}s",
+        "", "Check settings" + (" (timing settings inactive)" if inactive else ""),
+        f"  Interval  {values['every']}s",
         f"  Grace     {values['grace']}s before retrying",
         f"  Retries   {values['retries']}",
         f"  Backoff   {values['backoff']}s, doubles to 300s",
@@ -201,7 +202,7 @@ class Rail:
         self.repaint(lines)
         self.painted = 0
 
-    def frame(self, title, body, focus, pending=0, hint="↑↓/jk move · enter change · q back", flash="", primary="s  SAVE CHANGES"):
+    def frame(self, title, body, focus, pending=0, hint="↑↓/jk move · enter change · q back", flash="", primary="s  SAVE CHANGES", sections=None):
         width = self.cols()
         head = [f"  {self.style('◆', '36')}  {self.style(self.clip(title, 6), '1;36')}",
                 f"  {self.style('│', '33')}"]
@@ -215,8 +216,8 @@ class Rail:
             head = head[:1]
             footer = [f"      {self.style(self.clip(primary or hint, 6), '33')}"]
         physical = []
-        for index, (_, label, value) in enumerate(body):
-            section = {0: "ON CLOSE", 2: "MONITORING", 7: "FINISH"}.get(index) if len(body) == 10 else None
+        for index, (name, label, value) in enumerate(body):
+            section = (sections or {}).get(name)
             if section:
                 physical.append((f"  {self.style('│', '33')}   {self.style(section, '1;36')}", None))
             if width < 60 and value is not None:
@@ -278,7 +279,16 @@ def _choice(name, values):
     if name == "forever": return "disabled (run until Ctrl-C)" if value else "use selected checks"
     if name in ("agent", "internet"):
         return ("on" if value else "off") + (" (inactive while monitoring disabled)" if values["forever"] else "")
-    return f"{value}{'s' if name != 'retries' else ''}"
+    inactive = values["forever"] or not (values["agent"] or values["internet"])
+    return f"{value}{'s' if name != 'retries' else ''}" + (" (inactive)" if inactive else "")
+
+
+def changed(name, before, after):
+    # A toggle can change inactive annotations on other rows without changing
+    # their settings. Count and review only actual edits.
+    if name == "dim":
+        return display_mode(before) != display_mode(after)
+    return before[name] != after[name]
 
 
 def menu(values):
@@ -291,12 +301,16 @@ def menu(values):
     try:
         flash = ""
         while True:
-            pending = sum(_choice(name, edited) != _choice(name, values) for name in LABELS)
+            pending = sum(changed(name, values, edited) for name in LABELS)
             body = [(name, LABELS[name], _choice(name, edited)) for name in LABELS]
             body += [("defaults", "Restore defaults", None),
                      ("save", "Save changes", f"{pending} pending"),
                      ("cancel", "Cancel", None)]
-            ui.frame("Local settings", body, selected, pending, flash=flash)
+            inactive = edited["forever"] or not (edited["agent"] or edited["internet"])
+            sections = {"dim": "ON CLOSE", "forever": "CHECKS",
+                        "grace": "CHECK SETTINGS" + (" (inactive)" if inactive else ""),
+                        "defaults": "FINISH"}
+            ui.frame("Local settings", body, selected, pending, flash=flash, sections=sections)
             flash = ""
             pressed = key()
             if pressed in ("up", "k"):
@@ -355,7 +369,7 @@ def menu(values):
                     ui.commit(["  ◇  settings unchanged", ""])
                     return edited
                 changes = [(name, LABELS[name], f"{_choice(name, values)} → {_choice(name, edited)}")
-                           for name in LABELS if _choice(name, values) != _choice(name, edited)]
+                           for name in LABELS if changed(name, values, edited)]
                 review_focus = 0
                 while True:
                     ui.frame("Review changes", changes, review_focus, pending,

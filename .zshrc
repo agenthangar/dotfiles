@@ -219,10 +219,11 @@ _nosleep_config() { python3 "$_DOTS_SOURCE_ROOT/lib/nosleep_config.py" "$@"; }
 #   -d, --display-on    Keep the display on
 #   -D, --display-off   Turn the display off (also --no-dim)
 #   -m, --dim, -dim     Dim and keep display on, regardless of flag order
+#   -M, --undim         Clear saved dimming; keep the selected display mode
 #   -l, --lock          Lock the screen
 #   -L, --no-lock       Do not lock the screen
 #
-# FLAGS
+# CHECKS
 #   -f, --forever       Keep awake until Ctrl-C; skip checks
 #   -F, --no-forever    Resume selected checks; overrides saved forever
 #   -c, --checks        Enable both checks and clear forever
@@ -231,6 +232,8 @@ _nosleep_config() { python3 "$_DOTS_SOURCE_ROOT/lib/nosleep_config.py" "$@"; }
 #   -A, --no-agent      Disable agent activity checks
 #   -i, --internet      Enable internet checks (default on)
 #   -I, --no-internet   Disable internet checks
+#
+# CHECK SETTINGS
 #   -e, --every SECS    Check interval in seconds (default 30)
 #   -g, --grace SECS    Wait before retries when idle or offline (default 900)
 #   -r, --retries N     Retry limit, 0–10 (default 3)
@@ -238,8 +241,10 @@ _nosleep_config() { python3 "$_DOTS_SOURCE_ROOT/lib/nosleep_config.py" "$@"; }
 #   -h, --help          Show help
 #
 # EXAMPLES
-#   nosleep -m -L -I    Dim without locking; only check agent activity
-#   Use separate short flags. --forever overrides individual check settings.
+#   nosleep -dML        Display on, no dimming, no lock
+#   nosleep -mLIe10     Dim, no lock, agent checks only, every 10s
+#   Group short flags; values may be attached or separate. -dim stays an alias.
+#   --forever overrides individual check settings.
 nosleep() {
   [[ "$1" == config ]] && { shift; _nosleep_config "$@"; return $?; }
   [[ "$1" == -h || "$1" == --help ]] && { _help_for nosleep; return 0; }
@@ -261,6 +266,40 @@ nosleep() {
       backoff) backoff=$value ;;
     esac
   done
+  # Expand short-option groups before parsing. Value-taking options consume the
+  # remainder of their group (or the next argument). Preserve the legacy -dim
+  # spelling: it has always meant --dim, not -d -i -m.
+  local arg group flag
+  local -a nosleep_args
+  while (( $# )); do
+    arg=$1
+    shift
+    if [[ $arg == -?* && $arg != --* && $arg != -dim ]]; then
+      group=${arg#-}
+      while [[ -n $group ]]; do
+        flag=${group[1]}
+        group=${group[2,-1]}
+        nosleep_args+=("-$flag")
+        if [[ $flag == [egrb] ]]; then
+          if [[ -n $group ]]; then
+            nosleep_args+=("$group")
+          elif (( $# )); then
+            nosleep_args+=("$1")
+            shift
+          fi
+          break
+        fi
+      done
+    else
+      nosleep_args+=("$arg")
+      # Keep a long option's value intact too, including malformed negatives.
+      if [[ $arg == --(every|grace|retries|backoff) ]] && (( $# )); then
+        nosleep_args+=("$1")
+        shift
+      fi
+    fi
+  done
+  set -- "${nosleep_args[@]}"
   while (( $# )); do
     case $1 in
       -h|--help) _help_for nosleep; return 0 ;;
@@ -273,6 +312,7 @@ nosleep() {
       -I|--no-internet) internet=0 ;;
       -d|--display-on) display_on=1 ;;
       -m|--dim|-dim) dim_requested=1 ;;
+      -M|--undim) dim=0 ;;
       -D|--display-off|--no-dim) display_on=0 dim=0 ;;
       -L|--no-lock) lock=0 ;;
       -l|--lock) lock=1 ;;
@@ -638,10 +678,10 @@ _nosleep_status() {
     retries_text+=' (inactive)'
     _nosleep_duration "$backoff"; backoff_text="$REPLY (inactive)"
   fi
-  config_labels=('On close' Display Locking '' Monitoring Mode Checks Grace Retries Backoff)
-  config_values=('' "$display_text" "$lock_text" '' '' "$monitoring_text"
+  config_labels=('On close' Display Locking '' Checks Mode '' 'Check settings' Interval Grace Retries Backoff)
+  config_values=('' "$display_text" "$lock_text" '' '' "$monitoring_text" '' ''
                  "$every_text" "$grace_text" "$retries_text" "$backoff_text")
-  config_styles=('1;36' 0 0 0 '1;36' 0 0 0 0 0)
+  config_styles=('1;36' 0 0 0 '1;36' 0 0 '1;36' 0 0 0 0)
   rows+=('')
   styles+=(0)
   for (( item = 1; item <= ${#config_labels}; ++item )); do

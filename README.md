@@ -48,6 +48,9 @@ nosleep --dim                  # closing the lid locks and dims the display
 nosleep --no-lock              # display off on close, without requesting a lock
 nosleep --dim --no-lock         # dim on close, without requesting a lock
 nosleep --forever              # keep awake until Ctrl-C; skip activity checks
+nosleep -m -L -I               # dim, skip locking, check only agent activity
+nosleep -A                     # check only internet connectivity
+nosleep -A -I                  # disable both checks; keep awake until Ctrl-C
 nosleep config                # arrow-key menu for this machine's defaults
 nosleep config --show          # print effective defaults
 nosleep config --edit          # edit defaults with VISUAL/EDITOR
@@ -55,8 +58,8 @@ nosleep config --edit          # edit defaults with VISUAL/EDITOR
 
 Display behavior and locking are independent. `--display-off` turns the display
 off on close (the default). `--display-on` (or `-d`) keeps it awake without
-changing brightness. `--dim` (or `-dim`) also keeps it awake, but dims the built-in
-panel. An explicit `--dim` or `-dim` always enables display-on and dimming,
+changing brightness. `--dim` (`-m` or `-dim`) also keeps it awake, but dims the built-in
+panel. An explicit `--dim`, `-m`, or `-dim` always enables display-on and dimming,
 regardless of flag order. `-d` does not clear dimming; by itself it leaves
 brightness unchanged.
 `--no-dim` remains an alias for `--display-off`. Locking stays enabled by default; disable it with `--no-lock`
@@ -64,6 +67,27 @@ or a saved preference. `--no-lock` skips nosleep's explicit lock request. It nev
 changes macOS's own automatic locking settings. Locking requires authentication
 to use the session again; dimming only changes display brightness. With the
 built-in defaults, `nosleep --dim` does both when the lid closes.
+
+Short flags are separate arguments (for example, `-m -L`, not `-mL`):
+
+| Setting | Enable / select | Disable / opposite |
+| --- | --- | --- |
+| Display on | `-d`, `--display-on` | `-D`, `--display-off` |
+| Dim display | `-m`, `--dim` (also `-dim`) | `-D`, `--no-dim` (display off) |
+| Lock on close | `-l`, `--lock` | `-L`, `--no-lock` |
+| Agent activity check | `-a`, `--agent` | `-A`, `--no-agent` |
+| Internet check | `-i`, `--internet` | `-I`, `--no-internet` |
+| All checks | `-c`, `--checks` | `-C`, `--no-checks` |
+| Run until Ctrl-C | `-f`, `--forever` | `-F`, `--no-forever` |
+
+Timing flags also have short forms: `-e` / `--every`, `-g` / `--grace`,
+`-r` / `--retries`, and `-b` / `--backoff`, each followed by a value.
+Only enabled checks can trigger retries or allow automatic sleep. Disabling both
+keeps the Mac awake until Ctrl-C. `--forever` / `--no-checks` overrides individual
+check settings; `--no-forever` resumes the selected checks, while `--checks`
+enables both and clears forever. For opposing flags, the last one wins, except
+explicit dimming always wins as described above. Lid/display handling, sleep
+protection, sudo refresh, and cleanup continue even when checks are disabled.
 
 `nosleep config` follows `t config`: select a setting with arrow keys, stage
 changes, then review and save. Cancel leaves defaults unchanged. Defaults live
@@ -77,6 +101,10 @@ An explicit `--dim` still takes precedence over these overrides. Use `--lock` /
 Timing defaults use `--grace`, `--every`, `--retries`, and
 `--backoff`. `nosleep --help` highlights options that change the built-in defaults.
 Configuration commands never change power settings or an already-running instance.
+The menu has separate agent and internet toggles (`agent` and `internet` booleans
+in JSON, both defaulting to true). Monitoring can disable both temporarily without
+forgetting those preferences. Status shows which checks are disabled and marks
+timing settings inactive when neither check runs.
 
 `nosleep` shows a live snapshot instead of a long startup message:
 

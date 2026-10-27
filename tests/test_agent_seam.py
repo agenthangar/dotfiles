@@ -1006,7 +1006,7 @@ def test_zsh_nosleep_help_is_concise_and_does_not_change_power(zsh, args):
     assert "--dim, -dim" in result.stdout
     assert "--forever" in result.stdout
     assert "unexpected sudo" not in result.stdout
-    assert len(result.stdout.splitlines()) <= 24
+    assert len(result.stdout.splitlines()) <= 40
 
 
 
@@ -1039,3 +1039,92 @@ def test_zsh_nosleep_saved_display_on_and_teardown(nosleep_loop):
     assert [line for line in log if line.startswith("hold ")] == ["hold 1000 -dims"]
     assert [line for line in log if line.startswith("display-off ")] == ["display-off 1004"]
     assert not any(line.startswith("brightness ") for line in log)
+
+
+@pytest.mark.parametrize("short,long", [
+    ("-m", "--dim"), ("-D", "--display-off"), ("-d", "--display-on"),
+    ("-l", "--lock"), ("-L", "--no-lock"), ("-f", "--forever"),
+    ("-F", "--no-forever"), ("-c", "--checks"), ("-C", "--no-checks"),
+    ("-a", "--agent"), ("-A", "--no-agent"),
+    ("-i", "--internet"), ("-I", "--no-internet"),
+    ("-g 0 -e 2 -r 1 -b 2", "--grace 0 --every 2 --retries 1 --backoff 2"),
+])
+def test_zsh_nosleep_short_flags_match_long_flags(nosleep_loop, short, long):
+    short_result, short_log = nosleep_loop(short, FAKE_STOP_AT="1008")
+    long_result, long_log = nosleep_loop(long, FAKE_STOP_AT="1008")
+    assert short_result.stdout == long_result.stdout
+    assert short_log == long_log
+
+
+@pytest.mark.parametrize("args", ["-m -D -d", "-D -m", "-m -D"])
+def test_zsh_nosleep_short_dim_always_wins(nosleep_loop, args):
+    result, log = nosleep_loop(args + " -f -L", FAKE_STOP_AT="1004")
+    assert "no lock requested, display dimmed" in result.stdout
+    assert "brightness 1000 0" in log
+    assert "display-off 1000" not in log
+
+
+@pytest.mark.parametrize("args,disabled,mode", [
+    ("-I", "online", "Agent activity checks only"),
+    ("-A", "busy", "Internet checks only"),
+])
+def test_zsh_nosleep_disabled_signal_does_not_probe_or_release(nosleep_loop, args, disabled, mode):
+    result, log = nosleep_loop(args + " -e 2 -g 0 -r 0", FAKE_STOP_AT="1010",
+                               FAKE_ONLINE="0" if disabled == "online" else "1",
+                               FAKE_BUSY="0" if disabled == "busy" else "1")
+    assert not any(line.startswith(disabled + " ") for line in log)
+    assert "exit=130 at=1010" in result.stdout
+    assert mode in result.stdout
+    assert "Not checked (--no-" in result.stdout
+    assert "grace " not in result.stdout
+    assert "letting go" not in result.stdout
+    assert "sudo 1010 -n pmset -a disablesleep 0" in log
+
+
+@pytest.mark.parametrize("args,reason,disabled", [
+    ("-I", "no local agent activity", "online"),
+    ("-A", "the network has been down", "busy"),
+])
+def test_zsh_nosleep_enabled_signal_still_releases_after_retries(nosleep_loop, args, reason, disabled):
+    result, log = nosleep_loop(args + " -e 2 -g 0 -r 1 -b 2", FAKE_STOP_AT="1020",
+                               FAKE_ONLINE="0", FAKE_BUSY="0")
+    assert f"letting go — {reason}" in result.stdout
+    assert "1 retries exhausted" in result.stdout
+    assert "exit=0 at=1004" in result.stdout
+    assert not any(line.startswith(disabled + " ") for line in log)
+
+
+@pytest.mark.parametrize("args", ["-A -I", "-C", "--no-checks"])
+def test_zsh_nosleep_all_checks_off_preserves_lid_and_sleep_hold(nosleep_loop, args):
+    result, log = nosleep_loop(args + " -e 2 -g 0 -r 0", FAKE_STOP_AT="1040",
+                               FAKE_LID_AT="1004", FAKE_RESET_AT="1030")
+    assert not any(line.startswith(("busy ", "online ")) for line in log)
+    assert "lock 1004" in log and "display-off 1004" in log
+    assert "sudo 1030 -n -v" in log
+    assert "sudo 1030 -n pmset -a disablesleep 1" in log
+    assert "sudo 1040 -n pmset -a disablesleep 0" in log
+    assert "No checks" in result.stdout and "(inactive)" in result.stdout
+    assert "exit=130 at=1040" in result.stdout
+
+
+@pytest.mark.parametrize("args,agent,internet", [
+    ("", False, False), ("-F", False, True), ("-c", True, True),
+    ("-F -a -I", True, False), ("-F -i -I", False, False),
+    ("-c -C", False, False), ("-C -c", True, True),
+])
+def test_zsh_nosleep_saved_check_preferences_and_overrides(nosleep_loop, args, agent, internet):
+    config = nosleep_loop.home / ".config" / "nosleep" / "config.json"
+    config.parent.mkdir(parents=True)
+    saved = json.dumps({"agent": False, "internet": True, "forever": True})
+    config.write_text(saved)
+    result, log = nosleep_loop(args, FAKE_STOP_AT="1004")
+    assert any(line.startswith("busy ") for line in log) == agent
+    assert any(line.startswith("online ") for line in log) == internet
+    assert config.read_text() == saved
+
+
+@pytest.mark.parametrize("args", ["-g", "-e", "-r", "-b", "-e 0", "-r 11", "-b 301", "-g nope"])
+def test_zsh_nosleep_invalid_short_timing_flags_leave_power_untouched(zsh, args):
+    result = zsh(f'sudo() {{ print unexpected-power; }}; nosleep {args}; print rc=$?')
+    assert "rc=2" in result.stdout
+    assert "unexpected-power" not in result.stdout

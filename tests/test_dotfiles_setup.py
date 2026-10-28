@@ -173,10 +173,10 @@ def test_existing_zsh_function_dispatches_install(sandbox):
 def test_shell_update_and_legacy_flags_reconcile_links(sandbox, args):
     home, _, env, _ = sandbox
     assert run_setup(env).returncode == 0
-    (home / "bin/csync").unlink()
+    (home / "bin/sleep-manager").unlink()
     result = shell_dots(env, *args)
     assert result.returncode == 0, result.stderr
-    assert (home / "bin/csync").is_symlink()
+    assert (home / "bin/sleep-manager").is_symlink()
 
 
 @pytest.mark.parametrize("args", [("--help",), ("install", "--help"), ("update", "--help")])

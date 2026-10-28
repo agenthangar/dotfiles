@@ -18,7 +18,7 @@ Bugfix-only releases must increment only the patch version (for example, `0.8.0`
 
 ### Environment shape
 
-Cloud Agent VMs run **Linux**, not macOS. Full session workflows (`t open`, tmux slots, `t beam`, `sleep-manager disable`, `csync` via iCloud) require a real Mac with Homebrew, tmux, Claude Code, and configured `~/.zshrc.local`. On Linux, treat **CI-equivalent validation + CLI smoke tests** as the development loop.
+Cloud Agent VMs run **Linux**, not macOS. Full session workflows (`t open`, tmux slots, `t beam`, `sleep-manager disable`) require a real Mac with Homebrew, tmux, Claude Code, and configured `~/.zshrc.local`. On Linux, treat **CI-equivalent validation + CLI smoke tests** as the development loop.
 
 Committed **`.cursor/environment.json`** builds from `.cursor/Dockerfile` (shellcheck, zsh, Docker CE), runs `./install.sh` on every session start, and starts dockerd via `./scripts/cloud-docker-ready.sh` (systemd is unavailable in nested VMs).
 

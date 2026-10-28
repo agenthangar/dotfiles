@@ -1,4 +1,4 @@
-"""Dotfiles shell regression tests: csync, nosleep and zsh startup."""
+"""Dotfiles shell regression tests: nosleep and zsh startup."""
 
 import json
 import os
@@ -102,9 +102,6 @@ def test_dotfiles_without_standalone_t_keeps_local_config_and_explains_recovery(
     assert "standalone shell integration is missing" in result.stderr
 
 
-RSYNC_STUB = "#!/bin/bash\nprintf '%s\\n' \"$*\" >> \"$RSYNC_LOG\"\nexit 0\n"
-
-
 _ZSH_TIED_SPECIALS = {"path", "fpath", "cdpath", "manpath", "mailpath", "module_path", "prompt"}
 _ZSH_DECL_RE = re.compile(
     r"^\s*(?:local|typeset|declare|integer|float|readonly)\b"
@@ -124,48 +121,23 @@ def test_zshrc_never_declares_a_tied_special_as_a_plain_local():
                      "for the rest of the function):\n" + "\n".join(bad))
 
 
-CSYNC = REPO_ROOT / "bin" / "csync"
-
-
-def _csync_run(home, rsync_log, extra_bins):
-    bins = home.parent / "csyncbin"
-    bins.mkdir(exist_ok=True)
-    (bins / "rsync").write_text(RSYNC_STUB)
-    (bins / "rsync").chmod(0o755)
-    (bins / "brctl").write_text("#!/bin/bash\nexit 0\n")   # macOS-only; a no-op stand-in
-    (bins / "brctl").chmod(0o755)
-    env = {**os.environ, "HOME": str(home), "RSYNC_LOG": str(rsync_log),
-           "CSYNC_RSYNC": str(bins / "rsync"), "PATH": f"{bins}:{os.environ.get('PATH', '')}"}
-    return subprocess.run([str(CSYNC)], env=env, capture_output=True, text=True)
-
-
-def test_csync_codex_pair_is_gated_on_either_side(tmp_path):
-    home = tmp_path / "home"
-    icloud = home / "Library" / "Mobile Documents" / "com~apple~CloudDocs"
-    icloud.mkdir(parents=True)
-    log = tmp_path / "rsync.log"
-    # neither side exists → no codex pair (the claude + plan pairs always run)
-    r = _csync_run(home, log, {})
-    assert r.returncode == 0, r.stderr
-    argv = log.read_text()
-    assert "codex-sessions" not in argv and "claude-sessions" in argv
-    # the local tree exists → the pair runs, sessions/ only, never the sqlite state
-    (home / ".codex" / "sessions").mkdir(parents=True)
-    (home / ".codex" / "state_5.sqlite").write_text("x")
-    log.write_text("")
-    assert _csync_run(home, log, {}).returncode == 0
-    lines = [ln for ln in log.read_text().splitlines() if "codex-sessions/" in ln]
-    assert len(lines) == 2                                   # both directions, once
-    assert all("/.codex/sessions/" in ln for ln in lines)
-    assert not any("state_5" in ln for ln in log.read_text().splitlines())
-    # only the iCloud side exists (another machine ran codex) → still converges
-    import shutil as _sh
-    _sh.rmtree(home / ".codex")
-    (icloud / "codex-sessions").mkdir(exist_ok=True)   # the 2nd run already mirrored it
-    log.write_text("")
-    assert _csync_run(home, log, {}).returncode == 0
-    assert "codex-sessions" in log.read_text()
-    assert (home / ".codex" / "sessions").is_dir()   # sync_pair mkdir -p's both sides
+def test_reload_removes_retired_sync_hook_and_function(zsh):
+    result = zsh('''
+        csync() { print unexpected-sync; }
+        _csync_periodic() { csync; }
+        _keep_prompt_hook() { :; }
+        precmd_functions+=(_csync_periodic _keep_prompt_hook)
+        source "$DOTFILES_TEST_ZSHRC" >/dev/null 2>&1
+        print -r -- "sync=${+functions[csync]} hook=${+functions[_csync_periodic]}"
+        print -r -- "hooks=${(j:,:)precmd_functions}"
+        print -r -- "workspace=${+functions[_clawsync_periodic]}"
+    ''', DOTFILES_TEST_ZSHRC=str(ZSHRC))
+    assert result.returncode == 0, result.stderr
+    assert "sync=0 hook=0" in result.stdout
+    assert "_csync_periodic" not in result.stdout
+    assert "_keep_prompt_hook" in result.stdout
+    assert "workspace=1" in result.stdout
+    assert "unexpected-sync" not in result.stdout
 
 
 # ─── nosleep's busy probe: agent-agnostic ──────────────────────────────────────

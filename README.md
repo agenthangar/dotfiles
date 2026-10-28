@@ -20,7 +20,6 @@ agent settings, and desktop handoff. This repository consumes that project.
 | `dots --relink` | Reapply installed configuration without network access |
 | `dots --relink` | Reconcile the selected dotfiles links without fetching |
 | `help` / `h` | List shell and installed commands |
-| `csync` | Optional two-way iCloud sync of agent transcripts and plans |
 | `prview` | Inspect a pull request from the terminal |
 | `nosleep` | Keep the Mac awake while work is active |
 | `sleep-manager` | Explicit macOS sleep control |

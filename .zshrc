@@ -224,8 +224,8 @@ source "${${(%):-%x}:A:h}/lib/nosleep-fallback.zsh"
 # CHECKS
 #   -c, --checks MODE   all | agent | internet | none (until Ctrl-C)
 #                      Replaces saved checks and clears forever
-#   --require N        Number of passing checks needed to keep awake
-#                      Default: all enabled checks; passing means busy or online
+#   --require VALUE    all | none (until Ctrl-C) | N passing checks required
+#                      Saved default: all; passing means busy or online
 #
 # CHECK SETTINGS
 #   -e, --every SECS    Check interval in seconds (default 30)
@@ -271,6 +271,7 @@ nosleep() {
       forever) forever=$value ;;
       agent) agent=$value ;;
       internet) internet=$value ;;
+      requirement) requirement=$value ;;
       grace) grace=$value ;;
       every) every=$value ;;
       retries) retries=$value ;;
@@ -394,11 +395,11 @@ nosleep() {
         if [[ $1 == *=* ]]; then
           requirement=${1#*=}
         else
-          (( $# >= 2 )) || { echo 'nosleep: --require needs a positive count' >&2; return 2; }
+          (( $# >= 2 )) || { echo 'nosleep: --require needs all, none, or a positive count' >&2; return 2; }
           requirement=$2; shift
         fi
-        [[ $requirement =~ '^0*([1-9][0-9]*)$' ]] || {
-          echo 'nosleep: --require takes a positive count' >&2; return 2
+        [[ $requirement == all || $requirement == none || $requirement =~ '^0*([1-9][0-9]*)$' ]] || {
+          echo 'nosleep: --require takes all, none, or a positive count' >&2; return 2
         } ;;
       -g|--grace|-e|--every|-r|--retries|-b|--backoff)
         (( $# >= 2 )) || { echo "nosleep: $1 needs a value" >&2; return 2; }
@@ -418,15 +419,17 @@ nosleep() {
   (( dim_requested )) && dim=1
   (( dim )) && display_on=1
   monitoring=$(( ! forever && (agent || internet) ))
+  [[ $requirement == none ]] && monitoring=0
   enabled_count=$(( agent + internet ))
   case $requirement in
     all) required_count=$enabled_count ;;
+    none) required_count=0 ;;
     *)
       # Normalize as text before arithmetic: even huge input must not wrap around.
       if [[ $requirement =~ '^0*([1-9][0-9]*)$' ]]; then
         requirement=$match[1]
       else
-        echo 'nosleep: --require takes a positive count' >&2; return 2
+        echo 'nosleep: --require takes all, none, or a positive count' >&2; return 2
       fi
       if (( monitoring )) && [[ $requirement != 1 && $requirement != 2 ]]; then
         echo 'nosleep: --require exceeds the number of enabled checks' >&2; return 2
@@ -719,6 +722,11 @@ _nosleep_status() {
     agent_text='Not checked (--forever)' network_text='Not checked (--forever)'
     next_text='No checks (--forever)'
     sleep_text='Prevented until Ctrl-C' monitoring_text='Disabled (--forever)'
+  elif [[ $requirement == none ]]; then
+    agent_style=2 network_style=2 next_style=2
+    agent_text='Not checked (--require none)' network_text='Not checked (--require none)'
+    next_text='No checks (--require none)'
+    sleep_text='Prevented until Ctrl-C' monitoring_text='Disabled (--require none)'
   else
     if (( ! agent )); then
       agent_style=2 agent_text='Not checked (--no-agent)'

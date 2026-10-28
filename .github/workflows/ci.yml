@@ -141,6 +141,9 @@ jobs:
           }
           zsh --version
 
+      - name: Enforce nosleep CLI contract
+        run: pytest -q tests/test_agent_seam.py -k cli_contract
+
       - name: Run shell integration tests
         run: pytest
 

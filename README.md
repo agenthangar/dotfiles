@@ -60,6 +60,7 @@ Related choices use one mode flag per setting:
 | --- | --- | --- |
 | Display on lid close | `-d`, `--display` | `off`, `on`, `dim` |
 | Lock on lid close | `-l`, `--lock` | `on`, `off` |
+| Hotspot fallback | `--hotspot` | `on`, `off` |
 | Automatic checks | `-c`, `--checks` | `all`, positive count `N`, `none` |
 
 Use a separate value or `=`: `-d dim`, `-d=dim`, and `--display=dim` are equivalent.
@@ -216,8 +217,9 @@ in an unlocked terminal on each Mac:
 
 ```sh
 nosleep hotspot setup
-nosleep --hotspot-after 300     # five minutes of continuous internet outage
-nosleep --no-hotspot            # disable the saved fallback for this run
+nosleep config                 # Wi-Fi name, outage delay and attempt limit
+nosleep --hotspot off           # disable the saved fallback for this run
+nosleep --hotspot=on            # enable the configured fallback for this run
 ```
 
 Setup asks for the exact Wi-Fi name and lets macOS `security` prompt for the
@@ -225,9 +227,10 @@ password locally. It saves the password in this Mac's Keychain and enables the
 machine's private configuration only after setup succeeds. Passwords never appear
 in shell arguments, logs, or the JSON config. `nosleep config` can change the
 fallback toggle, Wi-Fi name, delay and attempt limit; changing the Wi-Fi name may
-require running setup again for its credentials. Flags override saved settings:
-`--hotspot`, `--no-hotspot`, `--hotspot-ssid NAME`, `--hotspot-after SECONDS`, and
-`--hotspot-timeout SECONDS` (1–300, default 30).
+require running setup again for its credentials. `--hotspot on|off` overrides the
+saved toggle for one run; both separate and `=` values work. The default delay is
+five minutes of continuous internet outage. Configure the Wi-Fi name, delay and
+attempt limit in `nosleep config` (limit 1–300 seconds, default 30).
 
 After the delay, `nosleep` makes one directed join to that exact SSID with
 `networksetup`, even if the current Wi-Fi uplink is broken. This can work with the

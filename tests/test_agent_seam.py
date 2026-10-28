@@ -240,6 +240,11 @@ def nosleep_loop(zsh, tmp_path):
         if [[ ${FAKE_HOTSPOT_BACKEND:-} == hang ]]; then
             _nosleep_hotspot_connect() { exec /bin/sleep 60; }
         fi
+        if [[ ${FAKE_HOTSPOT_BACKEND:-} == record ]]; then
+            _nosleep_hotspot_connect() {
+                print -r -- "hotspot $EPOCHSECONDS ssid=$hotspot_ssid after=$hotspot_after timeout=$1" >> "$LOOP_LOG"
+            }
+        fi
         sudo() { print -r -- "sudo $EPOCHSECONDS $*" >> "$LOOP_LOG"; }
         ps() { return 0; }
         caffeinate() { return 0; }
@@ -1509,22 +1514,120 @@ def test_nosleep_fallback_recovery_during_slow_activity_prevents_stale_release(n
     assert "exit=130 at=1036" in result.stdout
 
 
-@pytest.mark.parametrize("args", ["--hotspot", "--hotspot-after -1", "--hotspot-timeout 0",
-                                  "--hotspot-timeout 301", "--hotspot-after 18446744073709551616",
-                                  "--hotspot --hotspot-ssid='bad\nname'"])
-def test_nosleep_hotspot_invalid_flags_never_touch_power(zsh, args):
-    result = zsh('sudo() { print unexpected-power; }; nosleep ' + args + '; print rc=$?')
-    assert "rc=2" in result.stdout and "unexpected-power" not in result.stdout
-
-
-def test_nosleep_hotspot_saved_preferences_and_cli_precedence(nosleep_loop):
+@pytest.mark.parametrize("option,mode,expected", [
+    ("display", "on", r"Display\s+On"), ("display", "off", r"Display\s+Off"),
+    ("display", "dim", r"Display\s+Dim"),
+    ("lock", "on", r"Locking\s+Lock screen"), ("lock", "off", r"Locking\s+No lock requested"),
+    ("hotspot", "on", r"Hotspot\s+Inactive"), ("hotspot", "off", r"Hotspot\s+Off"),
+])
+@pytest.mark.parametrize("separator", [" ", "="])
+def test_nosleep_cli_contract_modes_accept_separate_and_equals(nosleep_loop, option, mode, expected, separator):
     path = nosleep_loop.home / ".config/nosleep/config.json"
     path.parent.mkdir(parents=True)
-    saved = json.dumps({"hotspot": True, "hotspot_ssid": "-Test Phone", "hotspot_after": 4,
+    path.write_text(json.dumps({"hotspot_ssid": "Test Phone"}))
+    result, _ = nosleep_loop(f"--{option}{separator}{mode} -f", FAKE_STOP_AT="1004")
+    assert "exit=130 at=1004" in result.stdout
+    assert re.search(expected, result.stdout), result.stdout
+
+
+def _assert_cli_contract_rejects_without_side_effects(zsh, args):
+    result = zsh('''
+        sudo() { print unexpected-side-effect; }
+        _nosleep_hold() { print unexpected-side-effect; }
+        _nosleep_online() { print unexpected-side-effect; }
+        _nosleep_hotspot_connect() { print unexpected-side-effect; }
+    ''' + f'nosleep {args}; print rc=$?')
+    assert "rc=2" in result.stdout and "unexpected-side-effect" not in result.stdout
+    return result
+
+
+@pytest.mark.parametrize("option", ["display", "lock", "hotspot"])
+@pytest.mark.parametrize("value", ["invalid", "", "ON"])
+@pytest.mark.parametrize("separator", [" ", "="])
+def test_nosleep_cli_contract_modes_reject_invalid_or_empty(zsh, option, value, separator):
+    # Quote the empty separate value so this also checks explicit empty arguments.
+    argument = shlex.quote(value) if separator == " " else value
+    _assert_cli_contract_rejects_without_side_effects(zsh, f"--{option}{separator}{argument}")
+
+
+@pytest.mark.parametrize("option", ["display", "hotspot"])
+@pytest.mark.parametrize("following", ["", " --lock=on"])
+def test_nosleep_cli_contract_display_and_hotspot_require_modes(zsh, option, following):
+    _assert_cli_contract_rejects_without_side_effects(zsh, f"--{option}{following}")
+
+
+def test_nosleep_cli_contract_legacy_bare_lock_stays_supported(nosleep_loop):
+    result, _ = nosleep_loop("--lock -f", FAKE_STOP_AT="1004")
+    assert "exit=130 at=1004" in result.stdout
+    assert re.search(r"Locking\s+Lock screen", result.stdout)
+
+
+@pytest.mark.parametrize("option,expected", [("display", r"Display\s+Off"),
+                                             ("lock", r"Locking\s+No lock requested"),
+                                             ("hotspot", r"Hotspot\s+Off")])
+def test_nosleep_cli_contract_last_mode_wins(nosleep_loop, option, expected):
+    result, _ = nosleep_loop(f"--{option}=on --{option} off -f", FAKE_STOP_AT="1004")
+    assert re.search(expected, result.stdout)
+
+
+@pytest.mark.parametrize("saved,args,enabled", [
+    (True, "--hotspot off", False), (False, "--hotspot=on", True),
+    (True, "--hotspot=off --hotspot on", True),
+    (False, "--hotspot on --hotspot=off", False),
+])
+def test_nosleep_cli_contract_hotspot_overrides_saved_toggle_without_writing(nosleep_loop, saved, args, enabled):
+    path = nosleep_loop.home / ".config/nosleep/config.json"
+    path.parent.mkdir(parents=True)
+    before = json.dumps({"hotspot": saved, "hotspot_ssid": "-Test Phone", "hotspot_after": 4,
+                         "hotspot_timeout": 6})
+    path.write_text(before)
+    result, _ = nosleep_loop(args + " -f", FAKE_STOP_AT="1004")
+    expected = r"Hotspot\s+Inactive" if enabled else r"Hotspot\s+Off"
+    assert re.search(expected, result.stdout)
+    assert path.read_text() == before
+
+
+@pytest.mark.parametrize("flag", ["--no-hotspot", "--hotspot-ssid", "--hotspot-after", "--hotspot-timeout"])
+@pytest.mark.parametrize("suffix", ["", " value", "=value"])
+def test_nosleep_cli_contract_rejects_retired_hotspot_flags(zsh, flag, suffix):
+    result = _assert_cli_contract_rejects_without_side_effects(zsh, flag + suffix)
+    assert "unknown option" in result.stderr
+
+
+def test_nosleep_cli_contract_saved_hotspot_details_reach_runtime(nosleep_loop):
+    path = nosleep_loop.home / ".config/nosleep/config.json"
+    path.parent.mkdir(parents=True)
+    saved = json.dumps({"hotspot": True, "hotspot_ssid": "📱 Test's", "hotspot_after": 4,
                         "hotspot_timeout": 6})
     path.write_text(saved)
-    result, _ = nosleep_loop("--no-hotspot -A -g0 -e2 -r0", FAKE_ONLINE="0")
-    assert "exit=0 at=1002" in result.stdout and "attempting hotspot" not in result.stdout
-    result, _ = nosleep_loop("--no-hotspot --hotspot --hotspot-after=20 -f", FAKE_STOP_AT="1010")
-    assert "Inactive (requires internet checks)" in result.stdout
+    result, log = nosleep_loop("--hotspot on -A -g0 -e2 -r0", FAKE_ONLINE="0", FAKE_HOTSPOT_BACKEND="record")
+    assert "hotspot 1004 ssid=📱 Test's after=4 timeout=6" in log
+    assert "exit=0 at=1010" in result.stdout
     assert path.read_text() == saved
+
+
+def test_nosleep_cli_contract_help_rows_align_descriptions(zsh):
+    source = ZSHRC.read_text().split("# nosleep —", 1)[1].split("nosleep() {", 1)[0]
+    option_rows = [line for line in source.split("# EXAMPLES", 1)[0].splitlines() if line.startswith("#   -")]
+    assert option_rows
+    rendered = zsh("nosleep --help").stdout
+    columns = set()
+    for line in option_rows:
+        row = re.fullmatch(r"#   ((?:-[A-Za-z], )?--[a-z][a-z-]*(?: [A-Z]+)?|-[A-Za-z] / -[A-Za-z])( {2,})(\S.*)", line)
+        assert row, f"Option help needs two spaces between term and description: {line}"
+        term, _, description = row.groups()
+        output = re.search(r"(?m)^  " + re.escape(term) + r"( {2,})(" + re.escape(description) + r")$", rendered)
+        assert output, f"Rendered help lost option description: {term}"
+        columns.add(output.start(2) - rendered.rfind("\n", 0, output.start(2)) - 1)
+    assert len(columns) == 1, columns
+    assert "--hotspot MODE" in rendered and "on | off" in rendered
+    hotspot_row = next(line for line in option_rows if "--hotspot MODE" in line)
+    assert re.fullmatch(r"#   --hotspot MODE {2,}on \| off", hotspot_row)
+    assert not re.search(r"--hotspot MODE[^\n]*\n# {4,}\S", source)
+
+
+def test_nosleep_cli_contract_documents_only_hotspot_mode(zsh):
+    rendered = zsh("nosleep --help").stdout
+    docs = (REPO_ROOT / "README.md").read_text()
+    assert not re.search(r"--(?:no-hotspot|hotspot-[a-z-]+)", rendered + docs)
+    assert "--hotspot off" in docs and "--hotspot=on" in docs

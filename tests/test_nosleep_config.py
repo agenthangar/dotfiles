@@ -43,7 +43,7 @@ def test_defaults_and_values_do_not_write(isolated):
     _, path = isolated
     result = run_config(isolated, "--values")
     assert result.returncode == 0
-    assert result.stdout.splitlines() == ["dim=0", "display_on=0", "lock=1", "forever=0", "agent=1", "internet=1", "grace=900",
+    assert result.stdout.splitlines() == ["dim=0", "display_on=0", "lock=1", "forever=0", "agent=1", "internet=1", "requirement=all", "grace=900",
                                           "every=30", "retries=3", "backoff=30", "hotspot=0",
                                           "hotspot_ssid=", "hotspot_after=300", "hotspot_timeout=30"]
     shown = run_config(isolated, "--show")
@@ -303,7 +303,7 @@ def test_menu_sections_and_only_actual_toggle_edits_are_reviewed(isolated):
 
 def test_settings_section_keyboard_navigation_edits_grace_without_toggling_checks(isolated):
     _, path = isolated
-    _pty_config(isolated, [(b"Local settings", b"jjjjj\r"),
+    _pty_config(isolated, [(b"Local settings", b"jjjjjj\r"),
                            (b"New value", b"42\n"),
                            (b"42s", b"s"),
                            (b"Review changes", b"y")], columns=42, lines=10)
@@ -338,7 +338,83 @@ def test_menu_enables_preconfigured_hotspot_and_marks_inactive(isolated):
     _, path = isolated
     path.parent.mkdir(parents=True)
     path.write_text(json.dumps({"hotspot_ssid": "Test Phone", "internet": False}))
-    _pty_config(isolated, [(b"Local settings", b"jjjjjjjjj\r"),
+    _pty_config(isolated, [(b"Local settings", b"jjjjjjjjjj\r"),
                            (b"on (inactive)", b"s"), (b"Review changes", b"y")], lines=40)
     assert json.loads(path.read_text())["hotspot"] is True
     assert "Hotspot   on (inactive)" in run_config(isolated, "--show").stdout
+
+
+@pytest.mark.parametrize("requirement", ["all", "none", 1, 2, 3, 18446744073709551617])
+def test_saved_requirement_read_show_values_and_write(isolated, requirement):
+    _, path = isolated
+    config.write(path, None, config.DEFAULTS | {"requirement": requirement, "internet": False})
+    before = path.read_bytes()
+    values, _ = config.read(path)
+    assert values["requirement"] == requirement
+    assert f"requirement={requirement}\n" in run_config(isolated, "--values").stdout
+    shown = run_config(isolated, "--show").stdout
+    assert f"Require   {requirement}" in shown
+    assert ("timing settings inactive" in shown) == (requirement == "none")
+    assert path.read_bytes() == before
+
+
+@pytest.mark.parametrize("requirement", [True, False, 0, -1, 1.0, "1", "one", "ALL", "", None, []])
+def test_invalid_requirement_config_blocks_modes(isolated, requirement):
+    _, path = isolated
+    path.parent.mkdir(parents=True)
+    path.write_text(json.dumps({"requirement": requirement}))
+    for mode in ("--values", "--show"):
+        result = run_config(isolated, mode)
+        assert result.returncode == 1
+        assert "requirement must be" in result.stderr
+        assert not result.stdout
+
+
+@pytest.mark.parametrize("presses,expected", [(1, "none"), (2, 1), (3, 2), (4, "all")])
+def test_tty_requirement_cycle_review_and_save(isolated, presses, expected):
+    _, path = isolated
+    output = _pty_config(isolated, [(b"Local settings", b"jjjjj" + b"\r" * presses + b"s"),
+                                    (b"Review changes" if presses != 4 else b"settings unchanged",
+                                     b"y" if presses != 4 else b"")], lines=40)
+    if presses == 4:
+        assert not path.exists()
+    else:
+        assert json.loads(path.read_text())["requirement"] == expected
+        review = output.split(b"Review changes", 1)[1]
+        assert b"Passing checks required" in review and b"1 pending" in review
+
+
+def test_tty_requirement_cancel_and_restore_defaults(isolated):
+    _, path = isolated
+    _pty_config(isolated, [(b"Local settings", b"jjjjj\rq"),
+                           (b"Unsaved changes", b"d")], lines=40)
+    assert not path.exists()
+    config.write(path, None, config.DEFAULTS | {"requirement": "none"})
+    defaults_index = len(config.LABELS)
+    _pty_config(isolated, [(b"Local settings", b"j" * defaults_index + b"\rs"),
+                           (b"Review changes", b"y")], lines=40)
+    assert json.loads(path.read_text())["requirement"] == "all"
+
+
+def test_editor_saves_and_rejects_requirement(isolated, tmp_path):
+    env, path = isolated
+    editor = tmp_path / "requirement_editor.py"
+    env["EDITOR"] = f"{sys.executable} {editor}"
+    editor.write_text("import pathlib, sys\npathlib.Path(sys.argv[1]).write_text('{\"requirement\": 2}')\n")
+    _pty_config(isolated, [], "--edit")
+    assert json.loads(path.read_text())["requirement"] == 2
+    before = path.read_bytes()
+    editor.write_text("import pathlib, sys\npathlib.Path(sys.argv[1]).write_text('{\"requirement\": true}')\n")
+    output = _pty_config(isolated, [], "--edit", expected_rc=1)
+    assert b"invalid edited config" in output
+    assert path.read_bytes() == before
+
+
+def test_none_requirement_marks_check_timing_and_hotspot_inactive(isolated):
+    _, path = isolated
+    values = config.DEFAULTS | {"requirement": "none", "hotspot": True, "hotspot_ssid": "test-hotspot"}
+    config.write(path, None, values)
+    shown = run_config(isolated, "--show").stdout
+    assert "Inactive (require none; saved on)" in shown
+    assert "timing settings inactive" in shown and "Hotspot   on (inactive)" in shown
+    assert "inactive" in config._choice("hotspot_after", values)

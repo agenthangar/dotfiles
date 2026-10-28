@@ -1255,7 +1255,7 @@ def test_zsh_nosleep_invalid_modes_do_not_touch_power(zsh, args):
     assert "unexpected-power" not in result.stdout
 
 
-@pytest.mark.parametrize("requirement", ["1", "2"])
+@pytest.mark.parametrize("requirement", ["all", "1", "2"])
 @pytest.mark.parametrize("busy,online", [(0, 0), (0, 1), (1, 0), (1, 1)])
 def test_zsh_nosleep_requirement_truth_table(nosleep_loop, requirement, busy, online):
     result, log = nosleep_loop(
@@ -1272,7 +1272,7 @@ def test_zsh_nosleep_requirement_truth_table(nosleep_loop, requirement, busy, on
         assert not re.search(r"(?m)^  Next\b.*(?:grace|Retry)", result.stdout)
 
 
-@pytest.mark.parametrize("requirement", ["1"])
+@pytest.mark.parametrize("requirement", ["all", "1"])
 @pytest.mark.parametrize("check,disabled", [("agent", "online"), ("internet", "busy")])
 def test_zsh_nosleep_requirement_with_one_enabled_check(nosleep_loop, requirement, check, disabled):
     result, log = nosleep_loop(
@@ -1283,7 +1283,7 @@ def test_zsh_nosleep_requirement_with_one_enabled_check(nosleep_loop, requiremen
 
 
 @pytest.mark.parametrize("args", ["--require", "--require=", "--require 0", "--require 000",
-                                  "--require -1", "--require=+1", "--require any", "--require one", "--require all",
+                                  "--require -1", "--require=+1", "--require any", "--require one",
                                   "--require 1.5", "--require 3", "--require 18446744073709551617",
                                   "--require 2 -c agent", "-c internet --require=2",
                                   "--forever --require 0"])
@@ -1599,3 +1599,65 @@ def test_nosleep_cli_contract_documents_only_hotspot_mode(zsh):
     docs = (REPO_ROOT / "README.md").read_text()
     assert not re.search(r"--(?:no-hotspot|hotspot-[a-z-]+)", rendered + docs)
     assert "--hotspot off" in docs and "--hotspot=on" in docs
+
+
+@pytest.mark.parametrize("args", [
+    "--require none", "--require=none -F", "--require none --checks all",
+    "--require none -ai", "--forever --require all", "--require all --forever",
+    "--require 1 --require none",
+])
+def test_zsh_nosleep_requirement_none_and_forever_are_independent(nosleep_loop, args):
+    result, log = nosleep_loop(args + " -d dim -g0 -e2 -r0", FAKE_STOP_AT="1006", FAKE_HOTSPOT="1")
+    assert "exit=130 at=1006" in result.stdout
+    assert "Prevented until Ctrl-C" in result.stdout
+    assert "(inactive)" in result.stdout and "Inactive (requires internet checks)" in result.stdout
+    assert not any(line.startswith(("busy ", "online ", "hotspot ")) for line in log)
+    assert "hold 1000 -dims" in log and any(line.startswith("brightness ") for line in log)
+    assert any(line.startswith("lock ") for line in log) and any("disablesleep 0" in line for line in log)
+
+
+@pytest.mark.parametrize("args", ["--require none --require all", "--require=all", "--require 1 --require all"])
+def test_zsh_nosleep_requirement_all_resumes_selected_checks(nosleep_loop, args):
+    result, log = nosleep_loop(args + " -I -g0 -e2 -r0", FAKE_STOP_AT="1006")
+    assert "letting go" in result.stdout
+    assert any(line.startswith("busy ") for line in log)
+    assert not any(line.startswith("online ") for line in log)
+
+
+@pytest.mark.parametrize("saved,args,release", [
+    ("all", "", True), (1, "", False), (2, "", True), ("none", "", False),
+    ("none", "--require all", True), (2, "--require 1", False),
+    (1, "--require all", True), ("none", "-F --checks all", False),
+])
+def test_zsh_nosleep_saved_requirement_and_cli_override(nosleep_loop, saved, args, release):
+    config = nosleep_loop.home / ".config" / "nosleep" / "config.json"
+    config.parent.mkdir(parents=True)
+    config.write_text(json.dumps({"requirement": saved}))
+    before = config.read_bytes()
+    result, log = nosleep_loop(args + " -g0 -e2 -r0", FAKE_STOP_AT="1006")
+    assert ("letting go" in result.stdout) == release
+    assert config.read_bytes() == before
+    if saved == "none" and "--require all" not in args:
+        assert not any(line.startswith(("busy ", "online ")) for line in log)
+
+
+def test_zsh_nosleep_saved_requirement_count_validates_final_selection(nosleep_loop, zsh):
+    config = nosleep_loop.home / ".config" / "nosleep" / "config.json"
+    config.parent.mkdir(parents=True)
+    config.write_text(json.dumps({"requirement": 2, "internet": False}))
+    result = zsh('sudo() { print unexpected-power; }; nosleep; print rc=$?')
+    assert "rc=2" in result.stdout and "unexpected-power" not in result.stdout
+    assert "exceeds the number of enabled checks" in result.stderr
+    result, log = nosleep_loop("--checks all -g0 -e2 -r0", FAKE_STOP_AT="1006")
+    assert "letting go" in result.stdout
+    assert any(line.startswith("online ") for line in log)
+
+
+@pytest.mark.parametrize("requirement", [True, 0, 1.5, "1", "one", "bogus"])
+def test_zsh_nosleep_invalid_saved_requirement_does_not_touch_power(zsh, requirement):
+    config = zsh.home / ".config" / "nosleep" / "config.json"
+    config.parent.mkdir(parents=True)
+    config.write_text(json.dumps({"requirement": requirement}))
+    result = zsh('sudo() { print unexpected-power; }; nosleep --require all; print rc=$?')
+    assert "rc=1" in result.stdout and "unexpected-power" not in result.stdout
+    assert "requirement must be" in result.stderr

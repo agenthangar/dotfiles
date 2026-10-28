@@ -24,6 +24,7 @@ DEFAULTS = {
     "forever": False,
     "agent": True,
     "internet": True,
+    "requirement": "all",
     "grace": 900,
     "every": 30,
     "retries": 3,
@@ -39,6 +40,7 @@ LABELS = {
     "forever": "Automatic checks",
     "agent": "Agent activity checks",
     "internet": "Internet checks",
+    "requirement": "Passing checks required",
     "grace": "Grace period",
     "every": "Check interval",
     "retries": "Retries",
@@ -73,6 +75,10 @@ def validate(data):
     for key in ("dim", "display_on", "lock", "forever", "agent", "internet", "hotspot"):
         if type(result[key]) is not bool:
             raise ValueError(f"{key} must be true or false")
+    requirement = result["requirement"]
+    if not ((type(requirement) is str and requirement in ("all", "none"))
+            or (type(requirement) is int and requirement > 0)):
+        raise ValueError("requirement must be all, none, or a positive integer")
     limits = {"grace": (0, None), "every": (1, None),
               "retries": (0, 10), "backoff": (1, 300),
               "hotspot_after": (0, 2147483647), "hotspot_timeout": (1, 300)}
@@ -130,9 +136,16 @@ def write(path, before, values):
             temporary.unlink(missing_ok=True)
 
 
+def monitoring(values):
+    return (not values["forever"] and values["requirement"] != "none"
+            and (values["agent"] or values["internet"]))
+
+
 def monitoring_mode(values):
     if values["forever"]:
         return "Disabled (run until Ctrl-C)"
+    if values["requirement"] == "none":
+        return "Disabled (require none; run until Ctrl-C)"
     if values["agent"] and values["internet"]:
         return "Activity and internet checks"
     if values["agent"]:
@@ -143,11 +156,13 @@ def monitoring_mode(values):
 
 
 def describe(values):
-    inactive = values["forever"] or not (values["agent"] or values["internet"])
+    inactive = not monitoring(values)
 
     def check_state(name):
         if values["forever"]:
             return f"Inactive (forever; saved {'on' if values[name] else 'off'})"
+        if values["requirement"] == "none":
+            return f"Inactive (require none; saved {'on' if values[name] else 'off'})"
         return "On" if values[name] else "Off"
 
     return [
@@ -158,6 +173,7 @@ def describe(values):
         f"  Mode      {monitoring_mode(values)}",
         f"  Agents    {check_state('agent')}",
         f"  Internet  {check_state('internet')}",
+        f"  Require   {_choice('requirement', values)}",
         "", "Check settings" + (" (timing settings inactive)" if inactive else ""),
         f"  Interval  {values['every']}s",
         f"  Grace     {values['grace']}s before retrying",
@@ -321,15 +337,17 @@ def _choice(name, values):
         return {"Off": "off on close", "On": "keep on when closed", "Dim": "dim on close"}[display_mode(values)]
     if name == "lock": return "lock on close" if value else "skip locking"
     if name == "forever": return "disabled (run until Ctrl-C)" if value else "use selected checks"
+    if name == "requirement":
+        return str(value) + (" (run until Ctrl-C)" if value == "none" else "")
     if name in ("agent", "internet"):
-        return ("on" if value else "off") + (" (inactive while monitoring disabled)" if values["forever"] else "")
+        return ("on" if value else "off") + (" (inactive while monitoring disabled)" if not monitoring(values) else "")
     if name == "hotspot":
-        return ("on" if value else "off") + (" (inactive)" if values["forever"] or not values["internet"] else "")
+        return ("on" if value else "off") + (" (inactive)" if not monitoring(values) or not values["internet"] else "")
     if name == "hotspot_ssid":
         return value or "run nosleep hotspot setup"
     if name.startswith("hotspot_"):
-        return f"{value}s" + (" (inactive)" if not values["hotspot"] or values["forever"] or not values["internet"] else "")
-    inactive = values["forever"] or not (values["agent"] or values["internet"])
+        return f"{value}s" + (" (inactive)" if not values["hotspot"] or not monitoring(values) or not values["internet"] else "")
+    inactive = not monitoring(values)
     return f"{value}{'s' if name != 'retries' else ''}" + (" (inactive)" if inactive else "")
 
 
@@ -356,7 +374,7 @@ def menu(values):
             body += [("defaults", "Restore defaults", None),
                      ("save", "Save changes", f"{pending} pending"),
                      ("cancel", "Cancel", None)]
-            inactive = edited["forever"] or not (edited["agent"] or edited["internet"])
+            inactive = not monitoring(edited)
             sections = {"dim": "ON CLOSE", "forever": "CHECKS",
                         "grace": "CHECK SETTINGS" + (" (inactive)" if inactive else ""),
                         "hotspot": "HOTSPOT FALLBACK · setup stores password in Keychain",
@@ -379,6 +397,10 @@ def menu(values):
                 edited["dim"] = mode == "On"
             elif name in ("lock", "forever", "agent", "internet"):
                 edited[name] = not edited[name]
+            elif name == "requirement":
+                choices = ("all", "none", 1, 2)
+                edited[name] = (choices[(choices.index(edited[name]) + 1) % len(choices)]
+                                if edited[name] in choices else "all")
             elif name == "hotspot":
                 if not edited["hotspot"] and not edited["hotspot_ssid"]:
                     flash = "Run nosleep hotspot setup first in an unlocked terminal"

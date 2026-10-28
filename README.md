@@ -188,15 +188,22 @@ activity sampling and grace so an agent has time to resume.
 nosleep --grace 900 --retries 3 --backoff 30
 ```
 
-By default, nosleep keeps awake while all enabled checks pass.
+`--require all` (the default) keeps awake while all enabled checks pass.
 `--require 1` keeps awake while any enabled check passes; `--require N`
 requires at least N enabled checks to pass. Passing means agent activity is busy
 or internet connectivity is online. Each failing check retains its grace period
 (and activity needs two samples) before it counts against the requirement.
 All enabled checks continue to run, even after enough pass. Counts must be positive
 and cannot exceed the final enabled check count when monitoring is active.
-The requirement is a one-run CLI option; it is inactive with `--checks none` or
-`--forever`, which keep awake until Ctrl-C.
+`--require none` skips monitoring until Ctrl-C while preserving selected checks.
+Save the policy in `nosleep config` under **Passing checks required** (all, none,
+1, or 2), or set `requirement` in JSON to `"all"`, `"none"`, or a positive integer.
+Command-line `--require` values override that saved policy for one run; separate
+and `=` values work, and the last value wins. The policy is independent of
+`--checks` selection and `--forever`: `--require all` does not clear forever,
+and `--no-forever` does not clear `--require none`. Timing and hotspot fallback
+are inactive whenever monitoring is disabled. A numeric policy is checked against
+the final selection when monitoring starts; `--checks all` can restore both checks.
 
 `--every` sets the normal check interval (30 seconds). `--backoff` sets the first
 retry delay (1–300 seconds), which doubles up to five minutes; `--retries` accepts

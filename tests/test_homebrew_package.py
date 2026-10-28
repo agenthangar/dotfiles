@@ -145,7 +145,7 @@ def test_shell_function_and_help_work_without_git(package):
     assert result.returncode == 0, result.stderr
     assert 'Homebrew dotfiles applied' in result.stdout
     assert 'nosleep' in result.stdout
-    assert '--hotspot-after' in result.stdout and 'Hotspot fallback' in result.stdout
+    assert '--hotspot MODE' in result.stdout and 'Hotspot fallback' in result.stdout
     assert (opt / 'lib/nosleep_hotspot.py').is_file()
     assert (opt / 'lib/nosleep-fallback.zsh').is_file()
     assert (home / '.zshrc').is_file()

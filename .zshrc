@@ -234,12 +234,7 @@ source "${${(%):-%x}:A:h}/lib/nosleep-fallback.zsh"
 #   -b, --backoff SECS  Retry delay; doubles to 300 seconds (default 30)
 #
 # HOTSPOT FALLBACK
-#   --hotspot          Join configured broadcasting hotspot after an outage
-#   --no-hotspot       Disable fallback for this run (default off)
-#   --hotspot-ssid SSID Exact Wi-Fi name; password comes from Keychain
-#   --hotspot-after SEC Continuous outage delay (default 300)
-#   --hotspot-timeout SEC Attempt/recovery limit, 1–300 (default 30)
-#                      Inactive without internet checks or with --forever.
+#   --hotspot MODE     on | off
 #   -h, --help          Show help
 #
 # EXAMPLES
@@ -316,7 +311,7 @@ nosleep() {
         nosleep_args+=("$1"); shift
       fi
       # Keep a long option's value intact too, including malformed negatives.
-      if [[ $arg == --(every|grace|retries|backoff|hotspot-ssid|hotspot-after|hotspot-timeout) ]] && (( $# )); then
+      if [[ $arg == --(every|grace|retries|backoff|hotspot) ]] && (( $# )); then
         nosleep_args+=("$1")
         shift
       fi
@@ -349,19 +344,17 @@ nosleep() {
       -A|--no-agent) agent=0 ;;
       -i|--internet) internet=1 ;;
       -I|--no-internet) internet=0 ;;
-      --hotspot) hotspot=1 ;;
-      --no-hotspot) hotspot=0 ;;
-      --hotspot-ssid|--hotspot-after|--hotspot-timeout|--hotspot-ssid=*|--hotspot-after=*|--hotspot-timeout=*)
-        arg=${1%%=*}
+      --hotspot|--hotspot=*)
         if [[ $1 == *=* ]]; then value=${1#*=}
-        else
-          (( $# >= 2 )) || { print -u2 -- "nosleep: $1 needs a value"; return 2; }
+        elif (( $# >= 2 )) && [[ $2 != -* ]]; then
           value=$2; shift
+        else
+          print -u2 -- 'nosleep: --hotspot needs on or off'; return 2
         fi
-        case $arg in
-          --hotspot-ssid) hotspot_ssid=$value ;;
-          --hotspot-after) hotspot_after=$value ;;
-          --hotspot-timeout) hotspot_timeout=$value ;;
+        case $value in
+          on) hotspot=1 ;;
+          off) hotspot=0 ;;
+          *) print -u2 -- 'nosleep: --hotspot takes on or off'; return 2 ;;
         esac ;;
       -d|--display|-d=*|--display=*)
         if [[ $1 == *=* ]]; then

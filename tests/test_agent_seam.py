@@ -1022,9 +1022,11 @@ def test_zsh_nosleep_help_is_concise_and_does_not_change_power(zsh, args):
     assert result.returncode == 0
     assert not result.stderr
     assert "nosleep" in result.stdout
+    assert "--no-lock" in result.stdout
     assert "-d, --display MODE" in result.stdout
     assert "-l, --lock MODE" in result.stdout
-    assert "-c, --checks VALUE" in result.stdout
+    assert "-c, --checks MODE" in result.stdout
+    assert "--forever" in result.stdout
     assert "unexpected sudo" not in result.stdout
     assert len(result.stdout.splitlines()) <= 50
 
@@ -1128,9 +1130,9 @@ def test_zsh_nosleep_all_checks_off_preserves_lid_and_sleep_hold(nosleep_loop, a
 
 
 @pytest.mark.parametrize("args,agent,internet", [
-    ("", False, False), ("-F", False, True), ("-c", False, True),
+    ("", False, False), ("-F", False, True), ("-c", True, True),
     ("-F -a -I", True, False), ("-F -i -I", False, False),
-    ("-c -C", False, False), ("-C -c", False, True),
+    ("-c -C", False, False), ("-C -c", True, True),
 ])
 def test_zsh_nosleep_saved_check_preferences_and_overrides(nosleep_loop, args, agent, internet):
     config = nosleep_loop.home / ".config" / "nosleep" / "config.json"
@@ -1189,10 +1191,7 @@ def test_zsh_nosleep_invalid_groups_leave_power_untouched(zsh, args):
 def test_zsh_nosleep_help_and_status_separate_checks_from_settings(zsh, nosleep_loop):
     help_result = zsh('nosleep -dMLh')
     checks, settings = help_result.stdout.split("CHECKS\n", 1)[1].split("CHECK SETTINGS\n", 1)
-    assert "--checks VALUE" in checks and "all | N | none" in checks
-    assert "--require" not in help_result.stdout and "SHORTCUTS" not in help_result.stdout
-    assert help_result.stdout.count("-c, --checks") == 1
-    assert "--no-agent" in checks and "--no-internet" in checks
+    assert "--checks MODE" in checks and "all | agent | internet | none" in checks
     assert "--grace" not in checks and "--grace" in settings
     result, _ = nosleep_loop("-AI", FAKE_STOP_AT="1004")
     checks, settings = result.stdout.split("\nChecks\n", 1)[1].split("\nCheck settings\n", 1)
@@ -1225,39 +1224,24 @@ def test_zsh_nosleep_mode_flags_replace_saved_display_and_lock(nosleep_loop, arg
 
 
 @pytest.mark.parametrize("args,agent,internet", [
-    ("--checks all", False, True), ("-c1", False, True),
-    ("-c=all", False, True), ("--checks=none", False, False),
-    ("-Lc=all", False, True), ("-Lc all", False, True),
-    ("--checks none --checks all", False, True),
-    ("-f --checks 1", False, True), ("--checks all -I", False, False),
-    ("--checks none -a -F", True, True),
-    ("--checks none -a", False, False),
-    ("--checks 1 --checks none -i", False, False),
-    ("-c", False, True), ("--checks", False, True),
+    ("--checks all", True, True), ("-c agent", True, False),
+    ("-c=internet", False, True), ("--checks=none", False, False),
+    ("-Lc=agent", True, False), ("-Lc internet", False, True),
+    ("--checks none --checks agent", True, False),
+    ("-f --checks internet", False, True),
+    ("--checks all -I", True, False),
 ])
-def test_zsh_nosleep_check_policy_preserves_saved_selection(nosleep_loop, args, agent, internet):
+def test_zsh_nosleep_check_mode_replaces_saved_checks_and_forever(nosleep_loop, args, agent, internet):
     config = nosleep_loop.home / ".config" / "nosleep" / "config.json"
     config.parent.mkdir(parents=True)
-    saved = json.dumps({"agent": False, "internet": True, "forever": True})
+    saved = json.dumps({"agent": False, "internet": False, "forever": True})
     config.write_text(saved)
     result, log = nosleep_loop(args, FAKE_STOP_AT="1004")
     assert any(line.startswith("busy ") for line in log) == agent
     assert any(line.startswith("online ") for line in log) == internet
     if not (agent or internet):
-        assert "(inactive)" in result.stdout
+        assert "No checks" in result.stdout and "(inactive)" in result.stdout
     assert config.read_text() == saved
-
-
-@pytest.mark.parametrize("selected", [(False, False), (True, False), (False, True)])
-@pytest.mark.parametrize("policy", ["all", "1"])
-def test_zsh_nosleep_policy_does_not_enable_saved_disabled_checks(nosleep_loop, selected, policy):
-    config = nosleep_loop.home / ".config" / "nosleep" / "config.json"
-    config.parent.mkdir(parents=True)
-    config.write_text(json.dumps(dict(zip(("agent", "internet"), selected))))
-    result, log = nosleep_loop(f"--checks none --checks {policy}", FAKE_STOP_AT="1004")
-    assert "exit=130 at=1004" in result.stdout
-    assert any(line.startswith("busy ") for line in log) == selected[0]
-    assert any(line.startswith("online ") for line in log) == selected[1]
 
 
 @pytest.mark.parametrize("args", [
@@ -1271,11 +1255,11 @@ def test_zsh_nosleep_invalid_modes_do_not_touch_power(zsh, args):
     assert "unexpected-power" not in result.stdout
 
 
-@pytest.mark.parametrize("requirement", ["all", "1", "2"])
+@pytest.mark.parametrize("requirement", ["1", "2"])
 @pytest.mark.parametrize("busy,online", [(0, 0), (0, 1), (1, 0), (1, 1)])
 def test_zsh_nosleep_requirement_truth_table(nosleep_loop, requirement, busy, online):
     result, log = nosleep_loop(
-        f"--checks {requirement} --grace 0 --every 2 --retries 0",
+        f"--require {requirement} --grace 0 --every 2 --retries 0",
         FAKE_BUSY=str(busy), FAKE_ONLINE=str(online), FAKE_STOP_AT="1006")
     required = 1 if requirement == "1" else 2
     releases = busy + online < required
@@ -1288,53 +1272,37 @@ def test_zsh_nosleep_requirement_truth_table(nosleep_loop, requirement, busy, on
         assert not re.search(r"(?m)^  Next\b.*(?:grace|Retry)", result.stdout)
 
 
-@pytest.mark.parametrize("requirement", ["all", "1"])
+@pytest.mark.parametrize("requirement", ["1"])
 @pytest.mark.parametrize("check,disabled", [("agent", "online"), ("internet", "busy")])
 def test_zsh_nosleep_requirement_with_one_enabled_check(nosleep_loop, requirement, check, disabled):
-    disabled_check = "internet" if check == "agent" else "agent"
     result, log = nosleep_loop(
-        f"--checks {requirement} --no-{disabled_check} --grace 0 --every 2 --retries 0",
+        f"--require {requirement} --checks {check} --grace 0 --every 2 --retries 0",
         FAKE_ONLINE="0", FAKE_STOP_AT="1006")
     assert "letting go" in result.stdout
     assert not any(line.startswith(disabled + " ") for line in log)
 
 
-@pytest.mark.parametrize("args", [
-    "--checks=", "--checks 0", "--checks 000", "--checks -1", "-c -1",
-    "--checks=+1", "--checks any", "--checks one", "--checks agent",
-    "--checks internet", "--checks 1.5", "--checks 3", "-c3", "-c1.5",
-    "--checks 18446744073709551617", "--checks 2 -I", "-A --checks=2",
-    "--forever --checks 0", "--checks 0 --checks all",
-])
+@pytest.mark.parametrize("args", ["--require", "--require=", "--require 0", "--require 000",
+                                  "--require -1", "--require=+1", "--require any", "--require one", "--require all",
+                                  "--require 1.5", "--require 3", "--require 18446744073709551617",
+                                  "--require 2 -c agent", "-c internet --require=2",
+                                  "--forever --require 0"])
 def test_zsh_nosleep_invalid_requirement_does_not_change_power(zsh, args):
     result = zsh('sudo() { echo unexpected-sudo; }; ' + f'nosleep {args}; echo rc=$?')
     assert result.stdout.strip() == "rc=2"
-    assert "nosleep: --checks" in result.stderr
+    assert "nosleep: --require" in result.stderr
 
 
-@pytest.mark.parametrize("args", ["--require", "--require=one", "--require 2"])
-def test_zsh_nosleep_obsolete_requirement_points_to_checks(zsh, args):
-    result = zsh('sudo() { echo unexpected-sudo; }; ' + f'nosleep {args}; echo rc=$?')
-    assert result.stdout.strip() == "rc=2"
-    assert "--require was replaced by --checks" in result.stderr
-
-
-@pytest.mark.parametrize("args", [
-    "--checks=1", "--checks=01", "--checks=0002 --checks 1",
-    "--checks 2 -I -i --checks 1", "-c1", "-Lc1", "-c 1", "-Lc=1",
-    "--checks none --checks 1", "-c1 -f -F", "-c1 -C -F",
-])
+@pytest.mark.parametrize("args", ["--require=1", "--require=01", "--require=0002 --require 1",
+                                  "--require 2 -c agent -c all --require 1"])
 def test_zsh_nosleep_requirement_forms_and_final_option_order(nosleep_loop, args):
     result, _ = nosleep_loop(args + " --grace 0 --every 2 --retries 0", FAKE_STOP_AT="1006")
     assert "exit=130 at=1006" in result.stdout
     assert "letting go" not in result.stdout
 
 
-@pytest.mark.parametrize("args", [
-    "--checks 2 --checks none", "--checks 1 -AI",
-    "--checks 99999999999999999999999999 --forever",
-    "--checks 99999999999999999999999999 -AI", "--checks none -ai",
-])
+@pytest.mark.parametrize("args", ["--checks none --require 2", "--require 1 -AI",
+                                  "--forever --require 99999999999999999999999999"])
 def test_zsh_nosleep_requirement_inactive_without_monitoring(nosleep_loop, args):
     result, log = nosleep_loop(args, FAKE_STOP_AT="1006")
     assert "exit=130 at=1006" in result.stdout
@@ -1343,20 +1311,20 @@ def test_zsh_nosleep_requirement_inactive_without_monitoring(nosleep_loop, args)
 
 
 def test_zsh_nosleep_one_requirement_waits_for_both_grace_periods(nosleep_loop):
-    result, _ = nosleep_loop("--checks 1 --grace 4 --every 2 --retries 0",
+    result, _ = nosleep_loop("--require 1 --grace 4 --every 2 --retries 0",
                              FAKE_ONLINE="0", FAKE_BUSY="1 1 0")
     assert "exit=0 at=1008" in result.stdout
     assert "the network has been down for 8s" in result.stdout
 
 
 def test_zsh_nosleep_one_requirement_still_needs_second_activity_sample(nosleep_loop):
-    result, log = nosleep_loop("--checks 1 --grace 0 --every 2 --retries 0", FAKE_ONLINE="0")
+    result, log = nosleep_loop("--require 1 --grace 0 --every 2 --retries 0", FAKE_ONLINE="0")
     assert "exit=0 at=1002" in result.stdout
     assert len([line for line in log if line.startswith("busy ")]) == 2
 
 
 def test_zsh_nosleep_one_requirement_recovery_resets_retry(nosleep_loop):
-    result, _ = nosleep_loop("--checks 1 --grace 0 --every 2 --backoff 2",
+    result, _ = nosleep_loop("--require 1 --grace 0 --every 2 --backoff 2",
                              FAKE_ONLINE="0", FAKE_BUSY="0 0 1 0", FAKE_STOP_AT="1010")
     assert "activity recovered" in result.stdout
     assert result.stdout.count("retry 1/3 in 2s") == 2
@@ -1364,7 +1332,7 @@ def test_zsh_nosleep_one_requirement_recovery_resets_retry(nosleep_loop):
 
 
 def test_zsh_nosleep_one_requirement_reconnect_resets_sampling(nosleep_loop):
-    result, log = nosleep_loop("--checks 1 --grace 0 --every 2 --backoff 2",
+    result, log = nosleep_loop("--require 1 --grace 0 --every 2 --backoff 2",
                                FAKE_ONLINE="0 0 1", FAKE_STOP_AT="1008")
     assert "network recovered — restarting agent activity sampling and grace" in result.stdout
     assert "busy 1004 baselines=0" in log
@@ -1373,7 +1341,7 @@ def test_zsh_nosleep_one_requirement_reconnect_resets_sampling(nosleep_loop):
 
 
 def test_zsh_nosleep_one_requirement_open_lid_cancels_retry(nosleep_loop):
-    result, _ = nosleep_loop("--checks 1 --grace 0 --every 2 --backoff 2 --retries 1",
+    result, _ = nosleep_loop("--require 1 --grace 0 --every 2 --backoff 2 --retries 1",
                              FAKE_ONLINE="0", FAKE_LID_OPEN_AT="1004", FAKE_STOP_AT="1008")
     assert "retry 1/1" in result.stdout
     assert "laptop open, sleep stays blocked" in result.stdout

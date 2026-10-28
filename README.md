@@ -41,17 +41,17 @@ Linux installs, and links-only updates skip this prompt; `DOTFILES_NO_SUDO=1`
 also skips it. Re-running the installer leaves an identical rule alone.
 
 ```sh
-nosleep                             # lock and turn the display off on lid close
-nosleep -d on                       # display on, normal brightness
-nosleep -d dim -l off               # dim without requesting a lock
-nosleep -c none                     # keep awake until Ctrl-C; skip all checks
-nosleep -d dim -l off --no-internet # dim, no lock, check only agent activity
-nosleep --no-agent                  # check only internet connectivity
-nosleep --checks 1                  # keep awake while busy OR online
-nosleep --checks all                # require both enabled checks to pass
-nosleep config                      # arrow-key menu for this machine's defaults
-nosleep config --show               # print effective defaults
-nosleep config --edit               # edit defaults with VISUAL/EDITOR
+nosleep                       # lock and turn the display off on lid close
+nosleep -d on                  # display on, normal brightness
+nosleep -d dim -l off          # dim without requesting a lock
+nosleep -c none                # keep awake until Ctrl-C; skip all checks
+nosleep -d dim -l off -c agent # dim, no lock, check only agent activity
+nosleep -c internet            # check only internet connectivity
+nosleep --require 1            # keep awake while busy OR online
+nosleep --require 2            # require both enabled checks to pass
+nosleep config                # arrow-key menu for this machine's defaults
+nosleep config --show          # print effective defaults
+nosleep config --edit          # edit defaults with VISUAL/EDITOR
 ```
 
 Related choices use one mode flag per setting:
@@ -61,15 +61,14 @@ Related choices use one mode flag per setting:
 | Display on lid close | `-d`, `--display` | `off`, `on`, `dim` |
 | Lock on lid close | `-l`, `--lock` | `on`, `off` |
 | Hotspot fallback | `--hotspot` | `on`, `off` |
-| Automatic checks | `-c`, `--checks` | `all`, positive count `N`, `none` |
+| Automatic checks | `-c`, `--checks` | `all`, `agent`, `internet`, `none` |
 
 Use a separate value or `=`: `-d dim`, `-d=dim`, and `--display=dim` are equivalent.
 A display mode replaces the whole display choice: `on` clears saved or earlier
 dimming, `off` turns the display off, and `dim` keeps it awake and dimmed.
-`--checks all` requires all selected checks to pass; `--checks N` requires N.
-Both resume checks while preserving saved agent/internet selections. `none` pauses
-checks and holds until Ctrl-C without forgetting those selections. Repeating the
-policy applies the last value. Display and locking remain independent.
+`--checks agent` selects only agent activity, replacing saved check choices and
+clearing forever; `none` disables both checks and holds until Ctrl-C.
+Repeating a mode applies the last selection. Display and locking remain independent.
 `--lock off` skips nosleep's lock request; it never unlocks an existing lock or
 changes macOS's own automatic locking settings. Dimming only changes brightness.
 
@@ -78,20 +77,25 @@ Check settings remain separate: `-e` / `--every`, `-g` / `--grace`,
 Only enabled checks can trigger retries or allow automatic sleep. Lid/display
 handling, sleep protection, sudo refresh, and cleanup continue with checks disabled.
 
-Individual checks use `-a` / `--agent`, `-A` / `--no-agent`, `-i` / `--internet`,
-and `-I` / `--no-internet`. These change the selection without resuming paused
-checks. Bare `-c` / `--checks` means `all`. `--checks none --checks all` resumes
-that selection; zero selected checks hold awake until Ctrl-C.
+Existing switches and groups still work. `-mLI` means dim, no lock, and no internet
+check; `-dML` means display on, no saved dimming, and no lock. Bare `-d` preserves
+saved dimming, while `-d on` explicitly clears it. Bare `-l` / `--lock` enables
+locking, and bare `-c` / `--checks` enables both checks and clears forever.
+The individual `-a` / `-A` and `-i` / `-I` check toggles are also retained.
+`-f` / `--forever` and `-C` / `--no-checks` override individual check settings;
+`-F` / `--no-forever` resumes the selected checks.
 
-Legacy switches and groups still work: `-mLI` means dim, no lock, and no internet;
-`-dML` means display on, no saved dimming, and no lock. Bare `-d` preserves saved
-dimming; `-d on` clears it. Bare `-l` enables locking. `-f` / `--forever` and
-`-C` / `--no-checks` pause checks; `-F` / `--no-forever` resumes the selection.
-Numeric values can attach to short flags (`-c1`, `-mLIe10`); other values use a
-separate argument or `=` (`-Lc all`, `-Ld=dim`). Put further flags in a new argument
-after a value. `-dim` still means `--dim`. Legacy `--dim` wins over legacy display
-switches; `--undim` clears saved dimming and `--display-off` turns the display off.
-A later explicit `--display MODE` replaces the whole display choice.
+Grouped numeric options accept attached or separate values: `-mLIe10` and
+`-mLIe 10` both use a 10-second interval. Mode values need a separate argument
+or `=`: `-Ld=dim` and `-Ld dim` combine no-lock with display dimming.
+Put further flags in a new argument after a value. The legacy `-dim` spelling
+still means only `--dim`; it does not enable the internet check.
+
+Among legacy display switches, `-m` / `--dim` / `-dim` wins regardless of order.
+`-M` / `--undim` clears saved dimming without changing the display mode;
+`-D` / `--display-off` / `--no-dim` turns the display off. A later
+`--display MODE` replaces the whole choice, including an earlier explicit dim
+request. A later legacy `--dim` requests dimming again.
 
 `nosleep config` follows `t config`: select a setting with arrow keys, stage
 changes, then review and save. Cancel leaves defaults unchanged. Defaults live
@@ -184,8 +188,8 @@ activity sampling and grace so an agent has time to resume.
 nosleep --grace 900 --retries 3 --backoff 30
 ```
 
-`--checks all` (the default) keeps awake while all enabled checks pass.
-`--checks 1` keeps awake while any enabled check passes; `--checks N`
+By default, nosleep keeps awake while all enabled checks pass.
+`--require 1` keeps awake while any enabled check passes; `--require N`
 requires at least N enabled checks to pass. Passing means agent activity is busy
 or internet connectivity is online. Each failing check retains its grace period
 (and activity needs two samples) before it counts against the requirement.

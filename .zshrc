@@ -222,10 +222,10 @@ source "${${(%):-%x}:A:h}/lib/nosleep-fallback.zsh"
 #   -l, --lock MODE     on | off
 #
 # CHECKS
-#   -c, --checks VALUE  all | N | none (until Ctrl-C); default all
-#                      Require all or N selected checks to pass; preserves selection
-#   -a / -A            Enable / disable agent activity (--agent / --no-agent)
-#   -i / -I            Enable / disable internet (--internet / --no-internet)
+#   -c, --checks MODE   all | agent | internet | none (until Ctrl-C)
+#                      Replaces saved checks and clears forever
+#   --require N        Number of passing checks needed to keep awake
+#                      Default: all enabled checks; passing means busy or online
 #
 # CHECK SETTINGS
 #   -e, --every SECS    Check interval in seconds (default 30)
@@ -238,10 +238,18 @@ source "${${(%):-%x}:A:h}/lib/nosleep-fallback.zsh"
 #   -h, --help          Show help
 #
 # EXAMPLES
-#   nosleep --checks 1                # stay awake while busy OR online
-#   nosleep --checks all --no-internet # check only agent activity
+#   nosleep -d dim -l off -c agent -e10
+#   nosleep --require 1             # stay awake while busy OR online
 #   nosleep --display=on --lock=off --checks=none
 #
+# SHORTCUTS
+#   Existing switches and groups still work: -dML, -mLI, -AI, -f / --forever.
+#   Bare -d / -l / -c mean display on / lock on / all checks.
+#   -m / --dim / -dim dim; -M / --undim clear saved dimming;
+#   -D / --display-off turn it off; -L / --no-lock skip locking.
+#   -a / -A and -i / -I enable/disable agent and internet checks.
+#   -C / --no-checks skips checks; -F / --no-forever resumes selected checks.
+#   Modes take separate or =values; numeric settings allow attached values.
 nosleep() {
   [[ "$1" == config ]] && { shift; _nosleep_config "$@"; return $?; }
   if [[ "$1" == hotspot ]]; then
@@ -286,15 +294,11 @@ nosleep() {
       while [[ -n $group ]]; do
         flag=${group[1]}
         group=${group[2,-1]}
-        if [[ $flag == [dlc] && $group == \=* ]] || [[ $flag == c && $group == [0-9]* ]]; then
-          [[ $flag == c && $group != \=* ]] && group="=$group"
+        if [[ $flag == [dlc] && $group == \=* ]]; then
           nosleep_args+=("-$flag$group")
           break
         fi
         nosleep_args+=("-$flag")
-        if [[ $flag == c && -z $group && ${1:-} == -[0-9]* ]]; then
-          nosleep_args+=("$1"); shift; break
-        fi
         if [[ $flag == [egrb] ]]; then
           if [[ -n $group ]]; then
             nosleep_args+=("$group")
@@ -307,11 +311,8 @@ nosleep() {
       done
     else
       nosleep_args+=("$arg")
-      if [[ $arg == --checks && ${1:-} == -[0-9]* ]]; then
-        nosleep_args+=("$1"); shift
-      fi
       # Keep a long option's value intact too, including malformed negatives.
-      if [[ $arg == --(every|grace|retries|backoff|hotspot) ]] && (( $# )); then
+      if [[ $arg == --(every|grace|retries|backoff|require|hotspot) ]] && (( $# )); then
         nosleep_args+=("$1")
         shift
       fi
@@ -327,19 +328,17 @@ nosleep() {
         value=all
         if [[ $1 == *=* ]]; then
           value=${1#*=}
-        elif (( $# >= 2 )) && [[ $2 != -* || $2 == -[0-9]* ]]; then
+        elif (( $# >= 2 )) && [[ $2 != -* ]]; then
           value=$2; shift
         fi
         case $value in
-          none) forever=1 ;;
-          all) requirement=all forever=0 ;;
-          *)
-            if [[ $value =~ '^0*([1-9][0-9]*)$' ]]; then
-              requirement=$match[1] forever=0
-            else
-              echo 'nosleep: --checks takes all, a positive count, or none' >&2; return 2
-            fi ;;
-        esac ;;
+          all) agent=1 internet=1 ;;
+          agent) agent=1 internet=0 ;;
+          internet) agent=0 internet=1 ;;
+          none) agent=0 internet=0 ;;
+          *) echo 'nosleep: --checks takes all, agent, internet, or none' >&2; return 2 ;;
+        esac
+        forever=0 ;;
       -a|--agent) agent=1 ;;
       -A|--no-agent) agent=0 ;;
       -i|--internet) internet=1 ;;
@@ -392,8 +391,15 @@ nosleep() {
           *) echo 'nosleep: --lock takes on or off' >&2; return 2 ;;
         esac ;;
       --require|--require=*)
-        echo 'nosleep: --require was replaced by --checks all|N|none (use --checks 1 for one)' >&2
-        return 2 ;;
+        if [[ $1 == *=* ]]; then
+          requirement=${1#*=}
+        else
+          (( $# >= 2 )) || { echo 'nosleep: --require needs a positive count' >&2; return 2; }
+          requirement=$2; shift
+        fi
+        [[ $requirement =~ '^0*([1-9][0-9]*)$' ]] || {
+          echo 'nosleep: --require takes a positive count' >&2; return 2
+        } ;;
       -g|--grace|-e|--every|-r|--retries|-b|--backoff)
         (( $# >= 2 )) || { echo "nosleep: $1 needs a value" >&2; return 2; }
         case $1 in
@@ -416,15 +422,19 @@ nosleep() {
   case $requirement in
     all) required_count=$enabled_count ;;
     *)
-      # The parser normalized the positive count as text. Bound it before
-      # arithmetic so even huge inactive thresholds cannot wrap around.
+      # Normalize as text before arithmetic: even huge input must not wrap around.
+      if [[ $requirement =~ '^0*([1-9][0-9]*)$' ]]; then
+        requirement=$match[1]
+      else
+        echo 'nosleep: --require takes a positive count' >&2; return 2
+      fi
       if (( monitoring )) && [[ $requirement != 1 && $requirement != 2 ]]; then
-        echo 'nosleep: --checks exceeds the number of enabled checks' >&2; return 2
+        echo 'nosleep: --require exceeds the number of enabled checks' >&2; return 2
       fi
       (( monitoring )) && required_count=$requirement ;;
   esac
   if (( monitoring && required_count > enabled_count )); then
-    echo 'nosleep: --checks exceeds the number of enabled checks' >&2; return 2
+    echo 'nosleep: --require exceeds the number of enabled checks' >&2; return 2
   fi
   [[ $grace == <-> && $every == <-> && $every -gt 0 ]] || { echo "nosleep: --grace/--every take a number of seconds" >&2; return 2; }
   [[ $retries == <-> && $retries -le 10 && $backoff == <-> && $backoff -ge 1 && $backoff -le 300 ]] || {

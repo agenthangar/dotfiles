@@ -21,7 +21,7 @@ INSTALL_SH = REPO_ROOT / "install.sh"
 # Everything install.sh links, plus the files it reads. Stand-ins are enough: the
 # migration cares about paths and git state, never file contents.
 STUB_BINS = [
-    "sleep-manager", "csync", "pii-scan", "dots-sync",
+    "sleep-manager", "pii-scan", "dots-sync",
 ]
 
 

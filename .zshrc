@@ -124,7 +124,7 @@ _help_style() {
 # reuses it, so a key added once stays loaded until reboot. An empty agent is
 # refilled from the macOS Keychain (--apple-load-keychain), so a reboot does
 # not bring back per-connection passphrase prompts — background ssh users
-# (worktree-sweep fetches, csync) prompt-spam the console otherwise.
+# (worktree-sweep fetches) prompt-spam the console otherwise.
 # Requires the passphrase to be IN the Keychain: one-time per machine, run
 #   ssh-add --apple-use-keychain ~/.ssh/id_ed25519
 # (UseKeychain in ~/.ssh/config only READS the Keychain; it never writes it.)
@@ -1077,7 +1077,7 @@ _nosleep_agent_of_comm() {
 #     its prompt held eight, a claude two) and they outlive the turn indefinitely;
 #   - CPU time — an idle codex TUI burned 0.85 s in 47 s while a claude waiting on a
 #     tool burned 1.36 s: the separation is inside the noise.
-#   (And transcript mtime before both: csync bulk-touches IDLE transcripts, and a
+#   (And transcript mtime before both: file transfers can touch IDLE transcripts, and a
 #   session mid-way through a long tool call had not written its transcript in 31 min.)
 # Returns through $REPLY, never stdout: a $(…) caller runs in a SUBSHELL, where the
 # baselines written to _NOSLEEP_NET would vanish and every probe would be a first
@@ -1546,7 +1546,7 @@ add-zsh-hook precmd _dots_reload_if_moved
 
 # Personal t integration. The validated standalone checkout owns the shell helpers
 # and generated shortcuts; this file keeps local policy and the unrelated dotfiles
-# commands. No t checkout is required to use dots, csync, or nosleep.
+# commands. No t checkout is required to use dots or nosleep.
 typeset -gA DEV_REPOS DEV_BRANCHES REMOTE_HOSTS DEV_WORKTREE DEV_AGENT DEV_MODEL DEV_EFFORT DEV_FAST
 _dots_t_environment "$_DOTS_SOURCE_ROOT"
 export T_DOTFILES_LIVE_TREE="$_DOTS_SOURCE_ROOT"
@@ -1569,17 +1569,12 @@ if [[ -d "$DOTFILES_SCRIPTS_DIR" ]] && (( ${path[(Ie)$DOTFILES_SCRIPTS_DIR]} == 
   path=("$DOTFILES_SCRIPTS_DIR" "${path[@]}")
 fi
 
-# csync — two-way sync of Claude Code session history with iCloud Drive.
-# Lives in bin/csync (install.sh symlinks it onto PATH; `help` lists it by
-# scanning ~/bin). Run `csync` on any machine to converge.
-#
-# Periodic csync, the shell way. A launchd agent *can't* do this: iCloud Drive
-# is TCC-protected and background agents are denied — granting /bin/bash Full
-# Disk Access has no effect on recent macOS (the grant won't pin to a platform
-# interpreter running an arbitrary script). The shell, though, runs in the
-# Terminal's already-approved context, so we piggyback on the prompt: at most
-# once every 15 min, fire csync detached in the background. A stamp file gates
-# the interval (written *before* the run so overlapping shells don't double-fire).
+# Remove the retired transcript sync hook and historical function when a running
+# shell reloads its configuration. Keep existing transcript and cache data.
+precmd_functions=(${precmd_functions:#_csync_periodic})
+unfunction _csync_periodic csync 2>/dev/null
+
+# Shared support for the workspace Git updater below.
 mkdir -p "$HOME/.cache" "$HOME/Library/Logs" 2>/dev/null
 zmodload zsh/datetime 2>/dev/null                     # $EPOCHSECONDS + strftime, no `date` fork
 # Only the zstat builtin (-F), NOT the module's `stat` — that would shadow the
@@ -1587,20 +1582,10 @@ zmodload zsh/datetime 2>/dev/null                     # $EPOCHSECONDS + strftime
 # mtime source: BSD `stat -f %m` and GNU `stat -c %Y` disagree, zstat is neither.
 zmodload -F zsh/stat b:zstat 2>/dev/null
 autoload -Uz add-zsh-hook
-_csync_periodic() {
-  local interval=900 stamp="$HOME/.cache/csync-last-run" now=$EPOCHSECONDS last=0
-  [[ -d "$HOME/Library/Mobile Documents/com~apple~CloudDocs" ]] || return  # no iCloud here
-  [[ -r "$stamp" ]] && last=$(<"$stamp")
-  (( now - last >= interval )) || return
-  print -r -- "$now" >| "$stamp"
-  ( csync >>"$HOME/Library/Logs/csync.log" 2>&1 & )   # detached; never blocks the prompt
-}
-add-zsh-hook precmd _csync_periodic
-
 # openclaw-workspace auto-pull — keep this machine's clone of the agent workspace
 # (DEV_REPOS[cw]) tracking the shared GitHub remote. The openclaw gateway auto-commits
 # + pushes the live workspace to that remote; every clone (laptop, mini) just rides
-# along by fast-forwarding. Same prompt-piggyback trick as csync: at most once per
+# along by fast-forwarding. Run from the prompt at most once per
 # interval, IF the repo exists AND its tracked tree is clean, `git pull --ff-only` in a
 # detached background job. Pull-only + clean-only + ff-only is the safety: a local edit
 # is never clobbered or merge-committed (a dirty/ahead clone simply skips — commit and
@@ -1615,7 +1600,7 @@ _clawsync_periodic() {
   # &! (background AND disown), not plain & — a plain & leaves the job in THIS
   # interactive shell's job table, so monitor mode prints `[1] PID` at launch and
   # `[1] + done  ( git -C … )` on the next prompt. &! keeps it out of the table
-  # entirely (csync above stays silent the same way, via its `( … & )` subshell form).
+  # entirely.
   ( git -C "$dir" diff --quiet && git -C "$dir" diff --cached --quiet \
       && git -C "$dir" pull --ff-only --quiet ) >>"$HOME/Library/Logs/clawsync.log" 2>&1 &!
 }
@@ -1684,7 +1669,7 @@ help() {
     "Repo shortcuts (cd):${(kj: :)DEV_REPOS}"
     "Remote machines:${(kj: :)REMOTE_HOSTS}"
     "Git & PRs:prview"
-    "Claude:t csync"
+    "Claude:t"
     "Agents (claude · codex · cursor):cursor-beam"
     "Keep the Mac awake:nosleep sleep-manager"
   )

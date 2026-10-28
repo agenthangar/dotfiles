@@ -5,7 +5,7 @@ workflow. Never develop or commit in the canonical checkout on `main`: it is
 the live source for files linked into `$HOME`.
 
 This repository owns personal zsh configuration, machine utilities, tmux and
-clipboard setup, optional iCloud sync, and PII scanning. The session manager
+clipboard setup, and PII scanning. The session manager
 `t` lives in [agenthangar/t](https://github.com/agenthangar/t), with its own
 canonical checkout, installer, zsh plugin, hooks, prompts, agent settings
 engine, tests, and release process. Dotfiles installs and consumes it through
@@ -91,9 +91,6 @@ tokens, transcripts, real settings, or the private PII denylist.
 - `nosleep` and `sleep-manager`: macOS activity and sleep controls.
   `nosleep` recognizes agent processes itself, so it also works when t is
   missing.
-- `csync` and `_csync_periodic`: optional iCloud transcript sync. Preserve
-  origin stamps and newest-file behavior; do not sync auth or live SQLite
-  databases.
 - `clip-bridge`, `.tmux.conf`, and the SSH snippet: clipboard routing for
   remote tmux sessions. Sandbox tests must not start the user's live listener.
 - `help`, `prview`, `pii-scan`, shell utilities, and local aliases. The PII

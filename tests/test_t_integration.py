@@ -307,3 +307,14 @@ def test_nosleep_preflight_rejects_partial_replacement(tmp_path):
     result = preflight(home, repo)
     assert result.returncode == 1 and "update t first" in result.stderr
     assert (repo / "lib/nosleep_config.py").exists()
+
+
+def test_nosleep_dependency_discovered_from_homebrew_before_account_setup(tmp_path):
+    home, repo = checkout(tmp_path)
+    t = standalone(tmp_path / 'brew-package')
+    (t / '.t-homebrew').write_text('{}\n')
+    env = {**os.environ, 'HOME': str(home), 'PATH': str(t / 'bin') + os.pathsep + os.environ['PATH']}
+    result = subprocess.run(['bash', '-c', 'source "$1/lib/t-integration.sh"; _dots_nosleep_require', '_', str(repo)],
+                            env=env, capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+    assert not (home / 'bin').exists()

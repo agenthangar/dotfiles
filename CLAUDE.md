@@ -88,9 +88,8 @@ tokens, transcripts, real settings, or the private PII denylist.
 
 ## What remains here
 
-- `nosleep` and `sleep-manager`: macOS activity and sleep controls.
-  `nosleep` recognizes agent processes itself, so it also works when t is
-  missing.
+- `sleep-manager`: explicit macOS sleep control. `nosleep` is bundled with t;
+  dotfiles keeps only its shell/help bridge. Its runtime, config, and tests belong in t.
 - `clip-bridge`, `.tmux.conf`, and the SSH snippet: clipboard routing for
   remote tmux sessions. Sandbox tests must not start the user's live listener.
 - `help`, `prview`, `pii-scan`, shell utilities, and local aliases. The PII

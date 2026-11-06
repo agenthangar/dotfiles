@@ -28,234 +28,25 @@ agent settings, and desktop handoff. This repository consumes that project.
 
 ## Sleep and connection recovery
 
-Full interactive macOS installs ask whether to trust dotfiles sleep controls
-with persistent passwordless sudo (default: No). Accepting allows only the exact
-`pmset` commands used to disable sleep, re-enable sleep, and restore
-`sleep-manager` defaults. Programs running as your account can also use these
-permissions. The installer validates the rule with `visudo` and installs it as
-a root-owned file at `/etc/sudoers.d/dotfiles-sleep-$(id -u)`; removing that file
-with sudo revokes the grant. Authentication may be requested during setup.
-Declining leaves the usual password prompts in place. Unattended installs,
-Linux installs, and links-only updates skip this prompt; `DOTFILES_NO_SUDO=1`
-also skips it. Re-running the installer leaves an identical rule alone.
+`nosleep` is now installed alongside [t](https://github.com/agenthangar/t).
+The command name, manual start, flags, saved defaults under
+`${XDG_CONFIG_HOME:-~/.config}/nosleep/config.json`, and local Keychain credentials
+are unchanged. Run `nosleep --help`, `nosleep config`, or `nosleep config --show`.
+See the [nosleep guide](https://github.com/agenthangar/t/blob/main/docs/nosleep.md).
+Dotfiles delegates to the same runtime; it no longer maintains a second copy.
+`sleep-manager` remains a dotfiles utility with its existing explicit controls.
 
-```sh
-nosleep                       # lock and turn the display off on lid close
-nosleep -d on                  # display on, normal brightness
-nosleep -d dim -l off          # dim without requesting a lock
-nosleep -c none                # keep awake until Ctrl-C; skip all checks
-nosleep -d dim -l off -c agent # dim, no lock, check only agent activity
-nosleep -c internet            # check only internet connectivity
-nosleep --require 1            # keep awake while busy OR online
-nosleep --require 2            # require both enabled checks to pass
-nosleep config                # arrow-key menu for this machine's defaults
-nosleep config --show          # print effective defaults
-nosleep config --edit          # edit defaults with VISUAL/EDITOR
-```
+Update t before updating from a dotfiles version that bundles nosleep. The source
+migration preflight checks the replacement before fast-forwarding; a missing or
+older t stops the cutover and explains how to update it. Versions predating this
+preflight need t updated first: new guards cannot run inside an already-loaded
+older updater. Packaged installs require the t release containing nosleep.
+`DOTFILES_NO_T=1` still opts out of t installation; nosleep then requires a separate
+installation on PATH. Loading the shell never starts a sleep monitor.
 
-Related choices use one mode flag per setting:
-
-| Setting | Flag | Modes |
-| --- | --- | --- |
-| Display on lid close | `-d`, `--display` | `off`, `on`, `dim` |
-| Lock on lid close | `-l`, `--lock` | `on`, `off` |
-| Hotspot fallback | `--hotspot` | `on`, `off` |
-| Automatic checks | `-c`, `--checks` | `all`, `agent`, `internet`, `none` |
-
-Use a separate value or `=`: `-d dim`, `-d=dim`, and `--display=dim` are equivalent.
-A display mode replaces the whole display choice: `on` clears saved or earlier
-dimming, `off` turns the display off, and `dim` keeps it awake and dimmed.
-`--checks agent` selects only agent activity, replacing saved check choices and
-clearing forever; `none` disables both checks and holds until Ctrl-C.
-Repeating a mode applies the last selection. Display and locking remain independent.
-`--lock off` skips nosleep's lock request; it never unlocks an existing lock or
-changes macOS's own automatic locking settings. Dimming only changes brightness.
-
-Check settings remain separate: `-e` / `--every`, `-g` / `--grace`,
-`-r` / `--retries`, and `-b` / `--backoff`, each taking a number.
-Only enabled checks can trigger retries or allow automatic sleep. Lid/display
-handling, sleep protection, sudo refresh, and cleanup continue with checks disabled.
-
-Existing switches and groups still work. `-mLI` means dim, no lock, and no internet
-check; `-dML` means display on, no saved dimming, and no lock. Bare `-d` preserves
-saved dimming, while `-d on` explicitly clears it. Bare `-l` / `--lock` enables
-locking, and bare `-c` / `--checks` enables both checks and clears forever.
-The individual `-a` / `-A` and `-i` / `-I` check toggles are also retained.
-`-f` / `--forever` and `-C` / `--no-checks` override individual check settings;
-`-F` / `--no-forever` resumes the selected checks.
-
-Grouped numeric options accept attached or separate values: `-mLIe10` and
-`-mLIe 10` both use a 10-second interval. Mode values need a separate argument
-or `=`: `-Ld=dim` and `-Ld dim` combine no-lock with display dimming.
-Put further flags in a new argument after a value. The legacy `-dim` spelling
-still means only `--dim`; it does not enable the internet check.
-
-Among legacy display switches, `-m` / `--dim` / `-dim` wins regardless of order.
-`-M` / `--undim` clears saved dimming without changing the display mode;
-`-D` / `--display-off` / `--no-dim` turns the display off. A later
-`--display MODE` replaces the whole choice, including an earlier explicit dim
-request. A later legacy `--dim` requests dimming again.
-
-`nosleep config` follows `t config`: select a setting with arrow keys, stage
-changes, then review and save. Cancel leaves defaults unchanged. Defaults live
-in `${XDG_CONFIG_HOME:-~/.config}/nosleep/config.json`, apply to the next run,
-and stay local to that machine. Command-line flags override them for one run.
-The display setting cycles through Off, On, and Dim (`display_on` and `dim`
-in JSON); dimming implies display-on. Use `--display-off` to override saved
-dimming, or `--display-off -d` to keep the display on without saved dimming.
-An explicit `--dim` still takes precedence over legacy overrides; `--display on`
-or `--display off` replaces it. Use `--lock on` /
-`--no-forever` to override the other modes.
-Timing defaults use `--grace`, `--every`, `--retries`, and
-`--backoff`. `nosleep --help` highlights options that change the built-in defaults.
-Configuration commands never change power settings or an already-running instance.
-The menu groups display and locking under **On close**, the automatic-check
-switch and individual agent/internet toggles under **Checks**, and their
-interval, grace threshold, retry limit, and backoff under **Check settings**.
-The toggles are `agent` and `internet` booleans in JSON, both defaulting to true.
-Automatic checks can be disabled without forgetting those preferences.
-Help, saved defaults, and live status use the same separation. Check settings
-are marked inactive when neither check runs.
-
-`nosleep` shows a live snapshot instead of a long startup message:
-
-```text
-nosleep
-
-Live status
-  Sleep     Prevented
-  Agents    Sampling activity… need a second check
-  Internet  Online · checked 0s ago
-  Next      Check in 30s
-
-On close
-  Display   Off
-  Locking   Lock screen
-
-Checks
-  Mode      Activity and internet checks
-
-Check settings
-  Interval  30s
-  Grace     15m before retrying
-  Retries   3
-  Backoff   30s, doubles to 5m
-
-  Options   nosleep --help · nosleep config
-  Stop      Ctrl-C
-```
-
-Live status refreshes every two seconds with current activity and connection checks
-and a countdown to the next check. Sleep reports whether sleep prevention is
-active. On close shows the selected display and locking behavior. Checks
-shows the monitoring mode; Check settings shows its timing and retry thresholds.
-Use `nosleep --help` for one-run
-options or `nosleep config` to save defaults. In `--forever` mode, unused timing
-controls are marked inactive.
-Agents shows activity observed at the last check, then switches to quiet
-with a last-seen time when activity stops. Internet shows the latest connection
-result; Next shows remaining grace or the pending retry when needed. Failures to
-hold sleep off, lock, dim, or restore brightness appear as a Notice when relevant.
-`--forever` explicitly marks agent and internet checks as disabled. Redirected
-output and basic terminals get plain snapshots at each check, without cursor codes.
-Interactive terminals use green for healthy states, amber for sampling, quiet
-periods, grace and retries, and red for lost connectivity or sleep-protection
-warnings. Bold labels, cyan section headings, and a muted footer keep the current
-state prominent.
-Use `NO_COLOR=1 nosleep` for an unstyled snapshot with live updates.
-
-While the laptop is open, `nosleep` keeps the display on and inhibits idle locking,
-so an unlocked session can stay unlocked. It never unlocks an existing lock.
-Closing the laptop normally requests a screen lock and turns the display off;
-opening it restores the display hold. Unlocking is manual.
-`nosleep --display-on` keeps the display awake on close without dimming;
-`nosleep --dim` keeps it awake and dims the built-in panel. The independent
-locking setting controls whether it also requests a lock; `--no-lock` skips it. Docked clamshell mode keeps the external
-display on and skips the lock/dim action when you close the laptop. The On close
-section shows the selected display and locking behavior.
-
-`nosleep` keeps the Mac awake until Ctrl-C while the laptop is open. Failed activity
-or internet checks only produce warnings in that state. Automatic sleep is allowed
-only when the laptop is closed and, by default, activity or internet connectivity remains absent
-through the 15-minute grace period and three extra checks (after 30, 60, and 120 seconds).
-Closing the laptop still locks or dims its display during retries.
-Opening the laptop cancels pending retries; closing it starts a fresh retry
-budget. Recovery resets the retry budget; a restored connection also restarts
-activity sampling and grace so an agent has time to resume.
-
-```sh
-nosleep --grace 900 --retries 3 --backoff 30
-```
-
-`--require all` (the default) keeps awake while all enabled checks pass.
-`--require 1` keeps awake while any enabled check passes; `--require N`
-requires at least N enabled checks to pass. Passing means agent activity is busy
-or internet connectivity is online. Each failing check retains its grace period
-(and activity needs two samples) before it counts against the requirement.
-All enabled checks continue to run, even after enough pass. Counts must be positive
-and cannot exceed the final enabled check count when monitoring is active.
-`--require none` skips monitoring until Ctrl-C while preserving selected checks.
-Save the policy in `nosleep config` under **Passing checks required** (all, none,
-1, or 2), or set `requirement` in JSON to `"all"`, `"none"`, or a positive integer.
-Command-line `--require` values override that saved policy for one run; separate
-and `=` values work, and the last value wins. The policy is independent of
-`--checks` selection and `--forever`: `--require all` does not clear forever,
-and `--no-forever` does not clear `--require none`. Timing and hotspot fallback
-are inactive whenever monitoring is disabled. A numeric policy is checked against
-the final selection when monitoring starts; `--checks all` can restore both checks.
-
-`--every` sets the normal check interval (30 seconds). `--backoff` sets the first
-retry delay (1–300 seconds), which doubles up to five minutes; `--retries` accepts
-0–10. `--forever` holds until Ctrl-C. Connectivity checks try both Anthropic and
-OpenAI, so a single provider being unreachable does not mean the network is down.
-
-For native reconnection, enable **System Settings → Wi-Fi → Details → Automatically
-join this network** for each trusted Wi-Fi network. On macOS Tahoe 26 or later,
-set **Wi-Fi → Ask to join hotspots → Automatic**. Keep the nearby iPhone/iPad's
-Wi-Fi and Bluetooth on and use the same Apple Account (or configured Family
-Sharing), with a cellular plan that supports Personal Hotspot. See Apple's
-[Wi-Fi settings](https://support.apple.com/guide/mac-help/mh11935/mac) and
-[Instant Hotspot guide](https://support.apple.com/en-us/109321).
-
-macOS attempts auto-join while `nosleep` waits. Hotspot auto-join applies when no
-known Wi-Fi is available; it may not leave connected Wi-Fi whose internet uplink
-is broken. `nosleep` does not toggle Wi-Fi or change those auto-join settings.
-These auto-join settings are per-machine and are not changed by `dots --all`.
-
-For an explicit fallback to an already broadcasting iPhone hotspot, run this once
-in an unlocked terminal on each Mac:
-
-```sh
-nosleep hotspot setup
-nosleep config                 # Wi-Fi name, outage delay and attempt limit
-nosleep --hotspot off           # disable the saved fallback for this run
-nosleep --hotspot=on            # enable the configured fallback for this run
-```
-
-Setup asks for the exact Wi-Fi name and lets macOS `security` prompt for the
-password locally. It saves the password in this Mac's Keychain and enables the
-machine's private configuration only after setup succeeds. Passwords never appear
-in shell arguments, logs, or the JSON config. `nosleep config` can change the
-fallback toggle, Wi-Fi name, delay and attempt limit; changing the Wi-Fi name may
-require running setup again for its credentials. `--hotspot on|off` overrides the
-saved toggle for one run; both separate and `=` values work. The default delay is
-five minutes of continuous internet outage. Configure the Wi-Fi name, delay and
-attempt limit in `nosleep config` (limit 1–300 seconds, default 30).
-
-After the delay, `nosleep` makes one directed join to that exact SSID with
-`networksetup`, even if the current Wi-Fi uplink is broken. This can work with the
-lid closed when the hotspot is advertising, Wi-Fi is already on, Keychain is
-accessible and macOS permits the Wi-Fi change. It does not scan all nearby phones
-or wake a dormant Instant Hotspot. Turn on Personal Hotspot's **Allow Others to
-Join** and keep it broadcasting nearby. A locked Keychain or permission policy
-can prevent joining; unlock the Mac and rerun setup to repair credentials.
-
-Internet checks verify recovery independently of a successful association.
-Automatic sleep waits for the outage delay and bounded attempt/recovery window,
-including when activity retries finish early. Recovery resets the timer for the
-next outage. Ctrl-C cancels the owned helper and releases the sleep hold.
-Fallback is inactive with `--forever`, `--no-internet`, or `--checks none`.
-It is off by default and is never enabled on other Macs by `dots --all`.
+Full interactive macOS installs retain the optional, narrowly scoped dotfiles
+sleep sudo rule for nosleep and sleep-manager. Existing grants remain valid;
+this migration does not create or broaden them. `DOTFILES_NO_SUDO=1` skips setup.
 
 ## Install
 
@@ -367,8 +158,8 @@ zsh -n .zshrc
 ```
 
 Tests exercise the shell utilities and installation/migration under sandbox HOME,
-XDG directories, and tmux sockets. A macOS CI job also creates real sleep assertions
-and checks `nosleep` against live `pmset` output on PRs and weekly. CI runs shellcheck,
+XDG directories, and tmux sockets. The standalone t repository owns nosleep tests,
+including opt-in native macOS assertion checks. CI runs shellcheck,
 gitleaks, the private PII scan, and dependency audit behind the required `CI` gate.
 The Python t suite and its 97% coverage requirement moved to the standalone repository.
 

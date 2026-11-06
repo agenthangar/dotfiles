@@ -26,16 +26,20 @@ def standalone(home):
     (repo / "bin").mkdir(parents=True)
     (repo / ".t-install-version").write_text("1\n")
     (repo / "t.plugin.zsh").write_text("# plugin\n")
-    for name in ("t", "claude-stamp-tmux", "cursor-beam"):
+    for name in ("t", "nosleep", "claude-stamp-tmux", "cursor-beam"):
         p = repo / "bin" / name
         p.write_text("#!/bin/sh\n")
         p.chmod(0o755)
+    for asset in ("zsh/nosleep.zsh", "zsh/nosleep-fallback.zsh", "libexec/nosleep_config.py", "libexec/nosleep_hotspot.py"):
+        path = repo / asset
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("# fixture\n")
     p = repo / "install.sh"
     p.write_text('''#!/bin/sh
 set -eu
 root=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 mkdir -p "$HOME/bin"
-for name in t claude-stamp-tmux cursor-beam; do
+for name in t nosleep claude-stamp-tmux cursor-beam; do
     ln -sfn "$root/bin/$name" "$HOME/bin/$name"
 done
 printf '%s\\n' "$T_LOCAL_RC" "$T_PERMISSIONS_DIR" "$T_AUTO_TRUST" > "$root/adapter.txt"
@@ -82,7 +86,7 @@ def test_repeated_dotfiles_relink_keeps_standalone_ownership(tmp_path):
     home, repo = checkout(tmp_path)
     t = standalone(home)
     (home / "bin").mkdir()
-    for name in ("t", "claude-stamp-tmux", "cursor-beam"):
+    for name in ("t", "nosleep", "claude-stamp-tmux", "cursor-beam"):
         (home / "bin" / name).symlink_to(t / "bin" / name)
     install_log = tmp_path / "t-install.log"
     (t / "install.sh").write_text('#!/bin/sh\necho called >> "$T_INSTALL_LOG"\nexit 42\n')
@@ -90,21 +94,22 @@ def test_repeated_dotfiles_relink_keeps_standalone_ownership(tmp_path):
         r = run_install(repo, home, DOTFILES_LINKS_ONLY="1", DOTFILES_NO_T="",
                         T_INSTALL_LOG=str(install_log))
         assert r.returncode == 0, r.stderr
-        for name in ("t", "claude-stamp-tmux", "cursor-beam"):
+        for name in ("t", "nosleep", "claude-stamp-tmux", "cursor-beam"):
             assert (home / "bin" / name).resolve() == t / "bin" / name
     assert not install_log.exists()
     assert not (t / "adapter.txt").exists()
 
 
-def test_invalid_standalone_marker_does_not_block_dotfiles_relink(tmp_path):
+def test_invalid_standalone_marker_blocks_cutover_before_relink(tmp_path):
     home, repo = checkout(tmp_path)
     t = standalone(home)
     (home / "bin").mkdir()
     (home / "bin" / "t").symlink_to(t / "bin" / "t")
     (t / ".t-install-version").write_text("99\n")
     r = run_install(repo, home, DOTFILES_LINKS_ONLY="1", DOTFILES_NO_T="")
-    assert r.returncode == 0, r.stderr
-    assert (home / ".zshrc").resolve() == repo / ".zshrc"
+    assert r.returncode == 1, r.stderr
+    assert "update t first" in r.stderr
+    assert not (home / ".zshrc").exists()
     assert (home / "bin" / "t").resolve() == t / "bin" / "t"
     assert not (t / "adapter.txt").exists()
 
@@ -193,8 +198,9 @@ def test_links_only_without_owned_link_stays_offline(tmp_path):
     home, repo = checkout(tmp_path)
     env, _ = release_stub(tmp_path, home)
     r = run_install(repo, home, DOTFILES_LINKS_ONLY="1", DOTFILES_NO_T="", **env)
-    assert r.returncode == 0, r.stderr
-    assert (home / ".zshrc").resolve() == repo / ".zshrc"
+    assert r.returncode == 1, r.stderr
+    assert "update t first" in r.stderr
+    assert not (home / ".zshrc").exists()
     assert not (tmp_path / "curl.log").exists()
 
 
@@ -260,3 +266,55 @@ def test_failed_release_validation_leaves_legacy_link(tmp_path):
     assert "release installation failed" in r.stderr
     assert (home / "bin/t").is_symlink()
     assert not (home / ".local/share/t/releases/v1.0.0").exists()
+
+
+def nosleep_removal_ref(repo):
+    # Model an installed bridge revision and the incoming removal revision.
+    (repo / "lib/nosleep_config.py").write_text("# working bundled monitor\n")
+    git("add", ".", cwd=repo)
+    git("commit", "-qm", "bundled nosleep", cwd=repo)
+    git("checkout", "-qb", "nosleep-removal", cwd=repo)
+    git("rm", "lib/nosleep_config.py", cwd=repo)
+    git("commit", "-qm", "move nosleep to t", cwd=repo)
+    git("update-ref", "refs/remotes/origin/main", "HEAD", cwd=repo)
+    git("checkout", "-q", "main", cwd=repo)
+
+
+def test_nosleep_preflight_preserves_working_monitor_without_replacement(tmp_path):
+    home, repo = checkout(tmp_path)
+    nosleep_removal_ref(repo)
+    result = preflight(home, repo)
+    assert result.returncode == 1 and "update t first" in result.stderr
+    assert (repo / "lib/nosleep_config.py").read_text() == "# working bundled monitor\n"
+
+
+def test_nosleep_preflight_accepts_complete_replacement_without_installing(tmp_path):
+    home, repo = checkout(tmp_path)
+    nosleep_removal_ref(repo)
+    t = standalone(home)
+    result = preflight(home, repo)
+    assert result.returncode == 0, result.stderr
+    assert not (t / "adapter.txt").exists()
+    git("merge", "--ff-only", "origin/main", cwd=repo)
+    assert not (repo / "lib/nosleep_config.py").exists()
+
+
+def test_nosleep_preflight_rejects_partial_replacement(tmp_path):
+    home, repo = checkout(tmp_path)
+    nosleep_removal_ref(repo)
+    t = standalone(home)
+    (t / "libexec/nosleep_hotspot.py").unlink()
+    result = preflight(home, repo)
+    assert result.returncode == 1 and "update t first" in result.stderr
+    assert (repo / "lib/nosleep_config.py").exists()
+
+
+def test_nosleep_dependency_discovered_from_homebrew_before_account_setup(tmp_path):
+    home, repo = checkout(tmp_path)
+    t = standalone(tmp_path / 'brew-package')
+    (t / '.t-homebrew').write_text('{}\n')
+    env = {**os.environ, 'HOME': str(home), 'PATH': str(t / 'bin') + os.pathsep + os.environ['PATH']}
+    result = subprocess.run(['bash', '-c', 'source "$1/lib/t-integration.sh"; _dots_nosleep_require', '_', str(repo)],
+                            env=env, capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+    assert not (home / 'bin').exists()

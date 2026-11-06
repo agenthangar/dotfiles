@@ -166,10 +166,10 @@ def test_no_hosts_syncs_only_here(world):
     assert not log.exists()
 
 
-def test_no_hosts_post_split_syncs_without_t(world):
+def test_no_hosts_post_split_syncs_with_t_opt_out(world):
     seed, co, home, log, stub = world
     tip = land(seed)
-    r = run(home, stub, "--no-hosts", t_opt_out=False)
+    r = run(home, stub, "--no-hosts", t_opt_out=True)
     assert r.returncode == 0, r.stderr
     assert not r.stderr
     assert head(co) == tip
@@ -179,7 +179,7 @@ def test_no_hosts_post_split_syncs_without_t(world):
 
 
 @pytest.mark.skipif(not subprocess.run(["which", "zsh"], capture_output=True).stdout, reason="no zsh")
-def test_zsh_dots_updates_post_split_without_t_or_brew(world, tmp_path):
+def test_zsh_dots_updates_with_t_opt_out_without_brew(world, tmp_path):
     seed, co, home, _, _ = world
     (seed / ".zshrc").write_bytes((REPO_ROOT / ".zshrc").read_bytes())
     git("add", ".zshrc", cwd=seed)
@@ -201,7 +201,7 @@ def test_zsh_dots_updates_post_split_without_t_or_brew(world, tmp_path):
     env = {k: v for k, v in os.environ.items() if not k.startswith("TMUX")}
     env.update(HOME=str(home), ZDOTDIR=str(home), XDG_CONFIG_HOME=str(home / ".config"),
                PATH=str(fakebin) + os.pathsep + os.environ["PATH"], EXTERNAL_CALLS=str(calls),
-               DOTFILES_NO_T="", DOTFILES_NO_CLIP_BRIDGE="1")
+               DOTFILES_NO_T="1", DOTFILES_NO_CLIP_BRIDGE="1")
     result = subprocess.run(["zsh", "-f", "-c", "source ~/.zshrc >/dev/null 2>&1; dots"],
                             env=env, capture_output=True, text=True, timeout=60)
     assert result.returncode == 0, result.stdout + result.stderr

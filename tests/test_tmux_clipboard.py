@@ -111,7 +111,7 @@ def _make_server(tmp_path, with_pbcopy=True, with_bridge=False):
     socket = f"clip-{tmp_path.name}-{'y' if with_pbcopy else 'n'}{'b' if with_bridge else ''}"
     server = Server(socket, env, clip_file)
     server.tmux("kill-server", check=False)
-    server.tmux("-f", str(TMUX_CONF), "new-session", "-d", "-s", "t", "-x", "80", "-y", "24")
+    server.tmux("-f", str(TMUX_CONF), "new-session", "-d", "-s", "t", "-x", "80", "-y", "24", "env PS1=\"$ \" /bin/sh")
     return server
 
 

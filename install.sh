@@ -284,6 +284,9 @@ if [[ -z "${DOTFILES_NO_T:-}" && -z "$PACKAGE_ROOT" ]]; then
     fi
 fi
 
+# Check before replacing loaders or symlinks. Explicit t opt-outs stay supported.
+_dots_nosleep_require
+
 link_all() {
     local backup
     if [[ -n "$PACKAGE_ROOT" ]]; then

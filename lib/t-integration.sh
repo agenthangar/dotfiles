@@ -22,6 +22,17 @@ _dots_t_find() {
             return
         fi
     fi
+    # Homebrew exposes t before account integration has created ~/bin links.
+    if command -v python3 >/dev/null 2>&1; then
+        candidate=$(command -v t 2>/dev/null) || candidate=""
+        if [ -n "$candidate" ]; then
+            candidate=$(python3 -c 'import os,sys; print(os.path.dirname(os.path.dirname(os.path.realpath(sys.argv[1]))))' "$candidate")
+            if [ -f "$candidate/.t-homebrew" ] && _dots_t_valid "$candidate"; then
+                printf '%s\n' "$candidate"
+                return
+            fi
+        fi
+    fi
     candidate="$HOME/code/t"
     _dots_t_valid "$candidate" || return 1
     printf '%s\n' "$candidate"
@@ -40,6 +51,22 @@ _dots_t_environment() {
     export T_NO_TRUST="${T_NO_TRUST:-${DOTFILES_NO_TRUST:-}}"
     export T_NO_AGENT_MODES="${T_NO_AGENT_MODES:-${DOTFILES_NO_AGENT_MODES:-}}"
     export T_NO_SUBAGENT_MODEL="${T_NO_SUBAGENT_MODEL:-${DOTFILES_NO_SUBAGENT_MODEL:-}}"
+}
+
+# nosleep moved to t without changing its machine-local settings or command name.
+_dots_nosleep_ready() {
+    local root
+    root=$(_dots_t_find) || return 1
+    [ -x "$root/bin/nosleep" ] && [ -r "$root/zsh/nosleep.zsh" ] &&
+        [ -r "$root/zsh/nosleep-fallback.zsh" ] &&
+        [ -r "$root/libexec/nosleep_config.py" ] && [ -r "$root/libexec/nosleep_hotspot.py" ]
+}
+
+_dots_nosleep_require() {
+    [ -z "${DOTFILES_NO_T:-}" ] || return 0
+    _dots_nosleep_ready && return 0
+    printf '%s\n' 'dots: nosleep now ships with t; update t first (t system update), then retry dots. Dotfiles was not applied.' >&2
+    return 1
 }
 
 # Fetch the small public bootstrap script first, so a failed download cannot be
@@ -116,6 +143,12 @@ _dots_t_install() {
 _dots_t_preflight() {
     local dotroot="$1"
     [ -z "${DOTFILES_NO_T:-}" ] || return 0
+    # Inspect the incoming tree before removing the working bundled monitor.
+    if git -C "$dotroot" cat-file -e HEAD:lib/nosleep_config.py 2>/dev/null &&
+       git -C "$dotroot" rev-parse --verify origin/main >/dev/null 2>&1 &&
+       ! git -C "$dotroot" cat-file -e origin/main:lib/nosleep_config.py 2>/dev/null; then
+        _dots_nosleep_require || return 1
+    fi
     # Once this checkout has crossed the split, t owns its own installation and
     # updates. A missing/broken standalone t is not another bundled migration.
     git -C "$dotroot" cat-file -e HEAD:bin/t 2>/dev/null || return 0

@@ -24,9 +24,8 @@ _dots_t_find() {
     fi
     # Homebrew exposes t before account integration has created ~/bin links.
     if command -v python3 >/dev/null 2>&1; then
-        candidate=$(command -v t 2>/dev/null) || candidate=""
+        candidate=$(python3 -c 'import os,shutil; command=shutil.which("t"); print(os.path.dirname(os.path.dirname(os.path.realpath(command))) if command else "")')
         if [ -n "$candidate" ]; then
-            candidate=$(python3 -c 'import os,sys; print(os.path.dirname(os.path.dirname(os.path.realpath(sys.argv[1]))))' "$candidate")
             if [ -f "$candidate/.t-homebrew" ] && _dots_t_valid "$candidate"; then
                 printf '%s\n' "$candidate"
                 return

@@ -7,6 +7,9 @@ usage() {
 Usage: dots <command>
 
 Commands:
+  system update [--all]     Update and apply managed configuration
+  system integrate [--relink]
+                             Apply installed configuration (optionally offline)
   install                   Apply the installed Homebrew package
   update [--all|--dev|--relink]
                              Update the installed configuration
@@ -34,6 +37,33 @@ payload_root() {
     printf '%s\n' "$root"
 }
 
+# Normalize the canonical namespace before selecting package/source behavior.
+# Validate the complete argument list before any setup or update can mutate state.
+if [[ "${1:-}" == system ]]; then
+    shift
+    case "${1:-}" in
+        update)
+            shift
+            if [[ $# -gt 1 ]] || { [[ $# -eq 1 ]] && [[ "$1" != --all && "$1" != -a && "$1" != -h && "$1" != --help ]]; }; then
+                echo 'Usage: dots system update [--all]' >&2; exit 2
+            fi
+            set -- update "$@" ;;
+        integrate)
+            shift
+            if [[ $# -eq 0 ]]; then
+                set -- install
+            elif [[ $# -eq 1 && "$1" == --relink ]]; then
+                set -- --relink
+            elif [[ $# -eq 1 && ( "$1" == -h || "$1" == --help ) ]]; then
+                echo 'Usage: dots system integrate [--relink]'; exit 0
+            else
+                echo 'Usage: dots system integrate [--relink]' >&2; exit 2
+            fi ;;
+        help|-h|--help) usage; exit 0 ;;
+        *) echo 'Usage: dots system <update|integrate>' >&2; exit 2 ;;
+    esac
+fi
+
 root=$(payload_root)
 if [[ -f "$root/.dotfiles-package" ]]; then
     # shellcheck source=lib/package.sh
@@ -60,6 +90,8 @@ case "${1:-}" in
     ""|--all|-a|--dev|-d|--relink) ;;
     *) printf 'dots update: unknown option: %s\n' "$1" >&2; exit 2 ;;
 esac
+
+[[ $# -le 1 ]] || { echo "dots: unexpected argument: $2" >&2; exit 2; }
 
 # Updates belong to the selected shell configuration, not Homebrew's snapshot.
 # Check for the function explicitly so an unconfigured shell cannot recurse

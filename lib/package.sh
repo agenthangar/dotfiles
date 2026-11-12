@@ -8,6 +8,22 @@ dots_package_main() {
         echo 'dots: Homebrew package is missing; reinstall agenthangar/tap/dotfiles' >&2
         return 1
     }
+    if [[ "${1:-}" == system ]]; then
+        shift
+        case "${1:-}" in
+            update) shift; [[ $# == 0 || ( $# == 1 && ( "$1" == --all || "$1" == -a ) ) ]] || { echo 'Usage: dots system update [--all]' >&2; return 2; }; set -- update "$@" ;;
+            integrate)
+                shift
+                if [[ $# == 0 ]]; then
+                    set -- install
+                elif [[ $# == 1 && "$1" == --relink ]]; then
+                    set -- --relink
+                else
+                    echo 'Usage: dots system integrate [--relink]' >&2; return 2
+                fi ;;
+            *) echo 'Usage: dots system <update|integrate>' >&2; return 2 ;;
+        esac
+    fi
     command=${1:-}
     case "$command" in
         help|-h|--help) usage; return ;;

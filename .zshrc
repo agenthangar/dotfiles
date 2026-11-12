@@ -289,7 +289,9 @@ _dots_legacy_present() {
 
 # dots — update your LIVE dotfiles to origin/main and reload zsh
 #
-# Usage: dots install [DIRECTORY]
+# Usage: dots system update [--all]
+#        dots system integrate [--relink]
+#        dots install [DIRECTORY]
 #        dots update [--all | --dev | --relink]
 #        dots [--all | --dev | --relink] (compatible update alias)
 #
@@ -338,7 +340,25 @@ dots() {
     fi
     return $result
   fi
+  if [[ "$1" == system && "$2" == update ]]; then
+    shift 2
+    if (( $# > 1 )) || { (( $# == 1 )) && [[ "$1" != --all && "$1" != -a && "$1" != -h && "$1" != --help ]]; }; then
+      print -u2 -- 'Usage: dots system update [--all]'
+      return 2
+    fi
+    set -- update "$@"
+  fi
+  if [[ "$1" == system && "$2" == integrate && "$3" == --relink && $# == 3 ]]; then
+    set -- --relink
+  fi
   case "$1" in
+    system)
+      "$_DOTS_SOURCE_ROOT/bin/dots" "$@"
+      local result=$?
+      if (( result == 0 )) && [[ "$2" == integrate && $# == 2 ]]; then
+        source ~/.zshrc
+      fi
+      return $result ;;
     install|help|-h|--help)
       "$_DOTS_SOURCE_ROOT/bin/dots" "$@"
       return $? ;;
@@ -349,6 +369,10 @@ dots() {
     ""|--all|-a|--dev|-d|--relink) ;;
     *) print -u2 -r -- "dots: unknown command or option: $1 (see dots --help)"; return 2 ;;
   esac
+  if (( $# > 1 )); then
+    print -u2 -r -- "dots: unexpected argument: $2"
+    return 2
+  fi
   # --all: the local run first (it re-sources ~/.zshrc, so what fans out is the
   # just-updated dots-sync), then `dots` on every host. dots-sync never runs `dots
   # --all` remotely, so the fan-out cannot echo back.
@@ -445,15 +469,16 @@ dots() {
       return 1
     fi
     local branch=$(git -C "$src" symbolic-ref --short -q HEAD)
-    local out
+    local out dev_failed=0
     if out=$(DOTFILES_NO_BREW=1 DOTFILES_LINK_DEV=1 "$src/install.sh" 2>&1); then
       print -r -- "${g}✓${r0} ${y}live = worktree ${src:t2} (${c}${branch:-detached}${r0}${y}) — in-progress edits are live, reloaded${r0}"
     else
+      dev_failed=1
       print -r -- "${y}dots --dev — install.sh failed on ${c}${branch:-detached}${r0}${y}:${r0}"
       print -r -- "$out"
     fi
     source ~/.zshrc
-    return
+    return $dev_failed
   fi
 
   # Default: fast-forward the canonical checkout (the live surface) to origin/main.
@@ -464,12 +489,18 @@ dots() {
     print -r -- "${y}dots — fetch failed (offline?), reloaded only${r0}"
     # relinking needs no network, and "already pulled but never relinked" is exactly
     # the state this fixes — so do it even when the fetch failed.
-    if relinked=$(_dots_relink "${live:-$primary}") && [[ -n "$relinked" ]]; then
-      print -r -- "${g}✓${r0} ${y}relinked newly managed file(s):${r0}"
-      print -r -- "$relinked"
+    local offline_failed=0
+    if relinked=$(_dots_relink "${live:-$primary}"); then
+      if [[ -n "$relinked" ]]; then
+        print -r -- "${g}✓${r0} ${y}relinked newly managed file(s):${r0}"
+        print -r -- "$relinked"
+      fi
+    else
+      print -u2 -r -- "dots: relink failed: $relinked"
+      offline_failed=1
     fi
     source ~/.zshrc
-    return
+    return $offline_failed
   fi
 
   _dots_t_preflight "$primary" || return 1
@@ -493,7 +524,7 @@ dots() {
       print -r -- "${y}dots — layout setup failed:${r0}"
       print -r -- "$out"
       source ~/.zshrc
-      return
+      return 1
     fi
     [[ -n "$out" ]] && print -r -- "$out"
     _dots_resolve   # the links just moved; re-read where live points

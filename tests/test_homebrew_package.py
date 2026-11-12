@@ -211,3 +211,90 @@ print -r -- "after=$_DOTS_PACKAGE_VERSION"
     assert 'before=1' in result.stdout
     assert 'after=2' in result.stdout
     assert opt.resolve().name == 'libexec'
+
+
+def test_canonical_system_commands(package):
+    home, _, _, env = package
+    result = run(package, 'system', 'integrate', '--relink')
+    assert result.returncode == 0, result.stderr
+    assert not (home / '.config/dotfiles/installed').exists()
+    assert not Path(env['CALL_LOG']).exists()
+    result = run(package, 'system', 'integrate')
+    assert result.returncode == 0, result.stderr
+    assert (home / '.config/dotfiles/installed').exists()
+    result = run(package, 'system', 'update', env_extra={'REMOVE_OLD': '1'})
+    assert result.returncode == 0, result.stderr
+    assert 'Homebrew dotfiles applied — 2' in result.stdout
+
+
+@pytest.mark.parametrize('args', [
+    ('system', 'integrate', '--all'), ('system', 'update', '--relink'),
+    ('system', 'integrate', '--relink', 'extra'),
+    ('system', 'update', '--all', 'extra'), ('system',),
+    ('update', '--all', 'extra'), ('--relink', 'extra'),
+])
+def test_rejects_invalid_commands_before_mutation(package, args):
+    home, _, _, env = package
+    result = run(package, *args)
+    assert result.returncode == 2, result.stderr
+    assert not Path(env['CALL_LOG']).exists()
+    assert not (home / '.zshrc').exists()
+
+
+def test_preference_failure_propagates_before_installed_marker(package):
+    home, _, releases, env = package
+    fake = Path(env['CALL_LOG']).parent / 'fake-bin'
+    (fake / 'uname').write_text('#!/bin/sh\necho Darwin\n')
+    (fake / 'uname').chmod(0o755)
+    # Fail the isolated packaged helper without reaching the real defaults tool.
+    (releases[0] / 'lib/macos/apply.py').write_text('import sys\nsys.exit(43)\n')
+    result = run(package, 'system', 'integrate', env_extra={'DOTFILES_NO_MACOS': ''})
+    assert result.returncode == 43, result.stderr
+    assert not (home / '.config/dotfiles/installed').exists()
+    assert not (home / '.zshrc.local').exists()
+
+
+def test_system_update_all_uses_new_package_host_sync(package):
+    _, _, releases, env = package
+    assert run(package, 'system', 'integrate').returncode == 0
+    sync = releases[1] / 'bin/dots-sync'
+    sync.write_text('#!/bin/sh\nprintf "sync %s\\n" "$*" >> "$CALL_LOG"\n')
+    result = run(package, 'system', 'update', '--all', env_extra={'REMOVE_OLD': '1'})
+    assert result.returncode == 0, result.stderr
+    assert Path(env['CALL_LOG']).read_text().endswith('sync --hosts-only\n')
+
+
+def test_source_system_relink_reloads_calling_shell(tmp_path):
+    home = tmp_path / 'home'
+    home.mkdir()
+    (home / '.zshrc').write_text('export RELOADED_AFTER_INTEGRATION=yes\n')
+    script = '''source "$1" >/dev/null 2>&1
+_dots_resolve() { live=$HOME; primary=$HOME; }
+_dots_relink() { return 0; }
+dots system integrate --relink >/dev/null || exit $?
+[[ $RELOADED_AFTER_INTEGRATION == yes ]]
+'''
+    env = {**os.environ, 'HOME': str(home), 'XDG_CONFIG_HOME': str(home / '.config'),
+           'DOTFILES_NO_T': '1', 'DOTFILES_NO_TMUX': '1'}
+    result = subprocess.run(['zsh', '-f', '-c', script, 'test', str(ROOT / '.zshrc')],
+                            env=env, capture_output=True, text=True, timeout=30)
+    assert result.returncode == 0, result.stderr
+
+
+def test_source_offline_preference_failure_blocks_host_sync(tmp_path):
+    home = tmp_path / 'home'
+    home.mkdir()
+    (home / '.zshrc').write_text(':\n')
+    script = '''source "$1" >/dev/null 2>&1
+_dots_resolve() { live=$HOME; primary=$HOME; }
+_dots_relink() { print -r -- 'preference write failed'; return 1; }
+git() { return 1; }
+dots-sync() { print -r -- 'unexpected host sync'; }
+dots system update --all
+'''
+    result = subprocess.run(['zsh', '-f', '-c', script, 'test', str(ROOT / '.zshrc')],
+                            env={**os.environ, 'HOME': str(home), 'DOTFILES_NO_T': '1'},
+                            capture_output=True, text=True, timeout=30)
+    assert result.returncode == 1
+    assert 'preference write failed' in result.stderr
+    assert 'unexpected host sync' not in result.stdout

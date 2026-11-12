@@ -480,6 +480,16 @@ install_clip_bridge() {
 }
 install_clip_bridge
 
+# Preferences are part of every integration, including offline relinking.
+# HOME does not isolate macOS cfprefsd; sandbox callers must opt out explicitly.
+if [[ "${DOTFILES_NO_MACOS:-}" == 1 ]]; then
+    echo 'macOS preferences: skipped (DOTFILES_NO_MACOS=1)'
+elif [[ "$(uname)" == Darwin ]]; then
+    python3 "$LINK_SRC/lib/macos/apply.py"
+else
+    echo "macOS preferences: skipped ($(uname))"
+fi
+
 # Everything below is the FULL install. The links-only relink stops here, before the
 # tmux source-file, the ssh Include rewrite, the ~/.zshrc.local
 # seed, the global gitconfig/hooksPath writes, the PII denylist branch (which would

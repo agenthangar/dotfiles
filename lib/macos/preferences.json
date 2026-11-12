@@ -1,0 +1,474 @@
+{
+  "version": 1,
+  "domains": {
+    "com.knollsoft.Rectangle": {
+      "allowAnyShortcut": {
+        "type": "bool",
+        "value": true
+      },
+      "almostMaximize": {
+        "type": "dict",
+        "value": {}
+      },
+      "alternateDefaultShortcuts": {
+        "type": "bool",
+        "value": true
+      },
+      "bottomCenterLeftEighth": {
+        "type": "dict",
+        "value": {
+          "keyCode": 7,
+          "modifierFlags": 1310720
+        }
+      },
+      "bottomCenterRightEighth": {
+        "type": "dict",
+        "value": {
+          "keyCode": 8,
+          "modifierFlags": 1310720
+        }
+      },
+      "bottomCenterSixth": {
+        "type": "dict",
+        "value": {
+          "keyCode": 8,
+          "modifierFlags": 1310720
+        }
+      },
+      "bottomHalf": {
+        "type": "dict",
+        "value": {}
+      },
+      "bottomLeft": {
+        "type": "dict",
+        "value": {
+          "keyCode": 123,
+          "modifierFlags": 1310720
+        }
+      },
+      "bottomLeftEighth": {
+        "type": "dict",
+        "value": {
+          "keyCode": 123,
+          "modifierFlags": 1310720
+        }
+      },
+      "bottomLeftSixth": {
+        "type": "dict",
+        "value": {
+          "keyCode": 123,
+          "modifierFlags": 1310720
+        }
+      },
+      "bottomRight": {
+        "type": "dict",
+        "value": {
+          "keyCode": 124,
+          "modifierFlags": 1310720
+        }
+      },
+      "bottomRightEighth": {
+        "type": "dict",
+        "value": {
+          "keyCode": 124,
+          "modifierFlags": 1310720
+        }
+      },
+      "bottomRightSixth": {
+        "type": "dict",
+        "value": {
+          "keyCode": 124,
+          "modifierFlags": 1310720
+        }
+      },
+      "bottomVerticalThird": {
+        "type": "dict",
+        "value": {}
+      },
+      "bottomVerticalTwoThirds": {
+        "type": "dict",
+        "value": {}
+      },
+      "center": {
+        "type": "dict",
+        "value": {
+          "keyCode": 8,
+          "modifierFlags": 1835008
+        }
+      },
+      "centerHalf": {
+        "type": "dict",
+        "value": {
+          "keyCode": 8,
+          "modifierFlags": 1835008
+        }
+      },
+      "centerThird": {
+        "type": "dict",
+        "value": {}
+      },
+      "centerThreeFourths": {
+        "type": "dict",
+        "value": {}
+      },
+      "centerTwoThirds": {
+        "type": "dict",
+        "value": {}
+      },
+      "cycleStackedWindows": {
+        "type": "dict",
+        "value": {
+          "keyCode": 43,
+          "modifierFlags": 1835008
+        }
+      },
+      "cycleStackedWindowsBackward": {
+        "type": "dict",
+        "value": {
+          "keyCode": 47,
+          "modifierFlags": 1835008
+        }
+      },
+      "cyclingOverlapOffset": {
+        "type": "int",
+        "value": 1
+      },
+      "doubleClickTitleBar": {
+        "type": "int",
+        "value": 0
+      },
+      "fifthVerticalSixth": {
+        "type": "dict",
+        "value": {}
+      },
+      "firstFourth": {
+        "type": "dict",
+        "value": {}
+      },
+      "firstThird": {
+        "type": "dict",
+        "value": {}
+      },
+      "firstThreeFourths": {
+        "type": "dict",
+        "value": {}
+      },
+      "firstTwoThirds": {
+        "type": "dict",
+        "value": {}
+      },
+      "firstVerticalSixth": {
+        "type": "dict",
+        "value": {}
+      },
+      "fourthVerticalSixth": {
+        "type": "dict",
+        "value": {}
+      },
+      "landscapeSnapAreas": {
+        "type": "string",
+        "value": "[2,{\"action\":29},3,{\"action\":15},6,{\"action\":13},4,{\"action\":96},7,{\"compound\":-6},1,{\"action\":15},8,{\"action\":14},5,{\"action\":1}]"
+      },
+      "larger": {
+        "type": "dict",
+        "value": {}
+      },
+      "largerWidth": {
+        "type": "dict",
+        "value": {
+          "keyCode": 24,
+          "modifierFlags": 1572864
+        }
+      },
+      "lastFourth": {
+        "type": "dict",
+        "value": {}
+      },
+      "lastThird": {
+        "type": "dict",
+        "value": {}
+      },
+      "lastThreeFourths": {
+        "type": "dict",
+        "value": {}
+      },
+      "lastTwoThirds": {
+        "type": "dict",
+        "value": {}
+      },
+      "lastVerticalSixth": {
+        "type": "dict",
+        "value": {}
+      },
+      "launchOnLogin": {
+        "type": "bool",
+        "value": true
+      },
+      "leftHalf": {
+        "type": "dict",
+        "value": {
+          "keyCode": 123,
+          "modifierFlags": 1835008
+        }
+      },
+      "maximize": {
+        "type": "dict",
+        "value": {
+          "keyCode": 46,
+          "modifierFlags": 1835008
+        }
+      },
+      "maximizeHeight": {
+        "type": "dict",
+        "value": {}
+      },
+      "middleVerticalThird": {
+        "type": "dict",
+        "value": {}
+      },
+      "moveDown": {
+        "type": "dict",
+        "value": {}
+      },
+      "moveLeft": {
+        "type": "dict",
+        "value": {}
+      },
+      "moveRight": {
+        "type": "dict",
+        "value": {}
+      },
+      "moveUp": {
+        "type": "dict",
+        "value": {}
+      },
+      "nextDisplay": {
+        "type": "dict",
+        "value": {}
+      },
+      "previousDisplay": {
+        "type": "dict",
+        "value": {}
+      },
+      "repeatedMaximizeRestoresPrevious": {
+        "type": "bool",
+        "value": true
+      },
+      "restore": {
+        "type": "dict",
+        "value": {
+          "keyCode": 9,
+          "modifierFlags": 1835008
+        }
+      },
+      "rightHalf": {
+        "type": "dict",
+        "value": {
+          "keyCode": 124,
+          "modifierFlags": 1835008
+        }
+      },
+      "secondFourth": {
+        "type": "dict",
+        "value": {}
+      },
+      "secondVerticalSixth": {
+        "type": "dict",
+        "value": {}
+      },
+      "smaller": {
+        "type": "dict",
+        "value": {}
+      },
+      "smallerWidth": {
+        "type": "dict",
+        "value": {
+          "keyCode": 27,
+          "modifierFlags": 1572864
+        }
+      },
+      "snapBeforeReachingEdges": {
+        "type": "float",
+        "value": 20.0
+      },
+      "stackBadge": {
+        "type": "int",
+        "value": 1
+      },
+      "stageSize": {
+        "type": "float",
+        "value": -1.0
+      },
+      "subsequentExecutionMode": {
+        "type": "int",
+        "value": 0
+      },
+      "thirdFourth": {
+        "type": "dict",
+        "value": {}
+      },
+      "thirdVerticalSixth": {
+        "type": "dict",
+        "value": {}
+      },
+      "tileColumns": {
+        "type": "dict",
+        "value": {}
+      },
+      "tileRows": {
+        "type": "dict",
+        "value": {}
+      },
+      "toggleStackBadge": {
+        "type": "dict",
+        "value": {
+          "keyCode": 44,
+          "modifierFlags": 1835008
+        }
+      },
+      "topCenterLeftEighth": {
+        "type": "dict",
+        "value": {
+          "keyCode": 7,
+          "modifierFlags": 1572864
+        }
+      },
+      "topCenterRightEighth": {
+        "type": "dict",
+        "value": {
+          "keyCode": 8,
+          "modifierFlags": 1572864
+        }
+      },
+      "topCenterSixth": {
+        "type": "dict",
+        "value": {
+          "keyCode": 8,
+          "modifierFlags": 1572864
+        }
+      },
+      "topHalf": {
+        "type": "dict",
+        "value": {}
+      },
+      "topLeft": {
+        "type": "dict",
+        "value": {
+          "keyCode": 123,
+          "modifierFlags": 1572864
+        }
+      },
+      "topLeftEighth": {
+        "type": "dict",
+        "value": {
+          "keyCode": 123,
+          "modifierFlags": 1572864
+        }
+      },
+      "topLeftNinth": {
+        "type": "dict",
+        "value": {}
+      },
+      "topLeftSixteenth": {
+        "type": "dict",
+        "value": {}
+      },
+      "topLeftSixth": {
+        "type": "dict",
+        "value": {
+          "keyCode": 123,
+          "modifierFlags": 1572864
+        }
+      },
+      "topLeftTwelfth": {
+        "type": "dict",
+        "value": {}
+      },
+      "topRight": {
+        "type": "dict",
+        "value": {
+          "keyCode": 124,
+          "modifierFlags": 1572864
+        }
+      },
+      "topRightEighth": {
+        "type": "dict",
+        "value": {
+          "keyCode": 124,
+          "modifierFlags": 1572864
+        }
+      },
+      "topRightSixth": {
+        "type": "dict",
+        "value": {
+          "keyCode": 124,
+          "modifierFlags": 1572864
+        }
+      },
+      "topVerticalThird": {
+        "type": "dict",
+        "value": {}
+      },
+      "topVerticalTwoThirds": {
+        "type": "dict",
+        "value": {}
+      },
+      "unsnapRestore": {
+        "type": "int",
+        "value": 2
+      },
+      "wasWelcomeDisplayed": {
+        "type": "bool",
+        "value": true
+      }
+    },
+    "com.apple.dock": {
+      "autohide": {
+        "type": "bool",
+        "value": true
+      },
+      "tilesize": {
+        "type": "int",
+        "value": 16
+      },
+      "show-recents": {
+        "type": "bool",
+        "value": false
+      },
+      "expose-group-apps": {
+        "type": "bool",
+        "value": true
+      }
+    },
+    "com.apple.finder": {
+      "FXPreferredViewStyle": {
+        "type": "string",
+        "value": "Nlsv"
+      }
+    },
+    "NSGlobalDomain": {
+      "com.apple.swipescrolldirection": {
+        "type": "bool",
+        "value": false
+      }
+    },
+    "com.apple.WindowManager": {
+      "EnableTiledWindowMargins": {
+        "type": "bool",
+        "value": false
+      },
+      "EnableTilingByEdgeDrag": {
+        "type": "bool",
+        "value": false
+      },
+      "EnableTilingOptionAccelerator": {
+        "type": "bool",
+        "value": false
+      },
+      "EnableTopTilingByEdgeDrag": {
+        "type": "bool",
+        "value": false
+      }
+    }
+  }
+}

@@ -13,12 +13,11 @@ agent settings, and desktop handoff. This repository consumes that project.
 | Command | Purpose |
 | --- | --- |
 | `dots` | Set up a new account, or update an existing installation |
-| `dots install` | Install dotfiles into this account |
-| `dots update` / `dots` | Update dotfiles, reconcile its links, reload |
-| `t update` | Update the independently installed session toolkit |
-| `dots --all` | Update here, then run dots on every configured remote host |
-| `dots --relink` | Reapply installed configuration without network access |
-| `dots --relink` | Reconcile the selected dotfiles links without fetching |
+| `dots system integrate` | Apply dotfiles and Mac preferences to this account |
+| `dots system update` / `dots` | Update dotfiles, apply preferences, reconcile links, reload |
+| `t system update` | Update the independently installed session toolkit |
+| `dots system update --all` | Update here, then run dots on every configured remote host |
+| `dots system integrate --relink` | Reapply installed configuration and preferences offline |
 | `help` / `h` | List shell and installed commands |
 | `prview` | Inspect a pull request from the terminal |
 | `nosleep` | Keep the Mac awake while work is active |
@@ -53,14 +52,15 @@ this migration does not create or broaden them. `DOTFILES_NO_SUDO=1` skips setup
 ```sh
 brew tap agenthangar/tap
 brew install dots
-dots
+dots system integrate
 ```
 
 Homebrew installs the complete configuration, utilities, and templates. No Git
-checkout is required. The first `dots` applies that installed package to your
-account; subsequent `dots` or `dots update` commands upgrade it through Homebrew
-and reconcile your configuration. `dots --relink` applies the installed files
-without network access. `dots install` reruns full account setup, including the
+checkout is required. Run `dots system integrate` to apply that installed package to your
+account; subsequent `dots system update` (or `dots`) commands upgrade it through
+Homebrew and reconcile your configuration. `dots system integrate --relink`
+reapplies the installed files and preferences without network access.
+`dots system integrate` reruns full account setup, including the
 optional sudo-trust prompt. Homebrew manages the runtime dependencies.
 
 After setup, open a new shell or run `source ~/.zshrc`. Your `.zshrc` is a real
@@ -164,3 +164,33 @@ gitleaks, the private PII scan, and dependency audit behind the required `CI` ga
 The Python t suite and its 97% coverage requirement moved to the standalone repository.
 
 MIT — [LICENSE](LICENSE). This remains a personal setup; [contributing](CONTRIBUTING.md).
+
+### Portable Mac preferences
+
+`dots system update [--all]` updates and applies the managed configuration.
+`dots system integrate` applies the installed configuration to this account;
+`dots system integrate --relink` reapplies it offline. Existing `dots`, `dots update`,
+`dots install`, and flag aliases continue to work.
+
+Every integration applies the typed profile in `lib/macos/preferences.json` on
+macOS, including offline relinking. It manages Rectangle shortcuts, snap areas,
+sizing, restore behavior and launch on login; Dock auto-hide, size 16, hidden
+recents and Mission Control grouping; Finder list view; natural scrolling off;
+and Apple's window tiling gestures and margins off. Only managed keys change.
+Unrelated preferences remain intact. Changed managed values (including absent
+keys) are saved first under `~/.config/dotfiles/backups/` as a private plist in a
+private timestamped directory. Writes stop with an error if a backup or preference
+write fails; a partial apply can be retried. Repeated applies make no writes when
+values already match. Managed keys are reapplied on future updates.
+
+Set `DOTFILES_NO_MACOS=1` to skip preferences. Linux skips them automatically.
+Install the app separately with `brew install --cask rectangle`, then open it and
+grant Accessibility access manually. Preferences never restart apps: relaunch
+Rectangle if running; some desktop settings may need logout/login. The profile marks Rectangle's welcome screen as displayed so its first-run
+shortcut preset chooser cannot overwrite the imported shortcuts. Accessibility
+approval is still required; all other Rectangle installation metadata is excluded.
+
+After `brew install agenthangar/tap/dotfiles`, run `dots system integrate` to
+apply the account configuration and preferences. Homebrew post-install runs with
+an isolated HOME and cannot apply account preferences. No checkout is required.
+The preference helper requires Python 3 (included by the package).

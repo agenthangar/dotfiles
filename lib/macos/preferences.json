@@ -311,6 +311,13 @@
         "type": "dict",
         "value": {}
       },
+      "tileActiveApp": {
+        "type": "dict",
+        "value": {
+          "keyCode": 19,
+          "modifierFlags": 393216
+        }
+      },
       "tileColumns": {
         "type": "dict",
         "value": {}

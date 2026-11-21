@@ -194,3 +194,43 @@ After `brew install agenthangar/tap/dotfiles`, run `dots system integrate` to
 apply the account configuration and preferences. Homebrew post-install runs with
 an isolated HOME and cannot apply account preferences. No checkout is required.
 The preference helper requires Python 3 (included by the package).
+
+One explicitly selected source Mac can publish subsequent Rectangle changes
+hourly. This is an account opt-in; ordinary installs and other Macs never enable
+publishing. After installing the released Homebrew package, authenticate `gh`
+with write access to both `agenthangar/dotfiles` and `agenthangar/homebrew-tap`,
+then run the private administration helper (substitute your Homebrew prefix):
+
+```sh
+/opt/homebrew/opt/python@3.14/bin/python3.14 /opt/homebrew/opt/dotfiles/libexec/lib/macos/rectangle_sync.py install
+```
+
+The first activation records current local and upstream values without publishing
+historical differences. Later runs capture only existing managed Rectangle keys;
+welcome-screen metadata, unrelated preferences and other domains are excluded.
+A missing shortcut dictionary is recorded as absent; deleting a shortcut after
+activation publishes an empty dictionary to disable it. Missing scalar values,
+invalid types, changing snapshots and same-key upstream conflicts stop the run.
+Independent upstream changes are preserved. While enabled, `dots` preserves this
+account's Rectangle preferences and continues applying other Mac preferences.
+Other Macs receive the published profile on their next normal update.
+
+The helper creates a source PR, immediately enables squash auto-merge, waits for
+required GitHub Actions CI and actual merge, then creates a verified patch release
+in the tap. It resumes pending work on subsequent hourly runs. Branch protection
+and CI remain required; conflicts, authentication errors and failed checks leave
+recoverable private state. It does not run checkout scripts or installers.
+
+Use the same helper with `status` to see activation and pending-operation status,
+`run` to check immediately, or `uninstall` to stop the per-user LaunchAgent and
+restore normal Rectangle profile application. Disable does not cancel PRs already
+submitted; their existing auto-merge and CI continue. State, managed-value
+baselines and logs live under `~/.config/dotfiles/rectangle-sync/` (or
+`$XDG_CONFIG_HOME/dotfiles/rectangle-sync/`), with private permissions. `sync.log`
+records outcomes and key names without preference values. Keep `state.json` when
+recovering an interrupted operation. The source marker intentionally protects
+Rectangle even if corrupted; use `uninstall` to remove that protection. Baselines
+are retained on disable/re-enable. To intentionally start a fresh baseline,
+disable, resolve any pending PRs, archive the private state directory, then enable
+again. The job uses stable Homebrew `opt` paths and runs only while this account
+is logged in; no native app windows are opened.

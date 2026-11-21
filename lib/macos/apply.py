@@ -53,7 +53,7 @@ def load_profile(path):
 
 
 def defaults(*args):
-    return subprocess.run(['defaults', *args], capture_output=True)
+    return subprocess.run(['defaults', *args], capture_output=True, timeout=30)
 
 
 def read_domain(domain):
@@ -83,7 +83,12 @@ def same(a, b):
 def apply(profile):
     domains = load_profile(profile)
     changes, before = [], {}
+    source_marker = Path(os.environ.get('XDG_CONFIG_HOME', str(Path.home() / '.config'))) / 'dotfiles/rectangle-sync/source.json'
     for domain, settings in domains.items():
+        # Presence fails closed, including corrupt state, to protect the source Mac.
+        if domain == 'com.knollsoft.Rectangle' and (source_marker.exists() or source_marker.is_symlink()):
+            print('Rectangle preferences: preserved on opted-in source Mac')
+            continue
         current = read_domain(domain)
         for key, value in settings.items():
             if key not in current or not same(current[key], value):
@@ -130,7 +135,7 @@ def main():
         return 0
     try:
         apply(Path(__file__).with_name('preferences.json'))
-    except (PreferenceError, OSError, ValueError, TypeError, OverflowError) as exc:
+    except (PreferenceError, OSError, ValueError, TypeError, OverflowError, subprocess.TimeoutExpired) as exc:
         print(f'macOS preferences: {exc}', file=sys.stderr)
         return 1
     return 0

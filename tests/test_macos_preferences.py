@@ -122,3 +122,15 @@ def test_skips_non_macos_and_optout(monkeypatch, capsys):
     monkeypatch.setattr(macos.platform, 'system', lambda: 'Linux')
     assert macos.main() == 0
     assert 'Linux' in capsys.readouterr().out
+
+
+def test_rectangle_source_guard_preserves_even_corrupt_marker(sandbox):
+    home, state, writes = sandbox
+    marker = home / '.config/dotfiles/rectangle-sync/source.json'
+    marker.parent.mkdir(parents=True)
+    marker.write_text('corrupt: fail closed')
+    state['com.knollsoft.Rectangle'] = {'leftHalf': {'keyCode': 5}}
+    macos.apply(ROOT / 'lib/macos/preferences.json')
+    assert state['com.knollsoft.Rectangle'] == {'leftHalf': {'keyCode': 5}}
+    assert writes and all(write[1] != 'com.knollsoft.Rectangle' for write in writes)
+    assert state['com.apple.dock']['tilesize'] == 16

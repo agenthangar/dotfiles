@@ -305,6 +305,25 @@ def test_ci_requires_exact_successful_required_checks(monkeypatch):
     assert not github.ci(sync.SOURCE, A)
 
 
+def test_ci_ignores_optional_checks_and_requires_all_tap_gates(monkeypatch):
+    github = sync.GitHub('/fake/gh')
+    def gate(name, **overrides):
+        return {'name': name, 'status': 'completed', 'conclusion': 'success',
+                'app': {'slug': 'github-actions'}, 'head_sha': A, **overrides}
+    runs = [gate('CI'), gate('Scorecard analysis', conclusion='failure'),
+            gate('Optional analysis', status='in_progress', conclusion=None)]
+    monkeypatch.setattr(github, 'api', lambda path: {'total_count': len(runs), 'check_runs': runs})
+    assert github.ci(sync.SOURCE, A)
+    assert not github.ci(sync.TAP, A)
+    runs.append(gate('formula (macos-latest)'))
+    assert not github.ci(sync.TAP, A)
+    runs.append(gate('formula (ubuntu-latest)'))
+    assert github.ci(sync.TAP, A)
+    runs[-1]['conclusion'] = 'failure'
+    with pytest.raises(sync.SyncError, match='CI failed'):
+        github.ci(sync.TAP, A)
+
+
 def test_gh_structured_input_and_timeout(monkeypatch):
     seen = []
     def execute(argv, **kwargs):

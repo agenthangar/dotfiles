@@ -226,22 +226,20 @@ class GitHub:
 
     def ci(self, repo, sha):
         checks = self.api(f'repos/{repo}/commits/{sha}/check-runs?per_page=100')
-        statuses = self.api(f'repos/{repo}/commits/{sha}/status')
         runs = checks['check_runs']
         if checks['total_count'] > len(runs):
             raise SyncError('too many CI checks to verify safely')
-        if any(run['status'] == 'completed' and run['conclusion'] not in ('success', 'neutral', 'skipped') for run in runs):
-            raise SyncError('CI failed; inspect the operation PR')
-        if statuses['state'] in ('failure', 'error'):
-            raise SyncError('commit status failed; inspect the operation PR')
         required = ('CI',) if repo == SOURCE else ('formula (macos-latest)', 'formula (ubuntu-latest)')
-        # A merged commit must have its own required CI, not merely unrelated checks.
-        required_passed = all(any(
+        # Only required gates authorize publishing. Scorecard and other optional
+        # checks do not belong to the release contract.
+        gates = [run for run in runs if run['name'] in required
+                 and run.get('app', {}).get('slug') == 'github-actions'
+                 and run.get('head_sha') == sha]
+        if any(run['status'] == 'completed' and run['conclusion'] not in ('success', 'neutral', 'skipped') for run in gates):
+            raise SyncError('CI failed; inspect the operation PR')
+        return all(any(
             run['name'] == name and run['status'] == 'completed' and run['conclusion'] == 'success'
-            and run.get('app', {}).get('slug') == 'github-actions'
-            and run.get('head_sha') == sha for run in runs) for name in required)
-        return required_passed and all(run['status'] == 'completed' for run in runs) and (
-            not statuses['statuses'] or statuses['state'] == 'success')
+            for run in gates) for name in required)
 
     def contains(self, ancestor, descendant):
         comparison = self.api(f'repos/{SOURCE}/compare/{ancestor}...{descendant}')

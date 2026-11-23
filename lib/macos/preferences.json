@@ -105,7 +105,10 @@
       },
       "centerThird": {
         "type": "dict",
-        "value": {}
+        "value": {
+          "keyCode": 8,
+          "modifierFlags": 1835008
+        }
       },
       "centerThreeFourths": {
         "type": "dict",
@@ -147,7 +150,10 @@
       },
       "firstThird": {
         "type": "dict",
-        "value": {}
+        "value": {
+          "keyCode": 123,
+          "modifierFlags": 1835008
+        }
       },
       "firstThreeFourths": {
         "type": "dict",
@@ -186,7 +192,10 @@
       },
       "lastThird": {
         "type": "dict",
-        "value": {}
+        "value": {
+          "keyCode": 124,
+          "modifierFlags": 1835008
+        }
       },
       "lastThreeFourths": {
         "type": "dict",

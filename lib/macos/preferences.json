@@ -8,7 +8,10 @@
       },
       "almostMaximize": {
         "type": "dict",
-        "value": {}
+        "value": {
+          "keyCode": 46,
+          "modifierFlags": 1835008
+        }
       },
       "alternateDefaultShortcuts": {
         "type": "bool",
@@ -98,10 +101,7 @@
       },
       "centerHalf": {
         "type": "dict",
-        "value": {
-          "keyCode": 8,
-          "modifierFlags": 1835008
-        }
+        "value": {}
       },
       "centerThird": {
         "type": "dict",
@@ -146,7 +146,10 @@
       },
       "firstFourth": {
         "type": "dict",
-        "value": {}
+        "value": {
+          "keyCode": 123,
+          "modifierFlags": 1835008
+        }
       },
       "firstThird": {
         "type": "dict",
@@ -173,11 +176,14 @@
       },
       "landscapeSnapAreas": {
         "type": "string",
-        "value": "[2,{\"action\":29},3,{\"action\":15},6,{\"action\":13},4,{\"action\":96},7,{\"compound\":-6},1,{\"action\":15},8,{\"action\":14},5,{\"action\":1}]"
+        "value": "[3,{\"action\":95},8,{\"action\":103},6,{\"action\":100},2,{\"action\":93},4,{\"action\":96},1,{\"action\":92},7,{\"action\":102},5,{\"action\":99}]"
       },
       "larger": {
         "type": "dict",
-        "value": {}
+        "value": {
+          "keyCode": 24,
+          "modifierFlags": 1835008
+        }
       },
       "largerWidth": {
         "type": "dict",
@@ -188,7 +194,10 @@
       },
       "lastFourth": {
         "type": "dict",
-        "value": {}
+        "value": {
+          "keyCode": 124,
+          "modifierFlags": 1835008
+        }
       },
       "lastThird": {
         "type": "dict",
@@ -215,10 +224,7 @@
       },
       "leftHalf": {
         "type": "dict",
-        "value": {
-          "keyCode": 123,
-          "modifierFlags": 1835008
-        }
+        "value": {}
       },
       "maximize": {
         "type": "dict",
@@ -237,19 +243,31 @@
       },
       "moveDown": {
         "type": "dict",
-        "value": {}
+        "value": {
+          "keyCode": 125,
+          "modifierFlags": 1441792
+        }
       },
       "moveLeft": {
         "type": "dict",
-        "value": {}
+        "value": {
+          "keyCode": 123,
+          "modifierFlags": 1441792
+        }
       },
       "moveRight": {
         "type": "dict",
-        "value": {}
+        "value": {
+          "keyCode": 124,
+          "modifierFlags": 1441792
+        }
       },
       "moveUp": {
         "type": "dict",
-        "value": {}
+        "value": {
+          "keyCode": 126,
+          "modifierFlags": 1441792
+        }
       },
       "nextDisplay": {
         "type": "dict",
@@ -272,14 +290,14 @@
       },
       "rightHalf": {
         "type": "dict",
-        "value": {
-          "keyCode": 124,
-          "modifierFlags": 1835008
-        }
+        "value": {}
       },
       "secondFourth": {
         "type": "dict",
-        "value": {}
+        "value": {
+          "keyCode": 7,
+          "modifierFlags": 1835008
+        }
       },
       "secondVerticalSixth": {
         "type": "dict",
@@ -287,7 +305,10 @@
       },
       "smaller": {
         "type": "dict",
-        "value": {}
+        "value": {
+          "keyCode": 27,
+          "modifierFlags": 1835008
+        }
       },
       "smallerWidth": {
         "type": "dict",
@@ -310,11 +331,14 @@
       },
       "subsequentExecutionMode": {
         "type": "int",
-        "value": 0
+        "value": 5
       },
       "thirdFourth": {
         "type": "dict",
-        "value": {}
+        "value": {
+          "keyCode": 8,
+          "modifierFlags": 1835008
+        }
       },
       "thirdVerticalSixth": {
         "type": "dict",
@@ -337,10 +361,7 @@
       },
       "toggleStackBadge": {
         "type": "dict",
-        "value": {
-          "keyCode": 44,
-          "modifierFlags": 1835008
-        }
+        "value": {}
       },
       "topCenterLeftEighth": {
         "type": "dict",
@@ -383,11 +404,17 @@
       },
       "topLeftNinth": {
         "type": "dict",
-        "value": {}
+        "value": {
+          "keyCode": 123,
+          "modifierFlags": 1572864
+        }
       },
       "topLeftSixteenth": {
         "type": "dict",
-        "value": {}
+        "value": {
+          "keyCode": 123,
+          "modifierFlags": 1572864
+        }
       },
       "topLeftSixth": {
         "type": "dict",
@@ -398,7 +425,10 @@
       },
       "topLeftTwelfth": {
         "type": "dict",
-        "value": {}
+        "value": {
+          "keyCode": 123,
+          "modifierFlags": 1572864
+        }
       },
       "topRight": {
         "type": "dict",
